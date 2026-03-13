@@ -1027,7 +1027,7 @@ function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, 
   const [menuOpen, setMenuOpen] = useState(false);
   const wasDragged = useRef(false);
   const materials = [...new Set((sample.layers || []).flatMap(l => (l.targets || []).map(t => t.material).filter(Boolean)))];
-  const dataCount = Object.values(plotData || {}).filter(hasPlotData).length;
+  const dataCount = Object.values(sample.filenames || {}).filter(Boolean).length;
 
   return (
     <div
