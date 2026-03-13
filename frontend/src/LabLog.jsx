@@ -917,8 +917,14 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 
 // ── AddSampleModal ────────────────────────────────────────────────────────────
 
-function AddSampleModal({ onAdd, onClose, folders }) {
-  const [f, setF] = useState({
+function AddSampleModal({ onAdd, onClose, folders, template }) {
+  const [f, setF] = useState(() => template ? {
+    id: "", date: template.date ?? new Date().toISOString().slice(0, 10),
+    substrate: template.substrate ?? "", notes: template.notes ?? "",
+    thickness_nm: template.thickness_nm ?? "",
+    technique: template.technique ?? "sputter",
+    folder_id: template.folder_id ?? "",
+  } : {
     id: "", date: new Date().toISOString().slice(0, 10),
     substrate: "STO (001)", notes: "", thickness_nm: "",
     technique: "sputter", folder_id: "",
@@ -935,7 +941,10 @@ function AddSampleModal({ onAdd, onClose, folders }) {
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 500, display: "flex", flexDirection: "column", gap: 16 }}>
-        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 22 }}>New Sample</h2>
+        <div>
+          <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 22 }}>{template ? "Duplicate Template" : "New Sample"}</h2>
+          {template && <div style={{ marginTop: 4, fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>From {template.id} — layers copied, data not included</div>}
+        </div>
 
         <div style={{ display: "flex", gap: 6 }}>
           {techniqueBtn("sputter", "Sputter")}
@@ -943,8 +952,8 @@ function AddSampleModal({ onAdd, onClose, folders }) {
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
-          <Input label="Sample ID"          value={f.id}           onChange={set("id")}           placeholder="e.g. SP026" />
-          <Input label="Date"               value={f.date}         onChange={set("date")}         type="date" />
+          <Input label="New Sample ID"  value={f.id}           onChange={set("id")}           placeholder="e.g. SP026" />
+          <Input label="Date"           value={f.date}         onChange={set("date")}         type="date" />
           <Input label="Thickness (nm)" value={f.thickness_nm} onChange={v => setF(p => ({ ...p, thickness_nm: v === "" ? "" : v }))} type="number" placeholder="e.g. 30" />
         </div>
         <Input label="Substrate"  value={f.substrate} onChange={set("substrate")} placeholder="e.g. STO (001)" />
@@ -957,7 +966,8 @@ function AddSampleModal({ onAdd, onClose, folders }) {
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
           <Btn onClick={() => {
             if (!f.id.trim()) return;
-            onAdd({ ...f, thickness_nm: f.thickness_nm === "" ? null : +f.thickness_nm, folder_id: f.folder_id || null, layers: [], filenames: {}, area_m2: null, area_correction: 1.0 });
+            const layers = template ? JSON.parse(JSON.stringify(template.layers || [])).map(l => ({ ...l, id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()) })) : [];
+            onAdd({ ...f, thickness_nm: f.thickness_nm === "" ? null : +f.thickness_nm, folder_id: f.folder_id || null, layers, filenames: {}, area_m2: null, area_correction: 1.0 });
           }} disabled={!f.id.trim()}>Create</Btn>
         </div>
       </div>
@@ -967,7 +977,7 @@ function AddSampleModal({ onAdd, onClose, folders }) {
 
 // ── SampleCard ────────────────────────────────────────────────────────────────
 
-function SampleCard({ sample, onClick, onDelete, plotData, onDragStart }) {
+function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, onDragStart }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const wasDragged = useRef(false);
   const materials = [...new Set((sample.layers || []).flatMap(l => (l.targets || []).map(t => t.material).filter(Boolean)))];
@@ -994,7 +1004,12 @@ function SampleCard({ sample, onClick, onDelete, plotData, onDragStart }) {
               onBlur={() => setTimeout(() => setMenuOpen(false), 120)}
               style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px", borderRadius: 4, letterSpacing: 1 }}>⋯</button>
             {menuOpen && (
-              <div style={{ position: "absolute", top: "100%", right: 0, marginTop: 4, background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, boxShadow: "0 4px 16px rgba(0,0,0,.5)", zIndex: 200, minWidth: 110, overflow: "hidden" }}>
+              <div style={{ position: "absolute", top: "100%", right: 0, marginTop: 4, background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, boxShadow: "0 4px 16px rgba(0,0,0,.5)", zIndex: 200, minWidth: 150, overflow: "hidden" }}>
+                <button onClick={e => { e.stopPropagation(); setMenuOpen(false); onDuplicateTemplate?.(sample); }}
+                  style={{ display: "block", width: "100%", background: "none", border: "none", color: T.textSecondary, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "9px 14px", textAlign: "left", cursor: "pointer" }}>
+                  Duplicate Template
+                </button>
+                <div style={{ height: 1, background: T.border, margin: "0 8px" }} />
                 <button onClick={e => { e.stopPropagation(); setMenuOpen(false); if (window.confirm(`Delete ${sample.id}?`)) onDelete(sample.id); }}
                   style={{ display: "block", width: "100%", background: "none", border: "none", color: T.red, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "9px 14px", textAlign: "left", cursor: "pointer" }}>
                   Delete
@@ -1024,7 +1039,7 @@ function SampleCard({ sample, onClick, onDelete, plotData, onDragStart }) {
 
 const COLOR_OPTIONS = ["#4a5568", "#3182ce", "#38a169", "#d69e2e", "#9f7aea", "#ed64a6", "#fc8181", "#4fd1c5"];
 
-function FolderTile({ folder, samples, plotCache, onSelectSample, onDeleteSample, onEdit, onDelete, onDropSample, onDragStartSample }) {
+function FolderTile({ folder, samples, plotCache, onSelectSample, onDeleteSample, onDuplicateTemplate, onEdit, onDelete, onDropSample, onDragStartSample }) {
   const [open, setOpen]       = useState(true);
   const [dragOver, setDragOver] = useState(false);
   const color = folder.color || T.borderBright;
@@ -1050,7 +1065,7 @@ function FolderTile({ folder, samples, plotCache, onSelectSample, onDeleteSample
       </div>
       {open && (
         <div style={{ padding: 12, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(270px,1fr))", gap: 12, background: T.bg0 }}>
-          {samples.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => onSelectSample(s.id)} onDelete={onDeleteSample} onDragStart={onDragStartSample} />)}
+          {samples.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => onSelectSample(s.id)} onDelete={onDeleteSample} onDuplicateTemplate={onDuplicateTemplate} onDragStart={onDragStartSample} />)}
           {!samples.length && (
             <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: dragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>
               {dragOver ? "Drop to add to this folder" : "Empty folder"}
@@ -1157,6 +1172,7 @@ export default function App() {
   const [plotCache, setPlotCache] = useState({}); // { [sampleId]: { xrd_ot, xrr, rsm, pe, diel_b_up, diel_b_down, diel_f } }
   const [active,   setActive]   = useState(null); // sample id
   const [adding,   setAdding]   = useState(false);
+  const [templateSample, setTemplateSample] = useState(null); // sample to duplicate
   const [draggingSampleId, setDraggingSampleId] = useState(null);
   const [addingFolder, setAddingFolder] = useState(false);
   const [editingFolder, setEditingFolder] = useState(null); // folder object
@@ -1397,6 +1413,7 @@ export default function App() {
                 {grouped.map(({ folder, samples: fs }) => (
                   <FolderTile key={folder.id} folder={folder} samples={fs} plotCache={plotCache}
                     onSelectSample={openSample} onDeleteSample={deleteSample}
+                    onDuplicateTemplate={setTemplateSample}
                     onEdit={() => setEditingFolder(folder)}
                     onDelete={() => deleteFolder(folder.id)}
                     onDropSample={() => handleDropToFolder(folder.id)}
@@ -1416,7 +1433,7 @@ export default function App() {
                       </div>
                     )}
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(270px,1fr))", gap: 12 }}>
-                      {ungrouped.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => openSample(s.id)} onDelete={deleteSample} onDragStart={setDraggingSampleId} />)}
+                      {ungrouped.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => openSample(s.id)} onDelete={deleteSample} onDuplicateTemplate={setTemplateSample} onDragStart={setDraggingSampleId} />)}
                     </div>
                   </div>
                 )}
@@ -1452,6 +1469,7 @@ export default function App() {
       </div>
 
       {adding && <AddSampleModal onAdd={addSample} onClose={() => setAdding(false)} folders={folders} />}
+      {templateSample && <AddSampleModal onAdd={s => { addSample(s); setTemplateSample(null); }} onClose={() => setTemplateSample(null)} folders={folders} template={templateSample} />}
       {(addingFolder || editingFolder) && (
         <AddFolderModal onSave={saveFolder} onClose={() => { setAddingFolder(false); setEditingFolder(null); }} existing={editingFolder} />
       )}
