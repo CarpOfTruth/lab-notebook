@@ -884,14 +884,17 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-        <button onClick={onBack} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 22, lineHeight: 1, padding: 0 }}>←</button>
-        <h1 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 28, color: T.amber }}>{sample.id}</h1>
-        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>{sample.technique || "sputter"}</span>
-        <div style={{ flex: 1 }} />
-        {hasFiles && <Btn variant="teal" small onClick={onReparseFiles} title="Re-fetch and re-parse all uploaded files">↻ Reparse</Btn>}
-        <Btn variant="ghost" small onClick={() => setEditingMeta(v => !v)}>{editingMeta ? "Cancel" : "Edit"}</Btn>
-        <Btn variant="danger" small onClick={() => { if (window.confirm(`Delete ${sample.id}?`)) onDelete(sample.id); }}>Delete</Btn>
+      {/* ── Sticky sample header bar ── */}
+      <div style={{ position: "sticky", top: 52, zIndex: 30, background: T.bg1, borderBottom: `1px solid ${T.border}`, margin: "0 -20px", padding: "10px 20px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <button onClick={onBack} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 22, lineHeight: 1, padding: 0 }}>←</button>
+          <h1 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 28, color: T.amber }}>{sample.id}</h1>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>{sample.technique || "sputter"}</span>
+          <div style={{ flex: 1 }} />
+          {hasFiles && <Btn variant="teal" small onClick={onReparseFiles} title="Re-fetch and re-parse all uploaded files">↻ Reparse</Btn>}
+          <Btn variant="ghost" small onClick={() => setEditingMeta(v => !v)}>{editingMeta ? "Cancel" : "Edit"}</Btn>
+          <Btn variant="danger" small onClick={() => { if (window.confirm(`Delete ${sample.id}?`)) onDelete(sample.id); }}>Delete</Btn>
+        </div>
       </div>
 
       {editingMeta ? (
