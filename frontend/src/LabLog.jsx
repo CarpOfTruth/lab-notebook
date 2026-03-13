@@ -46,7 +46,7 @@ const MEAS_TYPES = {
   xrd_ot: { label: "XRD ω–2θ",                    xLabel: "2θ (°)",         yLabel: "Intensity (cts)", logY: true,  color: T.amber },
   xrr:    { label: "XRR",                          xLabel: "2θ (°)",         yLabel: "Intensity (cts)", logY: true,  color: T.teal  },
   rsm:    { label: "RSM",                          xLabel: "Qₓ (Å⁻¹)",      yLabel: "Qz (Å⁻¹)",       isRSM: true, color: T.blue  },
-  pe:     { label: "P–E Hysteresis",               xLabel: "E (kV/cm)",      yLabel: "P (µC/cm²)",      logY: false, color: T.red },
+  pe:     { label: "P–E Hysteresis",               xLabel: "E (kV/cm)",      yLabel: "P (µC/cm²)",      logY: false, color: T.red, ySymRange: 30 },
   diel_f: { label: "Rel. Permittivity vs f",       xLabel: "Frequency (Hz)", yLabel: "εᵣ",              logX: true,  color: T.green, clampYZero: true },
   diel_b: { label: "Rel. Permittivity vs E",       xLabel: "E (kV/cm)",      yLabel: "εᵣ",              logY: false, color: T.green, clampYZero: true, twoSweep: true },
 };
@@ -288,6 +288,11 @@ function LinePlot({ data, cfg }) {
     const lo = Math.floor(arrMin(yVals)), hi = Math.ceil(arrMax(yVals));
     yDomain = [lo, hi];
     yTicks  = Array.from({ length: hi - lo + 1 }, (_, i) => lo + i);
+  } else if (cfg.ySymRange != null) {
+    const absMax = yVals.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+    const sym = Math.max(cfg.ySymRange, absMax * 1.1);
+    yDomain = [-sym, sym];
+    yTicks  = undefined;
   } else {
     const [domLo, domHi] = padDomain(yVals);
     yDomain = cfg.clampYZero ? [0, domHi] : [domLo, domHi];
