@@ -831,9 +831,8 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
 
 // ── SampleDetail ──────────────────────────────────────────────────────────────
 
-function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete }) {
+function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete, editingMeta, setEditingMeta }) {
   const [addingLayer, setAddingLayer]   = useState(false);
-  const [editingMeta, setEditingMeta]   = useState(false);
   const [meta, setMeta]                 = useState({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
   const [dragIdx, setDragIdx]           = useState(null);
   const [overIdx, setOverIdx]           = useState(null);
@@ -884,19 +883,6 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
-      {/* ── Sticky sample header bar ── */}
-      <div style={{ position: "sticky", top: 52, zIndex: 30, background: T.bg1, borderBottom: `1px solid ${T.border}`, margin: "0 -20px", padding: "10px 20px" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          <button onClick={onBack} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 22, lineHeight: 1, padding: 0 }}>←</button>
-          <h1 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 28, color: T.amber }}>{sample.id}</h1>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>{sample.technique || "sputter"}</span>
-          <div style={{ flex: 1 }} />
-          {hasFiles && <Btn variant="teal" small onClick={onReparseFiles} title="Re-fetch and re-parse all uploaded files">↻ Reparse</Btn>}
-          <Btn variant="ghost" small onClick={() => setEditingMeta(v => !v)}>{editingMeta ? "Cancel" : "Edit"}</Btn>
-          <Btn variant="danger" small onClick={() => { if (window.confirm(`Delete ${sample.id}?`)) onDelete(sample.id); }}>Delete</Btn>
-        </div>
-      </div>
-
       {editingMeta ? (
         <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: 14, display: "grid", gridTemplateColumns: "1fr 1fr 1fr 2fr", gap: 12 }}>
           <Input label="Date"              value={meta.date}         onChange={v => setMeta(p => ({ ...p, date: v }))} />
@@ -1231,6 +1217,7 @@ export default function App() {
   const [books,    setBooks]    = useState([]);
   const [plotCache, setPlotCache] = useState({}); // { [sampleId]: { xrd_ot, xrr, rsm, pe, diel_b_up, diel_b_down, diel_f } }
   const [active,   setActive]   = useState(null); // sample id
+  const [editingMeta, setEditingMeta] = useState(false);
   const [adding,   setAdding]   = useState(false);
   const [templateSample, setTemplateSample] = useState(null); // sample to duplicate
   const [draggingSampleId, setDraggingSampleId] = useState(null);
@@ -1412,9 +1399,13 @@ export default function App() {
     await updateSample({ ...sample, folder_id: newFolderId });
   };
 
+  // reset edit mode whenever the active sample changes
+  useEffect(() => { setEditingMeta(false); }, [active]);
+
   // ── Render ───────────────────────────────────────────────────────────────
 
   const activeSample = samples.find(s => s.id === active);
+  const hasFilesForActive = activeSample ? Object.keys(activeSample.filenames || {}).length > 0 : false;
 
   const byId = (a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" });
   const grouped   = folders.map(f => ({ folder: f, samples: samples.filter(s => s.folder_id === f.id).sort(byId) }));
@@ -1433,11 +1424,21 @@ export default function App() {
       <div style={{ minHeight: "100vh", background: T.bg0, color: T.textPrimary }}>
         {/* Header */}
         <div style={{ borderBottom: `1px solid ${T.border}`, padding: "12px 28px", display: "flex", alignItems: "center", gap: 14, background: T.bg1, position: "sticky", top: 0, zIndex: 50 }}>
-          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.amber, letterSpacing: 1 }}>LabLog</span>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>ferroelectric oxide films</span>
-          <div style={{ flex: 1 }} />
-          {!active && (
+          {active && activeSample ? (
             <>
+              <button onClick={() => setActive(null)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 20, lineHeight: 1, padding: 0 }}>←</button>
+              <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.amber }}>{activeSample.id}</span>
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>{activeSample.technique || "sputter"}</span>
+              <div style={{ flex: 1 }} />
+              {hasFilesForActive && <Btn variant="teal" small onClick={handleReparseFiles}>↻ Reparse</Btn>}
+              <Btn variant="ghost" small onClick={() => setEditingMeta(v => !v)}>{editingMeta ? "Cancel" : "Edit"}</Btn>
+              <Btn variant="danger" small onClick={() => { if (window.confirm(`Delete ${activeSample.id}?`)) deleteSample(activeSample.id); }}>Delete</Btn>
+            </>
+          ) : (
+            <>
+              <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.amber, letterSpacing: 1 }}>LabLog</span>
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>ferroelectric oxide films</span>
+              <div style={{ flex: 1 }} />
               <Btn variant="ghost" small onClick={() => setAddingFolder(true)}>+ Folder</Btn>
               <Btn onClick={() => setAdding(true)}>+ New Sample</Btn>
             </>
@@ -1460,7 +1461,9 @@ export default function App() {
               onUploadFile={handleUploadFile}
               onReparseFiles={handleReparseFiles}
               onBack={() => setActive(null)}
-              onDelete={deleteSample} />
+              onDelete={deleteSample}
+              editingMeta={editingMeta}
+              setEditingMeta={setEditingMeta} />
           ) : (
             <>
               {/* Samples section */}
