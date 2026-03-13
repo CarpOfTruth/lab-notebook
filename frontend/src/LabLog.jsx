@@ -1191,10 +1191,15 @@ export default function App() {
   };
 
   const deleteSample = async (id) => {
-    await api("DELETE", `/samples/${id}`);
+    try {
+      await api("DELETE", `/samples/${id}`);
+    } catch (e) {
+      alert(`Delete failed: ${e.message}`);
+      return;
+    }
     setSamples(p => p.filter(x => x.id !== id));
     setPlotCache(p => { const c = { ...p }; delete c[id]; return c; });
-    setActive(null);
+    setActive(prev => (prev === id ? null : prev));
   };
 
   // ── File upload + plotCache ──────────────────────────────────────────────
