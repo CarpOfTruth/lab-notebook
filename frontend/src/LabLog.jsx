@@ -46,7 +46,7 @@ const MEAS_TYPES = {
   xrd_ot: { label: "XRD ω–2θ",                    xLabel: "2θ (°)",         yLabel: "Intensity (cts)", logY: true,  color: T.amber },
   xrr:    { label: "XRR",                          xLabel: "2θ (°)",         yLabel: "Intensity (cts)", logY: true,  color: T.teal  },
   rsm:    { label: "RSM",                          xLabel: "Qₓ (Å⁻¹)",      yLabel: "Qz (Å⁻¹)",       isRSM: true, color: T.blue  },
-  pe:     { label: "P–E Hysteresis",               xLabel: "E (kV/cm)",      yLabel: "P (µC/cm²)",      logY: false, color: T.red,   twoSweep: true, ySymRange: 30 },
+  pe:     { label: "P–E Hysteresis",               xLabel: "E (kV/cm)",      yLabel: "P (µC/cm²)",      logY: false, color: T.red },
   diel_f: { label: "Rel. Permittivity vs f",       xLabel: "Frequency (Hz)", yLabel: "εᵣ",              logX: true,  color: T.green, clampYZero: true },
   diel_b: { label: "Rel. Permittivity vs E",       xLabel: "E (kV/cm)",      yLabel: "εᵣ",              logY: false, color: T.green, clampYZero: true, twoSweep: true },
 };
@@ -132,45 +132,11 @@ function findAreaFromFile(text) {
   return null;
 }
 
-function splitSweeps(points) {
-  if (points.length < 4) return { up: points, down: [] };
-  const xs = points.map(p => p.x);
-  const x0 = xs[0];
-  const maxX = xs.reduce((m, v) => Math.max(m, v), -Infinity);
-  const minX = xs.reduce((m, v) => Math.min(m, v),  Infinity);
-  const posThresh = maxX > 0 ? maxX * 0.9 : Infinity;
-  const negThresh = minX < 0 ? minX * 0.9 : -Infinity;
-  let cycleEnd = points.length;
-  if (maxX > 0 && minX < 0) {
-    let firstPos = -1, firstNeg = -1;
-    for (let i = 0; i < xs.length; i++) {
-      if (firstPos < 0 && xs[i] >= posThresh) firstPos = i;
-      if (firstNeg < 0 && xs[i] <= negThresh) firstNeg = i;
-      if (firstPos >= 0 && firstNeg >= 0) break;
-    }
-    const lastExtreme = Math.max(firstPos ?? -1, firstNeg ?? -1);
-    if (lastExtreme > 0) {
-      const thr = (maxX - minX) * 0.15;
-      for (let i = lastExtreme + 1; i < xs.length; i++) {
-        if (Math.abs(xs[i] - x0) < thr) { cycleEnd = i + 1; break; }
-      }
-    }
-  }
-  const cycle = points.slice(0, cycleEnd);
-  const up = [], down = [];
-  for (let i = 0; i < cycle.length; i++) {
-    if (i === 0) { up.push(cycle[i]); continue; }
-    (cycle[i].x >= cycle[i - 1].x ? up : down).push(cycle[i]);
-  }
-  up.sort((a, b) => a.x - b.x);
-  down.sort((a, b) => a.x - b.x);
-  return { up, down };
-}
 
 function hasPlotData(d) {
   if (!d) return false;
   if (Array.isArray(d)) return d.length > 0;
-  return !!(d.up?.length || d.down?.length);
+  return !!(d.up?.length || d.down?.length); // diel_b shape
 }
 
 function csvToPlotData(text, type, thicknessNm) {
@@ -186,7 +152,7 @@ function csvToPlotData(text, type, thicknessNm) {
     if (maxAbsX < 50 && thicknessNm > 0) xs = xs.map(v => v / (thicknessNm * 1e-4));
     const maxAbsY = ys.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
     if (maxAbsY > 0 && maxAbsY < 1e-3) ys = ys.map(p => p * 1e6);
-    return splitSweeps(xs.map((x, i) => ({ x, y: ys[i] })));
+    return xs.map((x, i) => ({ x, y: ys[i] }));
   }
   if (type === "diel_b_up" || type === "diel_b_down") {
     let xs = rows.map(r => r[0]);
@@ -488,10 +454,7 @@ function MeasPlot({ data, type, thicknessNm = 0, areaM2, areaCorrFactor = 1.0 })
   }
   if (type === "pe" && areaCorrFactor && areaCorrFactor !== 1.0) {
     const scale = 1.0 / (areaCorrFactor || 1.0);
-    const corr = pts => pts.map(p => ({ ...p, y: p.y * scale }));
-    plotData = Array.isArray(data)
-      ? corr(data)
-      : { up: corr(data.up || []), down: corr(data.down || []) };
+    plotData = data.map(p => ({ ...p, y: p.y * scale }));
   }
   if (cfg.twoSweep) return <TwoLinePlot data={plotData} cfg={cfg} />;
   return <LinePlot data={plotData} cfg={{ ...cfg, hasY2: type === "diel_f" }} />;
