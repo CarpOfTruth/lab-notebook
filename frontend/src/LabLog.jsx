@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from "react";
-import { LineChart, ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+import { LineChart, ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer } from "recharts";
 
 // ── API client ────────────────────────────────────────────────────────────────
 
@@ -46,7 +46,7 @@ const MEAS_TYPES = {
   xrd_ot: { label: "XRD ω–2θ",                    xLabel: "2θ (°)",         yLabel: "Intensity (cts)", logY: true,  color: T.amber },
   xrr:    { label: "XRR",                          xLabel: "2θ (°)",         yLabel: "Intensity (cts)", logY: true,  color: T.teal  },
   rsm:    { label: "RSM",                          xLabel: "Qₓ (Å⁻¹)",      yLabel: "Qz (Å⁻¹)",       isRSM: true, color: T.blue  },
-  pe:     { label: "P–E Hysteresis",               xLabel: "E (kV/cm)",      yLabel: "P (µC/cm²)",      logY: false, color: T.red, ySymRange: 30, symXTicks: true },
+  pe:     { label: "P–E Hysteresis",               xLabel: "E (kV/cm)",      yLabel: "P (µC/cm²)",      logY: false, color: T.red, ySymRange: 30, symXTicks: true, zeroRefY: true },
   diel_f: { label: "Rel. Permittivity vs f",       xLabel: "Frequency (Hz)", yLabel: "εᵣ",              logX: true,  color: T.green, clampYZero: true },
   diel_b: { label: "Rel. Permittivity vs E",       xLabel: "E (kV/cm)",      yLabel: "εᵣ",              logY: false, color: T.green, clampYZero: true, twoSweep: true, symXTicks: true },
 };
@@ -318,8 +318,8 @@ function LinePlot({ data, cfg }) {
     xTickFmt = v => { const n = Math.round(Math.log10(v)); return n === 0 ? "1" : n === 1 ? "10" : `10^${n}`; };
   } else {
     if (cfg.symXTicks) {
-      const { ticks, domain } = niceLinTicks(arrMin(xVals), arrMax(xVals));
-      xDomain = domain;
+      const { ticks } = niceLinTicks(arrMin(xVals), arrMax(xVals));
+      xDomain = padDomain(xVals, 0.05);
       xTicks  = ticks;
     } else {
       xDomain = padDomain(xVals);
@@ -371,6 +371,7 @@ function LinePlot({ data, cfg }) {
             contentStyle={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11 }}
             formatter={(v, name) => name === "y2" ? [numFmt(+v), "D (tan δ)"] : [logY ? numFmt(Math.pow(10, +v)) : numFmt(+v), yLabel]}
             labelFormatter={v => `${xLabel}: ${numFmt(+v)}`} />
+          {cfg.zeroRefY && <ReferenceLine yAxisId="left" y={0} stroke={T.borderBright} strokeWidth={1} />}
           <Line yAxisId="left" type="monotone" dataKey="yp" dot={false} stroke={color} strokeWidth={1.5} isAnimationActive={false} />
           {hasD && <Line yAxisId="right" type="monotone" dataKey="y2" dot={false} stroke={T.amber} strokeWidth={1.5} strokeDasharray="4 2" isAnimationActive={false} name="y2" />}
         </LineChart>
