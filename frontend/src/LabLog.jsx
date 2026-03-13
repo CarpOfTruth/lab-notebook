@@ -611,7 +611,7 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
 //     //          + layer-level: frequency_hz, focal_position
 //   }
 
-const SPUTTER_DEFAULTS = { material: "", oxygen_pct: 20, power_W: 150, time_s: 2000 };
+const SPUTTER_DEFAULTS = { material: "", power_W: 150 };
 const PLD_DEFAULTS     = { material: "", energy_mJ: 60, pulses: 10000 };
 
 function newLayer(technique) {
@@ -619,7 +619,7 @@ function newLayer(technique) {
     id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
     temp: 600,
     pressure: technique === "pld" ? 2 : 10,
-    ...(technique === "pld" ? { frequency_hz: 10, focal_position: "" } : {}),
+    ...(technique === "pld" ? { frequency_hz: 10, focal_position: "" } : { oxygen_pct: 20, time_s: 2000 }),
     targets: [technique === "pld" ? { ...PLD_DEFAULTS } : { ...SPUTTER_DEFAULTS }],
   };
 }
@@ -646,9 +646,7 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
       </div>
       {technique === "sputter" ? (
         <>
-          {tField("oxygen_pct", "O₂", "%", 56)}
-          {tField("power_W",   "Power", "W", 56)}
-          {tField("time_s",    "Time",  "s", 64)}
+          {tField("power_W", "Power", "W", 56)}
         </>
       ) : (
         <>
@@ -663,17 +661,17 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
   );
 }
 
-function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials }) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft]     = useState(null);
+function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials, initialEditing = false }) {
+  const [editing, setEditing] = useState(initialEditing);
+  const [draft, setDraft]     = useState(initialEditing ? JSON.parse(JSON.stringify(layer)) : null);
 
   const startEdit = (e) => {
     e.stopPropagation();
-    setDraft(JSON.parse(JSON.stringify(layer)));
+    if (!editing) setDraft(JSON.parse(JSON.stringify(layer)));
     setEditing(true);
   };
   const saveEdit = (e) => { e.stopPropagation(); onUpdate(draft); setEditing(false); };
-  const cancelEdit = (e) => { e.stopPropagation(); setEditing(false); };
+  const cancelEdit = (e) => { e.stopPropagation(); if (initialEditing) { onRemove(); } else { setEditing(false); } };
   const setDraftField = (k, v) => setDraft(p => ({ ...p, [k]: v }));
   const updateTarget = (i, t)  => setDraft(p => { const ts = [...p.targets]; ts[i] = t; return { ...p, targets: ts }; });
   const removeTarget = (i)     => setDraft(p => { const ts = p.targets.filter((_, j) => j !== i); return { ...p, targets: ts }; });
@@ -701,8 +699,8 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
         {sharedField("temp", "Temp", "°C")}
         {sharedField("pressure", "Press", "mTorr")}
         {technique === "pld"
-          ? <>{sharedField("frequency_hz", "Rep", "Hz")}{layer.targets[0] && sharedField("targets[0].energy", "Energy", "mJ")}</>
-          : <>{layer.targets[0] && <div style={{ textAlign: "center" }}><div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", marginBottom: 1 }}>Time</div><div style={{ fontSize: 12, color: T.textPrimary, fontFamily: "'DM Mono', monospace" }}>{layer.targets[0].time_s ?? "—"}<span style={{ fontSize: 10, color: T.textDim }}> s</span></div></div>}</>}
+          ? <>{sharedField("frequency_hz", "Rep", "Hz")}</>
+          : <>{sharedField("oxygen_pct", "O₂", "%")}{sharedField("time_s", "Time", "s")}</>}
         <button onClick={startEdit}   style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>✎</button>
         <button onClick={onDuplicate} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 15, padding: 0 }}>+</button>
         <button onClick={onRemove}    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, padding: 0 }}>×</button>
@@ -730,6 +728,24 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
             <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>mTorr</span>
           </div>
         </div>
+        {technique === "sputter" && (
+          <>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>O₂</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                <input value={draft.oxygen_pct ?? ""} onChange={e => setDraftField("oxygen_pct", e.target.value)} style={{ ...inputSm, width: 50 }} />
+                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>%</span>
+              </div>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Time</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                <input value={draft.time_s ?? ""} onChange={e => setDraftField("time_s", e.target.value)} style={{ ...inputSm, width: 60 }} />
+                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>s</span>
+              </div>
+            </div>
+          </>
+        )}
         {technique === "pld" && (
           <>
             <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -863,18 +879,17 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
           ))}
           {!sample.layers.length && !addingLayer && <div style={{ color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "10px 0" }}>No layers — add one above.</div>}
           {addingLayer && (
-            <div style={{ background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: 14 }}>
-              <LayerEditor
-                layer={newLayer(sample.technique || "sputter")}
-                technique={sample.technique || "sputter"}
-                knownMaterials={knownMaterials}
-                onRemove={() => setAddingLayer(false)}
-                onDuplicate={() => {}}
-                onUpdate={l => { addLayer(l); }}
-                isDragOver={false}
-                onDragStart={() => {}} onDragOver={() => {}} onDrop={() => {}} onDragEnd={() => {}}
-              />
-            </div>
+            <LayerEditor
+              layer={newLayer(sample.technique || "sputter")}
+              technique={sample.technique || "sputter"}
+              knownMaterials={knownMaterials}
+              initialEditing={true}
+              onRemove={() => setAddingLayer(false)}
+              onDuplicate={() => {}}
+              onUpdate={l => { addLayer(l); }}
+              isDragOver={false}
+              onDragStart={() => {}} onDragOver={() => {}} onDrop={() => {}} onDragEnd={() => {}}
+            />
           )}
         </div>
       </section>
@@ -939,7 +954,7 @@ function AddSampleModal({ onAdd, onClose, folders }) {
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
           <Input label="Sample ID"          value={f.id}           onChange={set("id")}           placeholder="e.g. SP026" />
           <Input label="Date"               value={f.date}         onChange={set("date")}         type="date" />
-          <Input label="Film thickness (nm)" value={f.thickness_nm} onChange={v => setF(p => ({ ...p, thickness_nm: v === "" ? "" : v }))} type="number" placeholder="e.g. 30" />
+          <Input label="Thickness (nm)" value={f.thickness_nm} onChange={v => setF(p => ({ ...p, thickness_nm: v === "" ? "" : v }))} type="number" placeholder="e.g. 30" />
         </div>
         <Input label="Substrate"  value={f.substrate} onChange={set("substrate")} placeholder="e.g. STO (001)" />
         <Input label="Notes"      value={f.notes}     onChange={set("notes")}     placeholder="Brief description…" />
