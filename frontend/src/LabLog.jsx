@@ -46,9 +46,9 @@ const MEAS_TYPES = {
   xrd_ot: { label: "XRD ω–2θ",                    xLabel: "2θ (°)",         yLabel: "Intensity (cts)", logY: true,  color: T.amber },
   xrr:    { label: "XRR",                          xLabel: "2θ (°)",         yLabel: "Intensity (cts)", logY: true,  color: T.teal  },
   rsm:    { label: "RSM",                          xLabel: "Qₓ (Å⁻¹)",      yLabel: "Qz (Å⁻¹)",       isRSM: true, color: T.blue  },
-  pe:     { label: "P–E Hysteresis",               xLabel: "E (kV/cm)",      yLabel: "P (µC/cm²)",      logY: false, color: T.red, ySymRange: 30 },
+  pe:     { label: "P–E Hysteresis",               xLabel: "E (kV/cm)",      yLabel: "P (µC/cm²)",      logY: false, color: T.red, ySymRange: 30, symXTicks: true },
   diel_f: { label: "Rel. Permittivity vs f",       xLabel: "Frequency (Hz)", yLabel: "εᵣ",              logX: true,  color: T.green, clampYZero: true },
-  diel_b: { label: "Rel. Permittivity vs E",       xLabel: "E (kV/cm)",      yLabel: "εᵣ",              logY: false, color: T.green, clampYZero: true, twoSweep: true },
+  diel_b: { label: "Rel. Permittivity vs E",       xLabel: "E (kV/cm)",      yLabel: "εᵣ",              logY: false, color: T.green, clampYZero: true, twoSweep: true, symXTicks: true },
 };
 
 // ── Material colour palette (hash-based for any string) ───────────────────────
@@ -241,6 +241,44 @@ function padDomain(vals, pct = 0.1) {
   return [mn - pad, mx + pad];
 }
 
+// Returns { ticks, domain } with zero always included, clean steps, ~5-7 ticks.
+function niceLinTicks(lo, hi, target = 6) {
+  const mn = Math.min(lo, 0, hi);
+  const mx = Math.max(hi, 0, lo);
+  const span = mx - mn || 1;
+  const base = Math.pow(10, Math.floor(Math.log10(span / target)));
+  const candidates = [1, 2, 2.5, 5, 10].map(f => f * base);
+  let step = candidates[candidates.length - 1];
+  for (const s of candidates) {
+    const n = Math.floor(mx / s) - Math.ceil(mn / s) + 1;
+    if (n >= 4 && n <= 8) { step = s; break; }
+  }
+  const t0 = Math.ceil(mn / step) * step, t1 = Math.floor(mx / step) * step;
+  const ticks = [];
+  for (let i = 0; t0 + i * step <= t1 + step * 1e-9; i++)
+    ticks.push(Math.round((t0 + i * step) * 1e10) / 1e10);
+  return { ticks, domain: [ticks[0], ticks[ticks.length - 1]] };
+}
+
+// Returns { ticks, fmt } with nice decimal labels for canvas-drawn axes (e.g. RSM).
+function niceCanvasTicks(lo, hi, target = 5) {
+  const span = hi - lo || 1;
+  const base = Math.pow(10, Math.floor(Math.log10(span / target)));
+  const candidates = [1, 2, 2.5, 5, 10].map(f => f * base);
+  let step = candidates[candidates.length - 1];
+  for (const s of candidates) {
+    const n = Math.floor(hi / s) - Math.ceil(lo / s) + 1;
+    if (n >= 3 && n <= 8) { step = s; break; }
+  }
+  const t0 = Math.ceil(lo / step) * step, t1 = Math.floor(hi / step) * step;
+  const ticks = [];
+  for (let i = 0; t0 + i * step <= t1 + step * 1e-9; i++)
+    ticks.push(Math.round((t0 + i * step) * 1e10) / 1e10);
+  const dec = step < 1 ? Math.max(0, Math.ceil(-Math.log10(step))) : 0;
+  const fmt = v => Number.isFinite(v) ? (v === 0 ? "0" : v.toFixed(dec)) : "";
+  return { ticks, fmt };
+}
+
 function numFmt(v) {
   if (v === 0) return "0";
   const abs = Math.abs(v);
@@ -279,8 +317,14 @@ function LinePlot({ data, cfg }) {
     xTicks  = Array.from({ length: hi - lo + 1 }, (_, i) => Math.pow(10, lo + i));
     xTickFmt = v => { const n = Math.round(Math.log10(v)); return n === 0 ? "1" : n === 1 ? "10" : `10^${n}`; };
   } else {
-    xDomain = padDomain(xVals);
-    xTicks  = undefined;
+    if (cfg.symXTicks) {
+      const { ticks, domain } = niceLinTicks(arrMin(xVals), arrMax(xVals));
+      xDomain = domain;
+      xTicks  = ticks;
+    } else {
+      xDomain = padDomain(xVals);
+      xTicks  = undefined;
+    }
     xTickFmt = v => numFmt(v);
   }
   let yDomain, yTicks;
@@ -367,20 +411,21 @@ function RSMPlot({ data, cfg }) {
       ctx.fillRect(Math.round(sx(d.x)), Math.round(sy(d.y)), 2, 2);
     }
     ctx.font = `10px "DM Mono", monospace`;
-    const N_X = 5, N_Y = 4;
+    const { ticks: xTkArr, fmt: xFmt } = niceCanvasTicks(x0, x1);
     ctx.textAlign = "center"; ctx.textBaseline = "top";
-    for (let i = 0; i <= N_X; i++) {
-      const xv = x0 + (x1 - x0) * i / N_X, px = Math.round(sx(xv));
+    for (const xv of xTkArr) {
+      const px = Math.round(sx(xv));
       ctx.strokeStyle = T.border; ctx.lineWidth = 0.5;
       ctx.beginPath(); ctx.moveTo(px, M.top); ctx.lineTo(px, M.top + ph); ctx.stroke();
-      ctx.fillStyle = T.textDim; ctx.fillText(numFmt(xv), px, M.top + ph + 4);
+      ctx.fillStyle = T.textDim; ctx.fillText(xFmt(xv), px, M.top + ph + 4);
     }
+    const { ticks: yTkArr, fmt: yFmt } = niceCanvasTicks(y0, y1);
     ctx.textAlign = "right"; ctx.textBaseline = "middle";
-    for (let i = 0; i <= N_Y; i++) {
-      const yv = y0 + (y1 - y0) * i / N_Y, py = Math.round(sy(yv));
+    for (const yv of yTkArr) {
+      const py = Math.round(sy(yv));
       ctx.strokeStyle = T.border; ctx.lineWidth = 0.5;
       ctx.beginPath(); ctx.moveTo(M.left, py); ctx.lineTo(M.left + pw, py); ctx.stroke();
-      ctx.fillStyle = T.textDim; ctx.fillText(numFmt(yv), M.left - 4, py);
+      ctx.fillStyle = T.textDim; ctx.fillText(yFmt(yv), M.left - 4, py);
     }
     ctx.strokeStyle = T.borderBright; ctx.lineWidth = 1;
     ctx.strokeRect(M.left + 0.5, M.top + 0.5, pw, ph);
@@ -413,7 +458,13 @@ function TwoLinePlot({ data, cfg }) {
   const allPts = [...up, ...down];
   if (!allPts.length) return null;
   const xVals = allPts.map(d => d.x), yVals = allPts.map(d => d.y);
-  const xDomain = padDomain(xVals);
+  let xDomain, xTicks;
+  if (cfg.symXTicks) {
+    const { ticks, domain } = niceLinTicks(arrMin(xVals), arrMax(xVals));
+    xDomain = domain; xTicks = ticks;
+  } else {
+    xDomain = padDomain(xVals); xTicks = undefined;
+  }
   let yDomain;
   if (cfg.ySymRange != null) {
     const absMax = yVals.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
@@ -432,7 +483,7 @@ function TwoLinePlot({ data, cfg }) {
       <ResponsiveContainer width="100%" height={200}>
         <ComposedChart onMouseMove={onMouseMove} margin={{ top: 6, right: hasD ? 44 : 12, bottom: 28, left: 10 }}>
           <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
-          <XAxis dataKey="x" type="number" domain={xDomain}
+          <XAxis dataKey="x" type="number" domain={xDomain} ticks={xTicks}
             tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
             label={{ value: xLabel, position: "insideBottom", offset: -14, fill: T.textSecondary, fontSize: 11 }} />
           <YAxis yAxisId="left" domain={yDomain}
