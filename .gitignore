@@ -1,0 +1,27 @@
+# Personal data — never commit
+backend/data/
+backend/config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Claude working files
+.claude/worktrees/
+Cowork folder/
