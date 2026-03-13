@@ -1142,7 +1142,7 @@ function AddBookModal({ onSave, onClose, existing, samples }) {
         <div style={{ display: "flex", flexDirection: "column", gap: 6, overflow: "hidden" }}>
           <Label>Samples</Label>
           <div style={{ overflowY: "auto", maxHeight: 260, display: "flex", flexDirection: "column", gap: 4, border: `1px solid ${T.border}`, borderRadius: 6, padding: 8 }}>
-            {samples.map(s => (
+            {[...samples].sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" })).map(s => (
               <label key={s.id} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 12, color: selected.has(s.id) ? T.blue : T.textSecondary, padding: "3px 4px", borderRadius: 4, background: selected.has(s.id) ? "rgba(99,179,237,.1)" : "transparent" }}>
                 <input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)} style={{ accentColor: T.blue }} />
                 <span style={{ fontWeight: 600 }}>{s.id}</span>
@@ -1356,8 +1356,9 @@ export default function App() {
 
   const activeSample = samples.find(s => s.id === active);
 
-  const grouped   = folders.map(f => ({ folder: f, samples: samples.filter(s => s.folder_id === f.id) }));
-  const ungrouped = samples.filter(s => !s.folder_id || !folders.find(f => f.id === s.folder_id));
+  const byId = (a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" });
+  const grouped   = folders.map(f => ({ folder: f, samples: samples.filter(s => s.folder_id === f.id).sort(byId) }));
+  const ungrouped = samples.filter(s => !s.folder_id || !folders.find(f => f.id === s.folder_id)).sort(byId);
   const [ungroupedDragOver, setUngroupedDragOver] = useState(false);
 
   return (
