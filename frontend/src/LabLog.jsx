@@ -691,9 +691,17 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
         style={{ background: T.bg3, border: `1px solid ${isDragOver ? T.amber : T.border}`, borderRadius: 7, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10, cursor: "grab", transition: "border-color .12s", flexWrap: "wrap" }}>
         <span style={{ color: T.textDim, fontSize: 14, cursor: "grab", userSelect: "none", letterSpacing: "-1px" }}>⠿</span>
         <div style={{ display: "flex", gap: 5, flex: 1, flexWrap: "wrap", alignItems: "center" }}>
-          {materials.length ? materials.map((m, i) => {
-            const s = getMaterialStyle(m);
-            return <span key={i} style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 700, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 8px" }}>{m}</span>;
+          {layer.targets.length && layer.targets.some(t => t.material) ? layer.targets.map((t, i) => {
+            const s = getMaterialStyle(t.material || "?");
+            const detail = technique === "pld"
+              ? [t.energy_mJ != null ? `${t.energy_mJ} mJ` : null, t.pulses != null ? `${Number(t.pulses).toLocaleString()} pulses` : null].filter(Boolean).join(" · ")
+              : t.power_W != null ? `${t.power_W} W` : null;
+            return (
+              <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 700, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 8px" }}>
+                {t.material || "?"}
+                {detail && <span style={{ fontWeight: 400, opacity: 0.7, fontSize: 11 }}>· {detail}</span>}
+              </span>
+            );
           }) : <span style={{ color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 12 }}>no material</span>}
         </div>
         {sharedField("temp", "Temp", "°C")}
