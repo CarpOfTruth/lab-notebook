@@ -200,6 +200,22 @@ const Sel = ({ label, value, onChange, options }) => (
   </div>
 );
 
+// Renders a chemical-formula string with digit sequences as subscripts.
+// e.g. "BaTiO3" → BaTiO₃, "Ba0.5Sr0.5TiO3" → Ba₀.₅Sr₀.₅TiO₃ (via <sub>)
+function ChemName({ name }) {
+  if (!name) return null;
+  const parts = name.split(/(\d+(?:\.\d+)?)/);
+  return (
+    <>
+      {parts.map((part, i) =>
+        /^\d/.test(part)
+          ? <sub key={i} style={{ fontSize: "0.8em", lineHeight: 0 }}>{part}</sub>
+          : part
+      )}
+    </>
+  );
+}
+
 function MaterialCombobox({ value, onChange, knownMaterials, small }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState(value || "");
@@ -220,7 +236,7 @@ function MaterialCombobox({ value, onChange, knownMaterials, small }) {
             return (
               <div key={m} onMouseDown={() => { onChange(m); setQuery(m); setOpen(false); }}
                 style={{ padding: "6px 10px", cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 12, color: s.border, borderLeft: `3px solid ${s.border}` }}>
-                {m}
+                <ChemName name={m} />
               </div>
             );
           })}
@@ -650,20 +666,57 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
 //     //          + layer-level: frequency_hz, focal_position
 //   }
 
+// ── Settings ──────────────────────────────────────────────────────────────────
+
+const DEFAULT_SETTINGS = {
+  defaultSubstrate: "STO (001)",
+  defaultAreaCm2: "",
+  sputter: { temp: 600, pressure: 10, oxygen_pct: 20, time_s: 2000, power_W: 150 },
+  pld:     { temp: 600, pressure: 2,  frequency_hz: 10, energy_mJ: 60, pulses: 10000 },
+  materials: { sputter: [], pld: [] },
+};
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem("lablog_settings");
+    if (!raw) return JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+    const parsed = JSON.parse(raw);
+    return {
+      ...DEFAULT_SETTINGS,
+      ...parsed,
+      sputter:   { ...DEFAULT_SETTINGS.sputter,   ...parsed.sputter },
+      pld:       { ...DEFAULT_SETTINGS.pld,       ...parsed.pld },
+      materials: {
+        sputter: parsed.materials?.sputter ?? [],
+        pld:     parsed.materials?.pld     ?? [],
+      },
+    };
+  } catch { return JSON.parse(JSON.stringify(DEFAULT_SETTINGS)); }
+}
+
+function saveSettings(s) {
+  localStorage.setItem("lablog_settings", JSON.stringify(s));
+}
+
 const SPUTTER_DEFAULTS = { material: "", power_W: 150 };
 const PLD_DEFAULTS     = { material: "", energy_mJ: 60, pulses: 10000 };
 
-function newLayer(technique) {
+function newLayer(technique, settings) {
+  const cfg = settings?.[technique] || {};
   return {
     id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
-    temp: 600,
-    pressure: technique === "pld" ? 2 : 10,
-    ...(technique === "pld" ? { frequency_hz: 10, focal_position: "" } : { oxygen_pct: 20, time_s: 2000 }),
-    targets: [technique === "pld" ? { ...PLD_DEFAULTS } : { ...SPUTTER_DEFAULTS }],
+    temp:     cfg.temp     ?? (technique === "pld" ? 600 : 600),
+    pressure: cfg.pressure ?? (technique === "pld" ? 2   : 10),
+    ...(technique === "pld"
+      ? { frequency_hz: cfg.frequency_hz ?? 10, focal_position: "" }
+      : { oxygen_pct:   cfg.oxygen_pct   ?? 20, time_s: cfg.time_s ?? 2000 }),
+    targets: [technique === "pld"
+      ? { material: "", energy_mJ: cfg.energy_mJ ?? 60, pulses: cfg.pulses ?? 10000 }
+      : { material: "", power_W:   cfg.power_W   ?? 150 }],
   };
 }
 
-function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMaterials }) {
+function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMaterials, settings }) {
   const s = getMaterialStyle(target.material);
   const tField = (k, label, unit, w = 70) => (
     <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -675,12 +728,28 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
       </div>
     </div>
   );
+  const handleMaterialChange = (v) => {
+    const lib   = settings?.materials?.[technique] || [];
+    const entry = lib.find(m => m.name === v);
+    if (entry) {
+      const merged = { ...target, material: v };
+      if (technique === "sputter") {
+        if (entry.power_W != null) merged.power_W = entry.power_W;
+      } else {
+        if (entry.energy_mJ != null) merged.energy_mJ = entry.energy_mJ;
+        if (entry.pulses    != null) merged.pulses    = entry.pulses;
+      }
+      onChange(merged);
+    } else {
+      onChange({ ...target, material: v });
+    }
+  };
   return (
     <div style={{ display: "flex", alignItems: "flex-end", gap: 8, flexWrap: "wrap" }}>
       <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
         <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Material</span>
         <div style={{ width: 120 }}>
-          <MaterialCombobox value={target.material} onChange={v => onChange({ ...target, material: v })} knownMaterials={knownMaterials} small />
+          <MaterialCombobox value={target.material} onChange={handleMaterialChange} knownMaterials={knownMaterials} small />
         </div>
       </div>
       {technique === "sputter" ? (
@@ -700,7 +769,7 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
   );
 }
 
-function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials, initialEditing = false }) {
+function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials, settings, initialEditing = false }) {
   const [editing, setEditing] = useState(initialEditing);
   const [draft, setDraft]     = useState(initialEditing ? JSON.parse(JSON.stringify(layer)) : null);
 
@@ -715,7 +784,13 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
   const setDraftField = (k, v) => setDraft(p => ({ ...p, [k]: v }));
   const updateTarget = (i, t)  => setDraft(p => { const ts = [...p.targets]; ts[i] = t; return { ...p, targets: ts }; });
   const removeTarget = (i)     => setDraft(p => { const ts = p.targets.filter((_, j) => j !== i); return { ...p, targets: ts }; });
-  const addTarget = () => setDraft(p => ({ ...p, targets: [...p.targets, technique === "pld" ? { ...PLD_DEFAULTS } : { ...SPUTTER_DEFAULTS }] }));
+  const addTarget = () => {
+    const cfg = settings?.[technique] || {};
+    const newTarget = technique === "pld"
+      ? { material: "", energy_mJ: cfg.energy_mJ ?? 60, pulses: cfg.pulses ?? 10000 }
+      : { material: "", power_W: cfg.power_W ?? 150 };
+    setDraft(p => ({ ...p, targets: [...p.targets, newTarget] }));
+  };
 
   const materials = layer.targets.map(t => t.material).filter(Boolean);
   const sharedField = (k, label, unit) => (
@@ -738,7 +813,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
               : t.power_W != null ? `${t.power_W} W` : null;
             return (
               <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 700, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 8px" }}>
-                {t.material || "?"}
+                <ChemName name={t.material || "?"} />
                 {detail && <span style={{ fontWeight: 400, opacity: 0.7, fontSize: 11 }}>· {detail}</span>}
               </span>
             );
@@ -814,7 +889,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Targets</span>
         {draft.targets.map((t, i) => (
-          <TargetRow key={i} target={t} technique={technique} knownMaterials={knownMaterials}
+          <TargetRow key={i} target={t} technique={technique} knownMaterials={knownMaterials} settings={settings}
             onChange={t2 => updateTarget(i, t2)}
             onRemove={() => removeTarget(i)}
             canRemove={draft.targets.length > 1} />
@@ -831,7 +906,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
 
 // ── SampleDetail ──────────────────────────────────────────────────────────────
 
-function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete, editingMeta, setEditingMeta }) {
+function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete, editingMeta, setEditingMeta, settings }) {
   const [addingLayer, setAddingLayer]   = useState(false);
   const [meta, setMeta]                 = useState({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
   const [dragIdx, setDragIdx]           = useState(null);
@@ -916,7 +991,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {sample.layers.map((l, i) => (
-            <LayerEditor key={l.id} layer={l} technique={sample.technique || "sputter"} knownMaterials={knownMaterials}
+            <LayerEditor key={l.id} layer={l} technique={sample.technique || "sputter"} knownMaterials={knownMaterials} settings={settings}
               onRemove={() => removeLayer(l.id)} onDuplicate={() => duplicateLayer(l.id)} onUpdate={updateLayer}
               isDragOver={overIdx === i && dragIdx !== i}
               onDragStart={() => setDragIdx(i)} onDragOver={() => setOverIdx(i)}
@@ -925,9 +1000,10 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
           {!sample.layers.length && !addingLayer && <div style={{ color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "10px 0" }}>No layers — add one above.</div>}
           {addingLayer && (
             <LayerEditor
-              layer={newLayer(sample.technique || "sputter")}
+              layer={newLayer(sample.technique || "sputter", settings)}
               technique={sample.technique || "sputter"}
               knownMaterials={knownMaterials}
+              settings={settings}
               initialEditing={true}
               onRemove={() => setAddingLayer(false)}
               onDuplicate={() => {}}
@@ -971,7 +1047,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 
 // ── AddSampleModal ────────────────────────────────────────────────────────────
 
-function AddSampleModal({ onAdd, onClose, folders, template }) {
+function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
   const [f, setF] = useState(() => template ? {
     id: "", date: template.date ?? new Date().toISOString().slice(0, 10),
     substrate: template.substrate ?? "", notes: template.notes ?? "",
@@ -980,7 +1056,7 @@ function AddSampleModal({ onAdd, onClose, folders, template }) {
     folder_id: template.folder_id ?? "",
   } : {
     id: "", date: new Date().toISOString().slice(0, 10),
-    substrate: "STO (001)", notes: "", thickness_nm: "",
+    substrate: settings?.defaultSubstrate ?? "STO (001)", notes: "", thickness_nm: "",
     technique: "sputter", folder_id: "",
   });
   const set = k => v => setF(p => ({ ...p, [k]: v }));
@@ -1023,6 +1099,161 @@ function AddSampleModal({ onAdd, onClose, folders, template }) {
             const layers = template ? JSON.parse(JSON.stringify(template.layers || [])).map(l => ({ ...l, id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()) })) : [];
             onAdd({ ...f, thickness_nm: f.thickness_nm === "" ? null : +f.thickness_nm, folder_id: f.folder_id || null, layers, filenames: {}, area_m2: null, area_correction: 1.0 });
           }} disabled={!f.id.trim()}>Create</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── SettingsModal ─────────────────────────────────────────────────────────────
+
+function SettingsModal({ settings, onSave, onClose }) {
+  const [draft, setDraft] = useState(() => JSON.parse(JSON.stringify(settings)));
+  const [knownMaterials, setKnownMaterials] = useState([]);
+  useEffect(() => { api("GET", "/materials").then(setKnownMaterials).catch(() => {}); }, []);
+  const set = (path, v) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    const keys = path.split(".");
+    let cur = d;
+    for (let i = 0; i < keys.length - 1; i++) cur = cur[keys[i]];
+    cur[keys[keys.length - 1]] = v;
+    return d;
+  });
+
+  const sectionHdr = (label) => (
+    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2, borderBottom: `1px solid ${T.border}`, paddingBottom: 6, marginBottom: 10, marginTop: 4 }}>{label}</div>
+  );
+  const fieldSm = (path, label, unit, w = 64, type = "text") => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{label}</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+        <input type={type} value={path.split(".").reduce((o, k) => o?.[k] ?? "", draft) ?? ""}
+          onChange={e => set(path, e.target.value)}
+          style={{ width: w, background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+        {unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", whiteSpace: "nowrap" }}>{unit}</span>}
+      </div>
+    </div>
+  );
+
+  // Material library helpers
+  const addMat = (tech) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.materials[tech].push(tech === "sputter"
+      ? { name: "", power_W: "", temp: "", pressure: "", oxygen_pct: "", time_s: "" }
+      : { name: "", energy_mJ: "", pulses: "", temp: "", pressure: "", frequency_hz: "" });
+    return d;
+  });
+  const removeMat = (tech, i) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.materials[tech].splice(i, 1);
+    return d;
+  });
+  const setMat = (tech, i, k, v) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.materials[tech][i][k] = v;
+    return d;
+  });
+
+  const matInput = (tech, i, k, label, unit, w = 52) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{label}</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+        <input value={draft.materials[tech][i][k] ?? ""}
+          onChange={e => setMat(tech, i, k, e.target.value)}
+          placeholder="—"
+          style={{ width: w, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "3px 5px", fontFamily: "'DM Mono', monospace", fontSize: 11, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+        {unit && <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{unit}</span>}
+      </div>
+    </div>
+  );
+
+  const renderMatLib = (tech) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {draft.materials[tech].map((m, i) => (
+        <div key={i} style={{ background: T.bg3, border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 10px", display: "flex", alignItems: "flex-end", gap: 8, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Material</span>
+            <div style={{ width: 100 }}>
+              <MaterialCombobox value={m.name} onChange={v => setMat(tech, i, "name", v)} knownMaterials={knownMaterials} small />
+            </div>
+          </div>
+          {tech === "sputter" ? (<>
+            {matInput(tech, i, "power_W",    "Power",  "W",    52)}
+            {matInput(tech, i, "temp",       "Temp",   "°C",   52)}
+            {matInput(tech, i, "pressure",   "Press",  "mT",   52)}
+            {matInput(tech, i, "oxygen_pct", "O₂",     "%",    44)}
+            {matInput(tech, i, "time_s",     "Time",   "s",    52)}
+          </>) : (<>
+            {matInput(tech, i, "energy_mJ",   "Energy", "mJ",   52)}
+            {matInput(tech, i, "pulses",      "Pulses", "",     64)}
+            {matInput(tech, i, "temp",        "Temp",   "°C",   52)}
+            {matInput(tech, i, "pressure",    "Press",  "mT",   52)}
+            {matInput(tech, i, "frequency_hz","Rep",    "Hz",   48)}
+          </>)}
+          <button onClick={() => removeMat(tech, i)}
+            style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 2px", alignSelf: "flex-end", marginBottom: 1 }}>×</button>
+        </div>
+      ))}
+      <button onClick={() => addMat(tech)}
+        style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
+        + Add material
+      </button>
+    </div>
+  );
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "flex-start", justifyContent: "center", zIndex: 100, overflowY: "auto", padding: "40px 20px" }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 640, display: "flex", flexDirection: "column", gap: 18, marginBottom: 40 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 22 }}>Settings</h2>
+
+        {/* General */}
+        {sectionHdr("General")}
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ flex: 1, minWidth: 180 }}>
+            <div style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", marginBottom: 4 }}>Default Substrate</div>
+            <input value={draft.defaultSubstrate}
+              onChange={e => set("defaultSubstrate", e.target.value)}
+              placeholder="e.g. STO (001)"
+              style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "5px 8px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
+          </div>
+          <div>
+            {fieldSm("defaultAreaCm2", "Default Cap. Area", "cm²", 80)}
+          </div>
+        </div>
+
+        {/* Sputter defaults */}
+        {sectionHdr("Sputter Defaults")}
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          {fieldSm("sputter.temp",       "Temp",    "°C")}
+          {fieldSm("sputter.pressure",   "Pressure","mTorr")}
+          {fieldSm("sputter.oxygen_pct", "O₂",      "%",  52)}
+          {fieldSm("sputter.time_s",     "Time",    "s",  72)}
+          {fieldSm("sputter.power_W",    "Power",   "W",  60)}
+        </div>
+
+        {/* PLD defaults */}
+        {sectionHdr("PLD Defaults")}
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          {fieldSm("pld.temp",         "Temp",     "°C")}
+          {fieldSm("pld.pressure",     "Pressure", "mTorr")}
+          {fieldSm("pld.frequency_hz", "Rep rate", "Hz",  60)}
+          {fieldSm("pld.energy_mJ",    "Energy",   "mJ",  60)}
+          {fieldSm("pld.pulses",       "Pulses",   "",    72)}
+        </div>
+
+        {/* Material library — Sputter */}
+        {sectionHdr("Material Library — Sputter")}
+        <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -10, marginBottom: 2 }}>Leave fields blank to use global sputter defaults for that material.</div>
+        {renderMatLib("sputter")}
+
+        {/* Material library — PLD */}
+        {sectionHdr("Material Library — PLD")}
+        <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -10, marginBottom: 2 }}>Leave fields blank to use global PLD defaults for that material.</div>
+        {renderMatLib("pld")}
+
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 4 }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn onClick={() => { onSave(draft); onClose(); }}>Save Settings</Btn>
         </div>
       </div>
     </div>
@@ -1077,7 +1308,7 @@ function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, 
       {materials.length > 0 && (
         <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
           {materials.map(m => { const s = getMaterialStyle(m); return (
-            <span key={m} style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 7px" }}>{m}</span>
+            <span key={m} style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 7px" }}><ChemName name={m} /></span>
           );})}
         </div>
       )}
@@ -1235,6 +1466,13 @@ export default function App() {
   const [editingBook,   setEditingBook]   = useState(null);
   const [loading,  setLoading]  = useState(true);
   const [error,    setError]    = useState(null);
+  const [settings, setSettings] = useState(() => loadSettings());
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const handleSaveSettings = (s) => {
+    saveSettings(s);
+    setSettings(s);
+  };
 
   // Load all data on mount
   useEffect(() => {
@@ -1449,6 +1687,9 @@ export default function App() {
               <div style={{ flex: 1 }} />
               <Btn variant="ghost" small onClick={() => setAddingFolder(true)}>+ Folder</Btn>
               <Btn onClick={() => setAdding(true)}>+ New Sample</Btn>
+              <button onClick={() => setSettingsOpen(true)}
+                title="Settings"
+                style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "2px 4px", borderRadius: 4, display: "flex", alignItems: "center" }}>⚙</button>
             </>
           )}
         </div>
@@ -1471,7 +1712,8 @@ export default function App() {
               onBack={() => setActive(null)}
               onDelete={deleteSample}
               editingMeta={editingMeta}
-              setEditingMeta={setEditingMeta} />
+              setEditingMeta={setEditingMeta}
+              settings={settings} />
           ) : (
             <>
               {/* Samples section */}
@@ -1540,8 +1782,9 @@ export default function App() {
         </div>
       </div>
 
-      {adding && <AddSampleModal onAdd={addSample} onClose={() => setAdding(false)} folders={folders} />}
-      {templateSample && <AddSampleModal onAdd={s => { addSample(s); setTemplateSample(null); }} onClose={() => setTemplateSample(null)} folders={folders} template={templateSample} />}
+      {adding && <AddSampleModal onAdd={addSample} onClose={() => setAdding(false)} folders={folders} settings={settings} />}
+      {templateSample && <AddSampleModal onAdd={s => { addSample(s); setTemplateSample(null); }} onClose={() => setTemplateSample(null)} folders={folders} template={templateSample} settings={settings} />}
+      {settingsOpen && <SettingsModal settings={settings} onSave={handleSaveSettings} onClose={() => setSettingsOpen(false)} />}
       {(addingFolder || editingFolder) && (
         <AddFolderModal onSave={saveFolder} onClose={() => { setAddingFolder(false); setEditingFolder(null); }} existing={editingFolder} />
       )}
