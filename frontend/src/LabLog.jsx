@@ -304,7 +304,7 @@ function LinePlot({ data, cfg }) {
   const hasD = cfg.hasY2 && plotData.some(d => d.y2 != null);
   const dVals = hasD ? plotData.filter(d => d.y2 != null).map(d => d.y2) : [];
   const [dDomLo, dDomHi] = hasD ? padDomain(dVals) : [0, 1];
-  const dDomain = hasD ? [Math.max(0, dDomLo), dDomHi] : [0, 1];
+  const dDomain = hasD ? [dDomLo, dDomHi] : [0, 1];
   return (
     <div ref={ref}>
       <ResponsiveContainer width="100%" height={200}>
@@ -426,7 +426,7 @@ function TwoLinePlot({ data, cfg }) {
   const hasD = allPts.some(d => d.y2 != null);
   const dVals = hasD ? allPts.filter(d => d.y2 != null).map(d => d.y2) : [];
   const [dDomLo, dDomHi] = hasD ? padDomain(dVals) : [0, 1];
-  const dDomain = hasD ? [Math.max(0, dDomLo), dDomHi] : [0, 1];
+  const dDomain = hasD ? [dDomLo, dDomHi] : [0, 1];
   return (
     <div ref={ref}>
       <ResponsiveContainer width="100%" height={200}>
