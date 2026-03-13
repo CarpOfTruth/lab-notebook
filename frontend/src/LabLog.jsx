@@ -672,6 +672,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
   };
   const saveEdit = (e) => { e.stopPropagation(); onUpdate(draft); setEditing(false); };
   const cancelEdit = (e) => { e.stopPropagation(); if (initialEditing) { onRemove(); } else { setEditing(false); } };
+  const handleEditKeyDown = (e) => { if (e.key === "Enter") { e.preventDefault(); onUpdate(draft); setEditing(false); } };
   const setDraftField = (k, v) => setDraft(p => ({ ...p, [k]: v }));
   const updateTarget = (i, t)  => setDraft(p => { const ts = [...p.targets]; ts[i] = t; return { ...p, targets: ts }; });
   const removeTarget = (i)     => setDraft(p => { const ts = p.targets.filter((_, j) => j !== i); return { ...p, targets: ts }; });
@@ -719,7 +720,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
   const inputSm = { background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" };
 
   return (
-    <div style={{ background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 7, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 12 }}>
+    <div onKeyDown={handleEditKeyDown} style={{ background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 7, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 12 }}>
       {/* shared layer fields */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
