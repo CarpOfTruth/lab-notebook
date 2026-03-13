@@ -250,8 +250,22 @@ function numFmt(v) {
   return parseFloat(v.toPrecision(3)).toString();
 }
 
+// Returns { ref, tooltipPos, onMouseMove } — snaps tooltip to whichever
+// horizontal half the cursor is NOT in, so it never overlaps the data.
+function useTooltipSide() {
+  const ref = useRef(null);
+  const [tooltipX, setTooltipX] = useState(10);
+  const onMouseMove = useCallback((state) => {
+    if (!state?.activeCoordinate || !ref.current) return;
+    const w = ref.current.clientWidth || 400;
+    setTooltipX(state.activeCoordinate.x > w / 2 ? 10 : w - 145);
+  }, []);
+  return { ref, tooltipPos: { x: tooltipX, y: 10 }, onMouseMove };
+}
+
 function LinePlot({ data, cfg }) {
   const { xLabel, yLabel, logY, logX, color } = cfg;
+  const { ref, tooltipPos, onMouseMove } = useTooltipSide();
   const plotData = logY
     ? data.filter(d => d.y > 0).map(d => ({ ...d, yp: +Math.log10(d.y).toFixed(4) }))
     : data.map(d => ({ ...d, yp: d.y }));
@@ -287,30 +301,32 @@ function LinePlot({ data, cfg }) {
   const [dDomLo, dDomHi] = hasD ? padDomain(dVals) : [0, 1];
   const dDomain = hasD ? [Math.max(0, dDomLo), dDomHi] : [0, 1];
   return (
-    <ResponsiveContainer width="100%" height={200}>
-      <LineChart data={plotData} margin={{ top: 6, right: hasD ? 44 : 12, bottom: 28, left: 10 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
-        <XAxis dataKey="x" type="number" tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
-          tickFormatter={xTickFmt} ticks={xTicks}
-          label={{ value: xLabel, position: "insideBottom", offset: -14, fill: T.textSecondary, fontSize: 11 }}
-          scale={logX ? "log" : "auto"} domain={xDomain} />
-        <YAxis yAxisId="left" tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
-          tickFormatter={yTickFmt} ticks={yTicks}
-          label={{ value: yLabel, angle: -90, position: "insideLeft", offset: 14, fill: T.textSecondary, fontSize: 10 }}
-          domain={yDomain} />
-        {hasD && <YAxis yAxisId="right" orientation="right"
-          tick={{ fill: T.amber, fontSize: 9, fontFamily: "'DM Mono', monospace" }}
-          tickFormatter={v => numFmt(v)}
-          label={{ value: "D (tan δ)", angle: 90, position: "insideRight", offset: -6, fill: T.amber, fontSize: 9 }}
-          domain={dDomain} />}
-        <Tooltip position={{ x: 10, y: 10 }}
-          contentStyle={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11 }}
-          formatter={(v, name) => name === "y2" ? [numFmt(+v), "D (tan δ)"] : [logY ? numFmt(Math.pow(10, +v)) : numFmt(+v), yLabel]}
-          labelFormatter={v => `${xLabel}: ${numFmt(+v)}`} />
-        <Line yAxisId="left" type="monotone" dataKey="yp" dot={false} stroke={color} strokeWidth={1.5} isAnimationActive={false} />
-        {hasD && <Line yAxisId="right" type="monotone" dataKey="y2" dot={false} stroke={T.amber} strokeWidth={1.5} strokeDasharray="4 2" isAnimationActive={false} name="y2" />}
-      </LineChart>
-    </ResponsiveContainer>
+    <div ref={ref}>
+      <ResponsiveContainer width="100%" height={200}>
+        <LineChart data={plotData} onMouseMove={onMouseMove} margin={{ top: 6, right: hasD ? 44 : 12, bottom: 28, left: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+          <XAxis dataKey="x" type="number" tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
+            tickFormatter={xTickFmt} ticks={xTicks}
+            label={{ value: xLabel, position: "insideBottom", offset: -14, fill: T.textSecondary, fontSize: 11 }}
+            scale={logX ? "log" : "auto"} domain={xDomain} />
+          <YAxis yAxisId="left" tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
+            tickFormatter={yTickFmt} ticks={yTicks}
+            label={{ value: yLabel, angle: -90, position: "insideLeft", offset: 14, fill: T.textSecondary, fontSize: 10 }}
+            domain={yDomain} />
+          {hasD && <YAxis yAxisId="right" orientation="right"
+            tick={{ fill: T.amber, fontSize: 9, fontFamily: "'DM Mono', monospace" }}
+            tickFormatter={v => numFmt(v)}
+            label={{ value: "D (tan δ)", angle: 90, position: "insideRight", offset: -6, fill: T.amber, fontSize: 9 }}
+            domain={dDomain} />}
+          <Tooltip position={tooltipPos}
+            contentStyle={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11 }}
+            formatter={(v, name) => name === "y2" ? [numFmt(+v), "D (tan δ)"] : [logY ? numFmt(Math.pow(10, +v)) : numFmt(+v), yLabel]}
+            labelFormatter={v => `${xLabel}: ${numFmt(+v)}`} />
+          <Line yAxisId="left" type="monotone" dataKey="yp" dot={false} stroke={color} strokeWidth={1.5} isAnimationActive={false} />
+          {hasD && <Line yAxisId="right" type="monotone" dataKey="y2" dot={false} stroke={T.amber} strokeWidth={1.5} strokeDasharray="4 2" isAnimationActive={false} name="y2" />}
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
   );
 }
 
@@ -387,6 +403,7 @@ function RSMPlot({ data, cfg }) {
 
 function TwoLinePlot({ data, cfg }) {
   const { xLabel, yLabel, color, clampYZero } = cfg;
+  const { ref, tooltipPos, onMouseMove } = useTooltipSide();
   const { up = [], down = [] } = data;
   const allPts = [...up, ...down];
   if (!allPts.length) return null;
@@ -406,31 +423,33 @@ function TwoLinePlot({ data, cfg }) {
   const [dDomLo, dDomHi] = hasD ? padDomain(dVals) : [0, 1];
   const dDomain = hasD ? [Math.max(0, dDomLo), dDomHi] : [0, 1];
   return (
-    <ResponsiveContainer width="100%" height={200}>
-      <ComposedChart margin={{ top: 6, right: hasD ? 44 : 12, bottom: 28, left: 10 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
-        <XAxis dataKey="x" type="number" domain={xDomain}
-          tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
-          label={{ value: xLabel, position: "insideBottom", offset: -14, fill: T.textSecondary, fontSize: 11 }} />
-        <YAxis yAxisId="left" domain={yDomain}
-          tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
-          label={{ value: yLabel, angle: -90, position: "insideLeft", offset: 14, fill: T.textSecondary, fontSize: 10 }} />
-        {hasD && <YAxis yAxisId="right" orientation="right" domain={dDomain}
-          tick={{ fill: T.amber, fontSize: 9, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
-          label={{ value: "D (tan δ)", angle: 90, position: "insideRight", offset: -6, fill: T.amber, fontSize: 9 }} />}
-        <Tooltip position={{ x: 10, y: 10 }}
-          contentStyle={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11 }}
-          formatter={(v, name) => {
-            if (name === "up_d" || name === "down_d") return [numFmt(+v), `D (tan δ) ${name === "up_d" ? "↑" : "↓"}`];
-            return [numFmt(+v), name === "up" ? `${yLabel} ↑` : `${yLabel} ↓`];
-          }}
-          labelFormatter={v => `${xLabel}: ${numFmt(+v)}`} />
-        {up.length > 0   && <Line yAxisId="left"  data={up}   dataKey="y"  dot={false} stroke={color}      strokeWidth={1.5} isAnimationActive={false} name="up" />}
-        {down.length > 0 && <Line yAxisId="left"  data={down} dataKey="y"  dot={false} stroke={T.teal}     strokeWidth={1.5} strokeDasharray="4 2" isAnimationActive={false} name="down" />}
-        {hasD && up.length > 0   && <Line yAxisId="right" data={up}   dataKey="y2" dot={false} stroke={T.amber}    strokeWidth={1} isAnimationActive={false} name="up_d" />}
-        {hasD && down.length > 0 && <Line yAxisId="right" data={down} dataKey="y2" dot={false} stroke={T.amberDim} strokeWidth={1} strokeDasharray="2 2" isAnimationActive={false} name="down_d" />}
-      </ComposedChart>
-    </ResponsiveContainer>
+    <div ref={ref}>
+      <ResponsiveContainer width="100%" height={200}>
+        <ComposedChart onMouseMove={onMouseMove} margin={{ top: 6, right: hasD ? 44 : 12, bottom: 28, left: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+          <XAxis dataKey="x" type="number" domain={xDomain}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
+            label={{ value: xLabel, position: "insideBottom", offset: -14, fill: T.textSecondary, fontSize: 11 }} />
+          <YAxis yAxisId="left" domain={yDomain}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
+            label={{ value: yLabel, angle: -90, position: "insideLeft", offset: 14, fill: T.textSecondary, fontSize: 10 }} />
+          {hasD && <YAxis yAxisId="right" orientation="right" domain={dDomain}
+            tick={{ fill: T.amber, fontSize: 9, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
+            label={{ value: "D (tan δ)", angle: 90, position: "insideRight", offset: -6, fill: T.amber, fontSize: 9 }} />}
+          <Tooltip position={tooltipPos}
+            contentStyle={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11 }}
+            formatter={(v, name) => {
+              if (name === "up_d" || name === "down_d") return [numFmt(+v), `D (tan δ) ${name === "up_d" ? "↑" : "↓"}`];
+              return [numFmt(+v), name === "up" ? `${yLabel} ↑` : `${yLabel} ↓`];
+            }}
+            labelFormatter={v => `${xLabel}: ${numFmt(+v)}`} />
+          {up.length > 0   && <Line yAxisId="left"  data={up}   dataKey="y"  dot={false} stroke={color}      strokeWidth={1.5} isAnimationActive={false} name="up" />}
+          {down.length > 0 && <Line yAxisId="left"  data={down} dataKey="y"  dot={false} stroke={T.teal}     strokeWidth={1.5} strokeDasharray="4 2" isAnimationActive={false} name="down" />}
+          {hasD && up.length > 0   && <Line yAxisId="right" data={up}   dataKey="y2" dot={false} stroke={T.amber}    strokeWidth={1} isAnimationActive={false} name="up_d" />}
+          {hasD && down.length > 0 && <Line yAxisId="right" data={down} dataKey="y2" dot={false} stroke={T.amberDim} strokeWidth={1} strokeDasharray="2 2" isAnimationActive={false} name="down_d" />}
+        </ComposedChart>
+      </ResponsiveContainer>
+    </div>
   );
 }
 
@@ -879,7 +898,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
       <section>
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Electrical Characterization</div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px,1fr))", gap: 12 }}>
-          {["pe", "diel_f", "diel_b"].map(t => (
+          {["pe", "diel_b", "diel_f"].map(t => (
             <MeasCard key={t} type={t}
               plotData={t === "diel_b" ? { up: pd.diel_b_up || [], down: pd.diel_b_down || [] } : pd[t]}
               filename={sample.filenames?.[t]}
