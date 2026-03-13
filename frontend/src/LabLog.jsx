@@ -961,14 +961,19 @@ function AddSampleModal({ onAdd, onClose, folders }) {
 
 // ── SampleCard ────────────────────────────────────────────────────────────────
 
-function SampleCard({ sample, onClick, onDelete, plotData }) {
+function SampleCard({ sample, onClick, onDelete, plotData, onDragStart }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const wasDragged = useRef(false);
   const materials = [...new Set((sample.layers || []).flatMap(l => (l.targets || []).map(t => t.material).filter(Boolean)))];
   const dataCount = Object.values(plotData || {}).filter(hasPlotData).length;
 
   return (
-    <div onClick={onClick}
-      style={{ position: "relative", background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 18px", cursor: "pointer", transition: "all .15s", display: "flex", flexDirection: "column", gap: 9 }}
+    <div
+      draggable
+      onDragStart={e => { wasDragged.current = true; e.dataTransfer.effectAllowed = "move"; onDragStart?.(sample.id); }}
+      onDragEnd={() => { setTimeout(() => { wasDragged.current = false; }, 50); }}
+      onClick={() => { if (wasDragged.current) return; onClick(); }}
+      style={{ position: "relative", background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 18px", cursor: "grab", transition: "all .15s", display: "flex", flexDirection: "column", gap: 9 }}
       onMouseEnter={e => { e.currentTarget.style.borderColor = T.amberDim; e.currentTarget.style.background = T.bg2; }}
       onMouseLeave={e => { e.currentTarget.style.borderColor = T.border;   e.currentTarget.style.background = T.bg1; }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -1013,13 +1018,22 @@ function SampleCard({ sample, onClick, onDelete, plotData }) {
 
 const COLOR_OPTIONS = ["#4a5568", "#3182ce", "#38a169", "#d69e2e", "#9f7aea", "#ed64a6", "#fc8181", "#4fd1c5"];
 
-function FolderTile({ folder, samples, plotCache, onSelectSample, onDeleteSample, onEdit, onDelete }) {
-  const [open, setOpen] = useState(true);
-  const s = getMaterialStyle(folder.name);
+function FolderTile({ folder, samples, plotCache, onSelectSample, onDeleteSample, onEdit, onDelete, onDropSample, onDragStartSample }) {
+  const [open, setOpen]       = useState(true);
+  const [dragOver, setDragOver] = useState(false);
   const color = folder.color || T.borderBright;
+
+  const handleDragOver = e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setDragOver(true); };
+  const handleDragLeave = e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false); };
+  const handleDrop = e => { e.preventDefault(); setDragOver(false); onDropSample?.(); };
+
   return (
-    <div style={{ border: `1px solid ${color}`, borderRadius: 10, overflow: "hidden", marginBottom: 16 }}>
-      <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: T.bg2, cursor: "pointer", userSelect: "none" }}
+    <div
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+      style={{ border: `2px solid ${dragOver ? T.amber : color}`, borderRadius: 10, overflow: "hidden", marginBottom: 16, boxShadow: dragOver ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
+      <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: dragOver ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
         onClick={() => setOpen(v => !v)}>
         <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
         <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: T.textPrimary, flex: 1 }}>{folder.name}</span>
@@ -1030,8 +1044,12 @@ function FolderTile({ folder, samples, plotCache, onSelectSample, onDeleteSample
       </div>
       {open && (
         <div style={{ padding: 12, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(270px,1fr))", gap: 12, background: T.bg0 }}>
-          {samples.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => onSelectSample(s.id)} onDelete={onDeleteSample} />)}
-          {!samples.length && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "8px 4px" }}>Empty folder</div>}
+          {samples.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => onSelectSample(s.id)} onDelete={onDeleteSample} onDragStart={onDragStartSample} />)}
+          {!samples.length && (
+            <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: dragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>
+              {dragOver ? "Drop to add to this folder" : "Empty folder"}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -1133,6 +1151,7 @@ export default function App() {
   const [plotCache, setPlotCache] = useState({}); // { [sampleId]: { xrd_ot, xrr, rsm, pe, diel_b_up, diel_b_down, diel_f } }
   const [active,   setActive]   = useState(null); // sample id
   const [adding,   setAdding]   = useState(false);
+  const [draggingSampleId, setDraggingSampleId] = useState(null);
   const [addingFolder, setAddingFolder] = useState(false);
   const [editingFolder, setEditingFolder] = useState(null); // folder object
   const [addingBook,    setAddingBook]    = useState(false);
@@ -1294,12 +1313,25 @@ export default function App() {
     setBooks(p => p.filter(b => b.id !== id));
   };
 
+  // ── Sample folder drag-and-drop ───────────────────────────────────────────
+
+  const handleDropToFolder = async (folderId) => {
+    if (!draggingSampleId) return;
+    const sample = samples.find(s => s.id === draggingSampleId);
+    if (!sample) return;
+    const newFolderId = folderId || null;
+    if (sample.folder_id === newFolderId) return;
+    setDraggingSampleId(null);
+    await updateSample({ ...sample, folder_id: newFolderId });
+  };
+
   // ── Render ───────────────────────────────────────────────────────────────
 
   const activeSample = samples.find(s => s.id === active);
 
   const grouped   = folders.map(f => ({ folder: f, samples: samples.filter(s => s.folder_id === f.id) }));
   const ungrouped = samples.filter(s => !s.folder_id || !folders.find(f => f.id === s.folder_id));
+  const [ungroupedDragOver, setUngroupedDragOver] = useState(false);
 
   return (
     <>
@@ -1355,17 +1387,25 @@ export default function App() {
                   <FolderTile key={folder.id} folder={folder} samples={fs} plotCache={plotCache}
                     onSelectSample={openSample} onDeleteSample={deleteSample}
                     onEdit={() => setEditingFolder(folder)}
-                    onDelete={() => deleteFolder(folder.id)} />
+                    onDelete={() => deleteFolder(folder.id)}
+                    onDropSample={() => handleDropToFolder(folder.id)}
+                    onDragStartSample={setDraggingSampleId} />
                 ))}
 
                 {/* Ungrouped */}
-                {ungrouped.length > 0 && (
-                  <div>
+                {(ungrouped.length > 0 || (draggingSampleId && folders.length > 0)) && (
+                  <div
+                    onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setUngroupedDragOver(true); }}
+                    onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setUngroupedDragOver(false); }}
+                    onDrop={e => { e.preventDefault(); setUngroupedDragOver(false); handleDropToFolder(null); }}
+                    style={{ border: `2px solid ${ungroupedDragOver ? T.amber : "transparent"}`, borderRadius: 10, padding: ungroupedDragOver ? 10 : 0, transition: "all .12s", boxShadow: ungroupedDragOver ? `0 0 0 3px ${T.amberGlow}` : "none" }}>
                     {folders.length > 0 && (
-                      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>Ungrouped</div>
+                      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: ungroupedDragOver ? T.amber : T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8, transition: "color .12s" }}>
+                        {ungroupedDragOver ? "Drop to ungroup" : "Ungrouped"}
+                      </div>
                     )}
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(270px,1fr))", gap: 12 }}>
-                      {ungrouped.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => openSample(s.id)} onDelete={deleteSample} />)}
+                      {ungrouped.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => openSample(s.id)} onDelete={deleteSample} onDragStart={setDraggingSampleId} />)}
                     </div>
                   </div>
                 )}
