@@ -842,6 +842,14 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
     api("GET", "/materials").then(setKnownMaterials).catch(() => {});
   }, []);
 
+  // Keep form values in sync with the sample prop (e.g. after an external update),
+  // but only when the edit form is closed so we don't overwrite in-progress edits.
+  useEffect(() => {
+    if (!editingMeta) {
+      setMeta({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
+    }
+  }, [sample, editingMeta]);
+
   const addLayer       = l  => { onUpdate({ ...sample, layers: [...sample.layers, l] }); setAddingLayer(false); };
   const removeLayer    = id => onUpdate({ ...sample, layers: sample.layers.filter(l => l.id !== id) });
   const updateLayer    = l  => onUpdate({ ...sample, layers: sample.layers.map(x => x.id === l.id ? l : x) });
@@ -887,7 +895,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: 14, display: "grid", gridTemplateColumns: "1fr 1fr 1fr 2fr", gap: 12 }}>
           <Input label="Date"              value={meta.date}         onChange={v => setMeta(p => ({ ...p, date: v }))} />
           <Input label="Substrate"         value={meta.substrate}    onChange={v => setMeta(p => ({ ...p, substrate: v }))} />
-          <Input label="Film thickness (nm)" value={meta.thickness_nm} onChange={v => setMeta(p => ({ ...p, thickness_nm: v === "" ? "" : v }))} type="number" placeholder="e.g. 30" />
+          <Input label="Thickness (nm)" value={meta.thickness_nm} onChange={v => setMeta(p => ({ ...p, thickness_nm: v === "" ? "" : v }))} type="number" placeholder="e.g. 30" />
           <Input label="Notes"             value={meta.notes}        onChange={v => setMeta(p => ({ ...p, notes: v }))} />
           <div style={{ gridColumn: "1/-1", display: "flex", justifyContent: "flex-end" }}><Btn small onClick={saveMeta}>Save</Btn></div>
         </div>
