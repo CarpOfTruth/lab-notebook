@@ -1,0 +1,29 @@
+{
+  "name": "lab-notebook",
+  "version": "1.0.0",
+  "description": "**A local lab notebook for ferroelectric oxide thin film growth and characterization.**",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "setup": "cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -q && (cp config.example.json config.json 2>/dev/null || true) && cd ../frontend && npm install",
+    "start": "concurrently -n backend,frontend -c cyan,yellow \"cd backend && .venv/bin/uvicorn main:app --reload\" \"cd frontend && npm run dev\"",
+    "seed":  "cd backend && .venv/bin/python3 seed_demo.py"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CarpOfTruth/lab-notebook.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/CarpOfTruth/lab-notebook/issues"
+  },
+  "homepage": "https://github.com/CarpOfTruth/lab-notebook#readme",
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

@@ -13,32 +13,26 @@ LabLog is a self-hosted web app that keeps deposition recipes, raw measurement f
 - Python 3.9+
 - Node.js 18+
 
-### 1. Clone
+### 1. Clone and set up
 
 ```bash
 git clone https://github.com/CarpOfTruth/lab-notebook.git
 cd lab-notebook
+npm run setup
 ```
 
-### 2. Backend
+This creates the Python virtual environment, installs all dependencies, and copies the default config.
+
+### 2. Load demo data (optional)
 
 ```bash
-cd backend
-python3 -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp config.example.json config.json
-uvicorn main:app --reload
+npm run seed
 ```
 
-### 3. Frontend
-
-In a second terminal:
+### 3. Start
 
 ```bash
-cd frontend
-npm install
-npm run dev
+npm start
 ```
 
 Open **http://localhost:5173**.
