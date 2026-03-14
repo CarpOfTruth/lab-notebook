@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from "react";
-import { LineChart, ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+import { LineChart, ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer, Customized } from "recharts";
 
 // ── API client ────────────────────────────────────────────────────────────────
 
@@ -32,13 +32,21 @@ async function fetchFile(sampleId, filename) {
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 
-const T = {
+const DARK_T = {
   bg0: "#0d1117", bg1: "#161b22", bg2: "#1c2333", bg3: "#243044",
   border: "#2d3748", borderBright: "#4a5568",
   amber: "#f6ad55", amberDim: "#c47f2a", amberGlow: "rgba(246,173,85,0.15)",
   teal: "#4fd1c5", red: "#fc8181", green: "#68d391", blue: "#63b3ed",
   textPrimary: "#e2e8f0", textSecondary: "#a0aec0", textDim: "#718096",
 };
+const LIGHT_T = {
+  bg0: "#f0f2f5", bg1: "#ffffff", bg2: "#f8f9fa", bg3: "#e4e8ef",
+  border: "#d0d7de", borderBright: "#8c959f",
+  amber: "#d97706", amberDim: "#b45309", amberGlow: "rgba(217,119,6,0.08)",
+  teal: "#0d9488", red: "#dc2626", green: "#16a34a", blue: "#2563eb",
+  textPrimary: "#1a202c", textSecondary: "#4a5568", textDim: "#6b7280",
+};
+let T = DARK_T;
 
 // ── Measurement type definitions ──────────────────────────────────────────────
 
@@ -46,14 +54,14 @@ const MEAS_TYPES = {
   xrd_ot: { label: "XRD ω–2θ",                    xLabel: "2θ (°)",         yLabel: "Intensity (cts)", logY: true,  color: T.amber },
   xrr:    { label: "XRR",                          xLabel: "2θ (°)",         yLabel: "Intensity (cts)", logY: true,  color: T.teal  },
   rsm:    { label: "RSM",                          xLabel: "Qₓ (Å⁻¹)",      yLabel: "Qz (Å⁻¹)",       isRSM: true, color: T.blue  },
-  pe:     { label: "P–E Hysteresis",               xLabel: "E (kV/cm)",      yLabel: "P (µC/cm²)",      logY: false, color: T.red,   twoSweep: true, ySymRange: 30 },
-  diel_f: { label: "Rel. Permittivity vs f",       xLabel: "Frequency (Hz)", yLabel: "εᵣ",              logX: true,  color: T.green, clampYZero: true },
-  diel_b: { label: "Rel. Permittivity vs E",       xLabel: "E (kV/cm)",      yLabel: "εᵣ",              logY: false, color: T.green, clampYZero: true, twoSweep: true },
+  pe:     { label: "P–E Hysteresis",               xLabel: "E (kV/cm)",      yLabel: "P (µC/cm²)",      logY: false, color: T.red, ySymRange: 30, symXTicks: true, zeroRefY: true },
+  diel_f: { label: "Rel. Permittivity vs f",       xLabel: "log f (Hz)",     yLabel: "εᵣ",              logX: true,  color: T.green, clampYZero: true },
+  diel_b: { label: "Rel. Permittivity vs E",       xLabel: "E (kV/cm)",      yLabel: "εᵣ",              logY: false, color: T.green, clampYZero: true, twoSweep: true, symXTicks: true },
 };
 
 // ── Material colour palette (hash-based for any string) ───────────────────────
 
-const MAT_PALETTE = [
+const MAT_PALETTE_DARK = [
   { bg: "#1a3a5c", border: "#3182ce" },
   { bg: "#1a3d2b", border: "#38a169" },
   { bg: "#3d2e0a", border: "#d69e2e" },
@@ -63,12 +71,57 @@ const MAT_PALETTE = [
   { bg: "#1a2a3d", border: "#63b3ed" },
   { bg: "#2a3d1a", border: "#68d391" },
 ];
+const MAT_PALETTE_LIGHT = [
+  { bg: "#dbeafe", border: "#2563eb" },
+  { bg: "#dcfce7", border: "#16a34a" },
+  { bg: "#fef3c7", border: "#d97706" },
+  { bg: "#f3e8ff", border: "#7c3aed" },
+  { bg: "#fee2e2", border: "#dc2626" },
+  { bg: "#ccfbf1", border: "#0d9488" },
+  { bg: "#eff6ff", border: "#3b82f6" },
+  { bg: "#f0fdf4", border: "#15803d" },
+];
+let MAT_PALETTE = MAT_PALETTE_DARK;
 
 function getMaterialStyle(material) {
   if (!material) return { ...MAT_PALETTE[0], label: "?" };
   let h = 0;
   for (const c of material) h = (h * 31 + c.charCodeAt(0)) & 0xffffffff;
   return { ...MAT_PALETTE[Math.abs(h) % MAT_PALETTE.length], label: material };
+}
+
+// ── Continuous color scales for analysis books ────────────────────────────────
+
+const COLOR_SCALES = {
+  viridis:  ["#440154","#482777","#3e4989","#30678d","#25838e","#1e9d89","#35b779","#6dce59","#b5dd2b","#fde725"],
+  cividis:  ["#00204d","#18306f","#31588b","#49739c","#628fa7","#7dadb2","#9acac0","#bae4cd","#dcf0d8","#fee838"],
+  inferno:  ["#000004","#1b0c42","#4a0c4e","#781c6d","#a52c60","#cf4446","#ed6925","#fb9b07","#f7d03c","#fcffa4"],
+  magma:    ["#000004","#180c3c","#40074e","#6b1b62","#982d80","#c24490","#e8688c","#f9a9a3","#fddac7","#fcfdbf"],
+  plasma:   ["#0d0887","#45039e","#7201a8","#9c179e","#bd3786","#d8576b","#ed7953","#fb9f3a","#fdcf18","#f0f921"],
+  coolwarm: ["#3b4cc0","#6e8ef0","#9ebcd8","#d1dae9","#e8d0c6","#f0a880","#e36a53","#b40426"],
+};
+
+function hexToRgb(hex) {
+  const h = hex.replace("#", "");
+  return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
+}
+function rgbToHex(r, g, b) {
+  return "#" + [r,g,b].map(v => Math.round(Math.max(0,Math.min(255,v))).toString(16).padStart(2,"0")).join("");
+}
+// trim = % to cut from each end of the scale, e.g. 5 → use t ∈ [0.05, 0.95]
+function sampleColorScale(scaleName, n, trim = 5) {
+  const anchors = COLOR_SCALES[scaleName] || COLOR_SCALES.viridis;
+  const tLo = Math.max(0, Math.min(0.49, (trim || 0) / 100));
+  const tHi = 1 - tLo;
+  if (n <= 0) return [];
+  return Array.from({ length: n }, (_, i) => {
+    const t = n === 1 ? (tLo + tHi) / 2 : tLo + (i / (n - 1)) * (tHi - tLo);
+    const scaled = t * (anchors.length - 1);
+    const lo = Math.floor(scaled), hi = Math.min(lo + 1, anchors.length - 1);
+    const f = scaled - lo;
+    const [r0,g0,b0] = hexToRgb(anchors[lo]), [r1,g1,b1] = hexToRgb(anchors[hi]);
+    return rgbToHex(r0+(r1-r0)*f, g0+(g1-g0)*f, b0+(b1-b0)*f);
+  });
 }
 
 // ── CSV + data utilities (unchanged from original) ────────────────────────────
@@ -132,45 +185,28 @@ function findAreaFromFile(text) {
   return null;
 }
 
-function splitSweeps(points) {
-  if (points.length < 4) return { up: points, down: [] };
-  const xs = points.map(p => p.x);
-  const x0 = xs[0];
-  const maxX = xs.reduce((m, v) => Math.max(m, v), -Infinity);
-  const minX = xs.reduce((m, v) => Math.min(m, v),  Infinity);
-  const posThresh = maxX > 0 ? maxX * 0.9 : Infinity;
-  const negThresh = minX < 0 ? minX * 0.9 : -Infinity;
-  let cycleEnd = points.length;
-  if (maxX > 0 && minX < 0) {
-    let firstPos = -1, firstNeg = -1;
-    for (let i = 0; i < xs.length; i++) {
-      if (firstPos < 0 && xs[i] >= posThresh) firstPos = i;
-      if (firstNeg < 0 && xs[i] <= negThresh) firstNeg = i;
-      if (firstPos >= 0 && firstNeg >= 0) break;
-    }
-    const lastExtreme = Math.max(firstPos ?? -1, firstNeg ?? -1);
-    if (lastExtreme > 0) {
-      const thr = (maxX - minX) * 0.15;
-      for (let i = lastExtreme + 1; i < xs.length; i++) {
-        if (Math.abs(xs[i] - x0) < thr) { cycleEnd = i + 1; break; }
-      }
-    }
-  }
-  const cycle = points.slice(0, cycleEnd);
-  const up = [], down = [];
-  for (let i = 0; i < cycle.length; i++) {
-    if (i === 0) { up.push(cycle[i]); continue; }
-    (cycle[i].x >= cycle[i - 1].x ? up : down).push(cycle[i]);
-  }
-  up.sort((a, b) => a.x - b.x);
-  down.sort((a, b) => a.x - b.x);
-  return { up, down };
-}
 
 function hasPlotData(d) {
   if (!d) return false;
   if (Array.isArray(d)) return d.length > 0;
-  return !!(d.up?.length || d.down?.length);
+  return !!(d.up?.length || d.down?.length); // diel_b shape
+}
+
+// Split a double-bipolar PE sweep into its two loops.
+// Snaps the split point to the nearest return to data[0].x (the starting voltage),
+// so biased sweeps that don't start at 0 V are handled correctly.
+function splitPELoops(data) {
+  if (!data || data.length < 4) return { first: data || [], second: data || [] };
+  const n = data.length;
+  const startX = data[0].x; // effective loop origin — the voltage the waveform starts from
+  const mid = Math.floor(n / 2);
+  const win = Math.floor(n * 0.15); // search ±15% of length around midpoint
+  let bestIdx = mid, bestDist = Infinity;
+  for (let i = Math.max(1, mid - win); i <= Math.min(n - 2, mid + win); i++) {
+    const dist = Math.abs(data[i].x - startX);
+    if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+  }
+  return { first: data.slice(0, bestIdx), second: data.slice(bestIdx) };
 }
 
 function csvToPlotData(text, type, thicknessNm) {
@@ -186,7 +222,7 @@ function csvToPlotData(text, type, thicknessNm) {
     if (maxAbsX < 50 && thicknessNm > 0) xs = xs.map(v => v / (thicknessNm * 1e-4));
     const maxAbsY = ys.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
     if (maxAbsY > 0 && maxAbsY < 1e-3) ys = ys.map(p => p * 1e6);
-    return splitSweeps(xs.map((x, i) => ({ x, y: ys[i] })));
+    return xs.map((x, i) => ({ x, y: ys[i] }));
   }
   if (type === "diel_b_up" || type === "diel_b_down") {
     let xs = rows.map(r => r[0]);
@@ -224,6 +260,33 @@ const Input = ({ label, value, onChange, placeholder, type = "text", small }) =>
   </div>
 );
 
+// Toggle between showing all PE loops or only the 2nd (cleaner) loop
+const LoopToggle = ({ value, onChange }) => (
+  <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+    <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>loop</span>
+    <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 10, overflow: "hidden" }}>
+      {[["all", "all"], ["second", "2nd"]].map(([val, lbl]) => (
+        <button key={val} onClick={() => onChange(val)}
+          style={{ background: value === val ? T.amber : "transparent", color: value === val ? "#0d1117" : T.textDim,
+            border: "none", cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 10,
+            padding: "2px 9px", transition: "all .15s", lineHeight: 1.6 }}>
+          {lbl}
+        </button>
+      ))}
+    </div>
+  </div>
+);
+
+// Recharts Customized component: draws inside tick marks on all 4 sides and closes
+// the plot box with top + right lines. Pass xTicks/yTicks as explicit arrays.
+// Recharts sets xAxis.scale range to absolute SVG coordinates, so no offset needed.
+function PlotBox({ offset }) {
+  if (!offset) return null;
+  const { left: ox, top: oy, width: ow, height: oh } = offset;
+  if (!ow || !oh) return null;
+  return <rect x={ox} y={oy} width={ow} height={oh} fill="none" stroke={T.borderBright} strokeWidth={1} />;
+}
+
 const Sel = ({ label, value, onChange, options }) => (
   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
     {label && <Label>{label}</Label>}
@@ -233,6 +296,22 @@ const Sel = ({ label, value, onChange, options }) => (
     </select>
   </div>
 );
+
+// Renders a chemical-formula string with digit sequences as subscripts.
+// e.g. "BaTiO3" → BaTiO₃, "Ba0.5Sr0.5TiO3" → Ba₀.₅Sr₀.₅TiO₃ (via <sub>)
+function ChemName({ name }) {
+  if (!name) return null;
+  const parts = name.split(/(\d+(?:\.\d+)?)/);
+  return (
+    <>
+      {parts.map((part, i) =>
+        /^\d/.test(part)
+          ? <sub key={i} style={{ fontSize: "0.8em", lineHeight: 0 }}>{part}</sub>
+          : part
+      )}
+    </>
+  );
+}
 
 function MaterialCombobox({ value, onChange, knownMaterials, small }) {
   const [open, setOpen] = useState(false);
@@ -254,7 +333,7 @@ function MaterialCombobox({ value, onChange, knownMaterials, small }) {
             return (
               <div key={m} onMouseDown={() => { onChange(m); setQuery(m); setOpen(false); }}
                 style={{ padding: "6px 10px", cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 12, color: s.border, borderLeft: `3px solid ${s.border}` }}>
-                {m}
+                <ChemName name={m} />
               </div>
             );
           })}
@@ -275,6 +354,59 @@ function padDomain(vals, pct = 0.1) {
   return [mn - pad, mx + pad];
 }
 
+// Returns { ticks, domain } with nice steps and ~5-7 ticks.
+// When the range straddles zero, ticks are symmetric about 0 and 0 is always included.
+function niceLinTicks(lo, hi, target = 6) {
+  if (!isFinite(lo) || !isFinite(hi) || lo === hi) return { ticks: [lo], domain: [lo, hi] };
+  const mn = Math.min(lo, hi), mx = Math.max(lo, hi);
+  if (mn < 0 && mx > 0) {
+    // Bipolar range — symmetric about 0, 0 always a tick
+    const absMax = Math.max(Math.abs(mn), Math.abs(mx));
+    const rawStep = absMax / Math.floor(target / 2);
+    const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+    const norm = rawStep / mag;
+    const niceNorm = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10;
+    const step = niceNorm * mag;
+    const symMax = Math.ceil(absMax / step) * step;
+    const n = Math.round(symMax / step);
+    const ticks = Array.from({ length: 2 * n + 1 }, (_, i) => Math.round((-symMax + i * step) * 1e10) / 1e10);
+    return { ticks, domain: [-symMax, symMax] };
+  }
+  // Unipolar range — standard nice ticks
+  const span = mx - mn || 1;
+  const base = Math.pow(10, Math.floor(Math.log10(span / target)));
+  const candidates = [1, 2, 2.5, 5, 10].map(f => f * base);
+  let step = candidates[candidates.length - 1];
+  for (const s of candidates) {
+    const n = Math.floor(mx / s) - Math.ceil(mn / s) + 1;
+    if (n >= 4 && n <= 8) { step = s; break; }
+  }
+  const t0 = Math.ceil(mn / step) * step, t1 = Math.floor(mx / step) * step;
+  const ticks = [];
+  for (let i = 0; t0 + i * step <= t1 + step * 1e-9; i++)
+    ticks.push(Math.round((t0 + i * step) * 1e10) / 1e10);
+  return { ticks, domain: [ticks[0], ticks[ticks.length - 1]] };
+}
+
+// Returns { ticks, fmt } with nice decimal labels for canvas-drawn axes (e.g. RSM).
+function niceCanvasTicks(lo, hi, target = 5) {
+  const span = hi - lo || 1;
+  const base = Math.pow(10, Math.floor(Math.log10(span / target)));
+  const candidates = [1, 2, 2.5, 5, 10].map(f => f * base);
+  let step = candidates[candidates.length - 1];
+  for (const s of candidates) {
+    const n = Math.floor(hi / s) - Math.ceil(lo / s) + 1;
+    if (n >= 3 && n <= 8) { step = s; break; }
+  }
+  const t0 = Math.ceil(lo / step) * step, t1 = Math.floor(hi / step) * step;
+  const ticks = [];
+  for (let i = 0; t0 + i * step <= t1 + step * 1e-9; i++)
+    ticks.push(Math.round((t0 + i * step) * 1e10) / 1e10);
+  const dec = step < 1 ? Math.max(0, Math.ceil(-Math.log10(step))) : 0;
+  const fmt = v => Number.isFinite(v) ? (v === 0 ? "0" : v.toFixed(dec)) : "";
+  return { ticks, fmt };
+}
+
 function numFmt(v) {
   if (v === 0) return "0";
   const abs = Math.abs(v);
@@ -284,8 +416,22 @@ function numFmt(v) {
   return parseFloat(v.toPrecision(3)).toString();
 }
 
+// Returns { ref, tooltipPos, onMouseMove } — snaps tooltip to whichever
+// horizontal half the cursor is NOT in, so it never overlaps the data.
+function useTooltipSide() {
+  const ref = useRef(null);
+  const [tooltipX, setTooltipX] = useState(10);
+  const onMouseMove = useCallback((state) => {
+    if (!state?.activeCoordinate || !ref.current) return;
+    const w = ref.current.clientWidth || 400;
+    setTooltipX(state.activeCoordinate.x > w / 2 ? 10 : w - 145);
+  }, []);
+  return { ref, tooltipPos: { x: tooltipX, y: 10 }, onMouseMove };
+}
+
 function LinePlot({ data, cfg }) {
   const { xLabel, yLabel, logY, logX, color } = cfg;
+  const { ref, tooltipPos, onMouseMove } = useTooltipSide();
   const plotData = logY
     ? data.filter(d => d.y > 0).map(d => ({ ...d, yp: +Math.log10(d.y).toFixed(4) }))
     : data.map(d => ({ ...d, yp: d.y }));
@@ -294,20 +440,34 @@ function LinePlot({ data, cfg }) {
   let xDomain, xTicks, xTickFmt;
   if (logX) {
     const lo = Math.floor(Math.log10(arrMin(xVals.filter(v => v > 0))));
-    const hi = Math.ceil(Math.log10(arrMax(xVals.filter(v => v > 0))));
-    xDomain = [Math.pow(10, lo), Math.pow(10, hi)];
-    xTicks  = Array.from({ length: hi - lo + 1 }, (_, i) => Math.pow(10, lo + i));
-    xTickFmt = v => { const n = Math.round(Math.log10(v)); return n === 0 ? "1" : n === 1 ? "10" : `10^${n}`; };
+    const hi = Math.floor(Math.log10(arrMax(xVals.filter(v => v > 0))));
+    xDomain  = [Math.pow(10, lo), Math.pow(10, hi)];
+    xTicks   = Array.from({ length: hi - lo + 1 }, (_, i) => Math.pow(10, lo + i));
+    xTickFmt = v => String(Math.round(Math.log10(v))); // show decade exponent: 3, 4, 5 …
   } else {
-    xDomain = padDomain(xVals);
-    xTicks  = undefined;
+    if (cfg.symXTicks) {
+      const { ticks, domain } = niceLinTicks(arrMin(xVals), arrMax(xVals));
+      xDomain = domain;
+      xTicks  = ticks;
+    } else {
+      const { ticks: t, domain: d } = niceLinTicks(arrMin(xVals), arrMax(xVals));
+      xDomain = d; xTicks = t;
+    }
     xTickFmt = v => numFmt(v);
   }
-  let yDomain, yTicks;
+  let yDomain, yTicks, yIntFmt = false;
   if (logY) {
     const lo = Math.floor(arrMin(yVals)), hi = Math.ceil(arrMax(yVals));
     yDomain = [lo, hi];
     yTicks  = Array.from({ length: hi - lo + 1 }, (_, i) => lo + i);
+  } else if (cfg.ySymRange != null) {
+    const absMax = yVals.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+    const absYMax0 = Math.max(cfg.ySymRange, absMax * 1.1);
+    const peStep = absYMax0 >= 500 ? 200 : absYMax0 >= 250 ? 100 : absYMax0 >= 100 ? 50 : absYMax0 >= 40 ? 10 : 5;
+    const sym = Math.ceil(absYMax0 / peStep) * peStep;
+    yDomain = [-sym, sym];
+    yTicks  = Array.from({ length: 2 * (sym / peStep) + 1 }, (_, i) => -sym + i * peStep);
+    yIntFmt = true;
   } else {
     const [domLo, domHi] = padDomain(yVals);
     yDomain = cfg.clampYZero ? [0, domHi] : [domLo, domHi];
@@ -315,40 +475,45 @@ function LinePlot({ data, cfg }) {
   }
   const yTickFmt = logY
     ? v => { const n = Math.round(v); return n === 0 ? "1" : n === 1 ? "10" : `10^${n}`; }
+    : yIntFmt ? v => Math.round(v).toString()
     : v => numFmt(v);
   const hasD = cfg.hasY2 && plotData.some(d => d.y2 != null);
   const dVals = hasD ? plotData.filter(d => d.y2 != null).map(d => d.y2) : [];
   const [dDomLo, dDomHi] = hasD ? padDomain(dVals) : [0, 1];
-  const dDomain = hasD ? [Math.max(0, dDomLo), dDomHi] : [0, 1];
+  const dDomain = hasD ? [dDomLo, dDomHi] : [0, 1];
   return (
-    <ResponsiveContainer width="100%" height={200}>
-      <LineChart data={plotData} margin={{ top: 6, right: hasD ? 44 : 12, bottom: 28, left: 10 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
-        <XAxis dataKey="x" type="number" tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
-          tickFormatter={xTickFmt} ticks={xTicks}
-          label={{ value: xLabel, position: "insideBottom", offset: -14, fill: T.textSecondary, fontSize: 11 }}
-          scale={logX ? "log" : "auto"} domain={xDomain} />
-        <YAxis yAxisId="left" tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
-          tickFormatter={yTickFmt} ticks={yTicks}
-          label={{ value: yLabel, angle: -90, position: "insideLeft", offset: 14, fill: T.textSecondary, fontSize: 10 }}
-          domain={yDomain} />
-        {hasD && <YAxis yAxisId="right" orientation="right"
-          tick={{ fill: T.amber, fontSize: 9, fontFamily: "'DM Mono', monospace" }}
-          tickFormatter={v => numFmt(v)}
-          label={{ value: "D (tan δ)", angle: 90, position: "insideRight", offset: -6, fill: T.amber, fontSize: 9 }}
-          domain={dDomain} />}
-        <Tooltip position={{ x: 10, y: 10 }}
-          contentStyle={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11 }}
-          formatter={(v, name) => name === "y2" ? [numFmt(+v), "D (tan δ)"] : [logY ? numFmt(Math.pow(10, +v)) : numFmt(+v), yLabel]}
-          labelFormatter={v => `${xLabel}: ${numFmt(+v)}`} />
-        <Line yAxisId="left" type="monotone" dataKey="yp" dot={false} stroke={color} strokeWidth={1.5} isAnimationActive={false} />
-        {hasD && <Line yAxisId="right" type="monotone" dataKey="y2" dot={false} stroke={T.amber} strokeWidth={1.5} strokeDasharray="4 2" isAnimationActive={false} name="y2" />}
-      </LineChart>
-    </ResponsiveContainer>
+    <div ref={ref}>
+      <ResponsiveContainer width="100%" height={200}>
+        <LineChart data={plotData} onMouseMove={onMouseMove} margin={{ top: 6, right: hasD ? 44 : 12, bottom: 28, left: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+          <XAxis dataKey="x" type="number" tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
+            tickFormatter={xTickFmt} ticks={xTicks} tickLine={false}
+            axisLine={{ stroke: T.borderBright }} label={{ value: xLabel, position: "insideBottom", offset: -14, fill: T.textSecondary, fontSize: 11 }}
+            scale={logX ? "log" : "auto"} domain={xDomain} />
+          <YAxis yAxisId="left" tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
+            tickFormatter={yTickFmt} ticks={yTicks} tickLine={false}
+            axisLine={{ stroke: T.borderBright }} label={{ value: yLabel, angle: -90, position: "insideLeft", offset: 14, fill: T.textSecondary, fontSize: 10 }}
+            domain={yDomain} />
+          {hasD && <YAxis yAxisId="right" orientation="right"
+            tick={{ fill: T.amber, fontSize: 9, fontFamily: "'DM Mono', monospace" }} tickLine={false}
+            tickFormatter={v => numFmt(v)} axisLine={false}
+            label={{ value: "D (tan δ)", angle: 90, position: "insideRight", offset: -6, fill: T.amber, fontSize: 9 }}
+            domain={dDomain} />}
+          <Tooltip position={tooltipPos}
+            contentStyle={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11 }}
+            formatter={(v, name) => name === "y2" ? [numFmt(+v), "D (tan δ)"] : [logY ? numFmt(Math.pow(10, +v)) : numFmt(+v), yLabel]}
+            labelFormatter={v => `${xLabel}: ${numFmt(+v)}`} />
+          {cfg.zeroRefY && <ReferenceLine yAxisId="left" y={0} stroke={T.borderBright} strokeWidth={1} />}
+          <Line yAxisId="left" type="monotone" dataKey="yp" dot={false} stroke={color} strokeWidth={1.5} isAnimationActive={false} />
+          {hasD && <Line yAxisId="right" type="monotone" dataKey="y2" dot={false} stroke={T.amber} strokeWidth={1.5} strokeDasharray="4 2" isAnimationActive={false} name="y2" />}
+          <Customized component={PlotBox} xTicks={xTicks ?? []} yTicks={yTicks ?? []} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
   );
 }
 
-function RSMPlot({ data, cfg }) {
+function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain }) {
   const containerRef = useRef(null);
   const canvasRef    = useRef(null);
   const draw = useCallback(() => {
@@ -366,7 +531,10 @@ function RSMPlot({ data, cfg }) {
       if (d.z < zMin) zMin = d.z; if (d.z > zMax) zMax = d.z;
     }
     const xp = (xMax - xMin) * 0.05, yp = (yMax - yMin) * 0.05;
-    const x0 = xMin - xp, x1 = xMax + xp, y0 = yMin - yp, y1 = yMax + yp;
+    const x0 = forcedXDomain ? forcedXDomain[0] : xMin - xp;
+    const x1 = forcedXDomain ? forcedXDomain[1] : xMax + xp;
+    const y0 = forcedYDomain ? forcedYDomain[0] : yMin - yp;
+    const y1 = forcedYDomain ? forcedYDomain[1] : yMax + yp;
     const logZMin   = zMin > 0 ? Math.log10(zMin) : 0;
     const logZRange = zMax > zMin ? Math.log10(Math.max(zMax, zMin + 1e-12)) - logZMin : 1;
     const sx = x => M.left + (x - x0) / (x1 - x0) * pw;
@@ -380,22 +548,35 @@ function RSMPlot({ data, cfg }) {
       ctx.fillRect(Math.round(sx(d.x)), Math.round(sy(d.y)), 2, 2);
     }
     ctx.font = `10px "DM Mono", monospace`;
-    const N_X = 5, N_Y = 4;
+    const { ticks: xTkArr, fmt: xFmt } = niceCanvasTicks(x0, x1);
     ctx.textAlign = "center"; ctx.textBaseline = "top";
-    for (let i = 0; i <= N_X; i++) {
-      const xv = x0 + (x1 - x0) * i / N_X, px = Math.round(sx(xv));
+    for (const xv of xTkArr) {
+      const px = Math.round(sx(xv));
       ctx.strokeStyle = T.border; ctx.lineWidth = 0.5;
       ctx.beginPath(); ctx.moveTo(px, M.top); ctx.lineTo(px, M.top + ph); ctx.stroke();
-      ctx.fillStyle = T.textDim; ctx.fillText(numFmt(xv), px, M.top + ph + 4);
+      ctx.fillStyle = T.textDim; ctx.fillText(xFmt(xv), px, M.top + ph + 4);
     }
+    const { ticks: yTkArr, fmt: yFmt } = niceCanvasTicks(y0, y1);
     ctx.textAlign = "right"; ctx.textBaseline = "middle";
-    for (let i = 0; i <= N_Y; i++) {
-      const yv = y0 + (y1 - y0) * i / N_Y, py = Math.round(sy(yv));
+    for (const yv of yTkArr) {
+      const py = Math.round(sy(yv));
       ctx.strokeStyle = T.border; ctx.lineWidth = 0.5;
       ctx.beginPath(); ctx.moveTo(M.left, py); ctx.lineTo(M.left + pw, py); ctx.stroke();
-      ctx.fillStyle = T.textDim; ctx.fillText(numFmt(yv), M.left - 4, py);
+      ctx.fillStyle = T.textDim; ctx.fillText(yFmt(yv), M.left - 4, py);
     }
+    // Inside tick marks on all 4 sides
+    const TK = 4;
     ctx.strokeStyle = T.borderBright; ctx.lineWidth = 1;
+    for (const xv of xTkArr) {
+      const px = Math.round(sx(xv));
+      ctx.beginPath(); ctx.moveTo(px, M.top);      ctx.lineTo(px, M.top + TK);      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(px, M.top + ph); ctx.lineTo(px, M.top + ph - TK); ctx.stroke();
+    }
+    for (const yv of yTkArr) {
+      const py = Math.round(sy(yv));
+      ctx.beginPath(); ctx.moveTo(M.left,      py); ctx.lineTo(M.left + TK,      py); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(M.left + pw, py); ctx.lineTo(M.left + pw - TK, py); ctx.stroke();
+    }
     ctx.strokeRect(M.left + 0.5, M.top + 0.5, pw, ph);
     ctx.fillStyle = T.textSecondary; ctx.font = `11px "DM Mono", monospace`;
     ctx.textAlign = "center"; ctx.textBaseline = "bottom";
@@ -403,7 +584,7 @@ function RSMPlot({ data, cfg }) {
     ctx.save(); ctx.translate(13, M.top + ph / 2); ctx.rotate(-Math.PI / 2);
     ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.fillText(cfg.yLabel, 0, 0); ctx.restore();
-  }, [data, cfg]);
+  }, [data, cfg, forcedXDomain, forcedYDomain]);
   useEffect(() => {
     draw();
     const container = containerRef.current;
@@ -421,50 +602,76 @@ function RSMPlot({ data, cfg }) {
 
 function TwoLinePlot({ data, cfg }) {
   const { xLabel, yLabel, color, clampYZero } = cfg;
+  const { ref, tooltipPos, onMouseMove } = useTooltipSide();
   const { up = [], down = [] } = data;
   const allPts = [...up, ...down];
   if (!allPts.length) return null;
   const xVals = allPts.map(d => d.x), yVals = allPts.map(d => d.y);
-  const xDomain = padDomain(xVals);
-  let yDomain;
+  let xDomain, xTicks;
+  if (cfg.symXTicks) {
+    const { ticks, domain } = niceLinTicks(arrMin(xVals), arrMax(xVals));
+    xDomain = domain; xTicks = ticks;
+  } else {
+    xDomain = padDomain(xVals); xTicks = undefined;
+  }
+  let yDomain, yTicks, yIntFmt = false;
   if (cfg.ySymRange != null) {
     const absMax = yVals.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
-    const sym = Math.max(cfg.ySymRange, Math.ceil(absMax * 1.05));
+    const absYMax0 = Math.max(cfg.ySymRange, absMax * 1.1);
+    const peStep = absYMax0 >= 500 ? 200 : absYMax0 >= 250 ? 100 : absYMax0 >= 100 ? 50 : absYMax0 >= 40 ? 10 : 5;
+    const sym = Math.ceil(absYMax0 / peStep) * peStep;
     yDomain = [-sym, sym];
+    yTicks = Array.from({ length: 2 * (sym / peStep) + 1 }, (_, i) => -sym + i * peStep);
+    yIntFmt = true;
   } else {
     const [domLo, domHi] = padDomain(yVals);
-    yDomain = clampYZero ? [0, domHi] : [domLo, domHi];
+    if (clampYZero) {
+      const erStep = domHi >= 8000 ? 2000 : domHi >= 4000 ? 1000 : domHi >= 2000 ? 500 : domHi >= 800 ? 200 : domHi >= 300 ? 100 : 50;
+      const erMax = Math.ceil(domHi / erStep) * erStep;
+      yDomain = [0, erMax];
+      yTicks = Array.from({ length: erMax / erStep + 1 }, (_, i) => i * erStep);
+      yIntFmt = true;
+    } else {
+      const { ticks, domain } = niceLinTicks(domLo, domHi);
+      yDomain = domain; yTicks = ticks;
+    }
   }
+  const yFmt = yIntFmt ? v => Math.round(v).toString() : v => numFmt(v);
   const hasD = allPts.some(d => d.y2 != null);
   const dVals = hasD ? allPts.filter(d => d.y2 != null).map(d => d.y2) : [];
   const [dDomLo, dDomHi] = hasD ? padDomain(dVals) : [0, 1];
-  const dDomain = hasD ? [Math.max(0, dDomLo), dDomHi] : [0, 1];
+  const dDomain = hasD ? [dDomLo, dDomHi] : [0, 1];
   return (
-    <ResponsiveContainer width="100%" height={200}>
-      <ComposedChart margin={{ top: 6, right: hasD ? 44 : 12, bottom: 28, left: 10 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
-        <XAxis dataKey="x" type="number" domain={xDomain}
-          tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
-          label={{ value: xLabel, position: "insideBottom", offset: -14, fill: T.textSecondary, fontSize: 11 }} />
-        <YAxis yAxisId="left" domain={yDomain}
-          tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
-          label={{ value: yLabel, angle: -90, position: "insideLeft", offset: 14, fill: T.textSecondary, fontSize: 10 }} />
-        {hasD && <YAxis yAxisId="right" orientation="right" domain={dDomain}
-          tick={{ fill: T.amber, fontSize: 9, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
-          label={{ value: "D (tan δ)", angle: 90, position: "insideRight", offset: -6, fill: T.amber, fontSize: 9 }} />}
-        <Tooltip position={{ x: 10, y: 10 }}
-          contentStyle={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11 }}
-          formatter={(v, name) => {
-            if (name === "up_d" || name === "down_d") return [numFmt(+v), `D (tan δ) ${name === "up_d" ? "↑" : "↓"}`];
-            return [numFmt(+v), name === "up" ? `${yLabel} ↑` : `${yLabel} ↓`];
-          }}
-          labelFormatter={v => `${xLabel}: ${numFmt(+v)}`} />
-        {up.length > 0   && <Line yAxisId="left"  data={up}   dataKey="y"  dot={false} stroke={color}      strokeWidth={1.5} isAnimationActive={false} name="up" />}
-        {down.length > 0 && <Line yAxisId="left"  data={down} dataKey="y"  dot={false} stroke={T.teal}     strokeWidth={1.5} strokeDasharray="4 2" isAnimationActive={false} name="down" />}
-        {hasD && up.length > 0   && <Line yAxisId="right" data={up}   dataKey="y2" dot={false} stroke={T.amber}    strokeWidth={1} isAnimationActive={false} name="up_d" />}
-        {hasD && down.length > 0 && <Line yAxisId="right" data={down} dataKey="y2" dot={false} stroke={T.amberDim} strokeWidth={1} strokeDasharray="2 2" isAnimationActive={false} name="down_d" />}
-      </ComposedChart>
-    </ResponsiveContainer>
+    <div ref={ref}>
+      <ResponsiveContainer width="100%" height={200}>
+        <ComposedChart onMouseMove={onMouseMove} margin={{ top: 6, right: hasD ? 44 : 12, bottom: 28, left: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+          <XAxis dataKey="x" type="number" domain={xDomain} ticks={xTicks} tickLine={false}
+            axisLine={{ stroke: T.borderBright }}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
+            label={{ value: xLabel, position: "insideBottom", offset: -14, fill: T.textSecondary, fontSize: 11 }} />
+          <YAxis yAxisId="left" domain={yDomain} ticks={yTicks} tickLine={false}
+            axisLine={{ stroke: T.borderBright }}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} tickFormatter={yFmt}
+            label={{ value: yLabel, angle: -90, position: "insideLeft", offset: 14, fill: T.textSecondary, fontSize: 10 }} />
+          {hasD && <YAxis yAxisId="right" orientation="right" domain={dDomain} tickLine={false} axisLine={false}
+            tick={{ fill: T.amber, fontSize: 9, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
+            label={{ value: "D (tan δ)", angle: 90, position: "insideRight", offset: -6, fill: T.amber, fontSize: 9 }} />}
+          <Tooltip position={tooltipPos}
+            contentStyle={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11 }}
+            formatter={(v, name) => {
+              if (name === "up_d" || name === "down_d") return [numFmt(+v), `D (tan δ) ${name === "up_d" ? "↑" : "↓"}`];
+              return [numFmt(+v), name === "up" ? `${yLabel} ↑` : `${yLabel} ↓`];
+            }}
+            labelFormatter={v => `${xLabel}: ${numFmt(+v)}`} />
+          {up.length > 0   && <Line yAxisId="left"  data={up}   dataKey="y"  dot={false} stroke={color}      strokeWidth={1.5} isAnimationActive={false} name="up" />}
+          {down.length > 0 && <Line yAxisId="left"  data={down} dataKey="y"  dot={false} stroke={T.teal}     strokeWidth={1.5} strokeDasharray="4 2" isAnimationActive={false} name="down" />}
+          {hasD && up.length > 0   && <Line yAxisId="right" data={up}   dataKey="y2" dot={false} stroke={T.amber}    strokeWidth={1} isAnimationActive={false} name="up_d" />}
+          {hasD && down.length > 0 && <Line yAxisId="right" data={down} dataKey="y2" dot={false} stroke={T.amberDim} strokeWidth={1} strokeDasharray="2 2" isAnimationActive={false} name="down_d" />}
+          <Customized component={PlotBox} xTicks={xTicks ?? []} yTicks={yTicks ?? []} />
+        </ComposedChart>
+      </ResponsiveContainer>
+    </div>
   );
 }
 
@@ -488,10 +695,7 @@ function MeasPlot({ data, type, thicknessNm = 0, areaM2, areaCorrFactor = 1.0 })
   }
   if (type === "pe" && areaCorrFactor && areaCorrFactor !== 1.0) {
     const scale = 1.0 / (areaCorrFactor || 1.0);
-    const corr = pts => pts.map(p => ({ ...p, y: p.y * scale }));
-    plotData = Array.isArray(data)
-      ? corr(data)
-      : { up: corr(data.up || []), down: corr(data.down || []) };
+    plotData = data.map(p => ({ ...p, y: p.y * scale }));
   }
   if (cfg.twoSweep) return <TwoLinePlot data={plotData} cfg={cfg} />;
   return <LinePlot data={plotData} cfg={{ ...cfg, hasY2: type === "diel_f" }} />;
@@ -525,7 +729,8 @@ function fmtAreaMicron(m2) {
 
 function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange }) {
   const cfg = MEAS_TYPES[type];
-  const [corrExpr, setCorrExpr] = useState(String(areaCorrFactor ?? 1.0));
+  const [corrExpr,      setCorrExpr]      = useState(String(areaCorrFactor ?? 1.0));
+  const [peLoop,        setPeLoop]        = useState("all"); // "all" | "second"
 
   if (type === "diel_b") {
     const hasUp    = !!(plotData?.up?.length);
@@ -556,16 +761,20 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
   const has  = hasPlotData(plotData);
   const isPE = type === "pe";
   const isDiel = type === "diel_f";
+  const displayPEData = isPE && has ? (peLoop === "second" ? splitPELoops(plotData).second : plotData) : plotData;
   return (
     <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden" }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 12px", borderBottom: `1px solid ${T.border}` }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "space-between", padding: "8px 12px", borderBottom: `1px solid ${T.border}` }}>
         <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: cfg.color, fontWeight: 600 }}>{cfg.label}</span>
-        {filename && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filename}</span>}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {isPE && has && <LoopToggle value={peLoop} onChange={setPeLoop} />}
+          {filename && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filename}</span>}
+        </div>
       </div>
       <div style={{ padding: "10px 12px" }}>
         {has ? (
           <>
-            <MeasPlot data={plotData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} />
+            <MeasPlot data={displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} />
             <div style={{ marginTop: 8 }}><UploadZone type={type} onFile={(file) => onFile(type, file)} hasData={true} thicknessNm={thicknessNm} /></div>
           </>
         ) : (
@@ -611,20 +820,57 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
 //     //          + layer-level: frequency_hz, focal_position
 //   }
 
-const SPUTTER_DEFAULTS = { material: "", oxygen_pct: 20, power_W: 150, time_s: 2000 };
+// ── Settings ──────────────────────────────────────────────────────────────────
+
+const DEFAULT_SETTINGS = {
+  defaultSubstrate: "STO (001)",
+  defaultAreaCm2: "",
+  sputter: { temp: 600, pressure: 10, oxygen_pct: 20, time_s: 2000, power_W: 150 },
+  pld:     { temp: 600, pressure: 2,  frequency_hz: 10, energy_mJ: 60, pulses: 10000 },
+  materials: { sputter: [], pld: [] },
+};
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem("lablog_settings");
+    if (!raw) return JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+    const parsed = JSON.parse(raw);
+    return {
+      ...DEFAULT_SETTINGS,
+      ...parsed,
+      sputter:   { ...DEFAULT_SETTINGS.sputter,   ...parsed.sputter },
+      pld:       { ...DEFAULT_SETTINGS.pld,       ...parsed.pld },
+      materials: {
+        sputter: parsed.materials?.sputter ?? [],
+        pld:     parsed.materials?.pld     ?? [],
+      },
+    };
+  } catch { return JSON.parse(JSON.stringify(DEFAULT_SETTINGS)); }
+}
+
+function saveSettings(s) {
+  localStorage.setItem("lablog_settings", JSON.stringify(s));
+}
+
+const SPUTTER_DEFAULTS = { material: "", power_W: 150 };
 const PLD_DEFAULTS     = { material: "", energy_mJ: 60, pulses: 10000 };
 
-function newLayer(technique) {
+function newLayer(technique, settings) {
+  const cfg = settings?.[technique] || {};
   return {
     id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
-    temp: 600,
-    pressure: technique === "pld" ? 2 : 10,
-    ...(technique === "pld" ? { frequency_hz: 10, focal_position: "" } : {}),
-    targets: [technique === "pld" ? { ...PLD_DEFAULTS } : { ...SPUTTER_DEFAULTS }],
+    temp:     cfg.temp     ?? (technique === "pld" ? 600 : 600),
+    pressure: cfg.pressure ?? (technique === "pld" ? 2   : 10),
+    ...(technique === "pld"
+      ? { frequency_hz: cfg.frequency_hz ?? 10, focal_position: "" }
+      : { oxygen_pct:   cfg.oxygen_pct   ?? 20, time_s: cfg.time_s ?? 2000 }),
+    targets: [technique === "pld"
+      ? { material: "", energy_mJ: cfg.energy_mJ ?? 60, pulses: cfg.pulses ?? 10000 }
+      : { material: "", power_W:   cfg.power_W   ?? 150 }],
   };
 }
 
-function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMaterials }) {
+function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMaterials, settings }) {
   const s = getMaterialStyle(target.material);
   const tField = (k, label, unit, w = 70) => (
     <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -636,19 +882,33 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
       </div>
     </div>
   );
+  const handleMaterialChange = (v) => {
+    const lib   = settings?.materials?.[technique] || [];
+    const entry = lib.find(m => m.name === v);
+    if (entry) {
+      const merged = { ...target, material: v };
+      if (technique === "sputter") {
+        if (entry.power_W != null) merged.power_W = entry.power_W;
+      } else {
+        if (entry.energy_mJ != null) merged.energy_mJ = entry.energy_mJ;
+        if (entry.pulses    != null) merged.pulses    = entry.pulses;
+      }
+      onChange(merged);
+    } else {
+      onChange({ ...target, material: v });
+    }
+  };
   return (
     <div style={{ display: "flex", alignItems: "flex-end", gap: 8, flexWrap: "wrap" }}>
       <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
         <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Material</span>
         <div style={{ width: 120 }}>
-          <MaterialCombobox value={target.material} onChange={v => onChange({ ...target, material: v })} knownMaterials={knownMaterials} small />
+          <MaterialCombobox value={target.material} onChange={handleMaterialChange} knownMaterials={knownMaterials} small />
         </div>
       </div>
       {technique === "sputter" ? (
         <>
-          {tField("oxygen_pct", "O₂", "%", 56)}
-          {tField("power_W",   "Power", "W", 56)}
-          {tField("time_s",    "Time",  "s", 64)}
+          {tField("power_W", "Power", "W", 56)}
         </>
       ) : (
         <>
@@ -663,21 +923,28 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
   );
 }
 
-function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials }) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft]     = useState(null);
+function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials, settings, initialEditing = false }) {
+  const [editing, setEditing] = useState(initialEditing);
+  const [draft, setDraft]     = useState(initialEditing ? JSON.parse(JSON.stringify(layer)) : null);
 
   const startEdit = (e) => {
     e.stopPropagation();
-    setDraft(JSON.parse(JSON.stringify(layer)));
+    if (!editing) setDraft(JSON.parse(JSON.stringify(layer)));
     setEditing(true);
   };
   const saveEdit = (e) => { e.stopPropagation(); onUpdate(draft); setEditing(false); };
-  const cancelEdit = (e) => { e.stopPropagation(); setEditing(false); };
+  const cancelEdit = (e) => { e.stopPropagation(); if (initialEditing) { onRemove(); } else { setEditing(false); } };
+  const handleEditKeyDown = (e) => { if (e.key === "Enter") { e.preventDefault(); onUpdate(draft); setEditing(false); } };
   const setDraftField = (k, v) => setDraft(p => ({ ...p, [k]: v }));
   const updateTarget = (i, t)  => setDraft(p => { const ts = [...p.targets]; ts[i] = t; return { ...p, targets: ts }; });
   const removeTarget = (i)     => setDraft(p => { const ts = p.targets.filter((_, j) => j !== i); return { ...p, targets: ts }; });
-  const addTarget = () => setDraft(p => ({ ...p, targets: [...p.targets, technique === "pld" ? { ...PLD_DEFAULTS } : { ...SPUTTER_DEFAULTS }] }));
+  const addTarget = () => {
+    const cfg = settings?.[technique] || {};
+    const newTarget = technique === "pld"
+      ? { material: "", energy_mJ: cfg.energy_mJ ?? 60, pulses: cfg.pulses ?? 10000 }
+      : { material: "", power_W: cfg.power_W ?? 150 };
+    setDraft(p => ({ ...p, targets: [...p.targets, newTarget] }));
+  };
 
   const materials = layer.targets.map(t => t.material).filter(Boolean);
   const sharedField = (k, label, unit) => (
@@ -693,16 +960,24 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
         style={{ background: T.bg3, border: `1px solid ${isDragOver ? T.amber : T.border}`, borderRadius: 7, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10, cursor: "grab", transition: "border-color .12s", flexWrap: "wrap" }}>
         <span style={{ color: T.textDim, fontSize: 14, cursor: "grab", userSelect: "none", letterSpacing: "-1px" }}>⠿</span>
         <div style={{ display: "flex", gap: 5, flex: 1, flexWrap: "wrap", alignItems: "center" }}>
-          {materials.length ? materials.map((m, i) => {
-            const s = getMaterialStyle(m);
-            return <span key={i} style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 700, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 8px" }}>{m}</span>;
+          {layer.targets.length && layer.targets.some(t => t.material) ? layer.targets.map((t, i) => {
+            const s = getMaterialStyle(t.material || "?");
+            const detail = technique === "pld"
+              ? [t.energy_mJ != null ? `${t.energy_mJ} mJ` : null, t.pulses != null ? `${Number(t.pulses).toLocaleString()} pulses` : null].filter(Boolean).join(" · ")
+              : t.power_W != null ? `${t.power_W} W` : null;
+            return (
+              <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 700, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 8px" }}>
+                <ChemName name={t.material || "?"} />
+                {detail && <span style={{ fontWeight: 400, opacity: 0.7, fontSize: 11 }}>· {detail}</span>}
+              </span>
+            );
           }) : <span style={{ color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 12 }}>no material</span>}
         </div>
         {sharedField("temp", "Temp", "°C")}
         {sharedField("pressure", "Press", "mTorr")}
         {technique === "pld"
-          ? <>{sharedField("frequency_hz", "Rep", "Hz")}{layer.targets[0] && sharedField("targets[0].energy", "Energy", "mJ")}</>
-          : <>{layer.targets[0] && <div style={{ textAlign: "center" }}><div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", marginBottom: 1 }}>Time</div><div style={{ fontSize: 12, color: T.textPrimary, fontFamily: "'DM Mono', monospace" }}>{layer.targets[0].time_s ?? "—"}<span style={{ fontSize: 10, color: T.textDim }}> s</span></div></div>}</>}
+          ? <>{sharedField("frequency_hz", "Rep", "Hz")}</>
+          : <>{sharedField("oxygen_pct", "O₂", "%")}{sharedField("time_s", "Time", "s")}</>}
         <button onClick={startEdit}   style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>✎</button>
         <button onClick={onDuplicate} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 15, padding: 0 }}>+</button>
         <button onClick={onRemove}    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, padding: 0 }}>×</button>
@@ -713,7 +988,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
   const inputSm = { background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" };
 
   return (
-    <div style={{ background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 7, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 12 }}>
+    <div onKeyDown={handleEditKeyDown} style={{ background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 7, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 12 }}>
       {/* shared layer fields */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -730,6 +1005,24 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
             <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>mTorr</span>
           </div>
         </div>
+        {technique === "sputter" && (
+          <>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>O₂</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                <input value={draft.oxygen_pct ?? ""} onChange={e => setDraftField("oxygen_pct", e.target.value)} style={{ ...inputSm, width: 50 }} />
+                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>%</span>
+              </div>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Time</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                <input value={draft.time_s ?? ""} onChange={e => setDraftField("time_s", e.target.value)} style={{ ...inputSm, width: 60 }} />
+                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>s</span>
+              </div>
+            </div>
+          </>
+        )}
         {technique === "pld" && (
           <>
             <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -750,7 +1043,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Targets</span>
         {draft.targets.map((t, i) => (
-          <TargetRow key={i} target={t} technique={technique} knownMaterials={knownMaterials}
+          <TargetRow key={i} target={t} technique={technique} knownMaterials={knownMaterials} settings={settings}
             onChange={t2 => updateTarget(i, t2)}
             onRemove={() => removeTarget(i)}
             canRemove={draft.targets.length > 1} />
@@ -767,9 +1060,8 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
 
 // ── SampleDetail ──────────────────────────────────────────────────────────────
 
-function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete }) {
+function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete, editingMeta, setEditingMeta, settings }) {
   const [addingLayer, setAddingLayer]   = useState(false);
-  const [editingMeta, setEditingMeta]   = useState(false);
   const [meta, setMeta]                 = useState({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
   const [dragIdx, setDragIdx]           = useState(null);
   const [overIdx, setOverIdx]           = useState(null);
@@ -778,6 +1070,14 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
   useEffect(() => {
     api("GET", "/materials").then(setKnownMaterials).catch(() => {});
   }, []);
+
+  // Keep form values in sync with the sample prop (e.g. after an external update),
+  // but only when the edit form is closed so we don't overwrite in-progress edits.
+  useEffect(() => {
+    if (!editingMeta) {
+      setMeta({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
+    }
+  }, [sample, editingMeta]);
 
   const addLayer       = l  => { onUpdate({ ...sample, layers: [...sample.layers, l] }); setAddingLayer(false); };
   const removeLayer    = id => onUpdate({ ...sample, layers: sample.layers.filter(l => l.id !== id) });
@@ -820,21 +1120,11 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-        <button onClick={onBack} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 22, lineHeight: 1, padding: 0 }}>←</button>
-        <h1 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 28, color: T.amber }}>{sample.id}</h1>
-        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>{sample.technique || "sputter"}</span>
-        <div style={{ flex: 1 }} />
-        {hasFiles && <Btn variant="teal" small onClick={onReparseFiles} title="Re-fetch and re-parse all uploaded files">↻ Reparse</Btn>}
-        <Btn variant="ghost" small onClick={() => setEditingMeta(v => !v)}>{editingMeta ? "Cancel" : "Edit"}</Btn>
-        <Btn variant="danger" small onClick={() => { if (window.confirm(`Delete ${sample.id}?`)) onDelete(sample.id); }}>Delete</Btn>
-      </div>
-
       {editingMeta ? (
         <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: 14, display: "grid", gridTemplateColumns: "1fr 1fr 1fr 2fr", gap: 12 }}>
           <Input label="Date"              value={meta.date}         onChange={v => setMeta(p => ({ ...p, date: v }))} />
           <Input label="Substrate"         value={meta.substrate}    onChange={v => setMeta(p => ({ ...p, substrate: v }))} />
-          <Input label="Film thickness (nm)" value={meta.thickness_nm} onChange={v => setMeta(p => ({ ...p, thickness_nm: v === "" ? "" : v }))} type="number" placeholder="e.g. 30" />
+          <Input label="Thickness (nm)" value={meta.thickness_nm} onChange={v => setMeta(p => ({ ...p, thickness_nm: v === "" ? "" : v }))} type="number" placeholder="e.g. 30" />
           <Input label="Notes"             value={meta.notes}        onChange={v => setMeta(p => ({ ...p, notes: v }))} />
           <div style={{ gridColumn: "1/-1", display: "flex", justifyContent: "flex-end" }}><Btn small onClick={saveMeta}>Save</Btn></div>
         </div>
@@ -855,7 +1145,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {sample.layers.map((l, i) => (
-            <LayerEditor key={l.id} layer={l} technique={sample.technique || "sputter"} knownMaterials={knownMaterials}
+            <LayerEditor key={l.id} layer={l} technique={sample.technique || "sputter"} knownMaterials={knownMaterials} settings={settings}
               onRemove={() => removeLayer(l.id)} onDuplicate={() => duplicateLayer(l.id)} onUpdate={updateLayer}
               isDragOver={overIdx === i && dragIdx !== i}
               onDragStart={() => setDragIdx(i)} onDragOver={() => setOverIdx(i)}
@@ -863,18 +1153,18 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
           ))}
           {!sample.layers.length && !addingLayer && <div style={{ color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "10px 0" }}>No layers — add one above.</div>}
           {addingLayer && (
-            <div style={{ background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: 14 }}>
-              <LayerEditor
-                layer={newLayer(sample.technique || "sputter")}
-                technique={sample.technique || "sputter"}
-                knownMaterials={knownMaterials}
-                onRemove={() => setAddingLayer(false)}
-                onDuplicate={() => {}}
-                onUpdate={l => { addLayer(l); }}
-                isDragOver={false}
-                onDragStart={() => {}} onDragOver={() => {}} onDrop={() => {}} onDragEnd={() => {}}
-              />
-            </div>
+            <LayerEditor
+              layer={newLayer(sample.technique || "sputter", settings)}
+              technique={sample.technique || "sputter"}
+              knownMaterials={knownMaterials}
+              settings={settings}
+              initialEditing={true}
+              onRemove={() => setAddingLayer(false)}
+              onDuplicate={() => {}}
+              onUpdate={l => { addLayer(l); }}
+              isDragOver={false}
+              onDragStart={() => {}} onDragOver={() => {}} onDrop={() => {}} onDragEnd={() => {}}
+            />
           )}
         </div>
       </section>
@@ -892,7 +1182,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
       <section>
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Electrical Characterization</div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px,1fr))", gap: 12 }}>
-          {["pe", "diel_f", "diel_b"].map(t => (
+          {["pe", "diel_b", "diel_f"].map(t => (
             <MeasCard key={t} type={t}
               plotData={t === "diel_b" ? { up: pd.diel_b_up || [], down: pd.diel_b_down || [] } : pd[t]}
               filename={sample.filenames?.[t]}
@@ -911,10 +1201,16 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 
 // ── AddSampleModal ────────────────────────────────────────────────────────────
 
-function AddSampleModal({ onAdd, onClose, folders }) {
-  const [f, setF] = useState({
+function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
+  const [f, setF] = useState(() => template ? {
+    id: "", date: template.date ?? new Date().toISOString().slice(0, 10),
+    substrate: template.substrate ?? "", notes: template.notes ?? "",
+    thickness_nm: template.thickness_nm ?? "",
+    technique: template.technique ?? "sputter",
+    folder_id: template.folder_id ?? "",
+  } : {
     id: "", date: new Date().toISOString().slice(0, 10),
-    substrate: "STO (001)", notes: "", thickness_nm: "",
+    substrate: settings?.defaultSubstrate ?? "STO (001)", notes: "", thickness_nm: "",
     technique: "sputter", folder_id: "",
   });
   const set = k => v => setF(p => ({ ...p, [k]: v }));
@@ -929,7 +1225,10 @@ function AddSampleModal({ onAdd, onClose, folders }) {
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 500, display: "flex", flexDirection: "column", gap: 16 }}>
-        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 22 }}>New Sample</h2>
+        <div>
+          <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 22 }}>{template ? "Duplicate Template" : "New Sample"}</h2>
+          {template && <div style={{ marginTop: 4, fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>From {template.id} — layers copied, data not included</div>}
+        </div>
 
         <div style={{ display: "flex", gap: 6 }}>
           {techniqueBtn("sputter", "Sputter")}
@@ -937,9 +1236,9 @@ function AddSampleModal({ onAdd, onClose, folders }) {
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
-          <Input label="Sample ID"          value={f.id}           onChange={set("id")}           placeholder="e.g. SP026" />
-          <Input label="Date"               value={f.date}         onChange={set("date")}         type="date" />
-          <Input label="Film thickness (nm)" value={f.thickness_nm} onChange={v => setF(p => ({ ...p, thickness_nm: v === "" ? "" : v }))} type="number" placeholder="e.g. 30" />
+          <Input label="New Sample ID"  value={f.id}           onChange={set("id")}           placeholder="e.g. SP026" />
+          <Input label="Date"           value={f.date}         onChange={set("date")}         type="date" />
+          <Input label="Thickness (nm)" value={f.thickness_nm} onChange={v => setF(p => ({ ...p, thickness_nm: v === "" ? "" : v }))} type="number" placeholder="e.g. 30" />
         </div>
         <Input label="Substrate"  value={f.substrate} onChange={set("substrate")} placeholder="e.g. STO (001)" />
         <Input label="Notes"      value={f.notes}     onChange={set("notes")}     placeholder="Brief description…" />
@@ -951,8 +1250,164 @@ function AddSampleModal({ onAdd, onClose, folders }) {
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
           <Btn onClick={() => {
             if (!f.id.trim()) return;
-            onAdd({ ...f, thickness_nm: f.thickness_nm === "" ? null : +f.thickness_nm, folder_id: f.folder_id || null, layers: [], filenames: {}, area_m2: null, area_correction: 1.0 });
+            const layers = template ? JSON.parse(JSON.stringify(template.layers || [])).map(l => ({ ...l, id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()) })) : [];
+            onAdd({ ...f, thickness_nm: f.thickness_nm === "" ? null : +f.thickness_nm, folder_id: f.folder_id || null, layers, filenames: {}, area_m2: null, area_correction: 1.0 });
           }} disabled={!f.id.trim()}>Create</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── SettingsModal ─────────────────────────────────────────────────────────────
+
+function SettingsModal({ settings, onSave, onClose }) {
+  const [draft, setDraft] = useState(() => JSON.parse(JSON.stringify(settings)));
+  const [knownMaterials, setKnownMaterials] = useState([]);
+  useEffect(() => { api("GET", "/materials").then(setKnownMaterials).catch(() => {}); }, []);
+  const set = (path, v) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    const keys = path.split(".");
+    let cur = d;
+    for (let i = 0; i < keys.length - 1; i++) cur = cur[keys[i]];
+    cur[keys[keys.length - 1]] = v;
+    return d;
+  });
+
+  const sectionHdr = (label) => (
+    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2, borderBottom: `1px solid ${T.border}`, paddingBottom: 6, marginBottom: 10, marginTop: 4 }}>{label}</div>
+  );
+  const fieldSm = (path, label, unit, w = 64, type = "text") => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{label}</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+        <input type={type} value={path.split(".").reduce((o, k) => o?.[k] ?? "", draft) ?? ""}
+          onChange={e => set(path, e.target.value)}
+          style={{ width: w, background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+        {unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", whiteSpace: "nowrap" }}>{unit}</span>}
+      </div>
+    </div>
+  );
+
+  // Material library helpers
+  const addMat = (tech) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.materials[tech].push(tech === "sputter"
+      ? { name: "", power_W: "", temp: "", pressure: "", oxygen_pct: "", time_s: "" }
+      : { name: "", energy_mJ: "", pulses: "", temp: "", pressure: "", frequency_hz: "" });
+    return d;
+  });
+  const removeMat = (tech, i) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.materials[tech].splice(i, 1);
+    return d;
+  });
+  const setMat = (tech, i, k, v) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.materials[tech][i][k] = v;
+    return d;
+  });
+
+  const matInput = (tech, i, k, label, unit, w = 52) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{label}</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+        <input value={draft.materials[tech][i][k] ?? ""}
+          onChange={e => setMat(tech, i, k, e.target.value)}
+          placeholder="—"
+          style={{ width: w, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "3px 5px", fontFamily: "'DM Mono', monospace", fontSize: 11, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+        {unit && <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{unit}</span>}
+      </div>
+    </div>
+  );
+
+  const renderMatLib = (tech) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {draft.materials[tech].map((m, i) => (
+        <div key={i} style={{ background: T.bg3, border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 10px", display: "flex", alignItems: "flex-end", gap: 8, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Material</span>
+            <div style={{ width: 100 }}>
+              <MaterialCombobox value={m.name} onChange={v => setMat(tech, i, "name", v)} knownMaterials={knownMaterials} small />
+            </div>
+          </div>
+          {tech === "sputter" ? (<>
+            {matInput(tech, i, "power_W",    "Power",  "W",    52)}
+            {matInput(tech, i, "temp",       "Temp",   "°C",   52)}
+            {matInput(tech, i, "pressure",   "Press",  "mT",   52)}
+            {matInput(tech, i, "oxygen_pct", "O₂",     "%",    44)}
+            {matInput(tech, i, "time_s",     "Time",   "s",    52)}
+          </>) : (<>
+            {matInput(tech, i, "energy_mJ",   "Energy", "mJ",   52)}
+            {matInput(tech, i, "pulses",      "Pulses", "",     64)}
+            {matInput(tech, i, "temp",        "Temp",   "°C",   52)}
+            {matInput(tech, i, "pressure",    "Press",  "mT",   52)}
+            {matInput(tech, i, "frequency_hz","Rep",    "Hz",   48)}
+          </>)}
+          <button onClick={() => removeMat(tech, i)}
+            style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 2px", alignSelf: "flex-end", marginBottom: 1 }}>×</button>
+        </div>
+      ))}
+      <button onClick={() => addMat(tech)}
+        style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
+        + Add material
+      </button>
+    </div>
+  );
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "flex-start", justifyContent: "center", zIndex: 100, overflowY: "auto", padding: "40px 20px" }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 640, display: "flex", flexDirection: "column", gap: 18, marginBottom: 40 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 22 }}>Settings</h2>
+
+        {/* General */}
+        {sectionHdr("General")}
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ flex: 1, minWidth: 180 }}>
+            <div style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", marginBottom: 4 }}>Default Substrate</div>
+            <input value={draft.defaultSubstrate}
+              onChange={e => set("defaultSubstrate", e.target.value)}
+              placeholder="e.g. STO (001)"
+              style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "5px 8px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
+          </div>
+          <div>
+            {fieldSm("defaultAreaCm2", "Default Cap. Area", "cm²", 80)}
+          </div>
+        </div>
+
+        {/* Sputter defaults */}
+        {sectionHdr("Sputter Defaults")}
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          {fieldSm("sputter.temp",       "Temp",    "°C")}
+          {fieldSm("sputter.pressure",   "Pressure","mTorr")}
+          {fieldSm("sputter.oxygen_pct", "O₂",      "%",  52)}
+          {fieldSm("sputter.time_s",     "Time",    "s",  72)}
+          {fieldSm("sputter.power_W",    "Power",   "W",  60)}
+        </div>
+
+        {/* PLD defaults */}
+        {sectionHdr("PLD Defaults")}
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          {fieldSm("pld.temp",         "Temp",     "°C")}
+          {fieldSm("pld.pressure",     "Pressure", "mTorr")}
+          {fieldSm("pld.frequency_hz", "Rep rate", "Hz",  60)}
+          {fieldSm("pld.energy_mJ",    "Energy",   "mJ",  60)}
+          {fieldSm("pld.pulses",       "Pulses",   "",    72)}
+        </div>
+
+        {/* Material library — Sputter */}
+        {sectionHdr("Material Library — Sputter")}
+        <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -10, marginBottom: 2 }}>Leave fields blank to use global sputter defaults for that material.</div>
+        {renderMatLib("sputter")}
+
+        {/* Material library — PLD */}
+        {sectionHdr("Material Library — PLD")}
+        <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -10, marginBottom: 2 }}>Leave fields blank to use global PLD defaults for that material.</div>
+        {renderMatLib("pld")}
+
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 4 }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn onClick={() => { onSave(draft); onClose(); }}>Save Settings</Btn>
         </div>
       </div>
     </div>
@@ -961,14 +1416,19 @@ function AddSampleModal({ onAdd, onClose, folders }) {
 
 // ── SampleCard ────────────────────────────────────────────────────────────────
 
-function SampleCard({ sample, onClick, onDelete, plotData }) {
+function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, onDragStart }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const wasDragged = useRef(false);
   const materials = [...new Set((sample.layers || []).flatMap(l => (l.targets || []).map(t => t.material).filter(Boolean)))];
-  const dataCount = Object.values(plotData || {}).filter(hasPlotData).length;
+  const dataCount = Object.values(sample.filenames || {}).filter(Boolean).length;
 
   return (
-    <div onClick={onClick}
-      style={{ position: "relative", background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 18px", cursor: "pointer", transition: "all .15s", display: "flex", flexDirection: "column", gap: 9 }}
+    <div
+      draggable
+      onDragStart={e => { wasDragged.current = true; e.dataTransfer.effectAllowed = "move"; onDragStart?.(sample.id); }}
+      onDragEnd={() => { setTimeout(() => { wasDragged.current = false; }, 50); }}
+      onClick={() => { if (wasDragged.current) return; onClick(); }}
+      style={{ position: "relative", background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 18px", cursor: "grab", transition: "all .15s", display: "flex", flexDirection: "column", gap: 9 }}
       onMouseEnter={e => { e.currentTarget.style.borderColor = T.amberDim; e.currentTarget.style.background = T.bg2; }}
       onMouseLeave={e => { e.currentTarget.style.borderColor = T.border;   e.currentTarget.style.background = T.bg1; }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -983,7 +1443,12 @@ function SampleCard({ sample, onClick, onDelete, plotData }) {
               onBlur={() => setTimeout(() => setMenuOpen(false), 120)}
               style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px", borderRadius: 4, letterSpacing: 1 }}>⋯</button>
             {menuOpen && (
-              <div style={{ position: "absolute", top: "100%", right: 0, marginTop: 4, background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, boxShadow: "0 4px 16px rgba(0,0,0,.5)", zIndex: 200, minWidth: 110, overflow: "hidden" }}>
+              <div style={{ position: "absolute", top: "100%", right: 0, marginTop: 4, background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, boxShadow: "0 4px 16px rgba(0,0,0,.5)", zIndex: 200, minWidth: 150, overflow: "hidden" }}>
+                <button onClick={e => { e.stopPropagation(); setMenuOpen(false); onDuplicateTemplate?.(sample); }}
+                  style={{ display: "block", width: "100%", background: "none", border: "none", color: T.textSecondary, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "9px 14px", textAlign: "left", cursor: "pointer" }}>
+                  Duplicate Template
+                </button>
+                <div style={{ height: 1, background: T.border, margin: "0 8px" }} />
                 <button onClick={e => { e.stopPropagation(); setMenuOpen(false); if (window.confirm(`Delete ${sample.id}?`)) onDelete(sample.id); }}
                   style={{ display: "block", width: "100%", background: "none", border: "none", color: T.red, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "9px 14px", textAlign: "left", cursor: "pointer" }}>
                   Delete
@@ -997,7 +1462,7 @@ function SampleCard({ sample, onClick, onDelete, plotData }) {
       {materials.length > 0 && (
         <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
           {materials.map(m => { const s = getMaterialStyle(m); return (
-            <span key={m} style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 7px" }}>{m}</span>
+            <span key={m} style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 7px" }}><ChemName name={m} /></span>
           );})}
         </div>
       )}
@@ -1013,13 +1478,22 @@ function SampleCard({ sample, onClick, onDelete, plotData }) {
 
 const COLOR_OPTIONS = ["#4a5568", "#3182ce", "#38a169", "#d69e2e", "#9f7aea", "#ed64a6", "#fc8181", "#4fd1c5"];
 
-function FolderTile({ folder, samples, plotCache, onSelectSample, onDeleteSample, onEdit, onDelete }) {
-  const [open, setOpen] = useState(true);
-  const s = getMaterialStyle(folder.name);
+function FolderTile({ folder, samples, plotCache, onSelectSample, onDeleteSample, onDuplicateTemplate, onEdit, onDelete, onDropSample, onDragStartSample }) {
+  const [open, setOpen]       = useState(true);
+  const [dragOver, setDragOver] = useState(false);
   const color = folder.color || T.borderBright;
+
+  const handleDragOver = e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setDragOver(true); };
+  const handleDragLeave = e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false); };
+  const handleDrop = e => { e.preventDefault(); setDragOver(false); onDropSample?.(); };
+
   return (
-    <div style={{ border: `1px solid ${color}`, borderRadius: 10, overflow: "hidden", marginBottom: 16 }}>
-      <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: T.bg2, cursor: "pointer", userSelect: "none" }}
+    <div
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+      style={{ border: `2px solid ${dragOver ? T.amber : color}`, borderRadius: 10, overflow: "hidden", marginBottom: 16, boxShadow: dragOver ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
+      <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: dragOver ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
         onClick={() => setOpen(v => !v)}>
         <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
         <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: T.textPrimary, flex: 1 }}>{folder.name}</span>
@@ -1030,8 +1504,12 @@ function FolderTile({ folder, samples, plotCache, onSelectSample, onDeleteSample
       </div>
       {open && (
         <div style={{ padding: 12, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(270px,1fr))", gap: 12, background: T.bg0 }}>
-          {samples.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => onSelectSample(s.id)} onDelete={onDeleteSample} />)}
-          {!samples.length && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "8px 4px" }}>Empty folder</div>}
+          {samples.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => onSelectSample(s.id)} onDelete={onDeleteSample} onDuplicateTemplate={onDuplicateTemplate} onDragStart={onDragStartSample} />)}
+          {!samples.length && (
+            <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: dragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>
+              {dragOver ? "Drop to add to this folder" : "Empty folder"}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -1066,26 +1544,551 @@ function AddFolderModal({ onSave, onClose, existing }) {
   );
 }
 
-// ── Analysis Books (stub) ─────────────────────────────────────────────────────
+// ── Analysis Books ────────────────────────────────────────────────────────────
 
-function AnalysisBookTile({ book, samples, onDelete, onEdit }) {
+const SCALE_OPTIONS = [
+  { value: "viridis",  label: "Viridis"  },
+  { value: "cividis",  label: "Cividis"  },
+  { value: "inferno",  label: "Inferno"  },
+  { value: "magma",    label: "Magma"    },
+  { value: "plasma",   label: "Plasma"   },
+  { value: "coolwarm", label: "Coolwarm" },
+];
+
+function defaultPanelConfig(type) {
+  if (type === "xrd") return { offset_decades: 2, theta_min: null, theta_max: null, pad_above: 2, pad_below: 1 };
+  return {};
+}
+
+// Inline sample picker shown inside SampleRoster
+function SamplePicker({ samples, alreadySelected, onAdd, onClose }) {
+  const [sel, setSel] = useState(new Set());
+  const available = samples
+    .filter(s => !alreadySelected.includes(s.id))
+    .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" }));
+  const toggle = id => setSel(p => { const s = new Set(p); s.has(id) ? s.delete(id) : s.add(id); return s; });
   return (
-    <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 18px", display: "flex", flexDirection: "column", gap: 8 }}>
+    <div style={{ marginTop: 8, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: 10, background: T.bg3, display: "flex", flexDirection: "column", gap: 6 }}>
+      <div style={{ maxHeight: 160, overflowY: "auto", display: "flex", flexDirection: "column", gap: 3 }}>
+        {available.length === 0 ? (
+          <span style={{ color: T.textDim, fontSize: 12, fontFamily: "'DM Mono', monospace" }}>All samples already added.</span>
+        ) : available.map(s => (
+          <label key={s.id} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 12, color: sel.has(s.id) ? T.blue : T.textSecondary, padding: "2px 4px", borderRadius: 4, background: sel.has(s.id) ? "rgba(99,179,237,.1)" : "transparent" }}>
+            <input type="checkbox" checked={sel.has(s.id)} onChange={() => toggle(s.id)} style={{ accentColor: T.blue }} />
+            <span style={{ fontWeight: 600 }}>{s.id}</span>
+            {s.date  && <span style={{ color: T.textDim, fontSize: 10 }}>{s.date}</span>}
+            {s.notes && <span style={{ color: T.textDim, fontSize: 10, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.notes}</span>}
+          </label>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+        <Btn variant="ghost" small onClick={onClose}>Cancel</Btn>
+        <Btn small disabled={!sel.size} onClick={() => onAdd([...sel])}>
+          Add{sel.size > 0 ? ` ${sel.size}` : ""}
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, onReorder, onRemove, onAddSamples, onChangeScale, onChangeTrim }) {
+  const [dragIdx,     setDragIdx]     = useState(null);
+  const [dragOverIdx, setDragOverIdx] = useState(null);
+  const [showPicker,  setShowPicker]  = useState(false);
+  const sampleMap = Object.fromEntries(samples.map(s => [s.id, s]));
+  return (
+    <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 16px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: sampleOrder.length ? 10 : 0, flexWrap: "wrap" }}>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>Samples</span>
+        <div style={{ flex: 1 }} />
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>Trim %</span>
+          <input type="number" value={colorTrim ?? 5} min={0} max={49} step={1}
+            onChange={e => onChangeTrim(Math.max(0, Math.min(49, Number(e.target.value) || 0)))}
+            style={{ width: 44, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 11, outline: "none", textAlign: "center" }} />
+        </div>
+        <select value={colorScale} onChange={e => onChangeScale(e.target.value)}
+          style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textSecondary, padding: "4px 8px", fontFamily: "'DM Mono', monospace", fontSize: 11, outline: "none", cursor: "pointer" }}>
+          {SCALE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+        <Btn variant="ghost" small onClick={() => setShowPicker(v => !v)}>+ Add</Btn>
+      </div>
+      {sampleOrder.length === 0 && !showPicker && (
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "4px 0" }}>No samples — click + Add to begin.</div>
+      )}
+      {sampleOrder.map((sid, i) => {
+        const s     = sampleMap[sid];
+        const color = colors[i] || T.textDim;
+        return (
+          <div key={sid}
+            draggable
+            onDragStart={() => setDragIdx(i)}
+            onDragOver={e => { e.preventDefault(); setDragOverIdx(i); }}
+            onDrop={e => { e.preventDefault(); if (dragIdx !== null && dragIdx !== i) onReorder(dragIdx, i); setDragIdx(null); setDragOverIdx(null); }}
+            onDragEnd={() => { setDragIdx(null); setDragOverIdx(null); }}
+            style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 4px", borderRadius: 5, background: dragOverIdx === i ? T.bg3 : "transparent", cursor: "grab", userSelect: "none" }}>
+            <span style={{ color: T.textDim, fontSize: 11 }}>⠿</span>
+            <div style={{ width: 11, height: 11, borderRadius: "50%", background: color, flexShrink: 0, border: `1px solid ${color}88` }} />
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.amber, fontWeight: 600, minWidth: 56 }}>{sid}</span>
+            {s?.date  && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{s.date}</span>}
+            {s?.notes && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.notes}</span>}
+            {!s       && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red }}>not found</span>}
+            <button onClick={() => onRemove(sid)}
+              style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 15, lineHeight: 1, marginLeft: "auto", padding: "0 2px" }}>×</button>
+          </div>
+        );
+      })}
+      {showPicker && (
+        <SamplePicker
+          samples={samples}
+          alreadySelected={sampleOrder}
+          onAdd={ids => { onAddSamples(ids); setShowPicker(false); }}
+          onClose={() => setShowPicker(false)} />
+      )}
+    </div>
+  );
+}
+
+// Color legend strip shown under each comparison chart
+function BookColorLegend({ sampleOrder, colors }) {
+  return (
+    <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginTop: 6 }}>
+      {sampleOrder.map((sid, i) => (
+        <div key={sid} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+          <div style={{ width: 18, height: 2.5, background: colors[i], borderRadius: 2 }} />
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{sid}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Compact numeric input used inside panel control rows
+function PanelInput({ label, value, onChange, placeholder = "auto", width = 72, step }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>{label}</span>
+      <input type="number" step={step} value={value ?? ""} placeholder={placeholder} onChange={onChange}
+        style={{ width, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", textAlign: "center", boxSizing: "border-box" }} />
+    </div>
+  );
+}
+
+// ── XRD ω–2θ comparison ───────────────────────────────────────────────────────
+
+function XRDComparisonPanel({ sampleOrder, plotCache, colors, config, onUpdate }) {
+  const offsetDecades = config.offset_decades ?? 2;
+  const thetaMin  = config.theta_min  != null ? Number(config.theta_min)  : null;
+  const thetaMax  = config.theta_max  != null ? Number(config.theta_max)  : null;
+  const padAbove  = config.pad_above  ?? 2;
+  const padBelow  = config.pad_below  ?? 1;
+
+  const traces = sampleOrder.map((sid, i) => {
+    let pts = plotCache[sid]?.xrd_ot || [];
+    // Restrict to x-window
+    if (thetaMin != null && !isNaN(thetaMin)) pts = pts.filter(p => p.x >= thetaMin);
+    if (thetaMax != null && !isNaN(thetaMax)) pts = pts.filter(p => p.x <= thetaMax);
+    // Keep only positive counts (zeros are undefined on log scale)
+    const pos = pts.filter(p => p.y > 0);
+    if (pos.length === 0) return null;
+    // Per-trace noise floor: 5th-percentile of positive values in this window.
+    // This clamps the inevitable dead-pixel / zero-count dips before scaling,
+    // so they don't plunge to the bottom of the log axis.
+    const sorted = [...pos.map(p => p.y)].sort((a, b) => a - b);
+    const floor  = sorted[Math.max(0, Math.floor(sorted.length * 0.05))];
+    const scale  = Math.pow(10, i * offsetDecades);
+    const data   = pos.map(p => ({ x: p.x, y: Math.max(p.y, floor) * scale }));
+    return { sid, color: colors[i], data };
+  }).filter(Boolean);
+
+  // Y domain from fully-processed (floored + scaled) data within the x-window,
+  // padded by padBelow decades below the min and padAbove decades above the max.
+  const posY    = traces.flatMap(t => t.data.map(p => p.y));
+  const yDomMin = posY.length ? Math.pow(10, Math.floor(Math.log10(Math.min(...posY))) - padBelow) : 1e-1;
+  const yDomMax = posY.length ? Math.pow(10, Math.ceil(Math.log10(Math.max(...posY)))  + padAbove) : 1e8;
+  const allX = traces.flatMap(t => t.data.map(p => p.x));
+  const { ticks: xTicks, domain: xDomain } = allX.length
+    ? niceLinTicks(Math.min(...allX), Math.max(...allX))
+    : { ticks: [], domain: ["auto", "auto"] };
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 12, marginBottom: 12, alignItems: "flex-end", flexWrap: "wrap" }}>
+        <PanelInput label="Offset (decades)" value={config.offset_decades ?? 2} placeholder="2" step="0.5" width={90}
+          onChange={e => onUpdate({ offset_decades: parseFloat(e.target.value) === 0 ? 0 : (parseFloat(e.target.value) || 2) })} />
+        <PanelInput label="2θ min" value={config.theta_min ?? ""} placeholder="auto"
+          onChange={e => onUpdate({ theta_min: e.target.value === "" ? null : Number(e.target.value) })} />
+        <PanelInput label="2θ max" value={config.theta_max ?? ""} placeholder="auto"
+          onChange={e => onUpdate({ theta_max: e.target.value === "" ? null : Number(e.target.value) })} />
+        <PanelInput label="Pad above (dec.)" value={config.pad_above ?? 2} placeholder="2" step="0.5" width={80}
+          onChange={e => onUpdate({ pad_above: parseFloat(e.target.value) === 0 ? 0 : (parseFloat(e.target.value) || 2) })} />
+        <PanelInput label="Pad below (dec.)" value={config.pad_below ?? 1} placeholder="1" step="0.5" width={80}
+          onChange={e => onUpdate({ pad_below: parseFloat(e.target.value) === 0 ? 0 : (parseFloat(e.target.value) || 1) })} />
+      </div>
+      {traces.length === 0 ? (
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No XRD ω–2θ data loaded for selected samples.</div>
+      ) : (
+        <>
+          <ResponsiveContainer width="100%" height={300}>
+            <LineChart margin={{ top: 8, right: 20, bottom: 36, left: 52 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+              <XAxis dataKey="x" type="number" domain={xDomain} ticks={xTicks} tickLine={false}
+                axisLine={{ stroke: T.borderBright }}
+                label={{ value: "2θ (°)", position: "insideBottom", offset: -16, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }}
+                tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
+                tickFormatter={v => Math.round(v).toString()} />
+              <YAxis type="number" scale="log" domain={[yDomMin, yDomMax]} allowDataOverflow width={52}
+                axisLine={{ stroke: T.borderBright }}
+                label={{ value: "Intensity (arb.)", angle: -90, position: "insideLeft", dx: 14, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }}
+                tick={false} tickLine={false} />
+              {traces.map(t => (
+                <Line key={t.sid} data={t.data} dataKey="y" dot={false} strokeWidth={1.5} stroke={t.color} isAnimationActive={false} name={t.sid} />
+              ))}
+              <Customized component={PlotBox} xTicks={xTicks} yTicks={[]} />
+            </LineChart>
+          </ResponsiveContainer>
+          <BookColorLegend sampleOrder={sampleOrder} colors={colors} />
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── P–E Hysteresis comparison ─────────────────────────────────────────────────
+
+function PEComparisonPanel({ sampleOrder, samples, plotCache, colors }) {
+  const [peLoop, setPeLoop] = useState("all"); // "all" | "second"
+
+  const traces = sampleOrder.map((sid, i) => {
+    const sample = samples.find(s => s.id === sid);
+    const corr   = sample?.area_correction ?? 1.0;
+    const raw    = plotCache[sid]?.pe || [];
+    const looped = peLoop === "second" ? splitPELoops(raw).second : raw;
+    const data   = (corr && corr !== 1.0) ? looped.map(p => ({ ...p, y: p.y / corr })) : looped;
+    return { sid, color: colors[i], data };
+  }).filter(t => t.data.length > 0);
+
+  if (!traces.length) return (
+    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No P–E data loaded for selected samples.</div>
+  );
+
+  const allX    = traces.flatMap(t => t.data.map(p => p.x));
+  const allY    = traces.flatMap(t => t.data.map(p => p.y));
+  const { ticks: xTicks, domain: xDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
+  const rawAbsY  = Math.max(...allY.map(Math.abs)) * 1.05;
+  const absYMax0 = Math.max(rawAbsY, 30);  // enforce minimum ±30
+  const peStep   = absYMax0 >= 500 ? 200 : absYMax0 >= 250 ? 100 : absYMax0 >= 100 ? 50 : absYMax0 >= 40 ? 10 : 5;
+  const absYMax  = Math.ceil(absYMax0 / peStep) * peStep;
+  const peTicks  = Array.from({ length: 2 * (absYMax / peStep) + 1 }, (_, i) => -absYMax + i * peStep);
+
+  return (
+    <>
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
+        <LoopToggle value={peLoop} onChange={setPeLoop} />
+      </div>
+      <ResponsiveContainer width="100%" height={300}>
+        <LineChart margin={{ top: 8, right: 20, bottom: 36, left: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+          <XAxis dataKey="x" type="number" domain={xDomain} ticks={xTicks} tickLine={false}
+            axisLine={{ stroke: T.borderBright }} tickFormatter={v => Math.round(v).toString()}
+            label={{ value: "E (kV/cm)", position: "insideBottom", offset: -16, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} />
+          <YAxis type="number" domain={[-absYMax, absYMax]} ticks={peTicks} width={52} tickLine={false}
+            axisLine={{ stroke: T.borderBright }} tickFormatter={v => Math.round(v).toString()}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
+            label={{ value: "P (µC/cm²)", angle: -90, position: "insideLeft", dx: 10, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }} />
+          <ReferenceLine y={0} stroke={T.borderBright} strokeWidth={1} />
+          {traces.map(t => (
+            <Line key={t.sid} data={t.data} dataKey="y" dot={false} strokeWidth={1.5} stroke={t.color} isAnimationActive={false} name={t.sid} />
+          ))}
+          <Customized component={PlotBox} xTicks={xTicks} yTicks={peTicks} />
+        </LineChart>
+      </ResponsiveContainer>
+      <BookColorLegend sampleOrder={sampleOrder} colors={colors} />
+    </>
+  );
+}
+
+// ── RSM comparison ────────────────────────────────────────────────────────────
+
+function RSMComparisonPanel({ sampleOrder, plotCache, colors }) {
+  const rsmCfg = MEAS_TYPES.rsm;
+  const entries = sampleOrder.map((sid, i) => ({
+    sid, color: colors[i], data: plotCache[sid]?.rsm || [],
+  })).filter(e => e.data.length > 0);
+
+  if (!entries.length) return (
+    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No RSM data loaded for selected samples.</div>
+  );
+
+  let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+  for (const e of entries) for (const p of e.data) {
+    if (p.x < xMin) xMin = p.x; if (p.x > xMax) xMax = p.x;
+    if (p.y < yMin) yMin = p.y; if (p.y > yMax) yMax = p.y;
+  }
+  const xp = (xMax - xMin) * 0.05, yp = (yMax - yMin) * 0.05;
+  const forcedXDomain = [xMin - xp, xMax + xp];
+  const forcedYDomain = [yMin - yp, yMax + yp];
+
+  return (
+    <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+      {entries.map(e => (
+        <div key={e.sid} style={{ flex: "0 0 auto", width: 220 }}>
+          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: e.color, marginBottom: 4, textAlign: "center" }}>{e.sid}</div>
+          <RSMPlot data={e.data} cfg={rsmCfg} forcedXDomain={forcedXDomain} forcedYDomain={forcedYDomain} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── εr vs E comparison ────────────────────────────────────────────────────────
+
+function DEComparisonPanel({ sampleOrder, samples, plotCache, colors }) {
+  const traces = sampleOrder.flatMap((sid, i) => {
+    const sample = samples.find(s => s.id === sid);
+    const thick  = (sample?.thickness_nm || 30) * 1e-9;
+    const area   = (sample?.area_m2 || DEFAULT_AREA_M2) * (sample?.area_correction || 1.0);
+    const convert = pts => {
+      if (!pts?.length) return [];
+      const maxY = pts.reduce((m, p) => Math.max(m, Math.abs(p.y)), 0);
+      return (maxY > 0 && maxY < 1)
+        ? pts.map(p => ({ x: p.x, y: p.y * thick / (area * EPS0) }))
+        : pts.map(p => ({ x: p.x, y: p.y }));
+    };
+    const up   = convert(plotCache[sid]?.diel_b_up   || []);
+    const down = convert(plotCache[sid]?.diel_b_down || []);
+    const color = colors[i];
+    return [
+      ...(up.length   ? [{ key: `${sid}_u`, sid, color, data: up   }] : []),
+      ...(down.length ? [{ key: `${sid}_d`, sid, color, data: down }] : []),
+    ];
+  });
+
+  if (!traces.length) return (
+    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No εᵣ vs E data loaded for selected samples.</div>
+  );
+
+  const allX    = traces.flatMap(t => t.data.map(p => p.x));
+  const allY    = traces.flatMap(t => t.data.map(p => p.y)).filter(v => isFinite(v) && v > 0);
+  const { ticks: xTicks, domain: xDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
+  const rawYMax = allY.length ? Math.max(...allY) * 1.05 : 1000;
+  const erStep  = rawYMax >= 8000 ? 2000 : rawYMax >= 4000 ? 1000 : rawYMax >= 2000 ? 500 : rawYMax >= 800 ? 200 : rawYMax >= 300 ? 100 : 50;
+  const erMax   = Math.ceil(rawYMax / erStep) * erStep;
+  const erTicks = Array.from({ length: erMax / erStep + 1 }, (_, i) => i * erStep);
+
+  return (
+    <>
+      <ResponsiveContainer width="100%" height={300}>
+        <LineChart margin={{ top: 8, right: 20, bottom: 36, left: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+          <XAxis dataKey="x" type="number" domain={xDomain} ticks={xTicks} tickLine={false}
+            axisLine={{ stroke: T.borderBright }} tickFormatter={v => Math.round(v).toString()}
+            label={{ value: "E (kV/cm)", position: "insideBottom", offset: -16, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} />
+          <YAxis type="number" domain={[0, erMax]} ticks={erTicks} width={60} tickLine={false}
+            axisLine={{ stroke: T.borderBright }} tickFormatter={v => Math.round(v).toString()}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
+            label={{ value: "εᵣ", angle: -90, position: "insideLeft", dx: 10, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }} />
+          {traces.map(t => (
+            <Line key={t.key} data={t.data} dataKey="y" dot={false} strokeWidth={1.5} stroke={t.color} isAnimationActive={false} name={t.sid} />
+          ))}
+          <Customized component={PlotBox} xTicks={xTicks} yTicks={erTicks} />
+        </LineChart>
+      </ResponsiveContainer>
+      <BookColorLegend sampleOrder={sampleOrder} colors={colors} />
+    </>
+  );
+}
+
+// ── εr vs f comparison ────────────────────────────────────────────────────────
+
+function DfComparisonPanel({ sampleOrder, samples, plotCache, colors }) {
+  const traces = sampleOrder.map((sid, i) => {
+    const sample = samples.find(s => s.id === sid);
+    const thick  = (sample?.thickness_nm || 30) * 1e-9;
+    const area   = (sample?.area_m2 || DEFAULT_AREA_M2) * (sample?.area_correction || 1.0);
+    const raw    = plotCache[sid]?.diel_f || [];
+    const maxY   = raw.reduce((m, p) => Math.max(m, Math.abs(p.y)), 0);
+    const data   = (maxY > 0 && maxY < 1)
+      ? raw.map(p => ({ x: p.x, y: p.y * thick / (area * EPS0) }))
+      : raw.map(p => ({ x: p.x, y: p.y }));
+    return { sid, color: colors[i], data: data.filter(p => p.x > 0 && p.y > 0) };
+  }).filter(t => t.data.length > 0);
+
+  if (!traces.length) return (
+    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No εᵣ vs f data loaded for selected samples.</div>
+  );
+
+  const allX    = traces.flatMap(t => t.data.map(p => p.x)).filter(v => v > 0);
+  const allY    = traces.flatMap(t => t.data.map(p => p.y)).filter(v => v > 0);
+  const xLo = Math.floor(Math.log10(Math.min(...allX)));
+  const xHi = Math.floor(Math.log10(Math.max(...allX)));
+  const xDom       = [Math.pow(10, xLo), Math.pow(10, xHi)];
+  const decadeTicks = Array.from({ length: xHi - xLo + 1 }, (_, i) => Math.pow(10, xLo + i));
+  const rawYMax = allY.length ? Math.max(...allY) * 1.05 : 1000;
+  const erStep  = rawYMax >= 8000 ? 2000 : rawYMax >= 4000 ? 1000 : rawYMax >= 2000 ? 500 : rawYMax >= 800 ? 200 : rawYMax >= 300 ? 100 : 50;
+  const erMax   = Math.ceil(rawYMax / erStep) * erStep;
+  const erTicks = Array.from({ length: erMax / erStep + 1 }, (_, i) => i * erStep);
+
+  return (
+    <>
+      <ResponsiveContainer width="100%" height={300}>
+        <LineChart margin={{ top: 8, right: 20, bottom: 36, left: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+          <XAxis dataKey="x" type="number" scale="log" domain={xDom} ticks={decadeTicks} allowDataOverflow tickLine={false}
+            axisLine={{ stroke: T.borderBright }} tickFormatter={v => String(Math.round(Math.log10(v)))}
+            label={{ value: "log f (Hz)", position: "insideBottom", offset: -16, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} />
+          <YAxis type="number" domain={[0, erMax]} ticks={erTicks} width={60} tickLine={false}
+            axisLine={{ stroke: T.borderBright }} tickFormatter={v => Math.round(v).toString()}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
+            label={{ value: "εᵣ", angle: -90, position: "insideLeft", dx: 10, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }} />
+          {traces.map(t => (
+            <Line key={t.sid} data={t.data} dataKey="y" dot={false} strokeWidth={1.5} stroke={t.color} isAnimationActive={false} name={t.sid} />
+          ))}
+          <Customized component={PlotBox} xTicks={decadeTicks} yTicks={erTicks} />
+        </LineChart>
+      </ResponsiveContainer>
+      <BookColorLegend sampleOrder={sampleOrder} colors={colors} />
+    </>
+  );
+}
+
+// ── Panel wrapper + add panel row ─────────────────────────────────────────────
+
+const PANEL_LABELS = { xrd: "XRD ω–2θ", pe: "P–E Hysteresis", rsm: "RSM", de: "εᵣ vs E", df: "εᵣ vs f" };
+
+function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, onRemove, onUpdate }) {
+  const { type, config } = panel;
+  return (
+    <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 18px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>{PANEL_LABELS[type] || type}</span>
+        <div style={{ flex: 1 }} />
+        <button onClick={onRemove} title="Remove panel"
+          style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px" }}>×</button>
+      </div>
+      {type === "xrd" && <XRDComparisonPanel sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} config={config} onUpdate={onUpdate} />}
+      {type === "pe"  && <PEComparisonPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} />}
+      {type === "rsm" && <RSMComparisonPanel sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} />}
+      {type === "de"  && <DEComparisonPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} />}
+      {type === "df"  && <DfComparisonPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} />}
+    </div>
+  );
+}
+
+function AddPanelRow({ onAdd }) {
+  const [open, setOpen] = useState(false);
+  const PANEL_TYPES = [
+    { type: "xrd", label: "XRD ω–2θ"      },
+    { type: "pe",  label: "P–E Hysteresis" },
+    { type: "rsm", label: "RSM"            },
+    { type: "de",  label: "εᵣ vs E"        },
+    { type: "df",  label: "εᵣ vs f"        },
+  ];
+  return (
+    <div style={{ position: "relative" }}>
+      <Btn variant="ghost" onClick={() => setOpen(v => !v)}>+ Add Panel</Btn>
+      {open && (
+        <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 4, background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: 6, zIndex: 200, display: "flex", flexDirection: "column", gap: 2, minWidth: 170, boxShadow: "0 4px 16px rgba(0,0,0,.55)" }}>
+          {PANEL_TYPES.map(p => (
+            <button key={p.type} onMouseDown={() => { onAdd(p.type); setOpen(false); }}
+              style={{ background: "none", border: "none", color: T.textSecondary, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "7px 12px", textAlign: "left", borderRadius: 5 }}>
+              {p.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook }) {
+  const cfg         = book.config || {};
+  const sampleOrder = cfg.sample_order?.length ? cfg.sample_order : (book.sample_ids || []);
+  const colorScale  = cfg.color_scale || "viridis";
+  const colorTrim   = cfg.color_trim  ?? 5;
+  const panels      = cfg.panels      || [];
+  const colors      = sampleColorScale(colorScale, sampleOrder.length, colorTrim);
+
+  const updateCfg = (patch) => {
+    const newCfg = { ...cfg, ...patch };
+    const updates = { config: newCfg };
+    if (patch.sample_order !== undefined) updates.sample_ids = patch.sample_order;
+    onUpdateBook(updates);
+  };
+
+  const reorderSamples = (fromIdx, toIdx) => {
+    const order = [...sampleOrder];
+    const [item] = order.splice(fromIdx, 1);
+    order.splice(toIdx, 0, item);
+    updateCfg({ sample_order: order });
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <SampleRoster
+        sampleOrder={sampleOrder}
+        samples={samples}
+        colors={colors}
+        colorScale={colorScale}
+        colorTrim={colorTrim}
+        onReorder={reorderSamples}
+        onRemove={id => updateCfg({ sample_order: sampleOrder.filter(s => s !== id) })}
+        onAddSamples={ids => {
+          const existing = new Set(sampleOrder);
+          updateCfg({ sample_order: [...sampleOrder, ...ids.filter(id => !existing.has(id))] });
+        }}
+        onChangeScale={scale => updateCfg({ color_scale: scale })}
+        onChangeTrim={trim => updateCfg({ color_trim: trim })}
+      />
+      {panels.map(panel => (
+        <AnalysisPanelBlock
+          key={panel.id}
+          panel={panel}
+          sampleOrder={sampleOrder}
+          samples={samples}
+          plotCache={plotCache}
+          colors={colors}
+          onRemove={() => updateCfg({ panels: panels.filter(p => p.id !== panel.id) })}
+          onUpdate={patch => updateCfg({ panels: panels.map(p => p.id === panel.id ? { ...p, config: { ...p.config, ...patch } } : p) })}
+        />
+      ))}
+      <AddPanelRow onAdd={type => updateCfg({ panels: [...panels, { id: String(Date.now()), type, config: defaultPanelConfig(type) }] })} />
+    </div>
+  );
+}
+
+// ── Analysis Books (tile + modal) ─────────────────────────────────────────────
+
+function AnalysisBookTile({ book, samples, onDelete, onEdit, onClick }) {
+  const orderedIds = book.config?.sample_order?.length ? book.config.sample_order : (book.sample_ids || []);
+  const n = orderedIds.length;
+  const scaleName  = book.config?.color_scale || "viridis";
+  const colorTrim  = book.config?.color_trim  ?? 5;
+  const colors = sampleColorScale(scaleName, n, colorTrim);
+  const colorMap = Object.fromEntries(orderedIds.map((id, i) => [id, colors[i]]));
+  return (
+    <div
+      onClick={onClick}
+      style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 18px", display: "flex", flexDirection: "column", gap: 8, cursor: onClick ? "pointer" : "default" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
         <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.blue }}>{book.name}</span>
         <div style={{ display: "flex", gap: 6 }}>
-          <button onClick={onEdit}   style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13 }}>✎</button>
-          <button onClick={onDelete} style={{ background: "none", border: "none", color: T.red,     cursor: "pointer", fontSize: 16 }}>×</button>
+          <button onClick={e => { e.stopPropagation(); onEdit(); }}   style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13 }}>✎</button>
+          <button onClick={e => { e.stopPropagation(); onDelete(); }} style={{ background: "none", border: "none", color: T.red,     cursor: "pointer", fontSize: 16 }}>×</button>
         </div>
       </div>
       <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>
-        {book.sample_ids?.length || 0} sample{(book.sample_ids?.length || 0) !== 1 ? "s" : ""}
+        {n} sample{n !== 1 ? "s" : ""}
+        {book.config?.color_scale && <span style={{ marginLeft: 8, opacity: 0.6 }}>{book.config.color_scale}</span>}
       </div>
       <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-        {(book.sample_ids || []).slice(0, 6).map(id => (
-          <span key={id} style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.amber, background: T.amberGlow, border: `1px solid ${T.amberDim}`, borderRadius: 3, padding: "1px 6px" }}>{id}</span>
+        {orderedIds.slice(0, 6).map(id => (
+          <span key={id} style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "#fff", background: colorMap[id] || T.amber, borderRadius: 3, padding: "1px 6px" }}>{id}</span>
         ))}
-        {(book.sample_ids?.length || 0) > 6 && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>+{book.sample_ids.length - 6} more</span>}
+        {n > 6 && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>+{n - 6} more</span>}
       </div>
     </div>
   );
@@ -1103,7 +2106,7 @@ function AddBookModal({ onSave, onClose, existing, samples }) {
         <div style={{ display: "flex", flexDirection: "column", gap: 6, overflow: "hidden" }}>
           <Label>Samples</Label>
           <div style={{ overflowY: "auto", maxHeight: 260, display: "flex", flexDirection: "column", gap: 4, border: `1px solid ${T.border}`, borderRadius: 6, padding: 8 }}>
-            {samples.map(s => (
+            {[...samples].sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" })).map(s => (
               <label key={s.id} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 12, color: selected.has(s.id) ? T.blue : T.textSecondary, padding: "3px 4px", borderRadius: 4, background: selected.has(s.id) ? "rgba(99,179,237,.1)" : "transparent" }}>
                 <input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)} style={{ accentColor: T.blue }} />
                 <span style={{ fontWeight: 600 }}>{s.id}</span>
@@ -1127,18 +2130,40 @@ function AddBookModal({ onSave, onClose, existing, samples }) {
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
+  const [darkMode, setDarkMode] = useState(() => localStorage.getItem("lablog-theme") !== "light");
+  // Re-assign module-level T and MAT_PALETTE so every child render sees the current theme
+  T = darkMode ? DARK_T : LIGHT_T;
+  MAT_PALETTE = darkMode ? MAT_PALETTE_DARK : MAT_PALETTE_LIGHT;
+
   const [samples,  setSamples]  = useState([]);
   const [folders,  setFolders]  = useState([]);
   const [books,    setBooks]    = useState([]);
   const [plotCache, setPlotCache] = useState({}); // { [sampleId]: { xrd_ot, xrr, rsm, pe, diel_b_up, diel_b_down, diel_f } }
-  const [active,   setActive]   = useState(null); // sample id
+  const [active,      setActive]      = useState(null); // sample id
+  const [activeBook,  setActiveBook]  = useState(null); // book id
+  const [editingMeta, setEditingMeta] = useState(false);
   const [adding,   setAdding]   = useState(false);
+  const [templateSample, setTemplateSample] = useState(null); // sample to duplicate
+  const [draggingSampleId, setDraggingSampleId] = useState(null);
   const [addingFolder, setAddingFolder] = useState(false);
   const [editingFolder, setEditingFolder] = useState(null); // folder object
   const [addingBook,    setAddingBook]    = useState(false);
   const [editingBook,   setEditingBook]   = useState(null);
   const [loading,  setLoading]  = useState(true);
   const [error,    setError]    = useState(null);
+  const [settings, setSettings] = useState(() => loadSettings());
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const handleSaveSettings = (s) => {
+    saveSettings(s);
+    setSettings(s);
+  };
+
+  // Persist theme choice + sync body background
+  useEffect(() => {
+    localStorage.setItem("lablog-theme", darkMode ? "dark" : "light");
+    document.body.style.background = darkMode ? DARK_T.bg0 : LIGHT_T.bg0;
+  }, [darkMode]);
 
   // Load all data on mount
   useEffect(() => {
@@ -1172,10 +2197,15 @@ export default function App() {
   };
 
   const deleteSample = async (id) => {
-    await api("DELETE", `/samples/${id}`);
+    try {
+      await api("DELETE", `/samples/${id}`);
+    } catch (e) {
+      alert(`Delete failed: ${e.message}`);
+      return;
+    }
     setSamples(p => p.filter(x => x.id !== id));
     setPlotCache(p => { const c = { ...p }; delete c[id]; return c; });
-    setActive(null);
+    setActive(prev => (prev === id ? null : prev));
   };
 
   // ── File upload + plotCache ──────────────────────────────────────────────
@@ -1230,9 +2260,8 @@ export default function App() {
     if (newArea !== sample.area_m2) await updateSample({ ...sample, area_m2: newArea });
   };
 
-  // Load plot data when opening a sample
-  const openSample = async (id) => {
-    setActive(id);
+  // Load plot data for a sample without changing the active view
+  const loadSampleData = async (id) => {
     if (plotCache[id]) return; // already loaded
     const sample = samples.find(s => s.id === id);
     if (!sample) return;
@@ -1248,6 +2277,12 @@ export default function App() {
       if (parsed && hasPlotData(parsed)) cache[measType] = parsed;
     }
     setPlotCache(p => ({ ...p, [id]: cache }));
+  };
+
+  // Load plot data when opening a sample
+  const openSample = async (id) => {
+    setActive(id);
+    await loadSampleData(id);
   };
 
   // ── Folders ──────────────────────────────────────────────────────────────
@@ -1292,14 +2327,48 @@ export default function App() {
   const deleteBook = async (id) => {
     await api("DELETE", `/analysis-books/${id}`);
     setBooks(p => p.filter(b => b.id !== id));
+    setActiveBook(prev => prev === id ? null : prev);
   };
+
+  const openBook = async (id) => {
+    const book = books.find(b => b.id === id);
+    if (!book) return;
+    setActiveBook(id);
+    const sampleIds = book.config?.sample_order?.length ? book.config.sample_order : (book.sample_ids || []);
+    await Promise.all(sampleIds.map(sid => loadSampleData(sid)));
+  };
+
+  const updateBookInPlace = async (bookId, updates) => {
+    setBooks(p => p.map(b => b.id === bookId ? { ...b, ...updates } : b));
+    const book = books.find(b => b.id === bookId);
+    if (book) await api("PUT", `/analysis-books/${bookId}`, { ...book, ...updates });
+  };
+
+  // ── Sample folder drag-and-drop ───────────────────────────────────────────
+
+  const handleDropToFolder = async (folderId) => {
+    if (!draggingSampleId) return;
+    const sample = samples.find(s => s.id === draggingSampleId);
+    if (!sample) return;
+    const newFolderId = folderId || null;
+    if (sample.folder_id === newFolderId) return;
+    setDraggingSampleId(null);
+    await updateSample({ ...sample, folder_id: newFolderId });
+  };
+
+  // reset edit mode whenever the active sample changes
+  useEffect(() => { setEditingMeta(false); }, [active]);
 
   // ── Render ───────────────────────────────────────────────────────────────
 
-  const activeSample = samples.find(s => s.id === active);
+  const activeSample  = samples.find(s => s.id === active);
+  const activeBookObj = books.find(b => b.id === activeBook);
+  const hasFilesForActive = activeSample ? Object.keys(activeSample.filenames || {}).length > 0 : false;
 
-  const grouped   = folders.map(f => ({ folder: f, samples: samples.filter(s => s.folder_id === f.id) }));
-  const ungrouped = samples.filter(s => !s.folder_id || !folders.find(f => f.id === s.folder_id));
+  const byId = (a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" });
+  const grouped   = folders.map(f => ({ folder: f, samples: samples.filter(s => s.folder_id === f.id).sort(byId) }));
+  const ungrouped = samples.filter(s => !s.folder_id || !folders.find(f => f.id === s.folder_id)).sort(byId);
+  const [ungroupedDragOver, setUngroupedDragOver] = useState(false);
 
   return (
     <>
@@ -1307,21 +2376,53 @@ export default function App() {
         @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&family=DM+Mono:wght@400;500&display=swap');
         * { box-sizing: border-box; }
         ::-webkit-scrollbar{width:6px} ::-webkit-scrollbar-track{background:${T.bg0}} ::-webkit-scrollbar-thumb{background:${T.border};border-radius:3px}
-        input[type=date]::-webkit-calendar-picker-indicator{filter:invert(0.5)}
+        input[type=date]::-webkit-calendar-picker-indicator{filter:invert(${darkMode ? "0.5" : "0.3"})}
         select option{background:${T.bg0}}
       `}</style>
       <div style={{ minHeight: "100vh", background: T.bg0, color: T.textPrimary }}>
         {/* Header */}
         <div style={{ borderBottom: `1px solid ${T.border}`, padding: "12px 28px", display: "flex", alignItems: "center", gap: 14, background: T.bg1, position: "sticky", top: 0, zIndex: 50 }}>
-          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.amber, letterSpacing: 1 }}>LabLog</span>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>ferroelectric oxide films</span>
-          <div style={{ flex: 1 }} />
-          {!active && (
-            <>
-              <Btn variant="ghost" small onClick={() => setAddingFolder(true)}>+ Folder</Btn>
-              <Btn onClick={() => setAdding(true)}>+ New Sample</Btn>
-            </>
-          )}
+          {/* Conditional nav — flex:1 so the theme toggle always sits at the far right */}
+          <div style={{ display: "flex", alignItems: "center", gap: 14, flex: 1, minWidth: 0 }}>
+            {active && activeSample ? (
+              <>
+                <button onClick={() => setActive(null)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 20, lineHeight: 1, padding: 0 }}>←</button>
+                <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.amber }}>{activeSample.id}</span>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>{activeSample.technique || "sputter"}</span>
+                <div style={{ flex: 1 }} />
+                {hasFilesForActive && <Btn variant="teal" small onClick={handleReparseFiles}>↻ Reparse</Btn>}
+                <Btn variant="ghost" small onClick={() => setEditingMeta(v => !v)}>{editingMeta ? "Cancel" : "Edit"}</Btn>
+                <Btn variant="danger" small onClick={() => { if (window.confirm(`Delete ${activeSample.id}?`)) deleteSample(activeSample.id); }}>Delete</Btn>
+              </>
+            ) : activeBook && activeBookObj ? (
+              <>
+                <button onClick={() => setActiveBook(null)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 20, lineHeight: 1, padding: 0 }}>←</button>
+                <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.blue }}>{activeBookObj.name}</span>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>Analysis Book</span>
+                <div style={{ flex: 1 }} />
+                <Btn variant="ghost" small onClick={() => setEditingBook(activeBookObj)}>Edit</Btn>
+                <Btn variant="danger" small onClick={() => { if (window.confirm(`Delete book "${activeBookObj.name}"?`)) { deleteBook(activeBookObj.id); } }}>Delete</Btn>
+              </>
+            ) : (
+              <>
+                <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.amber, letterSpacing: 1 }}>LabLog</span>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>ferroelectric oxide films</span>
+                <div style={{ flex: 1 }} />
+                <Btn variant="ghost" small onClick={() => setAddingFolder(true)}>+ Folder</Btn>
+                <Btn onClick={() => setAdding(true)}>+ New Sample</Btn>
+                <button onClick={() => setSettingsOpen(true)}
+                  title="Settings"
+                  style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "2px 4px", borderRadius: 4, display: "flex", alignItems: "center" }}>⚙</button>
+              </>
+            )}
+          </div>
+          {/* Theme toggle — always visible */}
+          <button
+            onClick={() => setDarkMode(v => !v)}
+            title={darkMode ? "Switch to light mode" : "Switch to dark mode"}
+            style={{ background: "none", border: `1px solid ${T.border}`, color: T.textDim, cursor: "pointer", fontSize: 15, lineHeight: 1, padding: "4px 8px", borderRadius: 6, flexShrink: 0 }}>
+            {darkMode ? "☀" : "🌙"}
+          </button>
         </div>
 
         <div style={{ maxWidth: 1100, margin: "0 auto", padding: "28px 20px" }}>
@@ -1340,7 +2441,16 @@ export default function App() {
               onUploadFile={handleUploadFile}
               onReparseFiles={handleReparseFiles}
               onBack={() => setActive(null)}
-              onDelete={deleteSample} />
+              onDelete={deleteSample}
+              editingMeta={editingMeta}
+              setEditingMeta={setEditingMeta}
+              settings={settings} />
+          ) : activeBook && activeBookObj ? (
+            <AnalysisBookDetail
+              book={activeBookObj}
+              samples={samples}
+              plotCache={plotCache}
+              onUpdateBook={(updates) => updateBookInPlace(activeBook, updates)} />
           ) : (
             <>
               {/* Samples section */}
@@ -1354,18 +2464,27 @@ export default function App() {
                 {grouped.map(({ folder, samples: fs }) => (
                   <FolderTile key={folder.id} folder={folder} samples={fs} plotCache={plotCache}
                     onSelectSample={openSample} onDeleteSample={deleteSample}
+                    onDuplicateTemplate={setTemplateSample}
                     onEdit={() => setEditingFolder(folder)}
-                    onDelete={() => deleteFolder(folder.id)} />
+                    onDelete={() => deleteFolder(folder.id)}
+                    onDropSample={() => handleDropToFolder(folder.id)}
+                    onDragStartSample={setDraggingSampleId} />
                 ))}
 
                 {/* Ungrouped */}
-                {ungrouped.length > 0 && (
-                  <div>
+                {(ungrouped.length > 0 || (draggingSampleId && folders.length > 0)) && (
+                  <div
+                    onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setUngroupedDragOver(true); }}
+                    onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setUngroupedDragOver(false); }}
+                    onDrop={e => { e.preventDefault(); setUngroupedDragOver(false); handleDropToFolder(null); }}
+                    style={{ border: `2px solid ${ungroupedDragOver ? T.amber : "transparent"}`, borderRadius: 10, padding: ungroupedDragOver ? 10 : 0, transition: "all .12s", boxShadow: ungroupedDragOver ? `0 0 0 3px ${T.amberGlow}` : "none" }}>
                     {folders.length > 0 && (
-                      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>Ungrouped</div>
+                      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: ungroupedDragOver ? T.amber : T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8, transition: "color .12s" }}>
+                        {ungroupedDragOver ? "Drop to ungroup" : "Ungrouped"}
+                      </div>
                     )}
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(270px,1fr))", gap: 12 }}>
-                      {ungrouped.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => openSample(s.id)} onDelete={deleteSample} />)}
+                      {ungrouped.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => openSample(s.id)} onDelete={deleteSample} onDuplicateTemplate={setTemplateSample} onDragStart={setDraggingSampleId} />)}
                     </div>
                   </div>
                 )}
@@ -1387,6 +2506,7 @@ export default function App() {
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 12 }}>
                     {books.map(b => (
                       <AnalysisBookTile key={b.id} book={b} samples={samples}
+                        onClick={() => openBook(b.id)}
                         onDelete={() => { if (window.confirm(`Delete book "${b.name}"?`)) deleteBook(b.id); }}
                         onEdit={() => setEditingBook(b)} />
                     ))}
@@ -1400,7 +2520,9 @@ export default function App() {
         </div>
       </div>
 
-      {adding && <AddSampleModal onAdd={addSample} onClose={() => setAdding(false)} folders={folders} />}
+      {adding && <AddSampleModal onAdd={addSample} onClose={() => setAdding(false)} folders={folders} settings={settings} />}
+      {templateSample && <AddSampleModal onAdd={s => { addSample(s); setTemplateSample(null); }} onClose={() => setTemplateSample(null)} folders={folders} template={templateSample} settings={settings} />}
+      {settingsOpen && <SettingsModal settings={settings} onSave={handleSaveSettings} onClose={() => setSettingsOpen(false)} />}
       {(addingFolder || editingFolder) && (
         <AddFolderModal onSave={saveFolder} onClose={() => { setAddingFolder(false); setEditingFolder(null); }} existing={editingFolder} />
       )}
