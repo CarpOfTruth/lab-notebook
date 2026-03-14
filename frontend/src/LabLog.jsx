@@ -1141,7 +1141,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
       <section>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
           <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2 }}>Deposition Layers</span>
-          <Btn variant="teal" small onClick={() => setAddingLayer(v => !v)}>{addingLayer ? "Cancel" : "+ Add Layer"}</Btn>
+          <Btn variant="teal" small onClick={() => setAddingLayer(true)}>+ Add Layer</Btn>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {sample.layers.map((l, i) => (
@@ -1151,22 +1151,16 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               onDragStart={() => setDragIdx(i)} onDragOver={() => setOverIdx(i)}
               onDrop={() => handleDrop(i)} onDragEnd={() => { setDragIdx(null); setOverIdx(null); }} />
           ))}
-          {!sample.layers.length && !addingLayer && <div style={{ color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "10px 0" }}>No layers — add one above.</div>}
-          {addingLayer && (
-            <LayerEditor
-              layer={newLayer(sample.technique || "sputter", settings)}
-              technique={sample.technique || "sputter"}
-              knownMaterials={knownMaterials}
-              settings={settings}
-              initialEditing={true}
-              onRemove={() => setAddingLayer(false)}
-              onDuplicate={() => {}}
-              onUpdate={l => { addLayer(l); }}
-              isDragOver={false}
-              onDragStart={() => {}} onDragOver={() => {}} onDrop={() => {}} onDragEnd={() => {}}
-            />
-          )}
+          {!sample.layers.length && <div style={{ color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "10px 0" }}>No layers — add one above.</div>}
         </div>
+        {addingLayer && (
+          <AddLayerModal
+            technique={sample.technique || "sputter"}
+            knownMaterials={knownMaterials}
+            settings={settings}
+            onAdd={addLayer}
+            onClose={() => setAddingLayer(false)} />
+        )}
       </section>
 
       <section>
@@ -1195,6 +1189,70 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
           ))}
         </div>
       </section>
+    </div>
+  );
+}
+
+// ── AddLayerModal ─────────────────────────────────────────────────────────────
+
+function AddLayerModal({ technique, knownMaterials, settings, onAdd, onClose }) {
+  const [draft, setDraft] = useState(() => newLayer(technique, settings));
+  const setDraftField = (k, v) => setDraft(p => ({ ...p, [k]: v }));
+  const updateTarget  = (i, t) => setDraft(p => { const ts = [...p.targets]; ts[i] = t; return { ...p, targets: ts }; });
+  const removeTarget  = (i)    => setDraft(p => ({ ...p, targets: p.targets.filter((_, j) => j !== i) }));
+  const addTarget = () => {
+    const cfg = settings?.[technique] || {};
+    const t = technique === "pld"
+      ? { material: "", energy_mJ: cfg.energy_mJ ?? 60, pulses: cfg.pulses ?? 10000 }
+      : { material: "", power_W: cfg.power_W ?? 150 };
+    setDraft(p => ({ ...p, targets: [...p.targets, t] }));
+  };
+
+  const inputSm = { background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" };
+  const field = (k, label, unit, w) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{label}</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+        <input value={draft[k] ?? ""} onChange={e => setDraftField(k, e.target.value)} style={{ ...inputSm, width: w }} />
+        {unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{unit}</span>}
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 500, display: "flex", flexDirection: "column", gap: 16 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 22 }}>New Layer</h2>
+
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          {field("temp",     "Temp",     "°C",    60)}
+          {field("pressure", "Pressure", "mTorr", 60)}
+          {technique === "sputter" && <>
+            {field("oxygen_pct", "O₂",  "%", 50)}
+            {field("time_s",     "Time", "s", 60)}
+          </>}
+          {technique === "pld" && <>
+            {field("frequency_hz",   "Rep rate",  "Hz", 56)}
+            {field("focal_position", "Focal pos.", "",   80)}
+          </>}
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Targets</span>
+          {draft.targets.map((t, i) => (
+            <TargetRow key={i} target={t} technique={technique} knownMaterials={knownMaterials} settings={settings}
+              onChange={t2 => updateTarget(i, t2)}
+              onRemove={() => removeTarget(i)}
+              canRemove={draft.targets.length > 1} />
+          ))}
+          <button onClick={addTarget} style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>+ co-dep target</button>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn onClick={() => onAdd(draft)}>Add Layer</Btn>
+        </div>
+      </div>
     </div>
   );
 }
