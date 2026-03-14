@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "frontend",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev", "--prefix", "frontend"],
+      "runtimeExecutable": "/Users/admin/Projects/Lab Notebook/frontend/node_modules/.bin/vite",
+      "runtimeArgs": ["--config", "/Users/admin/Projects/Lab Notebook/frontend/vite.config.js"],
       "port": 5173
     },
     {
