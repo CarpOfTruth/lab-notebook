@@ -1,0 +1,165 @@
+{
+  "folder": {
+    "id": "demo-folder-001",
+    "name": "Pressure and Boundary Condition Series",
+    "color": "#3182ce"
+  },
+  "samples": [
+    {
+      "id": "SP022",
+      "date": "2026-03-13",
+      "substrate": "Si:STO (001)",
+      "notes": "3 mTorr BTO",
+      "thickness_nm": 30.0,
+      "area_m2": 3.14e-10,
+      "area_correction": 1.0,
+      "technique": "sputter",
+      "folder_id": "demo-folder-001",
+      "layers": [
+        {
+          "id": "e82919bc-c672-4ab4-ada6-d190fa26ce46",
+          "temp": 600,
+          "pressure": "3",
+          "oxygen_pct": "10",
+          "time_s": "1000",
+          "targets": [{"material": "SrRuO3", "power_W": "125"}]
+        },
+        {
+          "id": "c2bba5c9-e265-4050-a33c-d0f1a0184f6c",
+          "temp": 600,
+          "pressure": "3",
+          "oxygen_pct": "10",
+          "time_s": "2300",
+          "targets": [{"material": "BaTiO3", "power_W": "150"}]
+        },
+        {
+          "id": "52301813-4844-4a71-8572-cbb7d4c6ed62",
+          "temp": 600,
+          "pressure": "3",
+          "oxygen_pct": "10",
+          "time_s": "1000",
+          "targets": [{"material": "SrRuO3", "power_W": "125"}]
+        }
+      ],
+      "filenames": {
+        "pe": "pe_SP022_10kHz_700mV_400mVb.txt",
+        "diel_b_down": "diel_b_down_BIAS_1V_DN.CSV",
+        "diel_b_up": "diel_b_up_BIAS_1V_UP.CSV",
+        "diel_f": "diel_f_FREQ_1K_1M_400MVB.CSV",
+        "xrd_ot": "xrd_ot_SP022_2theta_15-75.csv",
+        "rsm": "rsm_SP022_RSM_103.csv"
+      }
+    },
+    {
+      "id": "SP023",
+      "date": "2026-03-13",
+      "substrate": "Si:STO (001)",
+      "notes": "5 mTorr BTO",
+      "thickness_nm": 30.0,
+      "area_m2": 3.14e-10,
+      "area_correction": 0.5625,
+      "technique": "sputter",
+      "folder_id": "demo-folder-001",
+      "layers": [
+        {
+          "id": "4e2d30d8-efbf-4a35-91c8-5c7ff99b1f2b",
+          "temp": 600,
+          "pressure": "3",
+          "oxygen_pct": "10",
+          "time_s": "1000",
+          "targets": [{"material": "SrRuO3", "power_W": "125"}]
+        },
+        {
+          "id": "1773410367006",
+          "temp": 600,
+          "pressure": "5",
+          "oxygen_pct": "10",
+          "time_s": "2300",
+          "targets": [{"material": "BaTiO3", "power_W": "150"}]
+        },
+        {
+          "id": "1773410378372",
+          "temp": 600,
+          "pressure": "3",
+          "oxygen_pct": "10",
+          "time_s": "1000",
+          "targets": [{"material": "SrRuO3", "power_W": "125"}]
+        }
+      ],
+      "filenames": {
+        "xrd_ot": "xrd_ot_SP023_2theta_15-75.csv",
+        "xrr": "xrr_SP023_2theta_XRR.csv",
+        "rsm": "rsm_SP023_RSM_103.csv",
+        "diel_b_up": "diel_b_up_BIAS_1V_UP.CSV",
+        "diel_b_down": "diel_b_down_BIAS_1V_DN.CSV",
+        "pe": "pe_SP023_10kHz_750mV_250mVb.txt",
+        "diel_f": "diel_f_FREQ_1K_1M_250MVB.CSV"
+      }
+    },
+    {
+      "id": "SP024",
+      "date": "2026-03-13",
+      "substrate": "Si:STO (001)",
+      "notes": "4 mTorr BTO",
+      "thickness_nm": 30.0,
+      "area_m2": 3.14e-10,
+      "area_correction": 0.64,
+      "technique": "sputter",
+      "folder_id": "demo-folder-001",
+      "layers": [
+        {
+          "id": "cbc6d930-665e-4201-aaa4-dfed93afd962",
+          "temp": 600,
+          "pressure": "3",
+          "oxygen_pct": "10",
+          "time_s": "1000",
+          "targets": [{"material": "SrRuO3", "power_W": "125"}]
+        },
+        {
+          "id": "71bba3e1-7cc2-4549-a906-8b049805b9d8",
+          "temp": 600,
+          "pressure": "4",
+          "oxygen_pct": "10",
+          "time_s": "2300",
+          "targets": [{"material": "BaTiO3", "power_W": "150"}]
+        },
+        {
+          "id": "6a388af1-8e0e-405e-a655-43c49e8adf60",
+          "temp": 600,
+          "pressure": "3",
+          "oxygen_pct": "10",
+          "time_s": "1000",
+          "targets": [{"material": "SrRuO3", "power_W": "125"}]
+        }
+      ],
+      "filenames": {
+        "xrd_ot": "xrd_ot_SP024_2theta_15-75.csv",
+        "xrr": "xrr_SP024_2theta_XRR.csv",
+        "rsm": "rsm_SP024_RSM_103.csv",
+        "diel_f": "diel_f_FREQ_1K_3M_250MVB.CSV",
+        "diel_b_up": "diel_b_up_BIAS_1V_UP.CSV",
+        "diel_b_down": "diel_b_down_BIAS_1V_DN.CSV",
+        "pe": "pe_SP024_1kHz_750mV_250mVb.txt"
+      }
+    }
+  ],
+  "analysis_books": [
+    {
+      "id": "demo-book-001",
+      "name": "Demo Analysis Book",
+      "sample_ids": ["SP022", "SP024", "SP023"],
+      "config": {
+        "color_scale": "viridis",
+        "panels": [
+          {"id": "demo-panel-xrd", "type": "xrd", "config": {"offset_decades": 2, "theta_min": null, "theta_max": 50, "pad_above": 2, "pad_below": 1}},
+          {"id": "demo-panel-rsm", "type": "rsm", "config": {}},
+          {"id": "demo-panel-pe",  "type": "pe",  "config": {}},
+          {"id": "demo-panel-de",  "type": "de",  "config": {}},
+          {"id": "demo-panel-df",  "type": "df",  "config": {}}
+        ],
+        "sample_order": ["SP022", "SP024", "SP023"],
+        "color_trim": 10
+      }
+    }
+  ]
+}
