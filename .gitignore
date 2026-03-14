@@ -1,4 +1,4 @@
-# Personal data — never commit
+# Personal data — never commit (demo_data/ is intentionally tracked)
 backend/data/
 backend/config.json
 

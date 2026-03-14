@@ -75,6 +75,11 @@ def init_db():
                 conn.execute(f"ALTER TABLE samples ADD COLUMN {col} {defn}")
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # Migrations for analysis_books
+        try:
+            conn.execute("ALTER TABLE analysis_books ADD COLUMN config TEXT DEFAULT '{}'")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.commit()
 
 init_db()
@@ -94,6 +99,7 @@ def row_to_sample(row):
 def row_to_book(row):
     d = dict(row)
     d["sample_ids"] = json.loads(d.get("sample_ids") or "[]")
+    d["config"]     = json.loads(d.get("config")     or "{}")
     return d
 
 
@@ -256,8 +262,13 @@ def list_books():
 def create_book(book: dict):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO analysis_books (id, name, sample_ids) VALUES (:id, :name, :sample_ids)",
-            {"id": book["id"], "name": book["name"], "sample_ids": json.dumps(book.get("sample_ids", []))},
+            "INSERT INTO analysis_books (id, name, sample_ids, config) VALUES (:id, :name, :sample_ids, :config)",
+            {
+                "id":         book["id"],
+                "name":       book["name"],
+                "sample_ids": json.dumps(book.get("sample_ids", [])),
+                "config":     json.dumps(book.get("config", {})),
+            },
         )
         conn.commit()
     return {"ok": True, "id": book["id"]}
@@ -266,8 +277,13 @@ def create_book(book: dict):
 def update_book(book_id: str, book: dict):
     with get_db() as conn:
         conn.execute(
-            "UPDATE analysis_books SET name=:name, sample_ids=:sample_ids WHERE id=:id",
-            {"id": book_id, "name": book["name"], "sample_ids": json.dumps(book.get("sample_ids", []))},
+            "UPDATE analysis_books SET name=:name, sample_ids=:sample_ids, config=:config WHERE id=:id",
+            {
+                "id":         book_id,
+                "name":       book["name"],
+                "sample_ids": json.dumps(book.get("sample_ids", [])),
+                "config":     json.dumps(book.get("config", {})),
+            },
         )
         conn.commit()
     return {"ok": True}
@@ -278,3 +294,23 @@ def delete_book(book_id: str):
         conn.execute("DELETE FROM analysis_books WHERE id=?", (book_id,))
         conn.commit()
     return {"ok": True}
+
+
+# ── Screenshot helper (dev only) ───────────────────────────────────────────────
+import base64
+
+SCREENSHOTS_DIR = BASE_DIR.parent / "docs" / "screenshots"
+
+@app.post("/api/dev/screenshot")
+def save_screenshot(body: dict):
+    """Receive a base64 PNG from the browser and save to docs/screenshots/."""
+    name = body.get("name", "screenshot.png")
+    data = body.get("data", "")
+    if not data:
+        raise HTTPException(400, "No data")
+    # strip data-url prefix if present
+    if "," in data:
+        data = data.split(",", 1)[1]
+    SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    (SCREENSHOTS_DIR / name).write_bytes(base64.b64decode(data))
+    return {"ok": True, "path": str(SCREENSHOTS_DIR / name)}
