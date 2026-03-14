@@ -25,9 +25,19 @@ This creates the Python virtual environment, installs all dependencies, and copi
 
 ### 2. Load demo data (optional)
 
+The repo ships with measurement files for three BaTiO₃ / SrRuO₃ / Si:STO samples (SP022 – SP024) from a sputter pressure series, plus a pre-configured Analysis Book comparing them across all panel types.
+
 ```bash
 npm run seed
 ```
+
+Re-run with `--overwrite` to reset to a clean demo state:
+
+```bash
+npm run seed -- --overwrite
+```
+
+Your own data lives in `backend/data/` and is gitignored.
 
 ### 3. Start
 
@@ -39,28 +49,7 @@ Open **http://localhost:5173**.
 
 ---
 
-## Demo data
-
-The repo ships with measurement files for three BaTiO₃ / SrRuO₃ / Si:STO samples (SP022 – SP024) from a sputter pressure series (3, 4, 5 mTorr), plus a pre-configured **Demo Analysis Book** comparing them across all panel types.
-
-To load the demo data into a fresh database:
-
-```bash
-cd backend
-python3 seed_demo.py
-```
-
-Re-run with `--overwrite` to reset:
-
-```bash
-python3 seed_demo.py --overwrite
-```
-
-Your live data lives in `backend/data/` (gitignored). Demo files are in `backend/demo_data/` and are committed to the repo.
-
----
-
-## What it does
+## Features
 
 ### Dashboard
 
@@ -70,23 +59,17 @@ A **dark / light mode** toggle is always visible in the top bar and persists acr
 
 ![Dashboard — samples and analysis books](docs/screenshots/samples-dark.png)
 
----
-
 ### Creating a sample
 
 Click **+ New Sample** to open the creation dialog. Choose sputter or PLD technique, enter an ID, date, substrate, thickness, notes, and optionally assign the sample to a folder.
 
 ![New Sample dialog](docs/screenshots/new-sample-modal.png)
 
----
-
 ### Settings & material library
 
 The gear icon opens **Settings**, where you configure global deposition defaults (temperature, pressure, O₂ %, time, power/energy) for both sputter and PLD. The **Material Library** stores per-material target defaults — when you add a layer and type a known material, parameters auto-fill.
 
 ![Settings — global defaults and material library](docs/screenshots/settings.png)
-
----
 
 ### Deposition recipe editor
 
@@ -102,15 +85,11 @@ Multi-layer recipes are stored per sample. Both **sputter** and **PLD** techniqu
 
 ![Sample detail — layers and add-layer form](docs/screenshots/sample-layers.png)
 
----
-
 ### X-ray characterization
 
 Three X-ray panels per sample: **XRD ω-2θ** (log-scale intensity vs 2θ), **XRR** (reflectivity curve for thickness extraction), and **RSM** (false-color Qₓ–Qz heatmap for epitaxial strain analysis).
 
 ![X-ray characterization row — XRD, XRR, RSM](docs/screenshots/sample-detail-xray.png)
-
----
 
 ### Electrical characterization
 
@@ -123,8 +102,6 @@ Three electrical panels per sample:
 The capacitor area is entered per sample and the correction factor is shown inline.
 
 ![Electrical characterization row — P-E, εᵣ vs E, εᵣ vs f](docs/screenshots/sample-detail-electrical.png)
-
----
 
 ### Analysis Books
 
