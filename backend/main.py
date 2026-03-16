@@ -80,6 +80,12 @@ def init_db():
             conn.execute("ALTER TABLE analysis_books ADD COLUMN config TEXT DEFAULT '{}'")
         except sqlite3.OperationalError:
             pass  # column already exists
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         conn.commit()
 
 init_db()
@@ -209,6 +215,27 @@ def delete_sample(sample_id: str):
         conn.execute("DELETE FROM samples WHERE id=?", (sample_id,))
         conn.commit()
     return {"ok": True}
+
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/settings")
+def get_settings():
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = 'main'").fetchone()
+    if row:
+        return json.loads(row["value"])
+    return {}
+
+@app.put("/api/settings")
+def put_settings(body: dict):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('main', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (json.dumps(body),)
+        )
+        conn.commit()
+    return body
 
 
 # ── Materials autocomplete ────────────────────────────────────────────────────

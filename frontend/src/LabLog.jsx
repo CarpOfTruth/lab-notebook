@@ -879,23 +879,18 @@ const DEFAULT_SETTINGS = {
   structures: [],
 };
 
-function loadSettings() {
-  try {
-    const raw = localStorage.getItem("lablog_settings");
-    if (!raw) return JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
-    const parsed = JSON.parse(raw);
-    return {
-      ...DEFAULT_SETTINGS,
-      ...parsed,
-      sputter:    { ...DEFAULT_SETTINGS.sputter, ...parsed.sputter },
-      pld:        { ...DEFAULT_SETTINGS.pld,     ...parsed.pld },
-      materials: {
-        sputter: parsed.materials?.sputter ?? [],
-        pld:     parsed.materials?.pld     ?? [],
-      },
-      structures: parsed.structures ?? [],
-    };
-  } catch { return JSON.parse(JSON.stringify(DEFAULT_SETTINGS)); }
+function mergeSettings(parsed) {
+  return {
+    ...DEFAULT_SETTINGS,
+    ...parsed,
+    sputter:    { ...DEFAULT_SETTINGS.sputter, ...parsed.sputter },
+    pld:        { ...DEFAULT_SETTINGS.pld,     ...parsed.pld },
+    materials: {
+      sputter: parsed.materials?.sputter ?? [],
+      pld:     parsed.materials?.pld     ?? [],
+    },
+    structures: parsed.structures ?? [],
+  };
 }
 
 // Parse a CIF file text and return { name, a, b, c, alpha, beta, gamma }
@@ -917,7 +912,7 @@ function parseCIF(text) {
 }
 
 function saveSettings(s) {
-  localStorage.setItem("lablog_settings", JSON.stringify(s));
+  api("PUT", "/settings", s).catch(() => {});
 }
 
 const SPUTTER_DEFAULTS = { material: "", power_W: 150 };
@@ -2909,7 +2904,7 @@ export default function App() {
   const [editingBook,   setEditingBook]   = useState(null);
   const [loading,  setLoading]  = useState(true);
   const [error,    setError]    = useState(null);
-  const [settings, setSettings] = useState(() => loadSettings());
+  const [settings, setSettings] = useState(() => JSON.parse(JSON.stringify(DEFAULT_SETTINGS)));
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const handleSaveSettings = (s) => {
@@ -2930,8 +2925,11 @@ export default function App() {
       api("GET", "/samples"),
       api("GET", "/folders"),
       api("GET", "/analysis-books"),
-    ]).then(([s, f, b]) => {
-      setSamples(s); setFolders(f); setBooks(b); setLoading(false);
+      api("GET", "/settings"),
+    ]).then(([s, f, b, cfg]) => {
+      setSamples(s); setFolders(f); setBooks(b);
+      setSettings(mergeSettings(cfg || {}));
+      setLoading(false);
     }).catch(e => { setError(e.message); setLoading(false); });
   }, []);
 
