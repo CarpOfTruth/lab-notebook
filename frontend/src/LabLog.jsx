@@ -2040,10 +2040,23 @@ const DEFAULT_PLOT_STYLE = {
   grid: "dashed", lineWidth: 1.5, ticks: false, tickLen: 4,
 };
 
+// Generate evenly-spaced ticks at a given interval across [lo, hi].
+// Returns null if interval is falsy (caller uses auto ticks).
+function makeTicks(lo, hi, interval) {
+  if (!interval || interval <= 0) return null;
+  const start = Math.ceil(lo / interval - 1e-9) * interval;
+  const ticks = [];
+  for (let v = start; v <= hi + 1e-9; v += interval)
+    ticks.push(parseFloat(v.toFixed(10)));
+  return ticks.length ? ticks : null;
+}
+
 function buildPlotLayout(ps, xaxisExtra = {}, yaxisExtra = {}, extraShapes = []) {
   const gridDash = { dotted: "dot", dashed: "dash", solid: "solid" }[ps.grid] || "dash";
   const axisBase = {
-    showgrid: false, zeroline: false, showline: false,
+    showgrid: false, showline: false,
+    zeroline: ps.zeroLines ?? false,
+    zerolinecolor: T.borderBright, zerolinewidth: 1,
     ticks: ps.ticks ? "inside" : "", ticklen: ps.ticks ? ps.tickLen : 0,
     mirror: ps.ticks ? "ticks" : false,
   };
@@ -2062,7 +2075,7 @@ function buildPlotLayout(ps, xaxisExtra = {}, yaxisExtra = {}, extraShapes = [])
   }] : [];
   return {
     autosize: true, uirevision: "plot",
-    margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 },
+    margin: { t: 12, r: 20, b: 52, l: 72, pad: 0 },
     paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
     font: { family: ps.font, size: ps.fontSize, color: T.textPrimary },
     hovermode: "x", hoverdistance: 40,
@@ -2077,6 +2090,7 @@ function buildPlotLayout(ps, xaxisExtra = {}, yaxisExtra = {}, extraShapes = [])
       ...axisBase,
       showgrid: ps.grid !== "off", gridcolor: T.border, griddash: gridDash, color: T.textDim,
       tickfont: { size: ps.fontSize - 1, family: ps.font, color: T.textDim },
+      ticklabelstandoff: 4,
       ...yaxisExtra,
     },
     shapes: [...boxShapes, ...extraShapes],
@@ -2522,12 +2536,14 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
   const allX    = traces.flatMap(t => t.data.map(p => p.x));
   const allY    = traces.flatMap(t => t.data.map(p => p.y));
-  const { ticks: xTicks, domain: xDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
+  const { ticks: autoXTicks, domain: xDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
   const rawAbsY  = Math.max(...allY.map(Math.abs)) * 1.05;
   const absYMax0 = Math.max(rawAbsY, 30);
   const peStep   = absYMax0 >= 500 ? 200 : absYMax0 >= 250 ? 100 : absYMax0 >= 100 ? 50 : absYMax0 >= 40 ? 10 : 5;
   const absYMax  = Math.ceil(absYMax0 / peStep) * peStep;
-  const peTicks  = Array.from({ length: 2 * (absYMax / peStep) + 1 }, (_, i) => -absYMax + i * peStep);
+  const autoYTicks = Array.from({ length: 2 * (absYMax / peStep) + 1 }, (_, i) => -absYMax + i * peStep);
+  const xTicks = makeTicks(xDomain[0], xDomain[1], ps.xTick) || autoXTicks;
+  const peTicks = makeTicks(-absYMax, absYMax, ps.yTick) || autoYTicks;
 
   const plotlyTraces = traces.map(t => ({
     x: t.data.map(p => p.x), y: t.data.map(p => p.y),
@@ -2539,9 +2555,7 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
     { tickvals: xTicks, tickformat: "d", range: xDomain,
       title: { text: "E (kV/cm)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
     { range: [-absYMax, absYMax], tickvals: peTicks, tickformat: "d",
-      title: { text: "P (µC/cm²)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
-    [{ type: "line", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 0, y1: 0, layer: "below",
-       line: { color: T.borderBright, width: 1 } }]
+      title: { text: "P (µC/cm²)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } }
   );
 
   return (
@@ -2624,11 +2638,13 @@ function DEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
   const allX    = traces.flatMap(t => t.data.map(p => p.x));
   const allY    = traces.flatMap(t => t.data.map(p => p.y)).filter(v => isFinite(v) && v > 0);
-  const { ticks: xTicks, domain: xDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
+  const { ticks: autoXTicks, domain: xDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
   const rawYMax = allY.length ? Math.max(...allY) * 1.05 : 1000;
   const erStep  = rawYMax >= 8000 ? 2000 : rawYMax >= 4000 ? 1000 : rawYMax >= 2000 ? 500 : rawYMax >= 800 ? 200 : rawYMax >= 300 ? 100 : 50;
   const erMax   = Math.ceil(rawYMax / erStep) * erStep;
-  const erTicks = Array.from({ length: erMax / erStep + 1 }, (_, i) => i * erStep);
+  const autoYTicks = Array.from({ length: erMax / erStep + 1 }, (_, i) => i * erStep);
+  const xTicks = makeTicks(xDomain[0], xDomain[1], ps.xTick) || autoXTicks;
+  const erTicks = makeTicks(0, erMax, ps.yTick) || autoYTicks;
 
   const plotlyTraces = traces.map(t => ({
     x: t.data.map(p => p.x), y: t.data.map(p => p.y),
@@ -2686,7 +2702,8 @@ function DfComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
   const rawYMax = allY.length ? Math.max(...allY) * 1.05 : 1000;
   const erStep  = rawYMax >= 8000 ? 2000 : rawYMax >= 4000 ? 1000 : rawYMax >= 2000 ? 500 : rawYMax >= 800 ? 200 : rawYMax >= 300 ? 100 : 50;
   const erMax   = Math.ceil(rawYMax / erStep) * erStep;
-  const erTicks = Array.from({ length: erMax / erStep + 1 }, (_, i) => i * erStep);
+  const autoYTicks = Array.from({ length: erMax / erStep + 1 }, (_, i) => i * erStep);
+  const erTicks = makeTicks(0, erMax, ps.yTick) || autoYTicks;
 
   const plotlyTraces = traces.map(t => ({
     x: t.data.map(p => p.x), y: t.data.map(p => p.y),
@@ -2723,13 +2740,16 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
   const { type, config } = panel;
   const [cogOpen, setCogOpen] = useState(false);
   const ps = {
-    font:      config.plot_font       || "'DM Mono', monospace",
-    fontSize:  config.plot_font_size  || 11,
-    box:       config.plot_box        || "solid",
-    grid:      config.plot_grid       || "dashed",
-    lineWidth: config.plot_line_width || 1.5,
-    ticks:     config.plot_ticks      ?? false,
-    tickLen:   config.plot_tick_len   || 4,
+    font:       config.plot_font        || "'DM Mono', monospace",
+    fontSize:   config.plot_font_size   || 11,
+    box:        config.plot_box         || "solid",
+    grid:       config.plot_grid        || "dashed",
+    lineWidth:  config.plot_line_width  || 1.5,
+    ticks:      config.plot_ticks       ?? false,
+    tickLen:    config.plot_tick_len    || 4,
+    zeroLines:  config.plot_zero_lines  ?? (type === "pe" || type === "de"),
+    xTick:      config.plot_x_tick      || null,
+    yTick:      config.plot_y_tick      || null,
   };
   const btnStyle = { background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 0, borderRadius: 4, width: 26, height: 26, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 };
   const BOX_OPTS = ["off", "dashed", "solid"];
@@ -2811,6 +2831,36 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                   )}
                 </div>
               </div>
+              {/* Zero lines */}
+              {type !== "xrd" && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>ZERO LINES</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {["off", "on"].map((opt, idx) => (
+                      <button key={opt} onClick={() => onUpdate({ plot_zero_lines: opt === "on" })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (ps.zeroLines ? "on" : "off") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.zeroLines ? "on" : "off") === opt ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {/* Tick spacing overrides */}
+              {type !== "xrd" && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>TICK STEP</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>X</span>
+                    <DeferredInput type="number" value={ps.xTick || ""} onChange={v => onUpdate({ plot_x_tick: Number(v) > 0 ? Number(v) : null })}
+                      className="no-spin" min="0" placeholder="auto"
+                      style={{ width: 56, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>Y</span>
+                    <DeferredInput type="number" value={ps.yTick || ""} onChange={v => onUpdate({ plot_y_tick: Number(v) > 0 ? Number(v) : null })}
+                      className="no-spin" min="0" placeholder="auto"
+                      style={{ width: 56, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>
