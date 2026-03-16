@@ -2116,9 +2116,17 @@ function buildPlotConfig(filename = "plot") {
   };
 }
 
-function SciPlotWrap({ ps, cursorLabel, children }) {
+// yTickMaxStr: longest y-axis tick label string (e.g. "1500", "-25").
+// Used to push the cursor label clear of the tick labels + any inward tick marks.
+function SciPlotWrap({ ps, cursorLabel, yTickMaxStr = "", children }) {
   const [cursor, setCursor] = useState(null);
   const child = typeof children === "function" ? children(setCursor) : children;
+  // Tick labels are right-aligned, ending at margin.l(72) - ticklabelstandoff(4) = 68 px.
+  // Estimate their width: char count × ~0.62× font-size (DM Mono is roughly monospaced).
+  const tickLabelW = Math.ceil(yTickMaxStr.length * ps.fontSize * 0.62);
+  // Cursor label starts after: tick label left edge + gap + inward tick overhang.
+  const tickInset = ps.ticks ? ps.tickLen : 0;
+  const cursorLeft = Math.max(72, 68 - tickLabelW) + tickLabelW + tickInset + 10;
   return (
     <div className="sci-plot-wrap">
       <div style={{ height: 30 }} />
@@ -2127,7 +2135,7 @@ function SciPlotWrap({ ps, cursorLabel, children }) {
           {child}
         </Suspense>
         {cursor != null && (
-          <div style={{ position: "absolute", top: 20, left: 74, fontFamily: ps.font, fontSize: ps.fontSize, color: T.textSecondary, pointerEvents: "none", userSelect: "none", letterSpacing: "0.02em" }}>
+          <div style={{ position: "absolute", top: 20, left: cursorLeft, fontFamily: ps.font, fontSize: ps.fontSize, color: T.textSecondary, pointerEvents: "none", userSelect: "none", letterSpacing: "0.02em" }}>
             {cursorLabel(cursor)}
           </div>
         )}
@@ -2563,7 +2571,7 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
         <LoopToggle value={peLoop} onChange={setPeLoop} />
       </div>
-      <SciPlotWrap ps={ps} cursorLabel={x => `E = ${x.toFixed(3)} kV/cm`}>
+      <SciPlotWrap ps={ps} cursorLabel={x => `E = ${x.toFixed(3)} kV/cm`} yTickMaxStr={String(-absYMax)}>
         {setCursor => (
           <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("pe-hysteresis")}
             style={{ width: "100%", height: "320px" }} useResizeHandler
@@ -2661,7 +2669,7 @@ function DEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
   return (
     <>
-      <SciPlotWrap ps={ps} cursorLabel={x => `E = ${x.toFixed(3)} kV/cm`}>
+      <SciPlotWrap ps={ps} cursorLabel={x => `E = ${x.toFixed(3)} kV/cm`} yTickMaxStr={String(erMax)}>
         {setCursor => (
           <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("er-vs-E")}
             style={{ width: "100%", height: "320px" }} useResizeHandler
@@ -2720,7 +2728,7 @@ function DfComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
   return (
     <>
-      <SciPlotWrap ps={ps} cursorLabel={x => `log f = ${Math.log10(x).toFixed(3)}`}>
+      <SciPlotWrap ps={ps} cursorLabel={x => `log f = ${Math.log10(x).toFixed(3)}`} yTickMaxStr={String(erMax)}>
         {setCursor => (
           <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("er-vs-f")}
             style={{ width: "100%", height: "320px" }} useResizeHandler
