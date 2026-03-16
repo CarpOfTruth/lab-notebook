@@ -2033,6 +2033,95 @@ const LINE_STYLES = [
   { id: "dotted", label: "···", dash: "2 3"   },
 ];
 
+// ── Shared Plotly helpers ─────────────────────────────────────────────────────
+
+const DEFAULT_PLOT_STYLE = {
+  font: "'DM Mono', monospace", fontSize: 11, box: "solid",
+  grid: "dashed", lineWidth: 1.5, ticks: false, tickLen: 4,
+};
+
+function buildPlotLayout(ps, xaxisExtra = {}, yaxisExtra = {}, extraShapes = []) {
+  const gridDash = { dotted: "dot", dashed: "dash", solid: "solid" }[ps.grid] || "dash";
+  const axisBase = {
+    showgrid: false, zeroline: false, showline: false,
+    ticks: ps.ticks ? "inside" : "", ticklen: ps.ticks ? ps.tickLen : 0,
+    mirror: ps.ticks ? "ticks" : false,
+  };
+  const spikeProps = {
+    showspikes: true, spikemode: "across", spikecolor: T.textDim,
+    spikethickness: 1, spikedash: "dot", spikesnap: "cursor",
+  };
+  const boxShapes = ps.box !== "off" ? [{
+    type: "rect", xref: "paper", yref: "paper",
+    x0: 0, y0: 0, x1: 1, y1: 1, layer: "above",
+    line: {
+      color: ps.box === "solid" ? T.textPrimary : T.borderBright,
+      width: ps.box === "solid" ? 1.5 : 1,
+      dash: ps.box === "dashed" ? "dash" : "solid",
+    },
+  }] : [];
+  return {
+    autosize: true, uirevision: "plot",
+    margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 },
+    paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
+    font: { family: ps.font, size: ps.fontSize, color: T.textPrimary },
+    hovermode: "x", hoverdistance: 40,
+    hoverlabel: { bgcolor: "rgba(0,0,0,0)", bordercolor: "rgba(0,0,0,0)", font: { color: "rgba(0,0,0,0)" } },
+    xaxis: {
+      ...axisBase, ...spikeProps,
+      showgrid: ps.grid !== "off", gridcolor: T.border, griddash: gridDash, color: T.textDim,
+      tickfont: { size: ps.fontSize - 1, family: ps.font, color: T.textDim },
+      ...xaxisExtra,
+    },
+    yaxis: {
+      ...axisBase,
+      showgrid: ps.grid !== "off", gridcolor: T.border, griddash: gridDash, color: T.textDim,
+      tickfont: { size: ps.fontSize - 1, family: ps.font, color: T.textDim },
+      ...yaxisExtra,
+    },
+    shapes: [...boxShapes, ...extraShapes],
+  };
+}
+
+function buildPlotConfig(filename = "plot") {
+  return {
+    responsive: true, displayModeBar: true, displaylogo: false,
+    modeBarButtonsToRemove: ["lasso2d", "select2d", "autoScale2d"],
+    modeBarButtonsToAdd: [{
+      name: "copyImage", title: "Copy to clipboard",
+      icon: { width: 24, height: 24, path: "M16 1H4C2.9 1 2 1.9 2 3v14h2V3h12V1zm3 4H8C6.9 5 6 5.9 6 7v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z" },
+      click: async (gd) => {
+        try {
+          const dataUrl = await window.Plotly.toImage(gd, { format: "png", scale: 2, width: 900, height: 400 });
+          const blob = await fetch(dataUrl).then(r => r.blob());
+          await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+        } catch (err) { console.error("Copy to clipboard failed:", err); }
+      },
+    }],
+    toImageButtonOptions: { format: "svg", filename, width: 900, height: 400 },
+  };
+}
+
+function SciPlotWrap({ ps, cursorLabel, children }) {
+  const [cursor, setCursor] = useState(null);
+  const child = typeof children === "function" ? children(setCursor) : children;
+  return (
+    <div className="sci-plot-wrap">
+      <div style={{ height: 30 }} />
+      <div style={{ position: "relative" }} onMouseLeave={() => setCursor(null)}>
+        <Suspense fallback={<div style={{ height: 320, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>Loading chart…</div>}>
+          {child}
+        </Suspense>
+        {cursor != null && (
+          <div style={{ position: "absolute", top: 20, left: 74, fontFamily: ps.font, fontSize: ps.fontSize, color: T.textSecondary, pointerEvents: "none", userSelect: "none", letterSpacing: "0.02em" }}>
+            {cursorLabel(cursor)}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── XRD ω–2θ comparison ───────────────────────────────────────────────────────
 
 function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, config, plotStyle, structures = [], onUpdate }) {
@@ -2414,8 +2503,9 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
 
 // ── P–E Hysteresis comparison ─────────────────────────────────────────────────
 
-function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {} }) {
-  const [peLoop, setPeLoop] = useState("all"); // "all" | "second"
+function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {}, plotStyle }) {
+  const ps = plotStyle || DEFAULT_PLOT_STYLE;
+  const [peLoop, setPeLoop] = useState("all");
 
   const traces = sampleOrder.map((sid, i) => {
     const sample = samples.find(s => s.id === sid);
@@ -2434,34 +2524,38 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
   const allY    = traces.flatMap(t => t.data.map(p => p.y));
   const { ticks: xTicks, domain: xDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
   const rawAbsY  = Math.max(...allY.map(Math.abs)) * 1.05;
-  const absYMax0 = Math.max(rawAbsY, 30);  // enforce minimum ±30
+  const absYMax0 = Math.max(rawAbsY, 30);
   const peStep   = absYMax0 >= 500 ? 200 : absYMax0 >= 250 ? 100 : absYMax0 >= 100 ? 50 : absYMax0 >= 40 ? 10 : 5;
   const absYMax  = Math.ceil(absYMax0 / peStep) * peStep;
   const peTicks  = Array.from({ length: 2 * (absYMax / peStep) + 1 }, (_, i) => -absYMax + i * peStep);
+
+  const plotlyTraces = traces.map(t => ({
+    x: t.data.map(p => p.x), y: t.data.map(p => p.y),
+    type: "scatter", mode: "lines",
+    line: { color: t.color, width: ps.lineWidth },
+    showlegend: false, hovertemplate: "<extra></extra>",
+  }));
+  const layout = buildPlotLayout(ps,
+    { tickvals: xTicks, tickformat: "d", range: xDomain,
+      title: { text: "E (kV/cm)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+    { range: [-absYMax, absYMax], tickvals: peTicks, tickformat: "d",
+      title: { text: "P (µC/cm²)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
+    [{ type: "line", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 0, y1: 0, layer: "below",
+       line: { color: T.borderBright, width: 1 } }]
+  );
 
   return (
     <>
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
         <LoopToggle value={peLoop} onChange={setPeLoop} />
       </div>
-      <ResponsiveContainer width="100%" height={300}>
-        <LineChart margin={{ top: 8, right: 20, bottom: 36, left: 10 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
-          <XAxis dataKey="x" type="number" domain={xDomain} ticks={xTicks} tickLine={false}
-            axisLine={{ stroke: T.borderBright }} tickFormatter={v => Math.round(v).toString()}
-            label={{ value: "E (kV/cm)", position: "insideBottom", offset: -16, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }}
-            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} />
-          <YAxis type="number" domain={[-absYMax, absYMax]} ticks={peTicks} width={52} tickLine={false}
-            axisLine={{ stroke: T.borderBright }} tickFormatter={v => Math.round(v).toString()}
-            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
-            label={{ value: "P (µC/cm²)", angle: -90, position: "insideLeft", dx: 10, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }} />
-          <ReferenceLine y={0} stroke={T.borderBright} strokeWidth={1} />
-          {traces.map(t => (
-            <Line key={t.sid} data={t.data} dataKey="y" dot={false} strokeWidth={1.5} stroke={t.color} isAnimationActive={false} name={t.sid} />
-          ))}
-          <Customized component={PlotBox} xTicks={xTicks} yTicks={peTicks} />
-        </LineChart>
-      </ResponsiveContainer>
+      <SciPlotWrap ps={ps} cursorLabel={x => `E = ${x.toFixed(3)} kV/cm`}>
+        {setCursor => (
+          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("pe-hysteresis")}
+            style={{ width: "100%", height: "320px" }} useResizeHandler
+            onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+        )}
+      </SciPlotWrap>
       <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} />
     </>
   );
@@ -2502,7 +2596,8 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {} }) {
 
 // ── εr vs E comparison ────────────────────────────────────────────────────────
 
-function DEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {} }) {
+function DEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {}, plotStyle }) {
+  const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const traces = sampleOrder.flatMap((sid, i) => {
     const sample = samples.find(s => s.id === sid);
     const thick  = (sample?.thickness_nm || 30) * 1e-9;
@@ -2535,25 +2630,28 @@ function DEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
   const erMax   = Math.ceil(rawYMax / erStep) * erStep;
   const erTicks = Array.from({ length: erMax / erStep + 1 }, (_, i) => i * erStep);
 
+  const plotlyTraces = traces.map(t => ({
+    x: t.data.map(p => p.x), y: t.data.map(p => p.y),
+    type: "scatter", mode: "lines",
+    line: { color: t.color, width: ps.lineWidth },
+    showlegend: false, hovertemplate: "<extra></extra>",
+  }));
+  const layout = buildPlotLayout(ps,
+    { tickvals: xTicks, tickformat: "d", range: xDomain,
+      title: { text: "E (kV/cm)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+    { range: [0, erMax], tickvals: erTicks, tickformat: "d",
+      title: { text: "εᵣ", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } }
+  );
+
   return (
     <>
-      <ResponsiveContainer width="100%" height={300}>
-        <LineChart margin={{ top: 8, right: 20, bottom: 36, left: 10 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
-          <XAxis dataKey="x" type="number" domain={xDomain} ticks={xTicks} tickLine={false}
-            axisLine={{ stroke: T.borderBright }} tickFormatter={v => Math.round(v).toString()}
-            label={{ value: "E (kV/cm)", position: "insideBottom", offset: -16, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }}
-            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} />
-          <YAxis type="number" domain={[0, erMax]} ticks={erTicks} width={60} tickLine={false}
-            axisLine={{ stroke: T.borderBright }} tickFormatter={v => Math.round(v).toString()}
-            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
-            label={{ value: "εᵣ", angle: -90, position: "insideLeft", dx: 10, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }} />
-          {traces.map(t => (
-            <Line key={t.key} data={t.data} dataKey="y" dot={false} strokeWidth={1.5} stroke={t.color} isAnimationActive={false} name={t.sid} />
-          ))}
-          <Customized component={PlotBox} xTicks={xTicks} yTicks={erTicks} />
-        </LineChart>
-      </ResponsiveContainer>
+      <SciPlotWrap ps={ps} cursorLabel={x => `E = ${x.toFixed(3)} kV/cm`}>
+        {setCursor => (
+          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("er-vs-E")}
+            style={{ width: "100%", height: "320px" }} useResizeHandler
+            onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+        )}
+      </SciPlotWrap>
       <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} />
     </>
   );
@@ -2561,7 +2659,8 @@ function DEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
 // ── εr vs f comparison ────────────────────────────────────────────────────────
 
-function DfComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {} }) {
+function DfComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {}, plotStyle }) {
+  const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const traces = sampleOrder.map((sid, i) => {
     const sample = samples.find(s => s.id === sid);
     const thick  = (sample?.thickness_nm || 30) * 1e-9;
@@ -2581,33 +2680,36 @@ function DfComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
   const allX    = traces.flatMap(t => t.data.map(p => p.x)).filter(v => v > 0);
   const allY    = traces.flatMap(t => t.data.map(p => p.y)).filter(v => v > 0);
   const xLo = Math.floor(Math.log10(Math.min(...allX)));
-  const xHi = Math.floor(Math.log10(Math.max(...allX)));
-  const xDom       = [Math.pow(10, xLo), Math.pow(10, xHi)];
-  const decadeTicks = Array.from({ length: xHi - xLo + 1 }, (_, i) => Math.pow(10, xLo + i));
+  const xHi = Math.ceil(Math.log10(Math.max(...allX)));
+  const decadeVals = Array.from({ length: xHi - xLo + 1 }, (_, i) => Math.pow(10, xLo + i));
+  const decadeText = decadeVals.map(v => String(Math.round(Math.log10(v))));
   const rawYMax = allY.length ? Math.max(...allY) * 1.05 : 1000;
   const erStep  = rawYMax >= 8000 ? 2000 : rawYMax >= 4000 ? 1000 : rawYMax >= 2000 ? 500 : rawYMax >= 800 ? 200 : rawYMax >= 300 ? 100 : 50;
   const erMax   = Math.ceil(rawYMax / erStep) * erStep;
   const erTicks = Array.from({ length: erMax / erStep + 1 }, (_, i) => i * erStep);
 
+  const plotlyTraces = traces.map(t => ({
+    x: t.data.map(p => p.x), y: t.data.map(p => p.y),
+    type: "scatter", mode: "lines",
+    line: { color: t.color, width: ps.lineWidth },
+    showlegend: false, hovertemplate: "<extra></extra>",
+  }));
+  const layout = buildPlotLayout(ps,
+    { type: "log", range: [xLo, xHi], tickvals: decadeVals, ticktext: decadeText,
+      title: { text: "log f (Hz)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+    { range: [0, erMax], tickvals: erTicks, tickformat: "d",
+      title: { text: "εᵣ", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } }
+  );
+
   return (
     <>
-      <ResponsiveContainer width="100%" height={300}>
-        <LineChart margin={{ top: 8, right: 20, bottom: 36, left: 10 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
-          <XAxis dataKey="x" type="number" scale="log" domain={xDom} ticks={decadeTicks} allowDataOverflow tickLine={false}
-            axisLine={{ stroke: T.borderBright }} tickFormatter={v => String(Math.round(Math.log10(v)))}
-            label={{ value: "log f (Hz)", position: "insideBottom", offset: -16, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }}
-            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} />
-          <YAxis type="number" domain={[0, erMax]} ticks={erTicks} width={60} tickLine={false}
-            axisLine={{ stroke: T.borderBright }} tickFormatter={v => Math.round(v).toString()}
-            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
-            label={{ value: "εᵣ", angle: -90, position: "insideLeft", dx: 10, fill: T.textSecondary, fontSize: 11, fontFamily: "'DM Mono', monospace" }} />
-          {traces.map(t => (
-            <Line key={t.sid} data={t.data} dataKey="y" dot={false} strokeWidth={1.5} stroke={t.color} isAnimationActive={false} name={t.sid} />
-          ))}
-          <Customized component={PlotBox} xTicks={decadeTicks} yTicks={erTicks} />
-        </LineChart>
-      </ResponsiveContainer>
+      <SciPlotWrap ps={ps} cursorLabel={x => `log f = ${Math.log10(x).toFixed(3)}`}>
+        {setCursor => (
+          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("er-vs-f")}
+            style={{ width: "100%", height: "320px" }} useResizeHandler
+            onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+        )}
+      </SciPlotWrap>
       <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} />
     </>
   );
@@ -2716,10 +2818,10 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
           style={btnStyle}>×</button>
       </div>
       {type === "xrd" && <XRDComparisonPanel sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} structures={structures} config={config} plotStyle={ps} onUpdate={onUpdate} />}
-      {type === "pe"  && <PEComparisonPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} />}
+      {type === "pe"  && <PEComparisonPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
       {type === "rsm" && <RSMComparisonPanel sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} />}
-      {type === "de"  && <DEComparisonPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} />}
-      {type === "df"  && <DfComparisonPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} />}
+      {type === "de"  && <DEComparisonPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
+      {type === "df"  && <DfComparisonPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
     </div>
   );
 }
