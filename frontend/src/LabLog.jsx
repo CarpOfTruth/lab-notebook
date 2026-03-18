@@ -61,7 +61,7 @@ const MEAS_TYPES = {
   xrr:    { label: "XRR",                          xLabel: "2θ (°)",         yLabel: "Intensity (cts)", logY: true,  color: T.teal  },
   rsm:    { label: "RSM",                          xLabel: "Qₓ (nm⁻¹)",     yLabel: "Qz (nm⁻¹)",      isRSM: true, color: T.blue  },
   pe:     { label: "P–E Hysteresis",               xLabel: "E (kV/cm)",      yLabel: "P (µC/cm²)",      logY: false, color: T.red, ySymRange: 30, symXTicks: true, zeroRefY: true },
-  diel_f: { label: "Rel. Permittivity vs f",       xLabel: "log f (Hz)",     yLabel: "εᵣ",              logX: true,  color: T.green, clampYZero: true },
+  diel_f: { label: "Rel. Permittivity vs f",       xLabel: "Hz",             yLabel: "εᵣ",              logX: true,  color: T.green, clampYZero: true },
   diel_b: { label: "Rel. Permittivity vs E",       xLabel: "E (kV/cm)",      yLabel: "εᵣ",              logY: false, color: T.green, clampYZero: true, twoSweep: true, symXTicks: true },
 };
 
@@ -491,7 +491,7 @@ function LinePlot({ data, cfg }) {
     const hi = Math.floor(Math.log10(arrMax(xVals.filter(v => v > 0))));
     xDomain  = [Math.pow(10, lo), Math.pow(10, hi)];
     xTicks   = Array.from({ length: hi - lo + 1 }, (_, i) => Math.pow(10, lo + i));
-    xTickFmt = v => String(Math.round(Math.log10(v))); // show decade exponent: 3, 4, 5 …
+    xTickFmt = v => { const e = Math.round(Math.log10(v)); return `10${String(e).replace(/./g, d => '⁰¹²³⁴⁵⁶⁷⁸⁹'[d] ?? d)}`; };
   } else {
     if (cfg.symXTicks) {
       const { ticks, domain } = niceLinTicks(arrMin(xVals), arrMax(xVals));
@@ -2059,13 +2059,14 @@ function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, lab
 }
 
 // Color legend strip shown under each comparison chart
-function BookColorLegend({ sampleOrder, colors, labels = {} }) {
+function BookColorLegend({ sampleOrder, colors, labels = {}, ps }) {
+  const fs = ps ? ps.fontSize - 2 : 10;
   return (
     <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginTop: 6 }}>
       {sampleOrder.map((sid, i) => (
         <div key={sid} style={{ display: "flex", alignItems: "center", gap: 5 }}>
           <div style={{ width: 18, height: 2.5, background: colors[i], borderRadius: 2 }} />
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{labels[sid] || sid}</span>
+          <span style={{ fontFamily: ps?.font || "'DM Mono', monospace", fontSize: fs, color: T.textDim }}>{labels[sid] || sid}</span>
         </div>
       ))}
     </div>
@@ -2426,15 +2427,17 @@ function SciPlotWrap({ ps, cursorLabel, children }) {
   return (
     <div className="sci-plot-wrap">
       <div style={{ height: 30 }} />
-      <div style={{ position: "relative" }} onMouseLeave={() => setCursor(null)}>
-        <Suspense fallback={<div style={{ height: 320, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>Loading chart…</div>}>
-          {child}
-        </Suspense>
-        {cursor != null && (
-          <div style={{ position: "absolute", top: 20, left: 80, fontFamily: ps.font, fontSize: ps.fontSize, color: T.textSecondary, pointerEvents: "none", userSelect: "none", letterSpacing: "0.02em" }}>
-            {cursorLabel(cursor)}
-          </div>
-        )}
+      <div style={{ display: "flex", justifyContent: "center" }} onMouseLeave={() => setCursor(null)}>
+        <div style={{ position: "relative", width: ps.plotWidth ? Math.round(ps.plotWidth * 96) : "100%", flexShrink: 0 }}>
+          <Suspense fallback={<div style={{ height: 320, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>Loading chart…</div>}>
+            {child}
+          </Suspense>
+          {cursor != null && (
+            <div style={{ position: "absolute", top: 20, left: 80, fontFamily: ps.font, fontSize: ps.fontSize, color: T.textSecondary, pointerEvents: "none", userSelect: "none", letterSpacing: "0.02em" }}>
+              {cursorLabel(cursor)}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -2564,7 +2567,7 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
                 onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
             )}
           </SciPlotWrap>
-          <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} />
+          <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
         </>
       )}
 
@@ -2788,7 +2791,7 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
             onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
         )}
       </SciPlotWrap>
-      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} />
+      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
     </>
   );
 }
@@ -3090,7 +3093,7 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
       {entries.length === 0 ? (
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No RSM data loaded for selected samples.</div>
       ) : (
-        <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", justifyContent: "center" }}>
           {entries.map(e => (
             <div key={e.sid} style={{ flex: "0 0 auto", width: ps.plotWidth ? Math.round(ps.plotWidth * 96) : 280 }}>
               <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: e.color, marginBottom: 4, textAlign: "center" }}>{labels[e.sid] || e.sid}</div>
@@ -3164,7 +3167,7 @@ function DEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
             onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
         )}
       </SciPlotWrap>
-      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} />
+      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
     </>
   );
 }
@@ -3191,10 +3194,10 @@ function DfComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
   const allX    = traces.flatMap(t => t.data.map(p => p.x)).filter(v => v > 0);
   const allY    = traces.flatMap(t => t.data.map(p => p.y)).filter(v => v > 0);
-  const xLo = Math.floor(Math.log10(Math.min(...allX)));
-  const xHi = Math.ceil(Math.log10(Math.max(...allX)));
-  const decadeVals = Array.from({ length: xHi - xLo + 1 }, (_, i) => Math.pow(10, xLo + i));
-  const decadeText = decadeVals.map(v => String(Math.round(Math.log10(v))));
+  const xLo = ps.xMin != null ? Math.log10(ps.xMin) : Math.floor(Math.log10(Math.min(...allX)));
+  const xHi = ps.xMax != null ? Math.log10(ps.xMax) : Math.ceil(Math.log10(Math.max(...allX)));
+  const decadeVals = Array.from({ length: Math.floor(xHi) - Math.ceil(xLo) + 1 }, (_, i) => Math.pow(10, Math.ceil(xLo) + i));
+  const decadeText = decadeVals.map(v => { const e = Math.round(Math.log10(v)); return `10${String(e).replace(/\d/g, d => '⁰¹²³⁴⁵⁶⁷⁸⁹'[d])}`; });
   const rawYMax = allY.length ? Math.max(...allY) * 1.05 : 1000;
   const erStep  = rawYMax >= 8000 ? 2000 : rawYMax >= 4000 ? 1000 : rawYMax >= 2000 ? 500 : rawYMax >= 800 ? 200 : rawYMax >= 300 ? 100 : 50;
   const erMax   = Math.ceil(rawYMax / erStep) * erStep;
@@ -3209,7 +3212,7 @@ function DfComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
   }));
   const layout = buildPlotLayout(ps,
     { type: "log", range: [xLo, xHi], tickvals: decadeVals, ticktext: decadeText,
-      title: { text: "log f (Hz)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+      title: { text: "Hz", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
     { range: [0, erMax], tickvals: erTicks, tickformat: "d",
       title: { text: "εᵣ", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } }
   );
@@ -3223,7 +3226,7 @@ function DfComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
             onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
         )}
       </SciPlotWrap>
-      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} />
+      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
     </>
   );
 }
@@ -3443,7 +3446,7 @@ const META_PARAM_GROUPS = [
     { id: "thickness_nm",     label: "Thickness",      unit: "nm",    needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "thickness_nm") },
   ]},
   { group: "P–E Hysteresis", params: [
-    { id: "pe_ec",         label: "Coercive field Eᶜ",     unit: "kV/cm",  extract: (s, pc) => extractPEProps(pc[s.id]?.pe)?.ec         ?? null },
+    { id: "pe_ec",         label: "Coercive field E<sub>c</sub>", unit: "kV/cm",  extract: (s, pc) => extractPEProps(pc[s.id]?.pe)?.ec         ?? null },
     { id: "pe_imprint",    label: "Imprint field",          unit: "kV/cm",  extract: (s, pc) => extractPEProps(pc[s.id]?.pe)?.imprint    ?? null },
     { id: "pe_pr",     label: "Pᵣ at E = 0",       unit: "µC/cm²", paired: true, extract: (s, pc) => { const r = extractPEProps(pc[s.id]?.pe); return r ? { pos: r.pr_pos,     neg: r.pr_neg     } : null; } },
     { id: "pe_pr_imp", label: "Pᵣ at imprint field", unit: "µC/cm²", paired: true, extract: (s, pc) => { const r = extractPEProps(pc[s.id]?.pe); return r ? { pos: r.pr_imp_pos, neg: r.pr_imp_neg } : null; } },
@@ -3549,21 +3552,21 @@ function MetaScatterPlot({ points, y2Points = [], xLabel, yLabel, y2Label = "", 
   const layout = buildPlotLayout(ps,
     { range: xRange, ...xTickExtra, hoverformat: ".4g",
       title: { text: xLabel, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
-    { range: yRange, ...yTickExtra, ...(hasY2 ? { showgrid: false } : {}),
+    { range: yRange, ...yTickExtra,
+      ...(hasY2 ? { showgrid: false, mirror: ps.box !== "off" ? true : false } : {}),
       title: { text: yLabel, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
     [],
     {
-      // Reset Plotly's cached axis state when parameters change.
       uirevision: `meta-${xLabel}-${yLabel}-${y2Label}`,
-      // Widen right margin to fit the Y2 axis title when it's active.
-      ...(hasY2 ? { margin: { t: 12, r: 80, b: 52, l: 72, pad: 0 } } : {}),
+      ...(hasY2 ? { margin: { t: 12, r: 100, b: 52, l: 72, pad: 0 } } : {}),
       ...(hasY2 ? { yaxis2: {
         overlaying: "y", side: "right", showgrid: false,
         zeroline: false, showline: false, automargin: true,
         ticks: ps.ticks ? "inside" : "", ticklen: ps.ticks ? (ps.tickLen || 5) : 0,
+        ticklabelstandoff: 6,
         color: T.textDim,
         tickfont: { size: (ps.fontSize || 11) - 1, family: ps.font, color: T.textDim },
-        title: { text: y2Label, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 },
+        title: { text: y2Label, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 12 },
         range: y2Range, ...y2TickExtra,
       }} : {}),
     },
@@ -3579,7 +3582,7 @@ function MetaScatterPlot({ points, y2Points = [], xLabel, yLabel, y2Label = "", 
             onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
         )}
       </SciPlotWrap>
-      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} />
+      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
     </>
   );
 }
@@ -3613,7 +3616,7 @@ function CollapsibleParamSelect({ axis, value, onChange, groups, extra, rightSlo
           {open && <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />}
           <button onClick={handleOpen}
             style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: selectedParam ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 8px", outline: "none", cursor: "pointer", minWidth: 200, textAlign: "left", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
-            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{triggerLabel}</span>
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} dangerouslySetInnerHTML={{ __html: triggerLabel }} />
             <span style={{ fontSize: 8, opacity: 0.5, flexShrink: 0 }}>▼</span>
           </button>
           {open && (
@@ -3632,9 +3635,8 @@ function CollapsibleParamSelect({ axis, value, onChange, groups, extra, rightSlo
                   </div>
                   {expanded[g.group] && g.params.map(p => (
                     <div key={p.id} onClick={() => select(p.id)}
-                      style={{ padding: "5px 12px 5px 20px", fontFamily: "'DM Mono', monospace", fontSize: 11, color: p.id === value ? T.textPrimary : T.textSecondary, background: p.id === value ? T.bg3 : "transparent", cursor: "pointer" }}>
-                      {p.label}{p.unit ? ` (${p.unit})` : ""}
-                    </div>
+                      style={{ padding: "5px 12px 5px 20px", fontFamily: "'DM Mono', monospace", fontSize: 11, color: p.id === value ? T.textPrimary : T.textSecondary, background: p.id === value ? T.bg3 : "transparent", cursor: "pointer" }}
+                      dangerouslySetInnerHTML={{ __html: `${p.label}${p.unit ? ` (${p.unit})` : ""}` }} />
                   ))}
                 </div>
               ))}
@@ -3797,22 +3799,22 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
             <MetaMarkerPicker prefix="y" config={config} onUpdate={onUpdate} defaultSymbol="circle" />
           </div>
         </div>
-        {/* Row 2: Y₂ or + right axis button */}
-        {showY2 ? (
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <span style={axisLabelStyle}>Y₂</span>
-            <CollapsibleParamSelect axis={null} value={y2ParamId} onChange={v => onUpdate({ y2_param: v })} groups={displayGroups} />
-            <button onClick={() => { setShowY2(false); onUpdate({ y2_param: null }); }}
-              style={{ background: "transparent", border: "none", color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 16, lineHeight: 1, padding: "0 4px", cursor: "pointer", flexShrink: 0 }}>×</button>
-            <div style={{ marginLeft: "auto", flexShrink: 0 }}>
-              <MetaMarkerPicker prefix="y2" config={config} onUpdate={onUpdate} defaultSymbol="diamond" />
-            </div>
-          </div>
-        ) : (
-          <div style={{ paddingLeft: 30 }}>
+        {/* Row 2: Y₂ */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={axisLabelStyle}>Y₂</span>
+          {showY2 ? (
+            <>
+              <CollapsibleParamSelect axis={null} value={y2ParamId} onChange={v => onUpdate({ y2_param: v })} groups={displayGroups} />
+              <button onClick={() => { setShowY2(false); onUpdate({ y2_param: null }); }}
+                style={{ background: "transparent", border: "none", color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 16, lineHeight: 1, padding: "0 4px", cursor: "pointer", flexShrink: 0 }}>×</button>
+              <div style={{ marginLeft: "auto", flexShrink: 0 }}>
+                <MetaMarkerPicker prefix="y2" config={config} onUpdate={onUpdate} defaultSymbol="diamond" />
+              </div>
+            </>
+          ) : (
             <button style={addY2BtnStyle} onClick={() => setShowY2(true)}>+ right axis</button>
-          </div>
-        )}
+          )}
+        </div>
       </div>
       {(!xParam || !yParam) ? (
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "24px 0" }}>Select Y and X parameters above to plot.</div>
