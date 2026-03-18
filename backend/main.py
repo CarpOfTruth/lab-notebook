@@ -80,6 +80,15 @@ def init_db():
             conn.execute("ALTER TABLE analysis_books ADD COLUMN config TEXT DEFAULT '{}'")
         except sqlite3.OperationalError:
             pass  # column already exists
+        try:
+            conn.execute("ALTER TABLE analysis_books ADD COLUMN folder_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        # Migrations for folders: book_folder flag
+        try:
+            conn.execute("ALTER TABLE folders ADD COLUMN book_folder INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
@@ -121,8 +130,8 @@ def list_folders():
 def create_folder(folder: dict):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO folders (id, name, color) VALUES (:id, :name, :color)",
-            {"id": folder["id"], "name": folder["name"], "color": folder.get("color", "#4a5568")},
+            "INSERT INTO folders (id, name, color, book_folder) VALUES (:id, :name, :color, :book_folder)",
+            {"id": folder["id"], "name": folder["name"], "color": folder.get("color", "#4a5568"), "book_folder": 1 if folder.get("book_folder") else 0},
         )
         conn.commit()
     return {"ok": True, "id": folder["id"]}
@@ -131,8 +140,8 @@ def create_folder(folder: dict):
 def update_folder(folder_id: str, folder: dict):
     with get_db() as conn:
         conn.execute(
-            "UPDATE folders SET name=:name, color=:color WHERE id=:id",
-            {"id": folder_id, "name": folder["name"], "color": folder.get("color", "#4a5568")},
+            "UPDATE folders SET name=:name, color=:color, book_folder=:book_folder WHERE id=:id",
+            {"id": folder_id, "name": folder["name"], "color": folder.get("color", "#4a5568"), "book_folder": 1 if folder.get("book_folder") else 0},
         )
         conn.commit()
     return {"ok": True}
@@ -289,12 +298,13 @@ def list_books():
 def create_book(book: dict):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO analysis_books (id, name, sample_ids, config) VALUES (:id, :name, :sample_ids, :config)",
+            "INSERT INTO analysis_books (id, name, sample_ids, config, folder_id) VALUES (:id, :name, :sample_ids, :config, :folder_id)",
             {
                 "id":         book["id"],
                 "name":       book["name"],
                 "sample_ids": json.dumps(book.get("sample_ids", [])),
                 "config":     json.dumps(book.get("config", {})),
+                "folder_id":  book.get("folder_id"),
             },
         )
         conn.commit()
@@ -304,12 +314,13 @@ def create_book(book: dict):
 def update_book(book_id: str, book: dict):
     with get_db() as conn:
         conn.execute(
-            "UPDATE analysis_books SET name=:name, sample_ids=:sample_ids, config=:config WHERE id=:id",
+            "UPDATE analysis_books SET name=:name, sample_ids=:sample_ids, config=:config, folder_id=:folder_id WHERE id=:id",
             {
                 "id":         book_id,
                 "name":       book["name"],
                 "sample_ids": json.dumps(book.get("sample_ids", [])),
                 "config":     json.dumps(book.get("config", {})),
+                "folder_id":  book.get("folder_id"),
             },
         )
         conn.commit()
