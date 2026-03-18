@@ -25,7 +25,7 @@ This creates the Python virtual environment, installs all dependencies, and copi
 
 ### 2. Load demo data (optional)
 
-The repo ships with measurement files for three BaTiO₃ / SrRuO₃ / Si:STO samples (SP022 – SP024) from a sputter pressure series, plus a pre-configured Analysis Book comparing them across all panel types.
+The repo ships with measurement files for four BaTiO₃ / SrRuO₃ / Si:STO samples (SP022 – SP025) from a sputter pressure series (3 – 5 mTorr), plus a pre-configured Analysis Book comparing them across all panel types.
 
 ```bash
 npm run seed
@@ -53,7 +53,7 @@ Open **http://localhost:5173**.
 
 ### Dashboard
 
-Samples are organized into named, color-coded **folders** (growth series). Each card shows the deposition technique, substrate, layer material chips (SrRuO₃, BaTiO₃, etc.), notes, and a count of attached datasets. **Analysis Books** appear below for cross-sample comparisons.
+Samples are organized into named, color-coded **folders** (growth series). Each card shows the deposition technique, substrate, layer material chips (SrRuO₃, BaTiO₃, etc.), notes, and a count of attached datasets. **Analysis Books** appear below for cross-sample comparisons and can themselves be grouped into book folders.
 
 A **dark / light mode** toggle is always visible in the top bar and persists across sessions.
 
@@ -118,9 +118,18 @@ Comparison panels (each independently added/removed via **+ Add Panel**):
 | **P-E Hysteresis** | Overlaid loops, all-loop or 2nd-loop toggle |
 | **εᵣ vs E** | Overlaid butterfly curves |
 | **εᵣ vs frequency** | Overlaid frequency dispersion |
+| **Meta-Analysis** | Scatter plot of any extracted parameter vs any other |
 
 ![Analysis Book — XRD waterfall](docs/screenshots/book-xrd.png)
 ![Analysis Book — RSM gallery](docs/screenshots/book-rsm.png)
 ![Analysis Book — P-E overlay](docs/screenshots/book-pe.png)
 ![Analysis Book — εᵣ vs E overlay](docs/screenshots/book-de.png)
 ![Analysis Book — εᵣ vs f overlay](docs/screenshots/book-df.png)
+
+### Meta-Analysis
+
+The **Meta-Analysis** panel plots any extracted parameter against any other across all samples in a book. X and Y axes are chosen from a dropdown of all available quantities — growth conditions (pressure, temperature, O₂ %, time, power/energy) and fitted measurement parameters (remnant polarization Pᵣ, coercive field Eᶜ, saturation polarization Pₛ, permittivity εᵣ, and loss tan δ at any field or frequency).
+
+A second Y axis can be added for direct overlay of two different parameters. Marker color and style are configurable per axis.
+
+![Analysis Book — Meta-Analysis scatter](docs/screenshots/book-meta.png)
