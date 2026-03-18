@@ -286,6 +286,98 @@ def get_file(sample_id: str, filename: str):
     return FileResponse(path)
 
 
+@app.get("/api/samples/{sample_id}/afm_data")
+def get_afm_data(sample_id: str):
+    """Read the stored .ibw file, process each channel, and return display-ready JSON."""
+    try:
+        import numpy as np
+        import igor2.binarywave as bw
+    except ImportError:
+        raise HTTPException(500, "igor2 / numpy not installed — run: pip install igor2 numpy")
+
+    dest_dir = FILES_DIR / sample_id
+    afm_files = sorted(dest_dir.glob("afm_*.ibw"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not afm_files:
+        raise HTTPException(404, "No AFM file found for this sample")
+
+    path = afm_files[0]
+    wave = bw.load(str(path))
+    wdata = wave["wave"]["wData"]          # (H, W, C) float32, values already in SI units
+    note_raw = wave["wave"].get("note", b"")
+
+    # Parse note field (Key:Value\r pairs)
+    note: dict = {}
+    for line in note_raw.decode("latin-1", errors="replace").replace("\r\n", "\r").split("\r"):
+        if ":" in line:
+            k, _, v = line.partition(":")
+            note[k.strip()] = v.strip()
+
+    scan_size_m = float(note.get("ScanSize", 20e-6))
+
+    # Channel labels: dim2 of labels list; index 0 is always an empty placeholder in Igor
+    raw_labels = wave["wave"].get("labels", [])
+    dim2 = raw_labels[2] if len(raw_labels) > 2 else []
+    labels: list[str] = []
+    for lbl in dim2:
+        s = (lbl.decode("latin-1") if isinstance(lbl, bytes) else lbl).rstrip("\x00").strip()
+        labels.append(s)
+    # Drop the leading empty placeholder so index i matches channel i
+    while labels and not labels[0]:
+        labels.pop(0)
+
+    # Ensure 3-D shape
+    if wdata.ndim == 2:
+        wdata = wdata[:, :, np.newaxis]
+    H, W, C = wdata.shape
+
+    channels: dict = {}
+    channel_ranges: dict = {}
+    for i in range(C):
+        ch = np.rot90(wdata[:, :, i].astype(np.float64), k=1)  # 90° CCW before processing
+        Hr, Wr = ch.shape
+        ch_label = labels[i] if i < len(labels) else f"Ch{i}"
+
+        # Height channel: 2nd-order polynomial flatten on rotated data, then m → nm
+        if "height" in ch_label.lower() or i == 0:
+            ys, xs = np.mgrid[0:Hr, 0:Wr]
+            flat = ch.ravel()
+            ok = np.isfinite(flat)
+            # IQR masking — exclude particles / outliers from the plane fit
+            q1, q3 = np.percentile(flat[ok], [25, 75])
+            iqr = q3 - q1
+            ok &= (flat >= q1 - 3.0 * iqr) & (flat <= q3 + 3.0 * iqr)
+            xf, yf = xs.ravel()[ok], ys.ravel()[ok]
+            A = np.stack([np.ones(ok.sum()), xf, yf, xf**2, xf*yf, yf**2], axis=1)
+            coeffs, *_ = np.linalg.lstsq(A, flat[ok], rcond=None)
+            ch -= (coeffs[0]
+                   + coeffs[1]*xs + coeffs[2]*ys
+                   + coeffs[3]*xs**2 + coeffs[4]*xs*ys + coeffs[5]*ys**2)
+            ch *= 1e9  # m → nm
+
+        # Percentile-clipped display range (robust against outliers for all channels)
+        ch_flat = ch.ravel()
+        ch_ok = np.isfinite(ch_flat)
+        if ch_ok.any():
+            vmin, vmax = np.percentile(ch_flat[ch_ok], [0.5, 99.5])
+        else:
+            vmin, vmax = 0.0, 1.0
+        channel_ranges[ch_label] = [round(float(vmin), 4), round(float(vmax), 4)]
+
+        channels[ch_label] = ch.tolist()
+
+    first = next(iter(channels.values())) if channels else [[]]
+    out_h, out_w = len(first), len(first[0]) if first else 0
+
+    return {
+        "channels":       channels,
+        "channel_names":  list(channels.keys()),
+        "channel_ranges": channel_ranges,
+        "scan_size_um":   round(scan_size_m * 1e6, 3),
+        "pixels":         [out_h, out_w],
+        "filename":       path.name,
+    }
+
+
 # ── Analysis Books (stub) ─────────────────────────────────────────────────────
 
 @app.get("/api/analysis-books")
