@@ -701,7 +701,7 @@ function RsmCanvasPlot({ data, logIntensity = false }) {
   const bins = 400;
 
   const binned = useMemo(
-    () => binRSM(data, bins, bins, null, null, logIntensity, false, 0),
+    () => binRSM(data, bins, bins, null, null, logIntensity, true, 5),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [data, logIntensity]
   );
@@ -735,15 +735,19 @@ function RsmCanvasPlot({ data, logIntensity = false }) {
       const f = s - i;
       return [r1+f*(r2-r1), g1+f*(g2-g1), b1+f*(b2-b1)];
     };
+    const FADE = 0.15;
     canvas.width = nx; canvas.height = ny;
     const img = ctx.createImageData(nx, ny);
     for (let row = 0; row < ny; row++) {
       for (let col = 0; col < nx; col++) {
         const v = z[ny - 1 - row][col];
         if (v !== null) {
+          const t = (v - zMin) / zRange;
+          const ct = Math.max(0, (t - FADE) / (1 - FADE));
           const p = (row * nx + col) * 4;
-          const [r,g,b] = getColor((v - zMin) / zRange);
-          img.data[p]=r; img.data[p+1]=g; img.data[p+2]=b; img.data[p+3]=255;
+          const [r,g,b] = getColor(ct);
+          const a = t < FADE ? Math.round((t / FADE) * 255) : 255;
+          img.data[p]=r; img.data[p+1]=g; img.data[p+2]=b; img.data[p+3]=a;
         }
       }
     }
