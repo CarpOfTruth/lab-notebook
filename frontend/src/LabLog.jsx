@@ -59,7 +59,7 @@ let T = DARK_T;
 const MEAS_TYPES = {
   xrd_ot: { label: "XRD ω–2θ",                    xLabel: "2θ (°)",         yLabel: "Intensity (cts)", logY: true,  color: T.amber },
   xrr:    { label: "XRR",                          xLabel: "2θ (°)",         yLabel: "Intensity (cts)", logY: true,  color: T.teal  },
-  rsm:    { label: "RSM",                          xLabel: "Qₓ (Å⁻¹)",      yLabel: "Qz (Å⁻¹)",       isRSM: true, color: T.blue  },
+  rsm:    { label: "RSM",                          xLabel: "Qₓ (nm⁻¹)",     yLabel: "Qz (nm⁻¹)",      isRSM: true, color: T.blue  },
   pe:     { label: "P–E Hysteresis",               xLabel: "E (kV/cm)",      yLabel: "P (µC/cm²)",      logY: false, color: T.red, ySymRange: 30, symXTicks: true, zeroRefY: true },
   diel_f: { label: "Rel. Permittivity vs f",       xLabel: "log f (Hz)",     yLabel: "εᵣ",              logX: true,  color: T.green, clampYZero: true },
   diel_b: { label: "Rel. Permittivity vs E",       xLabel: "E (kV/cm)",      yLabel: "εᵣ",              logY: false, color: T.green, clampYZero: true, twoSweep: true, symXTicks: true },
@@ -561,90 +561,56 @@ function LinePlot({ data, cfg }) {
   );
 }
 
-function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain }) {
-  const containerRef = useRef(null);
-  const canvasRef    = useRef(null);
-  const draw = useCallback(() => {
-    const canvas = canvasRef.current, container = containerRef.current;
-    if (!canvas || !container || !data.length) return;
-    const W = container.clientWidth || 320, H = 220;
-    canvas.width = W; canvas.height = H;
-    const ctx = canvas.getContext("2d");
-    const M = { top: 10, right: 14, bottom: 36, left: 52 };
-    const pw = W - M.left - M.right, ph = H - M.top - M.bottom;
-    let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity, zMin = Infinity, zMax = -Infinity;
-    for (const d of data) {
-      if (d.x < xMin) xMin = d.x; if (d.x > xMax) xMax = d.x;
-      if (d.y < yMin) yMin = d.y; if (d.y > yMax) yMax = d.y;
-      if (d.z < zMin) zMin = d.z; if (d.z > zMax) zMax = d.z;
-    }
-    const xp = (xMax - xMin) * 0.05, yp = (yMax - yMin) * 0.05;
-    const x0 = forcedXDomain ? forcedXDomain[0] : xMin - xp;
-    const x1 = forcedXDomain ? forcedXDomain[1] : xMax + xp;
-    const y0 = forcedYDomain ? forcedYDomain[0] : yMin - yp;
-    const y1 = forcedYDomain ? forcedYDomain[1] : yMax + yp;
-    const logZMin   = zMin > 0 ? Math.log10(zMin) : 0;
-    const logZRange = zMax > zMin ? Math.log10(Math.max(zMax, zMin + 1e-12)) - logZMin : 1;
-    const sx = x => M.left + (x - x0) / (x1 - x0) * pw;
-    const sy = y => M.top  + (1 - (y - y0) / (y1 - y0)) * ph;
-    ctx.fillStyle = T.bg2; ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = T.bg1; ctx.fillRect(M.left, M.top, pw, ph);
-    for (const d of data) {
-      const lz = d.z > 0 ? Math.log10(d.z) : logZMin;
-      const t  = Math.max(0, Math.min(1, (lz - logZMin) / logZRange));
-      ctx.fillStyle = `hsl(${240 - 240 * t},80%,55%)`;
-      ctx.fillRect(Math.round(sx(d.x)), Math.round(sy(d.y)), 2, 2);
-    }
-    ctx.font = `10px "DM Mono", monospace`;
-    const { ticks: xTkArr, fmt: xFmt } = niceCanvasTicks(x0, x1);
-    ctx.textAlign = "center"; ctx.textBaseline = "top";
-    for (const xv of xTkArr) {
-      const px = Math.round(sx(xv));
-      ctx.strokeStyle = T.border; ctx.lineWidth = 0.5;
-      ctx.beginPath(); ctx.moveTo(px, M.top); ctx.lineTo(px, M.top + ph); ctx.stroke();
-      ctx.fillStyle = T.textDim; ctx.fillText(xFmt(xv), px, M.top + ph + 4);
-    }
-    const { ticks: yTkArr, fmt: yFmt } = niceCanvasTicks(y0, y1);
-    ctx.textAlign = "right"; ctx.textBaseline = "middle";
-    for (const yv of yTkArr) {
-      const py = Math.round(sy(yv));
-      ctx.strokeStyle = T.border; ctx.lineWidth = 0.5;
-      ctx.beginPath(); ctx.moveTo(M.left, py); ctx.lineTo(M.left + pw, py); ctx.stroke();
-      ctx.fillStyle = T.textDim; ctx.fillText(yFmt(yv), M.left - 4, py);
-    }
-    // Inside tick marks on all 4 sides
-    const TK = 4;
-    ctx.strokeStyle = T.borderBright; ctx.lineWidth = 1;
-    for (const xv of xTkArr) {
-      const px = Math.round(sx(xv));
-      ctx.beginPath(); ctx.moveTo(px, M.top);      ctx.lineTo(px, M.top + TK);      ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(px, M.top + ph); ctx.lineTo(px, M.top + ph - TK); ctx.stroke();
-    }
-    for (const yv of yTkArr) {
-      const py = Math.round(sy(yv));
-      ctx.beginPath(); ctx.moveTo(M.left,      py); ctx.lineTo(M.left + TK,      py); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(M.left + pw, py); ctx.lineTo(M.left + pw - TK, py); ctx.stroke();
-    }
-    ctx.strokeRect(M.left + 0.5, M.top + 0.5, pw, ph);
-    ctx.fillStyle = T.textSecondary; ctx.font = `11px "DM Mono", monospace`;
-    ctx.textAlign = "center"; ctx.textBaseline = "bottom";
-    ctx.fillText(cfg.xLabel, M.left + pw / 2, H - 2);
-    ctx.save(); ctx.translate(13, M.top + ph / 2); ctx.rotate(-Math.PI / 2);
-    ctx.textAlign = "center"; ctx.textBaseline = "middle";
-    ctx.fillText(cfg.yLabel, 0, 0); ctx.restore();
-  }, [data, cfg, forcedXDomain, forcedYDomain]);
-  useEffect(() => {
-    draw();
-    const container = containerRef.current;
-    if (!container) return;
-    const ro = new ResizeObserver(() => draw());
-    ro.observe(container);
-    return () => ro.disconnect();
-  }, [draw]);
+function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain, plotStyle, showColorbar = false, points = [] }) {
+  const ps = plotStyle || DEFAULT_PLOT_STYLE;
+  const bins = ps.rsmBins || 256;
+  const logIntensity = ps.rsmLogIntensity ?? true;
+  const bgSub = ps.rsmBgSub ?? false;
+  const bgPct = ps.rsmBgPct ?? 5;
+  const binned = useMemo(
+    () => binRSM(data, bins, bins, forcedXDomain || null, forcedYDomain || null, logIntensity, bgSub, bgPct),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [data, bins, forcedXDomain?.[0], forcedXDomain?.[1], forcedYDomain?.[0], forcedYDomain?.[1], logIntensity, bgSub, bgPct]
+  );
+  if (!binned) return null;
+  const xTicks = makeTicks(binned.xDomain[0], binned.xDomain[1], ps.xTick);
+  const yTicks = makeTicks(binned.yDomain[0], binned.yDomain[1], ps.yTick);
+  const q2pi = ps.rsmQ2pi ?? false;
+  const qUnit = q2pi ? "Å⁻¹" : "nm⁻¹";
+  const zLabel = logIntensity ? "log I" : "I";
+  const colorscale = makeHeatmapColorscale(ps.colorScale || "viridis", ps.rsmWhiteFade ?? 0);
+  const heatTrace = {
+    type: "heatmap", x: binned.x, y: binned.y, z: binned.z,
+    colorscale, showscale: showColorbar,
+    connectgaps: false, zsmooth: false,
+    hovertemplate: `Qₓ: %{x:.4f}<br>Qz: %{y:.4f}<br>${zLabel}: %{z:.2f}<extra></extra>`,
+  };
+  const pointTraces = points.map(pt => ({
+    type: "scatter", mode: "markers",
+    x: [pt.qx], y: [pt.qz],
+    marker: { color: pt.color, size: pt.markerSize ?? 9, symbol: pt.symbol || "cross", line: { color: "rgba(0,0,0,0.65)", width: 1.5 } },
+    showlegend: false,
+    hovertemplate: `${pt.label ? pt.label + "<br>" : ""}Qₓ: ${pt.qx.toFixed(4)}<br>Qz: ${pt.qz.toFixed(4)}<extra></extra>`,
+  }));
+  const spikeProps = { showspikes: true, spikemode: "across", spikecolor: T.textDim, spikethickness: 1, spikedash: "dot", spikesnap: "cursor" };
+  const layout = buildPlotLayout(ps,
+    { showgrid: false, ...spikeProps,
+      ...(xTicks ? { tickvals: xTicks, tickmode: "array" } : {}),
+      title: { text: `Qₓ (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+    { showgrid: false, ...spikeProps,
+      ...(yTicks ? { tickvals: yTicks, tickmode: "array" } : {}),
+      title: { text: `Qz (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
+    [],
+    { uirevision: "rsm", hovermode: "closest" }
+  );
   return (
-    <div ref={containerRef} style={{ width: "100%" }}>
-      <canvas ref={canvasRef} style={{ display: "block", width: "100%", height: 220 }} />
-    </div>
+    <SciPlotWrap ps={ps} cursorLabel={c => `Qₓ=${c.x.toFixed(4)}, Qz=${c.y.toFixed(4)}`}>
+      {setCursor => (
+        <Plot data={[heatTrace, ...pointTraces]} layout={layout} config={buildPlotConfig("rsm", ps)}
+          style={{ width: "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "280px" }} useResizeHandler
+          onHover={e => { const pt = e.points?.[0]; if (pt) setCursor({ x: pt.x, y: pt.y }); }} />
+      )}
+    </SciPlotWrap>
   );
 }
 
@@ -723,10 +689,112 @@ function TwoLinePlot({ data, cfg }) {
   );
 }
 
-function MeasPlot({ data, type, thicknessNm = 0, areaM2, areaCorrFactor = 1.0 }) {
+// Canvas-based RSM renderer for the sample detail view — raw display, no processing.
+function RsmCanvasPlot({ data, logIntensity = false }) {
+  const wrapRef   = useRef(null);
+  const canvasRef = useRef(null);
+  const [plotW, setPlotW] = useState(300);
+
+  const ML = 50, MR = 12, MT = 6, MB = 38, TOTAL_H = 200;
+  const PH = TOTAL_H - MT - MB;
+
+  const bins = 400;
+
+  const binned = useMemo(
+    () => binRSM(data, bins, bins, null, null, logIntensity, false, 0),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [data, logIntensity]
+  );
+
+  // Track container width
+  useEffect(() => {
+    if (!wrapRef.current) return;
+    const obs = new ResizeObserver(([e]) => setPlotW(Math.max(60, e.contentRect.width - ML - MR)));
+    obs.observe(wrapRef.current);
+    setPlotW(Math.max(60, wrapRef.current.offsetWidth - ML - MR));
+    return () => obs.disconnect();
+  }, []);
+
+  // Draw heatmap pixels to canvas using same colorscale logic as RSMPlot
+  useEffect(() => {
+    if (!binned || !canvasRef.current) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+    const { z } = binned;
+    const ny = z.length, nx = z[0].length;
+    let zMin = Infinity, zMax = -Infinity;
+    for (const row of z) for (const v of row) { if (v !== null) { if (v < zMin) zMin = v; if (v > zMax) zMax = v; } }
+    const zRange = zMax - zMin || 1;
+
+    const anchors = COLOR_SCALES.viridis;
+    const getColor = t => {
+      const s = Math.max(0, Math.min(1, t)) * (anchors.length - 1);
+      const i = Math.min(Math.floor(s), anchors.length - 2);
+      const [r1,g1,b1] = hexToRgb(anchors[i]);
+      const [r2,g2,b2] = hexToRgb(anchors[i+1]);
+      const f = s - i;
+      return [r1+f*(r2-r1), g1+f*(g2-g1), b1+f*(b2-b1)];
+    };
+    canvas.width = nx; canvas.height = ny;
+    const img = ctx.createImageData(nx, ny);
+    for (let row = 0; row < ny; row++) {
+      for (let col = 0; col < nx; col++) {
+        const v = z[ny - 1 - row][col];
+        if (v !== null) {
+          const p = (row * nx + col) * 4;
+          const [r,g,b] = getColor((v - zMin) / zRange);
+          img.data[p]=r; img.data[p+1]=g; img.data[p+2]=b; img.data[p+3]=255;
+        }
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }, [binned]);
+
+  if (!binned) return null;
+  const { xDomain, yDomain } = binned;
+  const { ticks: xTicks } = niceLinTicks(xDomain[0], xDomain[1]);
+  const { ticks: yTicks } = niceLinTicks(yDomain[0], yDomain[1]);
+  const xFrac = v => (v - xDomain[0]) / (xDomain[1] - xDomain[0]);
+  const yFrac = v => 1 - (v - yDomain[0]) / (yDomain[1] - yDomain[0]);
+  const PW = plotW;
+
+  return (
+    <div ref={wrapRef} style={{ position: "relative", width: "100%", height: TOTAL_H, overflow: "hidden" }}>
+      <canvas ref={canvasRef}
+        style={{ position: "absolute", left: ML, top: MT, width: PW, height: PH, imageRendering: "pixelated" }} />
+      <svg width={ML + PW + MR} height={TOTAL_H}
+        style={{ position: "absolute", left: 0, top: 0, overflow: "visible", pointerEvents: "none" }}>
+        {/* Tick marks + labels — X (no grid lines) */}
+        {xTicks.filter(t => xFrac(t) >= 0 && xFrac(t) <= 1).map(t => {
+          const px = ML + xFrac(t) * PW;
+          return <g key={t}>
+            <line x1={px} y1={MT+PH} x2={px} y2={MT+PH+4} stroke={T.borderBright} strokeWidth={1} />
+            <text x={px} y={MT+PH+14} textAnchor="middle" fill={T.textDim} fontSize={10} fontFamily="'DM Mono',monospace">{numFmt(t)}</text>
+          </g>;
+        })}
+        {/* Tick marks + labels — Y (no grid lines) */}
+        {yTicks.filter(t => yFrac(t) >= 0 && yFrac(t) <= 1).map(t => {
+          const py = MT + yFrac(t) * PH;
+          return <g key={t}>
+            <line x1={ML-4} y1={py} x2={ML} y2={py} stroke={T.borderBright} strokeWidth={1} />
+            <text x={ML-8} y={py+3} textAnchor="end" fill={T.textDim} fontSize={10} fontFamily="'DM Mono',monospace">{numFmt(t)}</text>
+          </g>;
+        })}
+        {/* Box border */}
+        <rect x={ML} y={MT} width={PW} height={PH} fill="none" stroke={T.borderBright} strokeWidth={1} />
+        {/* Axis labels */}
+        <text x={ML+PW/2} y={TOTAL_H-4} textAnchor="middle" fill={T.textSecondary} fontSize={11} fontFamily="'DM Mono',monospace">Qₓ (nm⁻¹)</text>
+        <text x={12} y={MT+PH/2} textAnchor="middle" fill={T.textSecondary} fontSize={10} fontFamily="'DM Mono',monospace"
+          transform={`rotate(-90,12,${MT+PH/2})`}>Qz (nm⁻¹)</text>
+      </svg>
+    </div>
+  );
+}
+
+function MeasPlot({ data, type, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, logIntensity = false }) {
   const cfg = MEAS_TYPES[type];
   if (!hasPlotData(data)) return null;
-  if (type === "rsm") return <RSMPlot data={data} cfg={cfg} />;
+  if (type === "rsm") return <RsmCanvasPlot data={data} logIntensity={logIntensity} />;
   let plotData = data;
   if (type === "diel_f" || type === "diel_b") {
     const d_m = (thicknessNm || 30) * 1e-9;
@@ -779,6 +847,7 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
   const cfg = MEAS_TYPES[type];
   const [corrExpr,      setCorrExpr]      = useState(String(areaCorrFactor ?? 1.0));
   const [peLoop,        setPeLoop]        = useState("all"); // "all" | "second"
+  const [rsmLog,        setRsmLog]        = useState(false); // lin by default
 
   if (type === "diel_b") {
     const hasUp    = !!(plotData?.up?.length);
@@ -816,13 +885,26 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
         <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: cfg.color, fontWeight: 600 }}>{cfg.label}</span>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {isPE && has && <LoopToggle value={peLoop} onChange={setPeLoop} />}
+          {type === "rsm" && has && (
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>intensity</span>
+              <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 10, overflow: "hidden" }}>
+                {[["lin", false], ["log", true]].map(([label, val]) => (
+                  <button key={label} onClick={() => setRsmLog(val)}
+                    style={{ padding: "2px 8px", fontSize: 10, fontFamily: "'DM Mono', monospace", border: "none", cursor: "pointer", background: rsmLog === val ? T.blue : "transparent", color: rsmLog === val ? "#fff" : T.textDim, transition: "background 0.15s" }}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           {filename && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filename}</span>}
         </div>
       </div>
       <div style={{ padding: "10px 12px" }}>
         {has ? (
           <>
-            <MeasPlot data={displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} />
+            <MeasPlot data={displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} logIntensity={rsmLog} />
             <div style={{ marginTop: 8 }}><UploadZone type={type} onFile={(file) => onFile(type, file)} hasData={true} thicknessNm={thicknessNm} /></div>
           </>
         ) : (
@@ -1702,7 +1784,7 @@ function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, 
 const COLOR_OPTIONS = ["#4a5568", "#3182ce", "#38a169", "#d69e2e", "#9f7aea", "#ed64a6", "#fc8181", "#4fd1c5"];
 
 function FolderTile({ folder, samples, plotCache, onSelectSample, onDeleteSample, onDuplicateTemplate, onEdit, onDelete, onDropSample, onDragStartSample }) {
-  const [open, setOpen]       = useState(true);
+  const [open, setOpen]       = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const color = folder.color || T.borderBright;
 
@@ -1740,13 +1822,27 @@ function FolderTile({ folder, samples, plotCache, onSelectSample, onDeleteSample
 }
 
 function AddFolderModal({ onSave, onClose, existing }) {
-  const [name, setName]   = useState(existing?.name || "");
-  const [color, setColor] = useState(existing?.color || COLOR_OPTIONS[0]);
+  const [name,    setName]    = useState(existing?.name || "");
+  const [color,   setColor]   = useState(existing?.color || COLOR_OPTIONS[0]);
+  const [forBooks, setForBooks] = useState(existing?.book_folder ?? false);
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 360, display: "flex", flexDirection: "column", gap: 16 }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 20 }}>{existing ? "Edit Folder" : "New Folder"}</h2>
         <Input label="Name" value={name} onChange={setName} placeholder="e.g. BTO Series" />
+        {/* Samples / Analysis Books segmented toggle */}
+        <div style={{ display: "flex", background: T.bg2, borderRadius: 8, padding: 3, gap: 2 }}>
+          {[{ label: "Samples", value: false }, { label: "Analysis Books", value: true }].map(opt => (
+            <button key={String(opt.value)} onClick={() => setForBooks(opt.value)}
+              style={{ flex: 1, padding: "6px 0", border: "none", borderRadius: 6, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 11, letterSpacing: 0.3, transition: "background .15s, color .15s",
+                background: forBooks === opt.value ? T.bg0 : "transparent",
+                color: forBooks === opt.value ? (opt.value ? T.blue : T.amber) : T.textDim,
+                fontWeight: forBooks === opt.value ? 600 : 400,
+                boxShadow: forBooks === opt.value ? "0 1px 3px rgba(0,0,0,.25)" : "none" }}>
+              {opt.label}
+            </button>
+          ))}
+        </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           <Label>Color</Label>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -1758,7 +1854,7 @@ function AddFolderModal({ onSave, onClose, existing }) {
         </div>
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn onClick={() => { if (name.trim()) onSave({ name: name.trim(), color }); }} disabled={!name.trim()}>
+          <Btn onClick={() => { if (name.trim()) onSave({ name: name.trim(), color, book_folder: forBooks }); }} disabled={!name.trim()}>
             {existing ? "Save" : "Create"}
           </Btn>
         </div>
@@ -1779,7 +1875,8 @@ const SCALE_OPTIONS = [
 ];
 
 function defaultPanelConfig(type) {
-  if (type === "xrd") return { offset_decades: 2, theta_min: null, theta_max: null, pad_above: 2, pad_below: 1 };
+  if (type === "xrd")  return { offset_decades: 2, theta_min: null, theta_max: null, pad_above: 2, pad_below: 1 };
+  if (type === "meta") return { x_param: "", y_param: "" };
   return {};
 }
 
@@ -1848,14 +1945,30 @@ function SampleRosterRow({ sid, s, color, label, dragOver, onDragStart, onDragOv
   );
 }
 
-function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, labels = {}, onReorder, onRemove, onAddSamples, onChangeScale, onChangeTrim, onLabelChange }) {
-  const [dragIdx,     setDragIdx]     = useState(null);
-  const [dragOverIdx, setDragOverIdx] = useState(null);
-  const [showPicker,  setShowPicker]  = useState(false);
-  const [localTrim,   setLocalTrim]   = useState(colorTrim ?? 5);
+function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, labels = {}, activeMaterial, onChangeActiveMaterial, onReorder, onRemove, onAddSamples, onChangeScale, onChangeTrim, onLabelChange }) {
+  const [dragIdx,       setDragIdx]       = useState(null);
+  const [dragOverIdx,   setDragOverIdx]   = useState(null);
+  const [showPicker,    setShowPicker]    = useState(false);
+  const [scaleDropOpen, setScaleDropOpen] = useState(false);
+  const [localTrim,     setLocalTrim]     = useState(colorTrim ?? 5);
   useEffect(() => { setLocalTrim(colorTrim ?? 5); }, [colorTrim]);
   const commitTrim = () => onChangeTrim(Math.max(0, Math.min(49, Number(localTrim) || 0)));
   const sampleMap = Object.fromEntries(samples.map(s => [s.id, s]));
+
+  // Collect unique non-co-deposited materials across selected samples
+  const availableMaterials = useMemo(() => {
+    const seen = new Set();
+    for (const sid of sampleOrder) {
+      const s = sampleMap[sid];
+      if (!s?.layers) continue;
+      for (const layer of s.layers) {
+        if (layer.targets?.length === 1 && layer.targets[0].material)
+          seen.add(layer.targets[0].material);
+      }
+    }
+    return [...seen].sort();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sampleOrder, samples]);
   return (
     <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 16px" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: sampleOrder.length ? 10 : 0, flexWrap: "wrap" }}>
@@ -1869,10 +1982,26 @@ function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, lab
             onKeyDown={e => e.key === "Enter" && commitTrim()}
             style={{ width: 44, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 11, outline: "none", textAlign: "center" }} />
         </div>
-        <select value={colorScale} onChange={e => onChangeScale(e.target.value)}
-          style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textSecondary, padding: "4px 8px", fontFamily: "'DM Mono', monospace", fontSize: 11, outline: "none", cursor: "pointer" }}>
-          {SCALE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-        </select>
+        {scaleDropOpen && <div onClick={() => setScaleDropOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />}
+        <div style={{ position: "relative" }}>
+          <button onClick={() => setScaleDropOpen(v => !v)}
+            style={{ display: "flex", alignItems: "center", gap: 5, background: T.bg0, border: `1px solid ${scaleDropOpen ? T.borderBright : T.border}`, borderRadius: 4, padding: "4px 8px", cursor: "pointer", outline: "none" }}>
+            <div style={{ width: 84, height: 14, borderRadius: 2, background: `linear-gradient(to right, ${sampleColorScale(colorScale, 20, colorTrim).join(",")})` }} />
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, lineHeight: 1 }}>▾</span>
+          </button>
+          {scaleDropOpen && (
+            <div onClick={e => e.stopPropagation()}
+              style={{ position: "absolute", right: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, padding: 6, zIndex: 200, boxShadow: "0 4px 12px rgba(0,0,0,.5)", display: "flex", flexDirection: "column", gap: 3, minWidth: 140 }}>
+              {SCALE_OPTIONS.map(o => (
+                <button key={o.value} onClick={() => { onChangeScale(o.value); setScaleDropOpen(false); }}
+                  style={{ display: "flex", flexDirection: "column", gap: 4, background: colorScale === o.value ? T.bg3 : "none", border: `1px solid ${colorScale === o.value ? T.borderBright : "transparent"}`, borderRadius: 4, padding: "5px 8px", cursor: "pointer", alignItems: "stretch" }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: colorScale === o.value ? T.textPrimary : T.textDim, textAlign: "left" }}>{o.label}</span>
+                  <div style={{ height: 10, borderRadius: 2, background: `linear-gradient(to right, ${sampleColorScale(o.value, 20, colorTrim).join(",")})` }} />
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
         <Btn variant="ghost" small onClick={() => setShowPicker(v => !v)}>+ Add</Btn>
       </div>
       {sampleOrder.length === 0 && !showPicker && (
@@ -1899,6 +2028,27 @@ function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, lab
           alreadySelected={sampleOrder}
           onAdd={ids => { onAddSamples(ids); setShowPicker(false); }}
           onClose={() => setShowPicker(false)} />
+      )}
+      {/* Active layer selector */}
+      {availableMaterials.length > 0 && (
+        <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${T.border}`, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, flexShrink: 0 }}>Active layer</span>
+          {availableMaterials.map(m => {
+            const ms = getMaterialStyle(m);
+            const active = activeMaterial === m;
+            return (
+              <span key={m} onClick={() => onChangeActiveMaterial?.(active ? null : m)}
+                style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: active ? ms.border : T.textDim,
+                  background: active ? ms.bg : T.bg0, border: `1px solid ${active ? ms.border : T.border}`,
+                  borderRadius: 4, padding: "2px 8px", cursor: "pointer", transition: "all .12s", userSelect: "none" }}>
+                <ChemName name={m} />
+              </span>
+            );
+          })}
+          {activeMaterial && !availableMaterials.includes(activeMaterial) && (
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, fontStyle: "italic" }}>{activeMaterial} (not in selection)</span>
+          )}
+        </div>
       )}
     </div>
   );
@@ -1955,6 +2105,7 @@ function DeferredInput({ value, onChange, ...props }) {
 const CU_KALPHA = 1.5406; // Å
 
 function parseHKL(str) {
+  if (str == null) return null;
   const s = str.trim();
   // Space/comma-separated (handles negatives): "1 0 0", "-1,0,1"
   const parts = s.match(/-?\d+/g);
@@ -1982,11 +2133,12 @@ function calcStrainedStruct(filmStruct, subStruct, ln) {
     return applyBiaxial(a_s, b_s);
   }
   if (smode === "arbitrary_strain") {
-    const exx = parseFloat(ln.strain_eps_xx), eyy = parseFloat(ln.strain_eps_yy ?? ln.strain_eps_xx);
-    if (isNaN(exx)) return null;
-    const ey = isNaN(eyy) ? exx : eyy;
-    const eps_zz = -nu / (1 - nu) * (exx + ey);
-    return { ...filmStruct, a: a_f * (1 + exx), b: b_f * (1 + ey), c: c_f * (1 + eps_zz) };
+    const exx = parseFloat(ln.strain_eps_xx);
+    const eyy = parseFloat(ln.strain_eps_yy ?? ln.strain_eps_xx);
+    const ex = isNaN(exx) ? 0 : exx;           // blank → 0 (no strain)
+    const ey = isNaN(eyy) ? ex : eyy;
+    const eps_zz = -nu / (1 - nu) * (ex + ey);
+    return { ...filmStruct, a: a_f * (1 + ex), b: b_f * (1 + ey), c: c_f * (1 + eps_zz) };
   }
   if (smode === "arbitrary_lattice") {
     const a_in = parseFloat(ln.strain_a), b_in = parseFloat(ln.strain_b || ln.strain_a);
@@ -2022,9 +2174,59 @@ function calcTwoTheta(structure, hklStr) {
   return 2 * Math.asin(sinTheta) / deg;
 }
 
+// Calculate (Qx, Qz) for a reflection hkl, assuming [001] surface normal.
+// q2pi=false (default): Q = h/a in nm⁻¹  (factor=10 since a is in Å → 10/a_Å = 1/a_nm)
+// q2pi=true:            Q = 2π·h/a in Å⁻¹ (standard physics convention)
+function calcQxQz(structure, hklStr, q2pi = false) {
+  const hkl = parseHKL(hklStr);
+  if (!hkl) return null;
+  const { h, k, l } = hkl;
+  const a = parseFloat(structure.a);
+  const b = parseFloat(structure.b) || a;
+  const c = parseFloat(structure.c);
+  if (!a || !c) return null;
+  const factor = q2pi ? 2 * Math.PI : 10; // 10/a_Å = 1/a_nm
+  const qx = h !== 0 ? factor * h / a : factor * k / b;
+  const qz = factor * l / c;
+  return { qx, qz };
+}
+
 const LINE_COLORS = [
   "#f0f0f0", "#bbbbbb", "#888888", "#555555", "#1a1a1a",
   "#c8b89a", "#8aa8b4",
+];
+
+// Bright primary/secondary palette for RSM peak markers
+const RSM_POINT_COLORS = [
+  "#ff3333", "#3399ff", "#ffee33", "#33ff66",
+  "#ff33cc", "#33ffee", "#ff8833", "#cc33ff", "#ffffff",
+];
+
+const RSM_POINT_SYMBOLS = [
+  { id: "cross",         glyph: "✚" },
+  { id: "circle",        glyph: "●" },
+  { id: "square",        glyph: "■" },
+  { id: "diamond",       glyph: "◆" },
+  { id: "x",             glyph: "✕" },
+  { id: "triangle-up",   glyph: "▲" },
+  { id: "triangle-down", glyph: "▼" },
+  { id: "star",          glyph: "★" },
+];
+
+// Palette for meta-scatter marker overrides. null = use sample colorscale colour.
+const META_MARKER_COLORS = [
+  null,       // auto (sample colour)
+  "#000000",  // black
+  "#888888",  // grey
+  "#ffffff",  // white
+  "#e05252",  // red
+  "#4d9de0",  // blue
+  "#3dba6a",  // green
+  "#e0b84d",  // amber/yellow
+  "#e08c3d",  // orange
+  "#9b59cc",  // purple
+  "#3dbdbd",  // teal/cyan
+  "#e05fa0",  // pink
 ];
 
 const LINE_STYLES = [
@@ -2038,7 +2240,72 @@ const LINE_STYLES = [
 const DEFAULT_PLOT_STYLE = {
   font: "'DM Mono', monospace", fontSize: 11, box: "solid",
   grid: "dashed", lineWidth: 1.5, ticks: false, tickLen: 4,
+  plotWidth: null, plotHeight: null,
+  rsmBins: 256, rsmColorbar: false, rsmLogIntensity: true,
+  rsmXMin: null, rsmXMax: null, rsmYMin: null, rsmYMax: null,
+  rsmBgSub: true, rsmBgPct: 5, rsmWhiteFade: 0.15, rsmQ2pi: false,
+  colorScale: "viridis", colorTrim: 5,
 };
+
+// Convert a named colour scale to a Plotly [[t, hex], …] colorscale array.
+// bgFade (0–1): fraction of the scale used for a bg-color → colorscale ramp at the bottom;
+// the original colorscale is then compressed into [bgFade, 1].
+function makeHeatmapColorscale(scaleName, bgFade = 0) {
+  const anchors = COLOR_SCALES[scaleName] || COLOR_SCALES.viridis;
+  const base = anchors.map((color, i) => [i / (anchors.length - 1), color]);
+  if (!bgFade || bgFade <= 0) return base;
+  const compressed = base.map(([t, color]) => [bgFade + t * (1 - bgFade), color]);
+  return [[0, T.bg0], ...compressed];
+}
+
+// Bin raw RSM points into an nx×ny grid, taking max-z per cell.
+// xRange/yRange: [min,max] from caller (already padded); null = auto from data.
+// logIntensity: apply log10 transform to z values.
+// bgSub: subtract the bgPct-th percentile of occupied cells before transform.
+// Returns { x, y, z, xDomain, yDomain } or null.
+function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true, bgSub = false, bgPct = 5) {
+  if (!data.length) return null;
+  let xMin, xMax, yMin, yMax;
+  if (xRange) { [xMin, xMax] = xRange; } else {
+    xMin = Infinity; xMax = -Infinity;
+    for (const d of data) { if (d.x < xMin) xMin = d.x; if (d.x > xMax) xMax = d.x; }
+    const xp = (xMax - xMin) * 0.05; xMin -= xp; xMax += xp;
+  }
+  if (yRange) { [yMin, yMax] = yRange; } else {
+    yMin = Infinity; yMax = -Infinity;
+    for (const d of data) { if (d.y < yMin) yMin = d.y; if (d.y > yMax) yMax = d.y; }
+    const yp = (yMax - yMin) * 0.05; yMin -= yp; yMax += yp;
+  }
+  const xStep = (xMax - xMin) / nx, yStep = (yMax - yMin) / ny;
+  const grid = new Float32Array(nx * ny);
+  for (const d of data) {
+    if (d.x < xMin || d.x > xMax || d.y < yMin || d.y > yMax) continue;
+    const xi = Math.min(nx - 1, Math.floor((d.x - xMin) / xStep));
+    const yi = Math.min(ny - 1, Math.floor((d.y - yMin) / yStep));
+    const idx = yi * nx + xi;
+    if (d.z > grid[idx]) grid[idx] = d.z;
+  }
+  // Background subtraction: find Nth percentile of occupied cells and remove it.
+  if (bgSub) {
+    const occupied = [];
+    for (let i = 0; i < grid.length; i++) { if (grid[i] > 0) occupied.push(grid[i]); }
+    if (occupied.length > 0) {
+      occupied.sort((a, b) => a - b);
+      const bgVal = occupied[Math.min(Math.floor(occupied.length * bgPct / 100), occupied.length - 1)];
+      for (let i = 0; i < grid.length; i++) { if (grid[i] > 0) grid[i] = Math.max(0, grid[i] - bgVal); }
+    }
+  }
+  const x = Array.from({ length: nx }, (_, i) => xMin + (i + 0.5) * xStep);
+  const y = Array.from({ length: ny }, (_, j) => yMin + (j + 0.5) * yStep);
+  const z = Array.from({ length: ny }, (_, j) =>
+    Array.from({ length: nx }, (_, i) => {
+      const v = grid[j * nx + i];
+      if (v <= 0) return null;
+      return logIntensity ? Math.log10(v) : v;
+    })
+  );
+  return { x, y, z, xDomain: [xMin, xMax], yDomain: [yMin, yMax] };
+}
 
 // Generate evenly-spaced ticks at a given interval across [lo, hi].
 // Returns null if interval is falsy (caller uses auto ticks).
@@ -2051,7 +2318,7 @@ function makeTicks(lo, hi, interval) {
   return ticks.length ? ticks : null;
 }
 
-function buildPlotLayout(ps, xaxisExtra = {}, yaxisExtra = {}, extraShapes = []) {
+function buildPlotLayout(ps, xaxisExtra = {}, yaxisExtra = {}, extraShapes = [], layoutOverrides = {}) {
   const gridDash = { dotted: "dot", dashed: "dash", solid: "solid" }[ps.grid] || "dash";
   const axisBase = {
     showgrid: false, showline: false,
@@ -2073,8 +2340,11 @@ function buildPlotLayout(ps, xaxisExtra = {}, yaxisExtra = {}, extraShapes = [])
       dash: ps.box === "dashed" ? "dash" : "solid",
     },
   }] : [];
+  const w = ps.plotWidth  ? Math.round(ps.plotWidth  * 96) : null;
+  const h = ps.plotHeight ? Math.round(ps.plotHeight * 96) : null;
   return {
-    autosize: true, uirevision: "plot",
+    ...(w || h ? { autosize: false, ...(w ? { width: w } : {}), ...(h ? { height: h } : {}) } : { autosize: true }),
+    uirevision: "plot",
     margin: { t: 12, r: 20, b: 52, l: 72, pad: 0 },
     paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
     font: { family: ps.font, size: ps.fontSize, color: T.textPrimary },
@@ -2084,6 +2354,7 @@ function buildPlotLayout(ps, xaxisExtra = {}, yaxisExtra = {}, extraShapes = [])
       ...axisBase, ...spikeProps,
       showgrid: ps.grid !== "off", gridcolor: T.border, griddash: gridDash, color: T.textDim,
       tickfont: { size: ps.fontSize - 1, family: ps.font, color: T.textDim },
+      ...(xaxisExtra.tickvals ? { tickmode: "array" } : {}),
       ...xaxisExtra,
     },
     yaxis: {
@@ -2091,42 +2362,63 @@ function buildPlotLayout(ps, xaxisExtra = {}, yaxisExtra = {}, extraShapes = [])
       showgrid: ps.grid !== "off", gridcolor: T.border, griddash: gridDash, color: T.textDim,
       tickfont: { size: ps.fontSize - 1, family: ps.font, color: T.textDim },
       ticklabelstandoff: 4,
+      ...(yaxisExtra.tickvals ? { tickmode: "array" } : {}),
       ...yaxisExtra,
     },
     shapes: [...boxShapes, ...extraShapes],
+    ...layoutOverrides,
   };
 }
 
-function buildPlotConfig(filename = "plot") {
+function buildPlotConfig(filename = "plot", ps = null) {
+  const hasSizeOverride = !!(ps?.plotWidth || ps?.plotHeight);
+  // Export helper: temporarily clears background colours for transparent output, then restores.
+  const exportTransparent = async (gd, format) => {
+    const { paper_bgcolor, plot_bgcolor } = gd.layout;
+    await window.Plotly.relayout(gd, { paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)" });
+    try {
+      return await window.Plotly.toImage(gd, { format });
+    } finally {
+      await window.Plotly.relayout(gd, { paper_bgcolor, plot_bgcolor });
+    }
+  };
   return {
-    responsive: true, displayModeBar: true, displaylogo: false,
-    modeBarButtonsToRemove: ["lasso2d", "select2d", "autoScale2d"],
-    modeBarButtonsToAdd: [{
-      name: "copyImage", title: "Copy to clipboard",
-      icon: { width: 24, height: 24, path: "M16 1H4C2.9 1 2 1.9 2 3v14h2V3h12V1zm3 4H8C6.9 5 6 5.9 6 7v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z" },
-      click: async (gd) => {
-        try {
-          const dataUrl = await window.Plotly.toImage(gd, { format: "png", scale: 2, width: 900, height: 400 });
-          const blob = await fetch(dataUrl).then(r => r.blob());
-          await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-        } catch (err) { console.error("Copy to clipboard failed:", err); }
+    responsive: !hasSizeOverride, displayModeBar: true, displaylogo: false,
+    modeBarButtonsToRemove: ["lasso2d", "select2d", "autoScale2d", "toImage"],
+    modeBarButtonsToAdd: [
+      {
+        name: "downloadSVG", title: "Download as SVG",
+        icon: { width: 24, height: 24, path: "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" },
+        click: async (gd) => {
+          try {
+            const dataUrl = await exportTransparent(gd, "svg");
+            const a = document.createElement("a");
+            a.href = dataUrl; a.download = `${filename}.svg`;
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+          } catch (err) { console.error("Download failed:", err); }
+        },
       },
-    }],
-    toImageButtonOptions: { format: "svg", filename, width: 900, height: 400 },
+      {
+        name: "copyImage", title: "Copy to clipboard",
+        icon: { width: 24, height: 24, path: "M16 1H4C2.9 1 2 1.9 2 3v14h2V3h12V1zm3 4H8C6.9 5 6 5.9 6 7v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z" },
+        click: async (gd) => {
+          try {
+            const dataUrl = await exportTransparent(gd, "png");
+            const blob = await fetch(dataUrl).then(r => r.blob());
+            await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+          } catch (err) { console.error("Copy to clipboard failed:", err); }
+        },
+      },
+    ],
   };
 }
 
-// yTickMaxStr: longest y-axis tick label string (e.g. "1500", "-25").
-// Used to push the cursor label clear of the tick labels + any inward tick marks.
-function SciPlotWrap({ ps, cursorLabel, yTickMaxStr = "", children }) {
+function SciPlotWrap({ ps, cursorLabel, children }) {
   const [cursor, setCursor] = useState(null);
-  const child = typeof children === "function" ? children(setCursor) : children;
-  // Tick labels are right-aligned, ending at margin.l(72) - ticklabelstandoff(4) = 68 px.
-  // Estimate their width: char count × ~0.62× font-size (DM Mono is roughly monospaced).
-  const tickLabelW = Math.ceil(yTickMaxStr.length * ps.fontSize * 0.62);
-  // Cursor label starts after: tick label left edge + gap + inward tick overhang.
-  const tickInset = ps.ticks ? ps.tickLen : 0;
-  const cursorLeft = Math.max(72, 68 - tickLabelW) + tickLabelW + tickInset + 10;
+  // Memoize the Plot element so cursor state updates don't re-render Plotly
+  // (which would cause zoom/pan to snap back). Only rebuilds when parent data changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const child = useMemo(() => typeof children === "function" ? children(setCursor) : children, [children]);
   return (
     <div className="sci-plot-wrap">
       <div style={{ height: 30 }} />
@@ -2135,7 +2427,7 @@ function SciPlotWrap({ ps, cursorLabel, yTickMaxStr = "", children }) {
           {child}
         </Suspense>
         {cursor != null && (
-          <div style={{ position: "absolute", top: 20, left: cursorLeft, fontFamily: ps.font, fontSize: ps.fontSize, color: T.textSecondary, pointerEvents: "none", userSelect: "none", letterSpacing: "0.02em" }}>
+          <div style={{ position: "absolute", top: 20, left: 80, fontFamily: ps.font, fontSize: ps.fontSize, color: T.textSecondary, pointerEvents: "none", userSelect: "none", letterSpacing: "0.02em" }}>
             {cursorLabel(cursor)}
           </div>
         )}
@@ -2147,8 +2439,7 @@ function SciPlotWrap({ ps, cursorLabel, yTickMaxStr = "", children }) {
 // ── XRD ω–2θ comparison ───────────────────────────────────────────────────────
 
 function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, config, plotStyle, structures = [], onUpdate }) {
-  const ps = plotStyle || { font: "'DM Mono', monospace", fontSize: 11, box: "solid", lineWidth: 1.5 };
-  const [cursor, setCursor] = useState(null);
+  const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const offsetDecades = config.offset_decades ?? 2;
   const thetaMin  = config.theta_min  != null ? Number(config.theta_min)  : null;
   const thetaMax  = config.theta_max  != null ? Number(config.theta_max)  : null;
@@ -2228,134 +2519,50 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lines, structures]);
 
+  const lineShapes = lines.map((ln, i) => {
+    const tt = lineEffStructs[i] ? calcTwoTheta(lineEffStructs[i], ln.hkl) : null;
+    if (tt == null) return null;
+    return {
+      type: "line", xref: "x", yref: "paper",
+      x0: tt, x1: tt, y0: 0, y1: 1, layer: "above",
+      line: { color: ln.color, width: ps.lineWidth, dash: ln.style === "dashed" ? "dash" : ln.style === "dotted" ? "dot" : "solid" },
+    };
+  }).filter(Boolean);
+
+  const plotlyTraces = traces.map(t => ({
+    x: t.data.map(p => p.x), y: t.data.map(p => p.y),
+    type: "scatter", mode: "lines",
+    line: { color: t.color, width: ps.lineWidth },
+    showlegend: false, hovertemplate: "<extra></extra>",
+  }));
+
+  const layout = buildPlotLayout(ps,
+    { range: xDomain[0] === "auto" ? undefined : xDomain, tickvals: xTicks.length ? xTicks : undefined,
+      tickformat: "~d",
+      title: { text: "2θ (°)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+    { type: "log", range: [Math.log10(yDomMin), Math.log10(yDomMax)],
+      showticklabels: false, showgrid: false,
+      title: { text: "Intensity (arb.)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
+    lineShapes,
+    { uirevision: "xrd", dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 } }
+  );
+
   return (
     <div>
-      <div style={{ display: "flex", gap: 12, marginBottom: 12, alignItems: "flex-end", flexWrap: "wrap" }}>
-        <PanelInput label="Offset (decades)" value={config.offset_decades ?? 2} placeholder="2" step="0.5" width={90}
-          onChange={e => onUpdate({ offset_decades: parseFloat(e.target.value) === 0 ? 0 : (parseFloat(e.target.value) || 2) })} />
-        <PanelInput label="2θ min" value={config.theta_min ?? ""} placeholder="auto"
-          onChange={e => onUpdate({ theta_min: e.target.value === "" ? null : Number(e.target.value) })} />
-        <PanelInput label="2θ max" value={config.theta_max ?? ""} placeholder="auto"
-          onChange={e => onUpdate({ theta_max: e.target.value === "" ? null : Number(e.target.value) })} />
-        <PanelInput label="Pad above (dec.)" value={config.pad_above ?? 2} placeholder="2" step="0.5" width={80}
-          onChange={e => onUpdate({ pad_above: parseFloat(e.target.value) === 0 ? 0 : (parseFloat(e.target.value) || 2) })} />
-        <PanelInput label="Pad below (dec.)" value={config.pad_below ?? 1} placeholder="1" step="0.5" width={80}
-          onChange={e => onUpdate({ pad_below: parseFloat(e.target.value) === 0 ? 0 : (parseFloat(e.target.value) || 1) })} />
-      </div>
       {traces.length === 0 ? (
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No XRD ω–2θ data loaded for selected samples.</div>
-      ) : (() => {
-        const gridDash = { dotted: "dot", dashed: "dash", solid: "solid" }[ps.grid] || "dash";
-        const shapes = [
-          ...(ps.box !== "off" ? [{
-            type: "rect", xref: "paper", yref: "paper",
-            x0: 0, y0: 0, x1: 1, y1: 1, layer: "above",
-            line: {
-              color: ps.box === "solid" ? T.textPrimary : T.borderBright,
-              width: ps.box === "solid" ? 1.5 : 1,
-              dash:  ps.box === "dashed" ? "dash" : "solid",
-            },
-          }] : []),
-          ...lines.map((ln, i) => {
-            const tt = lineEffStructs[i] ? calcTwoTheta(lineEffStructs[i], ln.hkl) : null;
-            if (tt == null) return null;
-            return {
-              type: "line", xref: "x", yref: "paper",
-              x0: tt, x1: tt, y0: 0, y1: 1, layer: "above",
-              line: {
-                color: ln.color, width: ps.lineWidth,
-                dash: ln.style === "dashed" ? "dash" : ln.style === "dotted" ? "dot" : "solid",
-              },
-            };
-          }).filter(Boolean),
-        ];
-        const axisBase = {
-          showgrid: false, zeroline: false, showline: false,
-          ticks:   ps.ticks ? "inside" : "",
-          ticklen: ps.ticks ? ps.tickLen : 0,
-          mirror:  ps.ticks ? "ticks" : false,
-        };
-        const plotlyTraces = traces.map(t => ({
-          x: t.data.map(p => p.x),
-          y: t.data.map(p => p.y),
-          type: "scatter", mode: "lines",
-          line: { color: t.color, width: ps.lineWidth },
-          showlegend: false,
-          hovertemplate: "<extra></extra>",
-        }));
-        const layout = {
-          autosize: true, uirevision: "xrd",
-          margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 },
-          paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
-          font: { family: ps.font, size: ps.fontSize, color: T.textPrimary },
-          hovermode: "x", hoverdistance: 40,
-          hoverlabel: { bgcolor: "rgba(0,0,0,0)", bordercolor: "rgba(0,0,0,0)", font: { color: "rgba(0,0,0,0)" } },
-          dragmode: "zoom",
-          xaxis: {
-            ...axisBase,
-            title: { text: "2θ (°)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 },
-            range: xDomain[0] === "auto" ? undefined : xDomain,
-            tickvals: xTicks.length ? xTicks : undefined,
-            tickformat: "~d",
-            tickfont: { size: ps.fontSize - 1, family: ps.font, color: T.textDim },
-            showgrid: ps.grid !== "off", gridcolor: T.border, griddash: gridDash, color: T.textDim,
-            showspikes: true, spikemode: "across", spikecolor: T.textDim,
-            spikethickness: 1, spikedash: "dot", spikesnap: "cursor",
-          },
-          yaxis: {
-            ...axisBase,
-            title: { text: "Intensity (arb.)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 },
-            type: "log", range: [Math.log10(yDomMin), Math.log10(yDomMax)],
-            showticklabels: false, color: T.textDim,
-          },
-          shapes,
-        };
-        const plotConfig = {
-          responsive: true, displayModeBar: true, displaylogo: false,
-          modeBarButtonsToRemove: ["lasso2d", "select2d", "autoScale2d"],
-          modeBarButtonsToAdd: [{
-            name: "copyImage", title: "Copy to clipboard",
-            icon: { width: 24, height: 24, path: "M16 1H4C2.9 1 2 1.9 2 3v14h2V3h12V1zm3 4H8C6.9 5 6 5.9 6 7v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z" },
-            click: async (gd) => {
-              try {
-                const dataUrl = await window.Plotly.toImage(gd, { format: "png", scale: 2, width: 900, height: 400 });
-                const blob = await fetch(dataUrl).then(r => r.blob());
-                await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-              } catch (err) { console.error("Copy to clipboard failed:", err); }
-            },
-          }],
-          toImageButtonOptions: { format: "svg", filename: "xrd", width: 900, height: 400 },
-        };
-        return (
-          <>
-            <div className="xrd-plot-wrap">
-              <div style={{ height: 30 }} />
-              <div style={{ position: "relative" }} onMouseLeave={() => setCursor(null)}>
-                <Suspense fallback={<div style={{ height: 320, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>Loading chart…</div>}>
-                  <Plot data={plotlyTraces} layout={layout} config={plotConfig}
-                    style={{ width: "100%", height: "320px" }}
-                    useResizeHandler
-                    onHover={e => {
-                      const x = e.xvals?.[0] ?? e.points?.[0]?.x;
-                      if (x != null) setCursor({ x });
-                    }} />
-                </Suspense>
-                {cursor && (
-                  <div style={{
-                    position: "absolute", top: 20, left: 74,
-                    fontFamily: ps.font, fontSize: ps.fontSize,
-                    color: T.textSecondary, pointerEvents: "none", userSelect: "none",
-                    letterSpacing: "0.02em",
-                  }}>
-                    2θ = {cursor.x.toFixed(3)}°
-                  </div>
-                )}
-              </div>
-            </div>
-            <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} />
-          </>
-        );
-      })()}
+      ) : (
+        <>
+          <SciPlotWrap ps={ps} cursorLabel={x => `2θ = ${x.toFixed(3)}°`}>
+            {setCursor => (
+              <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("xrd", ps)}
+                style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
+                onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+            )}
+          </SciPlotWrap>
+          <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} />
+        </>
+      )}
 
       {/* Peak lines */}
       {openPicker && <div onClick={() => setOpenPicker(null)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />}
@@ -2400,76 +2607,75 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
               <DeferredInput value={ln.hkl} onChange={v => updateLine(ln.id, { hkl: v })}
                 placeholder="hkl"
                 style={{ ...rc, width: 64, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center" }} />
-              {/* Bulk / Strained toggle */}
-              <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}`, flexShrink: 0 }}>
-                {["bulk", "strained"].map(m => (
-                  <button key={m} onClick={() => updateLine(ln.id, { mode: m })}
-                    style={{ ...rc, background: ln.mode === m ? T.bg3 : T.bg0, border: "none", borderRight: m === "bulk" ? `1px solid ${T.border}` : "none", color: ln.mode === m ? T.textPrimary : T.textDim, textTransform: "uppercase", letterSpacing: 0.5 }}>
-                    {m}
-                  </button>
-                ))}
-              </div>
-              {/* Configure + substrate (strained only) */}
-              {isStrained && (<>
-                <div style={{ position: "relative", zIndex: 50 }}>
-                  <button onClick={e => { e.stopPropagation(); setOpenPicker(cfgOpen ? null : { id: ln.id, type: "strainCfg" }); }}
-                    style={{ ...rc, background: cfgOpen ? T.bg3 : T.bg0, border: `1px solid ${cfgOpen ? T.borderBright : T.border}`, color: T.textSecondary }}>
-                    Configure
-                  </button>
-                  {cfgOpen && (
-                    <div onClick={e => e.stopPropagation()}
-                      style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 200, boxShadow: "0 4px 16px rgba(0,0,0,.55)", minWidth: 280, display: "flex", flexDirection: "column", gap: 12 }}>
-                      {[
-                        { id: "substrate",        label: "Strain based on substrate" },
-                        { id: "arbitrary_strain",  label: "Arbitrary strain (biaxial)" },
-                        { id: "arbitrary_lattice", label: "Arbitrary in-plane lattice parameter" },
-                      ].map(opt => (
-                        <div key={opt.id} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                          <div onClick={() => updateLine(ln.id, { strain_mode: opt.id })}
-                            style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-                            <div style={{ width: 14, height: 14, borderRadius: "50%", border: `2px solid ${smode === opt.id ? T.teal : T.border}`, background: smode === opt.id ? T.teal : "transparent", flexShrink: 0, transition: "all .12s" }} />
-                            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: smode === opt.id ? T.textPrimary : T.textDim }}>{opt.label}</span>
-                          </div>
-                          {smode === opt.id && opt.id === "arbitrary_strain" && (
-                            <div style={{ display: "flex", gap: 10, marginLeft: 22 }}>
-                              {[["strain_eps_xx", "ε_xx"], ["strain_eps_yy", "ε_yy"]].map(([k, lbl]) => (
-                                <div key={k} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                                  <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{lbl}</span>
-                                  <DeferredInput type="number" value={ln[k] ?? ""} placeholder="0.000"
-                                    onChange={v => updateLine(ln.id, { [k]: v })}
-                                    style={{ ...rc, width: 88, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text" }} />
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                          {smode === opt.id && opt.id === "arbitrary_lattice" && (
-                            <div style={{ display: "flex", gap: 10, marginLeft: 22 }}>
-                              {[["strain_a", "a (Å)"], ["strain_b", "b (Å)"]].map(([k, lbl]) => (
-                                <div key={k} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                                  <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{lbl}</span>
-                                  <DeferredInput type="number" value={ln[k] ?? ""} placeholder="—"
-                                    onChange={v => updateLine(ln.id, { [k]: v })}
-                                    style={{ ...rc, width: 88, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text" }} />
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
+              {/* Configure (bulk/strained + strain settings) */}
+              <div style={{ position: "relative", zIndex: 50 }}>
+                <button onClick={e => { e.stopPropagation(); setOpenPicker(cfgOpen ? null : { id: ln.id, type: "strainCfg" }); }}
+                  style={{ ...rc, background: cfgOpen ? T.bg3 : T.bg0, border: `1px solid ${cfgOpen ? T.borderBright : isStrained ? T.teal : T.border}`, color: isStrained ? T.teal : T.textSecondary }}>
+                  Configure
+                </button>
+                {cfgOpen && (
+                  <div onClick={e => e.stopPropagation()}
+                    style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 200, boxShadow: "0 4px 16px rgba(0,0,0,.55)", minWidth: 280, display: "flex", flexDirection: "column", gap: 12 }}>
+                    {/* Bulk / Strained toggle */}
+                    <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}`, alignSelf: "flex-start" }}>
+                      {["bulk", "strained"].map(m => (
+                        <button key={m} onClick={() => updateLine(ln.id, { mode: m })}
+                          style={{ ...rc, background: ln.mode === m ? T.bg3 : T.bg0, border: "none", borderRight: m === "bulk" ? `1px solid ${T.border}` : "none", color: ln.mode === m ? T.textPrimary : T.textDim, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                          {m}
+                        </button>
                       ))}
                     </div>
-                  )}
-                </div>
-                {smode === "substrate" && (
-                  <select value={ln.substrate} onChange={e => updateLine(ln.id, { substrate: e.target.value })}
-                    style={{ ...rc, background: T.bg0, border: `1px solid ${T.border}`, color: T.textSecondary }}>
-                    <option value="">— substrate —</option>
-                    {structures.filter(s => s.name !== ln.material).map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
-                    {lines.map((other, j) => j !== i && (
-                      <option key={`entry:${j}`} value={`entry:${j}`}>Entry {j + 1}</option>
+                    {/* Strain options (only when strained) */}
+                    {isStrained && [
+                      { id: "substrate",         label: "Strain based on substrate" },
+                      { id: "arbitrary_strain",  label: "Arbitrary strain (biaxial)" },
+                      { id: "arbitrary_lattice", label: "Arbitrary lattice parameter" },
+                    ].map(opt => (
+                      <div key={opt.id} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        <div onClick={() => updateLine(ln.id, { strain_mode: opt.id })}
+                          style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                          <div style={{ width: 14, height: 14, borderRadius: "50%", border: `2px solid ${smode === opt.id ? T.teal : T.border}`, background: smode === opt.id ? T.teal : "transparent", flexShrink: 0, transition: "all .12s" }} />
+                          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: smode === opt.id ? T.textPrimary : T.textDim }}>{opt.label}</span>
+                        </div>
+                        {smode === opt.id && opt.id === "substrate" && (
+                          <select value={ln.substrate} onChange={e => updateLine(ln.id, { substrate: e.target.value })}
+                            style={{ ...rc, marginLeft: 22, background: T.bg0, border: `1px solid ${T.border}`, color: T.textSecondary }}>
+                            <option value="">— substrate —</option>
+                            {structures.filter(s => s.name !== ln.material).map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
+                            {lines.map((other, j) => j !== i && (
+                              <option key={`entry:${j}`} value={`entry:${j}`}>Entry {j + 1}</option>
+                            ))}
+                          </select>
+                        )}
+                        {smode === opt.id && opt.id === "arbitrary_strain" && (
+                          <div style={{ display: "flex", gap: 10, marginLeft: 22 }}>
+                            {[["strain_eps_xx", "ε_xx"], ["strain_eps_yy", "ε_yy"]].map(([k, lbl]) => (
+                              <div key={k} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{lbl}</span>
+                                <DeferredInput type="number" value={ln[k] ?? ""} placeholder="0.000"
+                                  onChange={v => updateLine(ln.id, { [k]: v })}
+                                  style={{ ...rc, width: 88, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text" }} />
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {smode === opt.id && opt.id === "arbitrary_lattice" && (
+                          <div style={{ display: "flex", gap: 10, marginLeft: 22 }}>
+                            {[["strain_a", "a (Å)"], ["strain_b", "b (Å)"]].map(([k, lbl]) => (
+                              <div key={k} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{lbl}</span>
+                                <DeferredInput type="number" value={ln[k] ?? ""} placeholder="—"
+                                  onChange={v => updateLine(ln.id, { [k]: v })}
+                                  style={{ ...rc, width: 88, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text" }} />
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     ))}
-                  </select>
+                  </div>
                 )}
-              </>)}
+              </div>
               {/* calculated 2θ */}
               <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: twoTheta != null ? T.teal : T.textDim, minWidth: 60 }}>
                 {twoTheta != null ? `${twoTheta.toFixed(3)}°` : "—"}
@@ -2571,10 +2777,10 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
         <LoopToggle value={peLoop} onChange={setPeLoop} />
       </div>
-      <SciPlotWrap ps={ps} cursorLabel={x => `E = ${x.toFixed(3)} kV/cm`} yTickMaxStr={String(-absYMax)}>
+      <SciPlotWrap ps={ps} cursorLabel={x => `E = ${x.toFixed(3)} kV/cm`}>
         {setCursor => (
-          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("pe-hysteresis")}
-            style={{ width: "100%", height: "320px" }} useResizeHandler
+          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("pe-hysteresis", ps)}
+            style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
             onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
         )}
       </SciPlotWrap>
@@ -2585,33 +2791,311 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
 // ── RSM comparison ────────────────────────────────────────────────────────────
 
-function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {} }) {
+function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotStyle, config = {}, onUpdate, structures = [] }) {
+  const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const rsmCfg = MEAS_TYPES.rsm;
   const entries = sampleOrder.map((sid, i) => ({
     sid, color: colors[i], data: plotCache[sid]?.rsm || [],
   })).filter(e => e.data.length > 0);
 
-  if (!entries.length) return (
-    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No RSM data loaded for selected samples.</div>
-  );
+  // Migrate old-format points: (1) pre-XRD schema had raw qx/qz, no hkl;
+  // (2) old qxqz mode → now "__arbitrary__" material
+  const points = (config.rsm_points || []).map(p => {
+    if (p.hkl === undefined) return { id: p.id, material: p.material || "", hkl: "", mode: "bulk", substrate: "", color: p.color || RSM_POINT_COLORS[0] };
+    if (p.mode === "qxqz") return { ...p, material: "__arbitrary__", mode: "bulk" };
+    return p;
+  });
+  const addPoint    = () => onUpdate({ rsm_points: [...points, { id: String(Date.now()), material: structures[0]?.name || "", hkl: "", mode: "bulk", substrate: "", color: RSM_POINT_COLORS[points.length % RSM_POINT_COLORS.length], symbol: "cross", markerSize: 9 }] });
+  const updatePoint = (id, patch) => onUpdate({ rsm_points: points.map(p => p.id === id ? { ...p, ...patch } : p) });
+  const removePoint = (id) => onUpdate({ rsm_points: points.filter(p => p.id !== id) });
 
-  let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
-  for (const e of entries) for (const p of e.data) {
-    if (p.x < xMin) xMin = p.x; if (p.x > xMax) xMax = p.x;
-    if (p.y < yMin) yMin = p.y; if (p.y > yMax) yMax = p.y;
+  const [openPicker, setOpenPicker] = useState(null);
+  const [dragIdx, setDragIdx] = useState(null);
+  const [dragOverIdx, setDragOverIdx] = useState(null);
+
+  const reorderPoints = (fromIdx, toIdx) => {
+    if (fromIdx === toIdx) return;
+    const order = [...Array(points.length).keys()];
+    const [moved] = order.splice(fromIdx, 1);
+    order.splice(toIdx, 0, moved);
+    const oldToNew = new Array(points.length);
+    order.forEach((oldIdx, newIdx) => { oldToNew[oldIdx] = newIdx; });
+    const reordered = order.map(oldIdx => {
+      const pt = points[oldIdx];
+      if (!pt.substrate?.startsWith("entry:")) return pt;
+      const oldRef = parseInt(pt.substrate.slice(6));
+      const newRef = oldToNew[oldRef];
+      return newRef != null ? { ...pt, substrate: `entry:${newRef}` } : pt;
+    });
+    onUpdate({ rsm_points: reordered });
+  };
+
+  const pointEffStructs = useMemo(() => {
+    const q2pi = ps.rsmQ2pi ?? false;
+    const eff = new Array(points.length).fill(null);
+    const compute = (pt, i) => {
+      if (pt.material === "__arbitrary__") return null;
+      const film = structures.find(s => s.name === pt.material);
+      if (!film) return null;
+      if (pt.mode !== "strained") return film;
+      // arbitrary_q: derive in-plane a/b from measured Qx/Qy and h/k of the reflection
+      if (pt.strain_mode === "arbitrary_q") {
+        const qx = parseFloat(pt.strain_qx);
+        if (isNaN(qx) || qx === 0) return calcStrainedStruct(film, null, { ...pt, strain_mode: "arbitrary_strain" }) || film;
+        const hkl = parseHKL(pt.hkl);
+        const h = Math.abs(hkl?.h ?? 1) || Math.abs(hkl?.k ?? 1) || 1;
+        const k = Math.abs(hkl?.k ?? h) || h;
+        const factor = q2pi ? 2 * Math.PI : 10;
+        const a_in = factor * h / qx;
+        const qy = parseFloat(pt.strain_qy);
+        const b_in = (!isNaN(qy) && qy !== 0) ? factor * k / qy : a_in;
+        return calcStrainedStruct(film, null, { ...pt, strain_mode: "arbitrary_lattice", strain_a: String(a_in), strain_b: String(b_in) }) || null;
+      }
+      let sub;
+      if (pt.substrate?.startsWith("entry:")) {
+        const ref = parseInt(pt.substrate.slice(6));
+        sub = (ref >= 0 && ref < points.length && ref !== i) ? eff[ref] : null;
+      } else {
+        sub = structures.find(s => s.name === pt.substrate) || null;
+      }
+      return calcStrainedStruct(film, sub, pt) || null;
+    };
+    points.forEach((pt, i) => { eff[i] = compute(pt, i); });
+    points.forEach((pt, i) => { if (pt.substrate?.startsWith("entry:")) eff[i] = compute(pt, i); });
+    return eff;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [points, structures, ps.rsmQ2pi]);
+
+  // Compute (qx, qz) for each point to pass to RSMPlot
+  const q2pi = ps.rsmQ2pi ?? false;
+  const resolvedPoints = points.map((pt, i) => {
+    let pos;
+    if (pt.material === "__arbitrary__") {
+      const qx = parseFloat(pt.manual_qx), qz = parseFloat(pt.manual_qz);
+      pos = (!isNaN(qx) && !isNaN(qz)) ? { qx, qz } : null;
+    } else {
+      pos = pointEffStructs[i] ? calcQxQz(pointEffStructs[i], pt.hkl, q2pi) : null;
+    }
+    const label = pt.material === "__arbitrary__" ? "Arbitrary" : (pt.material && pt.hkl ? `${pt.material} ${pt.hkl}` : "");
+    return pos ? { id: pt.id, qx: pos.qx, qz: pos.qz, color: pt.color, symbol: pt.symbol || "cross", markerSize: pt.markerSize ?? 9, label } : null;
+  }).filter(Boolean);
+
+  let forcedXDomain = null, forcedYDomain = null;
+  if (entries.length) {
+    let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+    for (const e of entries) for (const p of e.data) {
+      if (p.x < xMin) xMin = p.x; if (p.x > xMax) xMax = p.x;
+      if (p.y < yMin) yMin = p.y; if (p.y > yMax) yMax = p.y;
+    }
+    const xp = (xMax - xMin) * 0.05, yp = (yMax - yMin) * 0.05;
+    forcedXDomain = [ps.rsmXMin != null ? ps.rsmXMin : xMin - xp, ps.rsmXMax != null ? ps.rsmXMax : xMax + xp];
+    forcedYDomain = [ps.rsmYMin != null ? ps.rsmYMin : yMin - yp, ps.rsmYMax != null ? ps.rsmYMax : yMax + yp];
   }
-  const xp = (xMax - xMin) * 0.05, yp = (yMax - yMin) * 0.05;
-  const forcedXDomain = [xMin - xp, xMax + xp];
-  const forcedYDomain = [yMin - yp, yMax + yp];
+
+  const rc = { fontFamily: "'DM Mono', monospace", fontSize: 11, borderRadius: 4, padding: "4px 8px", boxSizing: "border-box", outline: "none", cursor: "pointer" };
+  const pointRows = (
+    <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 6 }}>
+        {openPicker && <div onClick={() => setOpenPicker(null)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />}
+        {points.map((pt, i) => {
+          const effStruct   = pointEffStructs[i];
+          const isArbitrary = pt.material === "__arbitrary__";
+          const pos         = isArbitrary
+            ? (() => { const qx = parseFloat(pt.manual_qx), qz = parseFloat(pt.manual_qz); return (!isNaN(qx) && !isNaN(qz)) ? { qx, qz } : null; })()
+            : (effStruct ? calcQxQz(effStruct, pt.hkl, q2pi) : null);
+          const colorOpen   = openPicker?.id === pt.id && openPicker?.type === "color";
+          const cfgOpen     = openPicker?.id === pt.id && openPicker?.type === "strainCfg";
+          const shapeOpen   = openPicker?.id === pt.id && openPicker?.type === "shape";
+          const isStrained  = pt.mode === "strained";
+          const smode       = pt.strain_mode || "substrate";
+          const anyOpen     = colorOpen || cfgOpen || shapeOpen;
+          const isDragging  = dragIdx === i;
+          const isDropTarget = dragOverIdx === i && dragIdx !== i;
+          return (
+            <div key={pt.id}
+              draggable
+              onDragStart={e => { e.dataTransfer.effectAllowed = "move"; setDragIdx(i); }}
+              onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setDragOverIdx(i); }}
+              onDragLeave={() => setDragOverIdx(null)}
+              onDrop={e => { e.preventDefault(); reorderPoints(dragIdx, i); setDragIdx(null); setDragOverIdx(null); }}
+              onDragEnd={() => { setDragIdx(null); setDragOverIdx(null); }}
+              style={{ display: "flex", alignItems: "center", gap: 6, position: "relative", zIndex: anyOpen ? 100 : "auto",
+                opacity: isDragging ? 0.4 : 1, borderRadius: 5,
+                outline: isDropTarget ? `2px solid ${T.teal}` : "2px solid transparent",
+                transition: "opacity .15s, outline-color .1s" }}>
+              <span title="Drag to reorder" style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, minWidth: 16, textAlign: "right", flexShrink: 0, cursor: "grab", userSelect: "none" }}>{i + 1}</span>
+              {/* Material */}
+              <select value={pt.material} onChange={e => updatePoint(pt.id, { material: e.target.value })}
+                style={{ ...rc, background: T.bg0, border: `1px solid ${T.border}`, color: T.textSecondary }}>
+                <option value="__arbitrary__">— arbitrary —</option>
+                <option value="">— material —</option>
+                {structures.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
+              </select>
+              {/* hkl OR inline Qx/Qz for arbitrary */}
+              {isArbitrary ? (
+                <div style={{ display: "flex", gap: 4 }}>
+                  {[["manual_qx", "Qx"], ["manual_qz", "Qz"]].map(([k, lbl]) => (
+                    <DeferredInput key={k} type="number" value={pt[k] ?? ""} step="any" placeholder={lbl}
+                      onChange={v => updatePoint(pt.id, { [k]: v === "" ? "" : Number(v) })}
+                      style={{ ...rc, width: 72, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text" }} />
+                  ))}
+                </div>
+              ) : (
+                <DeferredInput value={pt.hkl} onChange={v => updatePoint(pt.id, { hkl: v })}
+                  placeholder="hkl"
+                  style={{ ...rc, width: 64, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text" }} />
+              )}
+              {/* Configure (bulk/strained + strain settings) — hidden for arbitrary */}
+              {!isArbitrary && <div style={{ position: "relative", zIndex: 50 }}>
+                <button onClick={e => { e.stopPropagation(); setOpenPicker(cfgOpen ? null : { id: pt.id, type: "strainCfg" }); }}
+                  style={{ ...rc, background: cfgOpen ? T.bg3 : T.bg0, border: `1px solid ${cfgOpen ? T.borderBright : pt.mode !== "bulk" ? T.teal : T.border}`, color: pt.mode !== "bulk" ? T.teal : T.textSecondary }}>
+                  Configure
+                </button>
+                {cfgOpen && (
+                  <div onClick={e => e.stopPropagation()}
+                    style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 200, boxShadow: "0 4px 16px rgba(0,0,0,.55)", minWidth: 280, display: "flex", flexDirection: "column", gap: 12 }}>
+                    {/* Mode toggle: BULK / STRAINED */}
+                    <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}`, alignSelf: "flex-start" }}>
+                      {[["bulk", "BULK"], ["strained", "STRAINED"]].map(([m, label], idx, arr) => (
+                        <button key={m} onClick={() => updatePoint(pt.id, { mode: m })}
+                          style={{ ...rc, background: pt.mode === m ? T.bg3 : T.bg0, border: "none", borderRight: idx < arr.length - 1 ? `1px solid ${T.border}` : "none", color: pt.mode === m ? T.textPrimary : T.textDim, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                    {/* Strain options (only when strained) */}
+                    {isStrained && [
+                      { id: "substrate",         label: "Strain based on substrate" },
+                      { id: "arbitrary_strain",  label: "Arbitrary strain (biaxial)" },
+                      { id: "arbitrary_lattice", label: "Arbitrary lattice parameter" },
+                      { id: "arbitrary_q",       label: "Measured Qx / Qy" },
+                    ].map(opt => (
+                      <div key={opt.id} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        <div onClick={() => updatePoint(pt.id, { strain_mode: opt.id })}
+                          style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                          <div style={{ width: 14, height: 14, borderRadius: "50%", border: `2px solid ${smode === opt.id ? T.teal : T.border}`, background: smode === opt.id ? T.teal : "transparent", flexShrink: 0, transition: "all .12s" }} />
+                          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: smode === opt.id ? T.textPrimary : T.textDim }}>{opt.label}</span>
+                        </div>
+                        {smode === opt.id && opt.id === "arbitrary_q" && (
+                          <div style={{ display: "flex", gap: 10, marginLeft: 22 }}>
+                            {[["strain_qx", "Qx"], ["strain_qy", "Qy (opt)"]].map(([k, lbl]) => (
+                              <div key={k} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{lbl}</span>
+                                <DeferredInput type="number" value={pt[k] ?? ""} step="any" placeholder="—"
+                                  onChange={v => updatePoint(pt.id, { [k]: v === "" ? "" : Number(v) })}
+                                  style={{ ...rc, width: 80, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text" }} />
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {smode === opt.id && opt.id === "substrate" && (
+                          <select value={pt.substrate} onChange={e => updatePoint(pt.id, { substrate: e.target.value })}
+                            style={{ ...rc, marginLeft: 22, background: T.bg0, border: `1px solid ${T.border}`, color: T.textSecondary }}>
+                            <option value="">— substrate —</option>
+                            {structures.filter(s => s.name !== pt.material).map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
+                            {points.map((other, j) => j !== i && (
+                              <option key={`entry:${j}`} value={`entry:${j}`}>Entry {j + 1}</option>
+                            ))}
+                          </select>
+                        )}
+                        {smode === opt.id && opt.id === "arbitrary_strain" && (
+                          <div style={{ display: "flex", gap: 10, marginLeft: 22 }}>
+                            {[["strain_eps_xx", "ε_xx"], ["strain_eps_yy", "ε_yy"]].map(([k, lbl]) => (
+                              <div key={k} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{lbl}</span>
+                                <DeferredInput type="number" value={pt[k] ?? ""} placeholder="0.000"
+                                  onChange={v => updatePoint(pt.id, { [k]: v })}
+                                  style={{ ...rc, width: 88, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text" }} />
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {smode === opt.id && opt.id === "arbitrary_lattice" && (
+                          <div style={{ display: "flex", gap: 10, marginLeft: 22 }}>
+                            {[["strain_a", "a (Å)"], ["strain_b", "b (Å)"]].map(([k, lbl]) => (
+                              <div key={k} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{lbl}</span>
+                                <DeferredInput type="number" value={pt[k] ?? ""} placeholder="—"
+                                  onChange={v => updatePoint(pt.id, { [k]: v })}
+                                  style={{ ...rc, width: 88, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text" }} />
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>}
+              {/* Calculated Qx / Qz */}
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: pos ? T.teal : T.textDim, minWidth: 148, whiteSpace: "nowrap" }}>
+                {pos ? `Qx=${pos.qx.toFixed(4)} Qz=${pos.qz.toFixed(4)}` : "—"}
+              </span>
+              <div style={{ flex: 1 }} />
+              {/* Color picker */}
+              <div style={{ position: "relative", zIndex: 50 }}>
+                <div onClick={e => { e.stopPropagation(); setOpenPicker(colorOpen ? null : { id: pt.id, type: "color" }); }}
+                  style={{ width: 26, height: 26, borderRadius: 4, background: pt.color, border: `2px solid ${colorOpen ? T.amber : T.border}`, outline: "1px solid rgba(0,0,0,0.5)", cursor: "pointer", flexShrink: 0 }} />
+                {colorOpen && (
+                  <div onClick={e => e.stopPropagation()}
+                    style={{ position: "absolute", right: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, padding: 6, display: "flex", gap: 4, zIndex: 200, boxShadow: "0 4px 12px rgba(0,0,0,.5)" }}>
+                    {RSM_POINT_COLORS.map(c => (
+                      <div key={c} onClick={() => { updatePoint(pt.id, { color: c }); setOpenPicker(null); }}
+                        style={{ width: 22, height: 22, borderRadius: 3, background: c, border: `2px solid ${pt.color === c ? T.amber : "transparent"}`, outline: "1px solid rgba(0,0,0,0.5)", cursor: "pointer", flexShrink: 0 }} />
+                    ))}
+                  </div>
+                )}
+              </div>
+              {/* Shape picker */}
+              <div style={{ position: "relative", zIndex: 50 }}>
+                <button onClick={e => { e.stopPropagation(); setOpenPicker(shapeOpen ? null : { id: pt.id, type: "shape" }); }}
+                  style={{ width: 26, height: 26, borderRadius: 4, background: T.bg0, border: `2px solid ${shapeOpen ? T.amber : T.border}`, cursor: "pointer", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", color: pt.color, fontSize: 13, padding: 0 }}>
+                  {RSM_POINT_SYMBOLS.find(s => s.id === (pt.symbol || "cross"))?.glyph || "✚"}
+                </button>
+                {shapeOpen && (
+                  <div onClick={e => e.stopPropagation()}
+                    style={{ position: "absolute", right: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, padding: 6, display: "flex", gap: 4, zIndex: 200, boxShadow: "0 4px 12px rgba(0,0,0,.5)" }}>
+                    {RSM_POINT_SYMBOLS.map(s => (
+                      <button key={s.id} onClick={() => { updatePoint(pt.id, { symbol: s.id }); setOpenPicker(null); }}
+                        style={{ width: 26, height: 26, borderRadius: 3, background: (pt.symbol || "cross") === s.id ? T.bg3 : T.bg0, border: `2px solid ${(pt.symbol || "cross") === s.id ? T.amber : T.border}`, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: pt.color, fontSize: 14, padding: 0 }}>
+                        {s.glyph}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {/* Marker size */}
+              <DeferredInput type="number" value={pt.markerSize ?? 9}
+                onChange={v => updatePoint(pt.id, { markerSize: Math.max(4, Math.min(30, Number(v) || 9)) })}
+                className="no-spin" min="4" max="30" step="1" title="Marker size"
+                style={{ ...rc, width: 38, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text" }} />
+              {/* Remove */}
+              <button onClick={() => removePoint(pt.id)}
+                style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px" }}>×</button>
+            </div>
+          );
+        })}
+        <button onClick={addPoint}
+          style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer", alignSelf: "flex-start", marginTop: points.length ? 2 : 0 }}>
+          + Add point
+        </button>
+      </div>
+    );
 
   return (
-    <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
-      {entries.map(e => (
-        <div key={e.sid} style={{ flex: "0 0 auto", width: 220 }}>
-          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: e.color, marginBottom: 4, textAlign: "center" }}>{labels[e.sid] || e.sid}</div>
-          <RSMPlot data={e.data} cfg={rsmCfg} forcedXDomain={forcedXDomain} forcedYDomain={forcedYDomain} />
+    <div>
+      {entries.length === 0 ? (
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No RSM data loaded for selected samples.</div>
+      ) : (
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+          {entries.map(e => (
+            <div key={e.sid} style={{ flex: "0 0 auto", width: ps.plotWidth ? Math.round(ps.plotWidth * 96) : 280 }}>
+              <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: e.color, marginBottom: 4, textAlign: "center" }}>{labels[e.sid] || e.sid}</div>
+              <RSMPlot data={e.data} cfg={rsmCfg} forcedXDomain={forcedXDomain} forcedYDomain={forcedYDomain} plotStyle={ps} showColorbar={ps.rsmColorbar} points={resolvedPoints} />
+            </div>
+          ))}
         </div>
-      ))}
+      )}
+      {pointRows}
     </div>
   );
 }
@@ -2669,10 +3153,10 @@ function DEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
   return (
     <>
-      <SciPlotWrap ps={ps} cursorLabel={x => `E = ${x.toFixed(3)} kV/cm`} yTickMaxStr={String(erMax)}>
+      <SciPlotWrap ps={ps} cursorLabel={x => `E = ${x.toFixed(3)} kV/cm`}>
         {setCursor => (
-          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("er-vs-E")}
-            style={{ width: "100%", height: "320px" }} useResizeHandler
+          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("er-vs-E", ps)}
+            style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
             onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
         )}
       </SciPlotWrap>
@@ -2728,10 +3212,10 @@ function DfComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
   return (
     <>
-      <SciPlotWrap ps={ps} cursorLabel={x => `log f = ${Math.log10(x).toFixed(3)}`} yTickMaxStr={String(erMax)}>
+      <SciPlotWrap ps={ps} cursorLabel={x => `log f = ${Math.log10(x).toFixed(3)}`}>
         {setCursor => (
-          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("er-vs-f")}
-            style={{ width: "100%", height: "320px" }} useResizeHandler
+          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("er-vs-f", ps)}
+            style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
             onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
         )}
       </SciPlotWrap>
@@ -2742,9 +3226,616 @@ function DfComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
 // ── Panel wrapper + add panel row ─────────────────────────────────────────────
 
-const PANEL_LABELS = { xrd: "XRD ω–2θ", pe: "P–E Hysteresis", rsm: "RSM", de: "εᵣ vs E", df: "εᵣ vs f" };
+const PANEL_LABELS = { xrd: "XRD ω–2θ", pe: "P–E Hysteresis", rsm: "RSM", de: "εᵣ vs E", df: "εᵣ vs f", meta: "Meta-analysis" };
 
-function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, labels = {}, structures = [], onRemove, onUpdate }) {
+// ── Meta-analysis parameter definitions ───────────────────────────────────────
+
+function metaLayerField(sample, activeMaterial, field) {
+  if (!sample?.layers || !activeMaterial) return null;
+  for (const layer of sample.layers) {
+    if (layer.targets?.length === 1 && layer.targets[0].material === activeMaterial) {
+      const v = layer[field] ?? layer.targets[0][field];
+      return v != null ? Number(v) : null;
+    }
+  }
+  return null;
+}
+
+// Split a PE trace into monotonic E segments (ascending / descending branches).
+// Returns the widest ascending and descending segments as the main loop branches.
+function peSplitBranches(data) {
+  const pts = data.filter(p => isFinite(p.x) && isFinite(p.y));
+  if (pts.length < 4) return null;
+
+  // Detect direction reversals with a small dead-band to ignore noise
+  const segments = [];
+  let seg = [pts[0]], dir = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const dx = pts[i].x - pts[i - 1].x;
+    const d = Math.abs(dx) < 1e-10 ? 0 : Math.sign(dx);
+    if (d === 0) { seg.push(pts[i]); continue; }
+    if (dir === 0) { dir = d; seg.push(pts[i]); continue; }
+    if (d === dir) { seg.push(pts[i]); continue; }
+    // Direction reversed — commit current segment (keep even if 2 points)
+    if (seg.length >= 2) segments.push({ dir, pts: seg });
+    seg = [pts[i - 1], pts[i]]; dir = d;
+  }
+  if (seg.length >= 2) segments.push({ dir, pts: seg });
+  if (segments.length < 2) return null;
+
+  const eSpan = s => Math.max(...s.pts.map(p => p.x)) - Math.min(...s.pts.map(p => p.x));
+  // Pick the widest ascending and descending segments (main loop branches)
+  const asc  = segments.filter(s => s.dir ===  1).sort((a, b) => eSpan(b) - eSpan(a))[0];
+  const desc = segments.filter(s => s.dir === -1).sort((a, b) => eSpan(b) - eSpan(a))[0];
+  return (asc && desc) ? { asc: asc.pts, desc: desc.pts } : null;
+}
+
+// Interpolate P at a given E value within a (roughly monotonic) branch.
+function peInterpP(branchPts, eTarget) {
+  for (let i = 0; i < branchPts.length - 1; i++) {
+    const a = branchPts[i], b = branchPts[i + 1];
+    const lo = Math.min(a.x, b.x), hi = Math.max(a.x, b.x);
+    if (lo <= eTarget && eTarget <= hi) {
+      const t = (b.x - a.x) !== 0 ? (eTarget - a.x) / (b.x - a.x) : 0;
+      return a.y + t * (b.y - a.y);
+    }
+  }
+  return null;
+}
+
+// Find the E where P crosses zero in a branch; returns the interpolated E value.
+function peFindZeroCrossing(branchPts) {
+  for (let i = 0; i < branchPts.length - 1; i++) {
+    const a = branchPts[i], b = branchPts[i + 1];
+    if ((a.y <= 0 && b.y > 0) || (a.y > 0 && b.y <= 0)) {
+      const t = Math.abs(a.y) / (Math.abs(a.y) + Math.abs(b.y) || 1);
+      return a.x + t * (b.x - a.x);
+    }
+  }
+  return null;
+}
+
+function extractPEProps(data) {
+  if (!data?.length) return null;
+  const pts = data.filter(p => isFinite(p.x) && isFinite(p.y));
+  if (pts.length < 4) return null;
+
+  // Collect ALL zero-crossings of P (gives coercive fields)
+  // and ALL zero-crossings of E (gives remnant polarizations).
+  // No branch assumption — works regardless of sweep start/direction.
+  const pCrossings = [];
+  const eCrossings = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    if ((a.y < 0 && b.y >= 0) || (a.y >= 0 && b.y < 0)) {
+      const t = Math.abs(a.y) / (Math.abs(a.y) + Math.abs(b.y) || 1);
+      pCrossings.push(a.x + t * (b.x - a.x));
+    }
+    if ((a.x < 0 && b.x >= 0) || (a.x >= 0 && b.x < 0)) {
+      const t = Math.abs(a.x) / (Math.abs(a.x) + Math.abs(b.x) || 1);
+      eCrossings.push(a.y + t * (b.y - a.y));
+    }
+  }
+  if (pCrossings.length < 2) return null;
+  pCrossings.sort((a, b) => a - b);
+
+  // Rightmost P=0 crossing = positive Ec (switching on descending branch)
+  // Leftmost  P=0 crossing = negative Ec (switching on ascending branch)
+  const ec_pos = pCrossings[pCrossings.length - 1];
+  const ec_neg = pCrossings[0];
+
+  // Ec = half the span between zero-crossings (always positive); imprint = midpoint
+  const ec      = (ec_pos - ec_neg) / 2;
+  const imprint = (ec_pos + ec_neg) / 2;
+
+  const pmax = Math.max(...pts.map(p => Math.abs(p.y)));
+
+  // +Pr = highest P at E = 0 (descending branch); −Pr = lowest (ascending branch)
+  const pr_pos = eCrossings.length ? Math.max(...eCrossings) : null;
+  const pr_neg = eCrossings.length ? Math.min(...eCrossings) : null;
+
+  // Pr at imprint: collect all P values where E passes through the imprint field,
+  // same all-crossings approach as Pr at E=0 — no branch assumption needed.
+  const impCrossings = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    if ((a.x - imprint) * (b.x - imprint) < 0) {
+      const t = (imprint - a.x) / (b.x - a.x);
+      impCrossings.push(a.y + t * (b.y - a.y));
+    }
+  }
+  const pr_imp_pos = impCrossings.length ? Math.max(...impCrossings) : null;
+  const pr_imp_neg = impCrossings.length ? Math.min(...impCrossings) : null;
+
+  return { ec, imprint, pmax, pr_pos, pr_neg, pr_imp_pos, pr_imp_neg };
+}
+
+// Mirrors the capacitance→permittivity conversion used in the comparison panel renderer.
+// Applied before all meta-analysis dielectric extractions so values are always in ε_r.
+function dielConvertPts(pts, sample) {
+  if (!pts?.length) return [];
+  const thick = (sample?.thickness_nm || 30) * 1e-9;
+  const area  = (sample?.area_m2 || DEFAULT_AREA_M2) * (sample?.area_correction || 1.0);
+  const maxY  = pts.reduce((m, p) => Math.max(m, Math.abs(p.y)), 0);
+  return (maxY > 0 && maxY < 1)
+    ? pts.map(p => ({ ...p, y: p.y * thick / (area * EPS0) }))
+    : pts;
+}
+
+function extractDielFVal(data, logFreqTarget) {
+  if (!data?.length) return null;
+  // x may be raw Hz (e.g. 1000 for 1 kHz) or already log10 (e.g. 3.0).
+  // Detect by checking whether max(x) > 100 — raw Hz values will always exceed that.
+  const maxX = Math.max(...data.map(p => p.x));
+  const toLog = maxX > 100;
+  let best = null, bestDist = Infinity;
+  for (const p of data) {
+    if (!isFinite(p.x) || p.x <= 0) continue;
+    const logX = toLog ? Math.log10(p.x) : p.x;
+    const d = Math.abs(logX - logFreqTarget);
+    if (d < bestDist) { bestDist = d; best = p.y; }
+  }
+  // Tolerance: 0.15 decades (~1.4×) — tight enough to reject the next log-spaced point.
+  return bestDist < 0.15 ? best : null;
+}
+
+function extractDielBiasProps(up, down) {
+  const validUp   = (up   || []).filter(p => isFinite(p.x) && isFinite(p.y) && p.y > 0);
+  const validDown = (down || []).filter(p => isFinite(p.x) && isFinite(p.y) && p.y > 0);
+  if (!validUp.length && !validDown.length) return null;
+
+  // Interpolate ε at an arbitrary E within a (possibly non-monotonic) point array.
+  const interpY = (pts, xTarget) => {
+    for (let i = 0; i < pts.length - 1; i++) {
+      const a = pts[i], b = pts[i + 1];
+      const lo = Math.min(a.x, b.x), hi = Math.max(a.x, b.x);
+      if (lo <= xTarget && xTarget <= hi && b.x !== a.x)
+        return a.y + (xTarget - a.x) / (b.x - a.x) * (b.y - a.y);
+    }
+    return null;
+  };
+
+  // Crossing: find all E values where ε_up(E) = ε_down(E).
+  // There are typically multiple crossings — at the saturation edges (low ε) and
+  // within the butterfly peak region (high ε). The physically meaningful crossing
+  // is the one at maximum ε, i.e. the crossing between the two switching peaks.
+  const crossEpsValues = [];
+  if (validUp.length && validDown.length) {
+    for (let i = 0; i < validUp.length - 1; i++) {
+      const e1 = validUp[i].x, e2 = validUp[i + 1].x;
+      const u1 = validUp[i].y, u2 = validUp[i + 1].y;
+      const d1 = interpY(validDown, e1), d2 = interpY(validDown, e2);
+      if (d1 == null || d2 == null) continue;
+      const diff1 = u1 - d1, diff2 = u2 - d2;
+      if (diff1 * diff2 < 0) {
+        const t = diff1 / (diff1 - diff2);
+        crossEpsValues.push(((u1 + t * (u2 - u1)) + (d1 + t * (d2 - d1))) / 2);
+      }
+    }
+  }
+  // Take the highest-ε crossing — that's the one between the butterfly peaks.
+  const crossEps = crossEpsValues.length ? Math.max(...crossEpsValues) : null;
+
+  const upMin   = validUp.length   ? Math.min(...validUp.map(p => p.y))   : null;
+  const upMax   = validUp.length   ? Math.max(...validUp.map(p => p.y))   : null;
+  const downMin = validDown.length ? Math.min(...validDown.map(p => p.y)) : null;
+  const downMax = validDown.length ? Math.max(...validDown.map(p => p.y)) : null;
+
+  return { crossEps, upMin, upMax, downMin, downMax };
+}
+
+const META_PARAM_GROUPS = [
+  { group: "Growth", params: [
+    { id: "growth_temp",      label: "Temperature",    unit: "°C",    needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "temp") },
+    { id: "growth_pressure",  label: "Pressure",       unit: "mTorr", needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "pressure") },
+    { id: "growth_o2_pct",    label: "O₂ %",           unit: "%",     needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "oxygen_pct") },
+    { id: "growth_power_w",   label: "Target power",   unit: "W",     needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "power_W") },
+    { id: "growth_time_s",    label: "Dep. time",      unit: "s",     needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "time_s") },
+    { id: "growth_pulses",    label: "Pulses",         unit: "",      needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "pulses") },
+    { id: "growth_energy_mj", label: "Laser energy",   unit: "mJ",    needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "energy_mJ") },
+    { id: "growth_freq_hz",   label: "Rep. rate",      unit: "Hz",    needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "frequency_hz") },
+  ]},
+  { group: "Sample", params: [
+    { id: "thickness_nm",     label: "Thickness",      unit: "nm",    needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "thickness_nm") },
+  ]},
+  { group: "P–E Hysteresis", params: [
+    { id: "pe_ec",         label: "Coercive field Eᶜ",     unit: "kV/cm",  extract: (s, pc) => extractPEProps(pc[s.id]?.pe)?.ec         ?? null },
+    { id: "pe_imprint",    label: "Imprint field",          unit: "kV/cm",  extract: (s, pc) => extractPEProps(pc[s.id]?.pe)?.imprint    ?? null },
+    { id: "pe_pr",     label: "Pᵣ at E = 0",       unit: "µC/cm²", paired: true, extract: (s, pc) => { const r = extractPEProps(pc[s.id]?.pe); return r ? { pos: r.pr_pos,     neg: r.pr_neg     } : null; } },
+    { id: "pe_pr_imp", label: "Pᵣ at imprint field", unit: "µC/cm²", paired: true, extract: (s, pc) => { const r = extractPEProps(pc[s.id]?.pe); return r ? { pos: r.pr_imp_pos, neg: r.pr_imp_neg } : null; } },
+    { id: "pe_pmax",       label: "Max polarization",       unit: "µC/cm²", extract: (s, pc) => extractPEProps(pc[s.id]?.pe)?.pmax       ?? null },
+  ]},
+  { group: "Dielectric — freq sweep", params: [
+    { id: "diel_eps_1khz",  label: "ε @ 1 kHz",  unit: "", extract: (s, pc) => extractDielFVal(dielConvertPts(pc[s.id]?.diel_f, s), 3.0) },
+    { id: "diel_eps_10khz", label: "ε @ 10 kHz", unit: "", extract: (s, pc) => extractDielFVal(dielConvertPts(pc[s.id]?.diel_f, s), 4.0) },
+  ]},
+  { group: "Dielectric — bias sweep", params: [
+    { id: "diel_eps_cross",   label: "ε at up/down crossing", unit: "",
+      extract: (s, pc) => extractDielBiasProps(dielConvertPts(pc[s.id]?.diel_b_up, s), dielConvertPts(pc[s.id]?.diel_b_down, s))?.crossEps ?? null },
+    { id: "diel_eps_min_b",   label: "Min ε (↑/↓ sweeps)",   unit: "", paired: true,
+      extract: (s, pc) => { const r = extractDielBiasProps(dielConvertPts(pc[s.id]?.diel_b_up, s), dielConvertPts(pc[s.id]?.diel_b_down, s)); return r ? { pos: r.upMin, neg: r.downMin } : null; } },
+    { id: "diel_eps_max_b",   label: "Max ε (↑/↓ sweeps)",   unit: "", paired: true,
+      extract: (s, pc) => { const r = extractDielBiasProps(dielConvertPts(pc[s.id]?.diel_b_up, s), dielConvertPts(pc[s.id]?.diel_b_down, s)); return r ? { pos: r.upMax, neg: r.downMax } : null; } },
+  ]},
+];
+const META_PARAMS_FLAT = META_PARAM_GROUPS.flatMap(g => g.params.map(p => ({ ...p, group: g.group })));
+
+// Generate nice round axis ticks spanning at least [dataMin, dataMax].
+// Does NOT force zero into the range.
+function niceAxisTicks(dataMin, dataMax, targetN = 5) {
+  const rawRange = dataMax - dataMin;
+  if (rawRange < 1e-10) {
+    // All values equal — build a symmetric range around the value
+    const v = dataMin;
+    const mag = v !== 0 ? Math.pow(10, Math.floor(Math.log10(Math.abs(v)))) * 0.5 : 1;
+    return Array.from({ length: targetN }, (_, i) => v + mag * (i - Math.floor(targetN / 2)));
+  }
+  const rawStep = rawRange / (targetN - 1);
+  const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+  const f = rawStep / mag;
+  const step = f < 1.5 ? mag : f < 3.5 ? 2 * mag : f < 7.5 ? 5 * mag : 10 * mag;
+  const start = Math.floor(dataMin / step) * step;
+  const ticks = [];
+  for (let v = start; v < dataMax + step * 0.5; v = parseFloat((v + step).toPrecision(12))) {
+    ticks.push(parseFloat(v.toPrecision(12)));
+    if (ticks.length > 20) break;
+  }
+  return ticks;
+}
+
+// Compute a padded auto-range for a set of Y values, matching the meta scatter axis logic.
+function metaYRange(allY, isPaired) {
+  const lo = allY.length ? Math.min(...allY) : 0, hi = allY.length ? Math.max(...allY) : 1;
+  if (isPaired && lo < 0 && hi > 0) {
+    const absMax = Math.max(Math.abs(lo), Math.abs(hi)) || 1;
+    return niceLinTicks(-absMax * 1.20, absMax * 1.20).domain;
+  }
+  const span = (hi - lo) || Math.abs(hi) * 0.5 || 1;
+  const pad  = span * 0.20;
+  return [lo >= 0 ? 0 : lo - pad, hi + pad];
+}
+
+function MetaScatterPlot({ points, y2Points = [], xLabel, yLabel, y2Label = "", ps = DEFAULT_PLOT_STYLE, pairedY = false, pairedY2 = false, sampleOrder = [], colors = [], labels = {}, yMarker = {}, y2Marker = {} }) {
+  const allX  = points.map(p => p.x),  allY  = points.map(p => p.y);
+  const allY2 = y2Points.map(p => p.y);
+  const dataXLo = allX.length ? Math.min(...allX) : 0, dataXHi = allX.length ? Math.max(...allX) : 1;
+
+  // X: pad 20% each side so points are never flush with the edge.
+  const xSpan = (dataXHi - dataXLo) || Math.abs(dataXHi) * 0.5 || 1;
+  const xRangeAuto = [dataXLo - xSpan * 0.20, dataXHi + xSpan * 0.20];
+
+  const yRangeAuto  = metaYRange(allY,  pairedY);
+  const y2RangeAuto = metaYRange(allY2, pairedY2);
+
+  const xRange  = [ps.xMin  ?? xRangeAuto[0],  ps.xMax  ?? xRangeAuto[1]];
+  const yRange  = [ps.yMin  ?? yRangeAuto[0],   ps.yMax  ?? yRangeAuto[1]];
+  const y2Range = [ps.y2Min ?? y2RangeAuto[0],  ps.y2Max ?? y2RangeAuto[1]];
+
+  // Use dtick for explicit user-set step; otherwise let Plotly auto-tick within range.
+  // tickvals+tickmode:"array" is unreliable in Plotly React — dtick/tick0 is the safe path.
+  const xTickExtra  = ps.xTick  ? { tickmode: "linear", tick0: 0, dtick: ps.xTick  } : {};
+  const yTickExtra  = ps.yTick  ? { tickmode: "linear", tick0: 0, dtick: ps.yTick  } : {};
+  const y2TickExtra = ps.y2Tick ? { tickmode: "linear", tick0: 0, dtick: ps.y2Tick } : {};
+
+  const hasY2 = y2Points.length > 0 && !!y2Label;
+
+  const plotlyTraces = [
+    ...points.map(pt => ({
+      x: [pt.x], y: [pt.y], yaxis: "y",
+      type: "scatter", mode: ps.metaLabels ? "markers+text" : "markers",
+      marker: { color: yMarker.color ?? pt.color, size: yMarker.size ?? 9, symbol: yMarker.symbol ?? "circle", line: { color: T.bg0, width: 1.5 } },
+      text: ps.metaLabels ? [pt.label] : undefined,
+      textposition: "top center",
+      textfont: { size: (ps.fontSize || 11) - 1, family: ps.font, color: yMarker.color ?? pt.color },
+      showlegend: false,
+      hovertemplate: `<b>${pt.label}</b><br>${xLabel}: %{x}<br>${yLabel}: %{y}<extra></extra>`,
+    })),
+    ...(hasY2 ? y2Points.map(pt => ({
+      x: [pt.x], y: [pt.y], yaxis: "y2",
+      type: "scatter", mode: ps.metaLabels ? "markers+text" : "markers",
+      marker: { color: y2Marker.color ?? pt.color, size: y2Marker.size ?? 9, symbol: y2Marker.symbol ?? "diamond", line: { color: T.bg0, width: 1.5 } },
+      text: ps.metaLabels ? [pt.label] : undefined,
+      textposition: "top center",
+      textfont: { size: (ps.fontSize || 11) - 1, family: ps.font, color: y2Marker.color ?? pt.color },
+      showlegend: false,
+      hovertemplate: `<b>${pt.label}</b><br>${xLabel}: %{x}<br>${y2Label}: %{y}<extra></extra>`,
+    })) : []),
+  ];
+
+  const layout = buildPlotLayout(ps,
+    { range: xRange, ...xTickExtra, hoverformat: ".4g",
+      title: { text: xLabel, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+    { range: yRange, ...yTickExtra, ...(hasY2 ? { showgrid: false } : {}),
+      title: { text: yLabel, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
+    [],
+    {
+      // Reset Plotly's cached axis state when parameters change.
+      uirevision: `meta-${xLabel}-${yLabel}-${y2Label}`,
+      // Widen right margin to fit the Y2 axis title when it's active.
+      ...(hasY2 ? { margin: { t: 12, r: 80, b: 52, l: 72, pad: 0 } } : {}),
+      ...(hasY2 ? { yaxis2: {
+        overlaying: "y", side: "right", showgrid: false,
+        zeroline: false, showline: false, automargin: true,
+        ticks: ps.ticks ? "inside" : "", ticklen: ps.ticks ? (ps.tickLen || 5) : 0,
+        color: T.textDim,
+        tickfont: { size: (ps.fontSize || 11) - 1, family: ps.font, color: T.textDim },
+        title: { text: y2Label, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 },
+        range: y2Range, ...y2TickExtra,
+      }} : {}),
+    },
+  );
+
+  return (
+    <>
+      <SciPlotWrap ps={ps} cursorLabel={x => `${xLabel} = ${x}`}>
+        {setCursor => (
+          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("meta-scatter", ps)}
+            style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }}
+            useResizeHandler
+            onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+        )}
+      </SciPlotWrap>
+      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} />
+    </>
+  );
+}
+
+function CollapsibleParamSelect({ axis, value, onChange, groups, extra, rightSlot }) {
+  const [open, setOpen] = useState(false);
+  const [expanded, setExpanded] = useState({});
+
+  const handleOpen = () => {
+    if (!open && value) {
+      // Auto-expand whichever group holds the current selection
+      const g = groups.find(g => g.params.some(p => p.id === value));
+      if (g) setExpanded(prev => ({ ...prev, [g.group]: true }));
+    }
+    setOpen(v => !v);
+  };
+
+  const allParams = groups.flatMap(g => g.params);
+  const selectedParam = allParams.find(p => p.id === value);
+  const triggerLabel = selectedParam
+    ? `${selectedParam.label}${selectedParam.unit ? ` (${selectedParam.unit})` : ""}`
+    : "— select —";
+  const select = (id) => { onChange(id); setOpen(false); };
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: axis ? 6 : 0 }}>
+      {!!axis && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, minWidth: 12, flexShrink: 0 }}>{axis}</span>}
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <div style={{ position: "relative" }}>
+          {open && <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />}
+          <button onClick={handleOpen}
+            style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: selectedParam ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 8px", outline: "none", cursor: "pointer", minWidth: 200, textAlign: "left", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{triggerLabel}</span>
+            <span style={{ fontSize: 8, opacity: 0.5, flexShrink: 0 }}>▼</span>
+          </button>
+          {open && (
+            <div onClick={e => e.stopPropagation()}
+              style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, zIndex: 200, minWidth: 240, maxHeight: 320, overflowY: "auto", boxShadow: "0 4px 16px rgba(0,0,0,.5)" }}>
+              <div onClick={() => select("")}
+                style={{ padding: "6px 12px", fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, cursor: "pointer", borderBottom: `1px solid ${T.border}` }}>
+                — select —
+              </div>
+              {groups.map(g => (
+                <div key={g.group}>
+                  <div onClick={() => setExpanded(prev => ({ ...prev, [g.group]: !prev[g.group] }))}
+                    style={{ padding: "5px 12px", fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 0.5, background: T.bg3, cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center", userSelect: "none", borderTop: `1px solid ${T.border}` }}>
+                    <span>{g.group}</span>
+                    <span style={{ fontSize: 9, opacity: 0.6 }}>{expanded[g.group] ? "▲" : "▼"}</span>
+                  </div>
+                  {expanded[g.group] && g.params.map(p => (
+                    <div key={p.id} onClick={() => select(p.id)}
+                      style={{ padding: "5px 12px 5px 20px", fontFamily: "'DM Mono', monospace", fontSize: 11, color: p.id === value ? T.textPrimary : T.textSecondary, background: p.id === value ? T.bg3 : "transparent", cursor: "pointer" }}>
+                      {p.label}{p.unit ? ` (${p.unit})` : ""}
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        {rightSlot}
+        </div>
+        {extra}
+      </div>
+    </div>
+  );
+}
+
+function MetaMarkerPicker({ prefix, config, onUpdate, defaultSymbol = "circle" }) {
+  const [open, setOpen] = useState(null); // "color" | "symbol" | null
+  const color  = config[`${prefix}_color`]  ?? null;
+  const symbol = config[`${prefix}_symbol`] ?? defaultSymbol;
+  const size   = config[`${prefix}_size`]   ?? 9;
+  const currentGlyph = RSM_POINT_SYMBOLS.find(s => s.id === symbol)?.glyph || "●";
+  const swatchBg = color ?? "linear-gradient(135deg,#e05252 0%,#4d9de0 50%,#3dba6a 100%)";
+  const btnBase = { border: `1px solid ${T.border}`, borderRadius: 4, cursor: "pointer", flexShrink: 0, padding: 0, display: "flex", alignItems: "center", justifyContent: "center" };
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+      {/* Color swatch */}
+      <div style={{ position: "relative" }}>
+        <div onClick={e => { e.stopPropagation(); setOpen(open === "color" ? null : "color"); }}
+          style={{ ...btnBase, width: 22, height: 22, background: swatchBg, border: `2px solid ${open === "color" ? T.amber : T.border}`, borderRadius: 4, outline: "1px solid rgba(0,0,0,0.4)", cursor: "pointer" }} />
+        {open === "color" && (
+          <>
+            <div onClick={() => setOpen(null)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />
+            <div onClick={e => e.stopPropagation()}
+              style={{ position: "absolute", right: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, padding: 6, display: "flex", flexWrap: "wrap", gap: 4, zIndex: 200, boxShadow: "0 4px 12px rgba(0,0,0,.5)", width: 176 }}>
+              {META_MARKER_COLORS.map((c, i) => (
+                <div key={i} onClick={() => { onUpdate({ [`${prefix}_color`]: c }); setOpen(null); }}
+                  title={c ?? "Auto (sample colour)"}
+                  style={{ width: 22, height: 22, borderRadius: 3, cursor: "pointer", flexShrink: 0, outline: "1px solid rgba(0,0,0,0.4)",
+                    border: `2px solid ${color === c ? T.amber : "transparent"}`,
+                    background: c ?? "linear-gradient(135deg,#e05252 0%,#4d9de0 50%,#3dba6a 100%)",
+                    display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  {c === null && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 8, color: "#fff", fontWeight: 700, textShadow: "0 1px 2px rgba(0,0,0,.8)" }}>A</span>}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+      {/* Symbol picker */}
+      <div style={{ position: "relative" }}>
+        <button onClick={e => { e.stopPropagation(); setOpen(open === "symbol" ? null : "symbol"); }}
+          style={{ ...btnBase, width: 22, height: 22, background: T.bg0, border: `2px solid ${open === "symbol" ? T.amber : T.border}`, color: color ?? T.textSecondary, fontSize: 12 }}>
+          {currentGlyph}
+        </button>
+        {open === "symbol" && (
+          <>
+            <div onClick={() => setOpen(null)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />
+            <div onClick={e => e.stopPropagation()}
+              style={{ position: "absolute", right: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, padding: 6, display: "flex", gap: 4, zIndex: 200, boxShadow: "0 4px 12px rgba(0,0,0,.5)" }}>
+              {RSM_POINT_SYMBOLS.map(s => (
+                <button key={s.id} onClick={() => { onUpdate({ [`${prefix}_symbol`]: s.id }); setOpen(null); }}
+                  style={{ ...btnBase, width: 26, height: 26, background: symbol === s.id ? T.bg3 : T.bg0, border: `2px solid ${symbol === s.id ? T.amber : T.border}`, color: color ?? T.textSecondary, fontSize: 14 }}>
+                  {s.glyph}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+      {/* Size */}
+      <DeferredInput type="number" value={size}
+        onChange={v => onUpdate({ [`${prefix}_size`]: Math.max(3, Math.min(30, Number(v) || 9)) })}
+        className="no-spin" min="3" max="30" step="1" title="Marker size"
+        style={{ width: 34, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, textAlign: "center", padding: "3px 0" }} />
+    </div>
+  );
+}
+
+function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {}, config = {}, plotStyle, activeMaterial, onUpdate }) {
+  const ps = plotStyle || DEFAULT_PLOT_STYLE;
+  const xParamId  = config.x_param  || "";
+  const yParamId  = config.y_param  || "";
+  const y2ParamId = config.y2_param || "";
+  const xParam  = META_PARAMS_FLAT.find(p => p.id === xParamId)  || null;
+  const yParam  = META_PARAMS_FLAT.find(p => p.id === yParamId)  || null;
+  const y2Param = META_PARAMS_FLAT.find(p => p.id === y2ParamId) || null;
+  const [showY2, setShowY2] = useState(!!config.y2_param);
+  const sampleMap = useMemo(() => Object.fromEntries(samples.map(s => [s.id, s])), [samples]);
+
+  const extractPoints = (param) => {
+    if (!xParam || !param) return [];
+    return sampleOrder.flatMap((sid, i) => {
+      const s = sampleMap[sid];
+      if (!s) return [];
+      const x = xParam.extract(s, plotCache, activeMaterial);
+      const yRaw = param.extract(s, plotCache, activeMaterial);
+      if (x == null || yRaw == null || !isFinite(x)) return [];
+      const base = { sid, x, color: colors[i], label: labels[sid] || sid };
+      if (param.paired) {
+        const pts = [];
+        if (yRaw.pos != null && isFinite(yRaw.pos)) pts.push({ ...base, y: yRaw.pos });
+        if (yRaw.neg != null && isFinite(yRaw.neg)) pts.push({ ...base, y: yRaw.neg });
+        return pts;
+      }
+      if (!isFinite(yRaw)) return [];
+      return [{ ...base, y: yRaw }];
+    });
+  };
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const points  = useMemo(() => extractPoints(yParam),  [sampleOrder, xParamId, yParamId,  plotCache, activeMaterial, colors.join(","), sampleMap]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const y2Points = useMemo(() => extractPoints(y2Param), [sampleOrder, xParamId, y2ParamId, plotCache, activeMaterial, colors.join(","), sampleMap]);
+
+  const needsLayer = xParam?.needsLayer || yParam?.needsLayer || y2Param?.needsLayer;
+
+  // Build filtered groups: hide groups with no data, filter growth/sample params
+  // to only those with a non-null value for at least one selected sample.
+  const displayGroups = useMemo(() => {
+    const hasPE    = sampleOrder.some(sid => plotCache[sid]?.pe?.length > 0);
+    const hasDielF = sampleOrder.some(sid => plotCache[sid]?.diel_f?.length > 0);
+    const hasDielB = sampleOrder.some(sid => (plotCache[sid]?.diel_b_up?.length || 0) + (plotCache[sid]?.diel_b_down?.length || 0) > 0);
+    return META_PARAM_GROUPS.map(g => {
+      let params;
+      if (g.group === "Growth" || g.group === "Sample") {
+        // Include only params where at least one sample has a non-null value
+        params = g.params.filter(p =>
+          sampleOrder.some(sid => { const s = sampleMap[sid]; return s && p.extract(s, {}, activeMaterial) != null; })
+        );
+      } else if (g.group === "P–E Hysteresis") {
+        params = hasPE ? g.params : [];
+      } else if (g.group === "Dielectric — freq sweep") {
+        params = hasDielF ? g.params : [];
+      } else if (g.group === "Dielectric — bias sweep") {
+        params = hasDielB ? g.params : [];
+      } else {
+        params = g.params;
+      }
+      return { ...g, params };
+    }).filter(g => g.params.length > 0);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sampleOrder, sampleMap, plotCache, activeMaterial]);
+
+  const addY2BtnStyle = { background: "transparent", border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 8px", cursor: "pointer", letterSpacing: 0.5, textTransform: "uppercase" };
+
+  const axisLabelStyle = { fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, minWidth: 20, flexShrink: 0 };
+
+  return (
+    <div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16 }}>
+        {/* Row 1: Y vs X */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={axisLabelStyle}>Y</span>
+          <CollapsibleParamSelect axis={null} value={yParamId} onChange={v => onUpdate({ y_param: v })} groups={displayGroups} />
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>vs</span>
+          <CollapsibleParamSelect axis="X" value={xParamId} onChange={v => onUpdate({ x_param: v })} groups={displayGroups} />
+          {needsLayer && !activeMaterial && (
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.amber }}>⚠ Set an active layer above to extract growth data</span>
+          )}
+          <div style={{ marginLeft: "auto", flexShrink: 0 }}>
+            <MetaMarkerPicker prefix="y" config={config} onUpdate={onUpdate} defaultSymbol="circle" />
+          </div>
+        </div>
+        {/* Row 2: Y₂ or + right axis button */}
+        {showY2 ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={axisLabelStyle}>Y₂</span>
+            <CollapsibleParamSelect axis={null} value={y2ParamId} onChange={v => onUpdate({ y2_param: v })} groups={displayGroups} />
+            <button onClick={() => { setShowY2(false); onUpdate({ y2_param: null }); }}
+              style={{ background: "transparent", border: "none", color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 16, lineHeight: 1, padding: "0 4px", cursor: "pointer", flexShrink: 0 }}>×</button>
+            <div style={{ marginLeft: "auto", flexShrink: 0 }}>
+              <MetaMarkerPicker prefix="y2" config={config} onUpdate={onUpdate} defaultSymbol="diamond" />
+            </div>
+          </div>
+        ) : (
+          <div style={{ paddingLeft: 30 }}>
+            <button style={addY2BtnStyle} onClick={() => setShowY2(true)}>+ right axis</button>
+          </div>
+        )}
+      </div>
+      {(!xParam || !yParam) ? (
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "24px 0" }}>Select Y and X parameters above to plot.</div>
+      ) : points.length === 0 ? (
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "24px 0" }}>No data found for the selected parameters{needsLayer && !activeMaterial ? " — active layer not set" : ""}.</div>
+      ) : (
+        <MetaScatterPlot
+          points={points}
+          y2Points={y2Points}
+          xLabel={`${xParam.label}${xParam.unit ? ` (${xParam.unit})` : ""}`}
+          yLabel={`${yParam.label}${yParam.unit ? ` (${yParam.unit})` : ""}`}
+          y2Label={y2Param ? `${y2Param.label}${y2Param.unit ? ` (${y2Param.unit})` : ""}` : ""}
+          ps={ps}
+          pairedY={yParam.paired ?? false}
+          pairedY2={y2Param?.paired ?? false}
+          sampleOrder={sampleOrder}
+          colors={colors}
+          labels={labels}
+          yMarker={{ color: config.y_color ?? null, symbol: config.y_symbol ?? "circle", size: config.y_size ?? 9 }}
+          y2Marker={{ color: config.y2_color ?? null, symbol: config.y2_symbol ?? "diamond", size: config.y2_size ?? 9 }}
+        />
+      )}
+    </div>
+  );
+}
+
+function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, labels = {}, colorScale: bookColorScale = "viridis", structures = [], activeMaterial = null, onRemove, onUpdate }) {
   const { type, config } = panel;
   const [cogOpen, setCogOpen] = useState(false);
   const ps = {
@@ -2758,6 +3849,26 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
     zeroLines:  config.plot_zero_lines  ?? (type === "pe" || type === "de"),
     xTick:      config.plot_x_tick      || null,
     yTick:      config.plot_y_tick      || null,
+    plotWidth:  config.plot_width       != null ? Number(config.plot_width)  : null,
+    plotHeight: config.plot_height      != null ? Number(config.plot_height) : null,
+    rsmBins:        config.rsm_bins          || 256,
+    rsmColorbar:    config.rsm_colorbar      ?? false,
+    rsmLogIntensity: config.rsm_log_intensity ?? true,
+    rsmXMin:        config.rsm_x_min         != null ? Number(config.rsm_x_min) : null,
+    rsmXMax:        config.rsm_x_max         != null ? Number(config.rsm_x_max) : null,
+    rsmYMin:        config.rsm_y_min         != null ? Number(config.rsm_y_min) : null,
+    rsmYMax:        config.rsm_y_max         != null ? Number(config.rsm_y_max) : null,
+    rsmBgSub:       config.rsm_bg_sub        ?? false,
+    rsmBgPct:       config.rsm_bg_pct        != null ? Number(config.rsm_bg_pct) : 5,
+    rsmWhiteFade:   config.rsm_white_fade    != null ? Number(config.rsm_white_fade) : 0.10,
+    rsmQ2pi:        config.rsm_q2pi         ?? false,
+    colorScale:     bookColorScale,
+    colorTrim:      config.color_trim        ?? 5,
+    xMin:           config.x_min  != null ? Number(config.x_min)  : null,
+    xMax:           config.x_max  != null ? Number(config.x_max)  : null,
+    yMin:           config.y_min  != null ? Number(config.y_min)  : null,
+    yMax:           config.y_max  != null ? Number(config.y_max)  : null,
+    metaLabels:     config.meta_labels    ?? false,
   };
   const btnStyle = { background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 0, borderRadius: 4, width: 26, height: 26, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 };
   const BOX_OPTS = ["off", "dashed", "solid"];
@@ -2869,35 +3980,236 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                   </div>
                 </div>
               )}
+              {/* Size */}
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>SIZE</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>W</span>
+                  <DeferredInput type="number" value={ps.plotWidth ?? ""} onChange={v => onUpdate({ plot_width: v === "" ? null : Math.max(0.5, Math.round(Number(v) * 100) / 100 || 4) })}
+                    className="no-spin" min="0.5" max="30" step="0.25" placeholder="auto"
+                    style={{ width: 56, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>H</span>
+                  <DeferredInput type="number" value={ps.plotHeight ?? ""} onChange={v => onUpdate({ plot_height: v === "" ? null : Math.max(0.5, Math.round(Number(v) * 100) / 100 || 3.5) })}
+                    className="no-spin" min="0.5" max="30" step="0.25" placeholder="auto"
+                    style={{ width: 56, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>in</span>
+                </div>
+              </div>
+              {/* Point labels — meta only */}
+              {type === "meta" && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>LABELS</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {["off", "on"].map((opt, idx) => (
+                      <button key={opt} onClick={() => onUpdate({ meta_labels: opt === "on" })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (ps.metaLabels ? "on" : "off") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.metaLabels ? "on" : "off") === opt ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {/* X/Y Range — for panels other than xrd/rsm which have their own range controls */}
+              {type !== "xrd" && type !== "rsm" && <>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>X RANGE</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <DeferredInput type="number" value={ps.xMin ?? ""} onChange={v => onUpdate({ x_min: v === "" ? null : Number(v) })}
+                      className="no-spin" placeholder="min"
+                      style={{ width: 56, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>–</span>
+                    <DeferredInput type="number" value={ps.xMax ?? ""} onChange={v => onUpdate({ x_max: v === "" ? null : Number(v) })}
+                      className="no-spin" placeholder="max"
+                      style={{ width: 56, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>Y RANGE</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <DeferredInput type="number" value={ps.yMin ?? ""} onChange={v => onUpdate({ y_min: v === "" ? null : Number(v) })}
+                      className="no-spin" placeholder="min"
+                      style={{ width: 56, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>–</span>
+                    <DeferredInput type="number" value={ps.yMax ?? ""} onChange={v => onUpdate({ y_max: v === "" ? null : Number(v) })}
+                      className="no-spin" placeholder="max"
+                      style={{ width: 56, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  </div>
+                </div>
+              </>}
+              {/* XRD-specific */}
+              {type === "xrd" && <>
+                <div style={{ borderTop: `1px solid ${T.border}`, margin: "2px 0" }} />
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>OFFSET</span>
+                  <DeferredInput type="number" value={config.offset_decades ?? 2} onChange={v => onUpdate({ offset_decades: parseFloat(v) === 0 ? 0 : (parseFloat(v) || 2) })}
+                    className="no-spin" min="0" step="0.5" placeholder="2"
+                    style={{ width: 60, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>dec.</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>2θ RANGE</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <DeferredInput type="number" value={config.theta_min ?? ""} onChange={v => onUpdate({ theta_min: v === "" ? null : Number(v) })}
+                      className="no-spin" placeholder="min"
+                      style={{ width: 52, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>–</span>
+                    <DeferredInput type="number" value={config.theta_max ?? ""} onChange={v => onUpdate({ theta_max: v === "" ? null : Number(v) })}
+                      className="no-spin" placeholder="max"
+                      style={{ width: 52, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>PAD Y</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>↑</span>
+                    <DeferredInput type="number" value={config.pad_above ?? 2} onChange={v => onUpdate({ pad_above: parseFloat(v) === 0 ? 0 : (parseFloat(v) || 2) })}
+                      className="no-spin" min="0" step="0.5" placeholder="2"
+                      style={{ width: 48, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>↓</span>
+                    <DeferredInput type="number" value={config.pad_below ?? 1} onChange={v => onUpdate({ pad_below: parseFloat(v) === 0 ? 0 : (parseFloat(v) || 1) })}
+                      className="no-spin" min="0" step="0.5" placeholder="1"
+                      style={{ width: 48, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>dec.</span>
+                  </div>
+                </div>
+              </>}
+              {/* RSM-specific */}
+              {type === "rsm" && <>
+                <div style={{ borderTop: `1px solid ${T.border}`, margin: "2px 0" }} />
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>BIN SIZE</span>
+                  <DeferredInput type="number" value={ps.rsmBins} onChange={v => onUpdate({ rsm_bins: Math.max(32, Math.min(512, Number(v) || 256)) })}
+                    className="no-spin" min="32" max="512" step="32" placeholder="256"
+                    style={{ width: 60, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>px</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>COLORBAR</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {["off", "on"].map((opt, idx) => (
+                      <button key={opt} onClick={() => onUpdate({ rsm_colorbar: opt === "on" })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (ps.rsmColorbar ? "on" : "off") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.rsmColorbar ? "on" : "off") === opt ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>INTENSITY</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {["log", "linear"].map((opt, idx) => (
+                      <button key={opt} onClick={() => onUpdate({ rsm_log_intensity: opt === "log" })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (ps.rsmLogIntensity ? "log" : "linear") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.rsmLogIntensity ? "log" : "linear") === opt ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>BG SUB</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {["off", "on"].map((opt, idx) => (
+                      <button key={opt} onClick={() => onUpdate({ rsm_bg_sub: opt === "on" })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (ps.rsmBgSub ? "on" : "off") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.rsmBgSub ? "on" : "off") === opt ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                  {ps.rsmBgSub && <>
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>pct</span>
+                    <DeferredInput type="number" value={ps.rsmBgPct} onChange={v => onUpdate({ rsm_bg_pct: Math.max(0, Math.min(49, Number(v) || 5)) })}
+                      className="no-spin" min="0" max="49" step="1" placeholder="5"
+                      style={{ width: 44, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  </>}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>Q UNITS</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {[["nm⁻¹ (h/a)", false], ["Å⁻¹ (2π/d)", true]].map(([label, val], idx) => (
+                      <button key={label} onClick={() => onUpdate({ rsm_q2pi: val })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 9px", background: (ps.rsmQ2pi ?? false) === val ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.rsmQ2pi ?? false) === val ? T.textPrimary : T.textDim, cursor: "pointer" }}>
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>BG FADE</span>
+                  <DeferredInput type="number" value={ps.rsmWhiteFade} onChange={v => onUpdate({ rsm_white_fade: Math.max(0, Math.min(0.9, Number(v) || 0)) })}
+                    className="no-spin" min="0" max="0.9" step="0.05" placeholder="0"
+                    style={{ width: 56, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>0–0.9</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>Qx RANGE</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <DeferredInput type="number" value={ps.rsmXMin ?? ""} onChange={v => onUpdate({ rsm_x_min: v === "" ? null : Number(v) })}
+                      step="any" placeholder="auto"
+                      style={{ width: 76, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>–</span>
+                    <DeferredInput type="number" value={ps.rsmXMax ?? ""} onChange={v => onUpdate({ rsm_x_max: v === "" ? null : Number(v) })}
+                      step="any" placeholder="auto"
+                      style={{ width: 76, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>Qz RANGE</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <DeferredInput type="number" value={ps.rsmYMin ?? ""} onChange={v => onUpdate({ rsm_y_min: v === "" ? null : Number(v) })}
+                      step="any" placeholder="auto"
+                      style={{ width: 76, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>–</span>
+                    <DeferredInput type="number" value={ps.rsmYMax ?? ""} onChange={v => onUpdate({ rsm_y_max: v === "" ? null : Number(v) })}
+                      step="any" placeholder="auto"
+                      style={{ width: 76, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  </div>
+                </div>
+              </>}
             </div>
           )}
         </div>
         <button onClick={onRemove} title="Remove panel"
           style={btnStyle}>×</button>
       </div>
-      {type === "xrd" && <XRDComparisonPanel sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} structures={structures} config={config} plotStyle={ps} onUpdate={onUpdate} />}
-      {type === "pe"  && <PEComparisonPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
-      {type === "rsm" && <RSMComparisonPanel sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} />}
-      {type === "de"  && <DEComparisonPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
-      {type === "df"  && <DfComparisonPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
+      {type === "xrd"  && <XRDComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} structures={structures} config={config} plotStyle={ps} onUpdate={onUpdate} />}
+      {type === "pe"   && <PEComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
+      {type === "rsm"  && <RSMComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} structures={structures} />}
+      {type === "de"   && <DEComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
+      {type === "df"   && <DfComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
+      {type === "meta" && <MetaAnalysisPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} onUpdate={onUpdate} />}
     </div>
   );
 }
 
 function AddPanelRow({ onAdd }) {
   const [open, setOpen] = useState(false);
+  const [openUp, setOpenUp] = useState(false);
+  const btnRef = useRef(null);
   const PANEL_TYPES = [
-    { type: "xrd", label: "XRD ω–2θ"      },
-    { type: "pe",  label: "P–E Hysteresis" },
-    { type: "rsm", label: "RSM"            },
-    { type: "de",  label: "εᵣ vs E"        },
-    { type: "df",  label: "εᵣ vs f"        },
+    { type: "xrd",  label: "XRD ω–2θ"      },
+    { type: "pe",   label: "P–E Hysteresis" },
+    { type: "rsm",  label: "RSM"            },
+    { type: "de",   label: "εᵣ vs E"        },
+    { type: "df",   label: "εᵣ vs f"        },
+    { type: "meta", label: "Meta-analysis"  },
   ];
+  const toggle = () => {
+    if (!open && btnRef.current) {
+      const rect = btnRef.current.getBoundingClientRect();
+      const spaceBelow = window.innerHeight - rect.bottom;
+      setOpenUp(spaceBelow < 240); // dropdown is ~220px tall
+    }
+    setOpen(v => !v);
+  };
+  const dropStyle = openUp
+    ? { bottom: "100%", marginBottom: 4 }
+    : { top: "100%",    marginTop: 4 };
   return (
-    <div style={{ position: "relative" }}>
-      <Btn variant="ghost" onClick={() => setOpen(v => !v)}>+ Add Panel</Btn>
+    <div ref={btnRef} style={{ position: "relative", alignSelf: "center" }}>
+      {open && <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 190 }} />}
+      <Btn variant="ghost" onClick={toggle}>+ Add Panel</Btn>
       {open && (
-        <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 4, background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: 6, zIndex: 200, display: "flex", flexDirection: "column", gap: 2, minWidth: 170, boxShadow: "0 4px 16px rgba(0,0,0,.55)" }}>
+        <div style={{ position: "absolute", left: "50%", transform: "translateX(-50%)", ...dropStyle, background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: 6, zIndex: 200, display: "flex", flexDirection: "column", gap: 2, minWidth: 170, boxShadow: "0 4px 16px rgba(0,0,0,.55)" }}>
           {PANEL_TYPES.map(p => (
             <button key={p.type} onMouseDown={() => { onAdd(p.type); setOpen(false); }}
               style={{ background: "none", border: "none", color: T.textSecondary, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "7px 12px", textAlign: "left", borderRadius: 5 }}>
@@ -2911,12 +4223,13 @@ function AddPanelRow({ onAdd }) {
 }
 
 function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings }) {
-  const cfg         = book.config || {};
-  const sampleOrder = cfg.sample_order?.length ? cfg.sample_order : (book.sample_ids || []);
-  const colorScale  = cfg.color_scale || "viridis";
-  const colorTrim   = cfg.color_trim  ?? 5;
-  const panels      = cfg.panels      || [];
-  const labels      = cfg.labels      || {};
+  const cfg            = book.config || {};
+  const sampleOrder    = cfg.sample_order?.length ? cfg.sample_order : (book.sample_ids || []);
+  const colorScale     = cfg.color_scale    || "viridis";
+  const colorTrim      = cfg.color_trim     ?? 5;
+  const panels         = cfg.panels         || [];
+  const labels         = cfg.labels         || {};
+  const activeMaterial = cfg.active_material ?? null;
   const colors      = sampleColorScale(colorScale, sampleOrder.length, colorTrim);
 
   const updateCfg = (patch) => {
@@ -2942,6 +4255,8 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings }
         colorScale={colorScale}
         colorTrim={colorTrim}
         labels={labels}
+        activeMaterial={activeMaterial}
+        onChangeActiveMaterial={m => updateCfg({ active_material: m })}
         onReorder={reorderSamples}
         onRemove={id => updateCfg({ sample_order: sampleOrder.filter(s => s !== id) })}
         onAddSamples={ids => {
@@ -2961,7 +4276,9 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings }
           plotCache={plotCache}
           colors={colors}
           labels={labels}
+          colorScale={colorScale}
           structures={settings?.structures || []}
+          activeMaterial={activeMaterial}
           onRemove={() => updateCfg({ panels: panels.filter(p => p.id !== panel.id) })}
           onUpdate={patch => updateCfg({ panels: panels.map(p => p.id === panel.id ? { ...p, config: { ...p.config, ...patch } } : p) })}
         />
@@ -2971,9 +4288,44 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings }
   );
 }
 
-// ── Analysis Books (tile + modal) ─────────────────────────────────────────────
+// ── Analysis Books (tile + folder tile + modal) ───────────────────────────────
 
-function AnalysisBookTile({ book, samples, onDelete, onEdit, onClick }) {
+function BookFolderTile({ folder, books, onDeleteBook, onEditBook, onOpenBook, onDrop, onDragStartBook, onEdit, onDelete }) {
+  const [open, setOpen] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const color = folder.color || T.borderBright;
+  return (
+    <div
+      onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setDragOver(true); }}
+      onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false); }}
+      onDrop={e => { e.preventDefault(); setDragOver(false); onDrop?.(); }}
+      style={{ border: `2px solid ${dragOver ? T.amber : color}`, borderRadius: 10, overflow: "hidden", marginBottom: 12, boxShadow: dragOver ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
+      <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: dragOver ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
+        onClick={() => setOpen(v => !v)}>
+        <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
+        <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: T.textPrimary, flex: 1 }}>{folder.name}</span>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>{books.length}</span>
+        <span style={{ color: T.textDim, fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+        <button onClick={e => { e.stopPropagation(); onEdit?.(); }} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: "0 3px" }}>✎</button>
+        <button onClick={e => { e.stopPropagation(); if (window.confirm(`Delete folder "${folder.name}"? Books will become ungrouped.`)) onDelete?.(); }} style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, padding: "0 3px" }}>×</button>
+      </div>
+      {open && (
+        <div style={{ padding: 12, display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 12, background: T.bg0 }}>
+          {books.map(b => (
+            <AnalysisBookTile key={b.id} book={b}
+              onClick={() => onOpenBook(b.id)}
+              onDelete={() => { if (window.confirm(`Delete book "${b.name}"?`)) onDeleteBook(b.id); }}
+              onEdit={() => onEditBook(b)}
+              onDragStart={onDragStartBook} />
+          ))}
+          {!books.length && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: dragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>{dragOver ? "Drop to add" : "Empty folder"}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AnalysisBookTile({ book, onDelete, onEdit, onClick, onDragStart }) {
   const orderedIds = book.config?.sample_order?.length ? book.config.sample_order : (book.sample_ids || []);
   const n = orderedIds.length;
   const scaleName  = book.config?.color_scale || "viridis";
@@ -2982,6 +4334,8 @@ function AnalysisBookTile({ book, samples, onDelete, onEdit, onClick }) {
   const colorMap = Object.fromEntries(orderedIds.map((id, i) => [id, colors[i]]));
   return (
     <div
+      draggable={!!onDragStart}
+      onDragStart={onDragStart ? e => { e.dataTransfer.effectAllowed = "move"; onDragStart(book.id); } : undefined}
       onClick={onClick}
       style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 18px", display: "flex", flexDirection: "column", gap: 8, cursor: onClick ? "pointer" : "default" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -2993,7 +4347,6 @@ function AnalysisBookTile({ book, samples, onDelete, onEdit, onClick }) {
       </div>
       <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>
         {n} sample{n !== 1 ? "s" : ""}
-        {book.config?.color_scale && <span style={{ marginLeft: 8, opacity: 0.6 }}>{book.config.color_scale}</span>}
       </div>
       <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
         {orderedIds.slice(0, 6).map(id => (
@@ -3005,31 +4358,72 @@ function AnalysisBookTile({ book, samples, onDelete, onEdit, onClick }) {
   );
 }
 
-function AddBookModal({ onSave, onClose, existing, samples }) {
-  const [name, setName]       = useState(existing?.name || "");
+function AddBookModal({ onSave, onClose, existing, samples, folders = [], bookFolders = [] }) {
+  const [name,     setName]     = useState(existing?.name || "");
+  const [folderId, setFolderId] = useState(existing?.folder_id || "");
   const [selected, setSelected] = useState(new Set(existing?.sample_ids || []));
   const toggle = id => setSelected(p => { const s = new Set(p); s.has(id) ? s.delete(id) : s.add(id); return s; });
+
+  // Group samples by sample folder; ungrouped last.
+  const byId = (a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" });
+  const sampleFolders = folders.filter(f => !f.book_folder);
+  const groups = [
+    ...sampleFolders.map(f => ({ id: f.id, name: f.name, color: f.color, samples: samples.filter(s => s.folder_id === f.id).sort(byId) })),
+    { id: "__ungrouped__", name: "Ungrouped", color: null, samples: samples.filter(s => !s.folder_id || !sampleFolders.find(f => f.id === s.folder_id)).sort(byId) },
+  ].filter(g => g.samples.length > 0);
+
+  // Auto-expand groups that contain already-selected samples (useful when editing).
+  const [expanded, setExpanded] = useState(() => {
+    const init = {};
+    groups.forEach(g => { if (g.samples.some(s => selected.has(s.id))) init[g.id] = true; });
+    return init;
+  });
+  const toggleGroup = id => setExpanded(p => ({ ...p, [id]: !p[id] }));
+
+  const SampleRow = ({ s }) => (
+    <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 12, color: selected.has(s.id) ? T.blue : T.textSecondary, padding: "3px 8px", borderRadius: 4, background: selected.has(s.id) ? "rgba(99,179,237,.1)" : "transparent" }}>
+      <input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)} style={{ accentColor: T.blue }} />
+      <span style={{ fontWeight: 600 }}>{s.id}</span>
+      {s.date  && <span style={{ color: T.textDim, fontSize: 10 }}>{s.date}</span>}
+      {s.notes && <span style={{ color: T.textDim, fontSize: 10, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.notes}</span>}
+    </label>
+  );
+
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 480, display: "flex", flexDirection: "column", gap: 16, maxHeight: "80vh" }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.blue, fontSize: 20 }}>{existing ? "Edit Book" : "New Analysis Book"}</h2>
         <Input label="Name" value={name} onChange={setName} placeholder="e.g. Thickness Study" />
+        {bookFolders.length > 0 && (
+          <Sel label="Folder (optional)" value={folderId} onChange={setFolderId}
+            options={[{ value: "", label: "— No folder —" }, ...bookFolders.map(f => ({ value: f.id, label: f.name }))]} />
+        )}
         <div style={{ display: "flex", flexDirection: "column", gap: 6, overflow: "hidden" }}>
           <Label>Samples</Label>
-          <div style={{ overflowY: "auto", maxHeight: 260, display: "flex", flexDirection: "column", gap: 4, border: `1px solid ${T.border}`, borderRadius: 6, padding: 8 }}>
-            {[...samples].sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" })).map(s => (
-              <label key={s.id} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 12, color: selected.has(s.id) ? T.blue : T.textSecondary, padding: "3px 4px", borderRadius: 4, background: selected.has(s.id) ? "rgba(99,179,237,.1)" : "transparent" }}>
-                <input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)} style={{ accentColor: T.blue }} />
-                <span style={{ fontWeight: 600 }}>{s.id}</span>
-                {s.date && <span style={{ color: T.textDim, fontSize: 10 }}>{s.date}</span>}
-                {s.notes && <span style={{ color: T.textDim, fontSize: 10, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.notes}</span>}
-              </label>
+          <div style={{ overflowY: "auto", maxHeight: 300, border: `1px solid ${T.border}`, borderRadius: 6, overflow: "hidden auto" }}>
+            {groups.map(g => (
+              <div key={g.id}>
+                {/* Group header */}
+                <div onClick={() => toggleGroup(g.id)}
+                  style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", background: T.bg2, cursor: "pointer", userSelect: "none", borderBottom: `1px solid ${T.border}` }}>
+                  {g.color && <div style={{ width: 8, height: 8, borderRadius: "50%", background: g.color, flexShrink: 0 }} />}
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 0.8, flex: 1 }}>{g.name}</span>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{g.samples.filter(s => selected.has(s.id)).length}/{g.samples.length}</span>
+                  <span style={{ fontSize: 9, color: T.textDim }}>{expanded[g.id] ? "▲" : "▼"}</span>
+                </div>
+                {/* Group samples */}
+                {expanded[g.id] && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 2, padding: "4px 0", background: T.bg0 }}>
+                    {g.samples.map(s => <SampleRow key={s.id} s={s} />)}
+                  </div>
+                )}
+              </div>
             ))}
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn onClick={() => { if (name.trim()) onSave({ name: name.trim(), sample_ids: [...selected] }); }} disabled={!name.trim()}>
+          <Btn onClick={() => { if (name.trim()) onSave({ name: name.trim(), sample_ids: [...selected], folder_id: folderId || null }); }} disabled={!name.trim()}>
             {existing ? "Save" : "Create"}
           </Btn>
         </div>
@@ -3058,6 +4452,7 @@ export default function App() {
   const [adding,   setAdding]   = useState(false);
   const [templateSample, setTemplateSample] = useState(null); // sample to duplicate
   const [draggingSampleId, setDraggingSampleId] = useState(null);
+  const [draggingBookId,   setDraggingBookId]   = useState(null);
   const [addingFolder, setAddingFolder] = useState(false);
   const [editingFolder, setEditingFolder] = useState(null); // folder object
   const [addingBook,    setAddingBook]    = useState(false);
@@ -3224,6 +4619,8 @@ export default function App() {
     await api("DELETE", `/folders/${id}`);
     setFolders(p => p.filter(f => f.id !== id));
     setSamples(p => p.map(s => s.folder_id === id ? { ...s, folder_id: null } : s));
+    // Ungroup any books in a book folder being deleted
+    setBooks(p => p.map(b => b.folder_id === id ? { ...b, folder_id: null } : b));
   };
 
   // ── Books ────────────────────────────────────────────────────────────────
@@ -3270,6 +4667,18 @@ export default function App() {
 
   // ── Sample folder drag-and-drop ───────────────────────────────────────────
 
+  const handleDropToBookFolder = async (folderId) => {
+    if (!draggingBookId) return;
+    const book = books.find(b => b.id === draggingBookId);
+    if (!book) return;
+    const newFolderId = folderId || null;
+    if (book.folder_id === newFolderId) return;
+    setDraggingBookId(null);
+    const updated = { ...book, folder_id: newFolderId };
+    setBooks(p => p.map(b => b.id === draggingBookId ? updated : b));
+    await api("PUT", `/analysis-books/${draggingBookId}`, updated);
+  };
+
   const handleDropToFolder = async (folderId) => {
     if (!draggingSampleId) return;
     const sample = samples.find(s => s.id === draggingSampleId);
@@ -3290,9 +4699,11 @@ export default function App() {
   const hasFilesForActive = activeSample ? Object.keys(activeSample.filenames || {}).length > 0 : false;
 
   const byId = (a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" });
-  const grouped   = folders.map(f => ({ folder: f, samples: samples.filter(s => s.folder_id === f.id).sort(byId) }));
-  const ungrouped = samples.filter(s => !s.folder_id || !folders.find(f => f.id === s.folder_id)).sort(byId);
-  const [ungroupedDragOver, setUngroupedDragOver] = useState(false);
+  const sampleFolders = folders.filter(f => !f.book_folder);
+  const grouped   = sampleFolders.map(f => ({ folder: f, samples: samples.filter(s => s.folder_id === f.id).sort(byId) }));
+  const ungrouped = samples.filter(s => !s.folder_id || !sampleFolders.find(f => f.id === s.folder_id)).sort(byId);
+  const [ungroupedDragOver,     setUngroupedDragOver]     = useState(false);
+  const [bookUngroupedDragOver, setBookUngroupedDragOver] = useState(false);
 
   return (
     <>
@@ -3305,7 +4716,7 @@ export default function App() {
       `}</style>
       <div style={{ minHeight: "100vh", background: T.bg0, color: T.textPrimary }}>
         {/* Header */}
-        <div style={{ borderBottom: `1px solid ${T.border}`, padding: "12px 28px", display: "flex", alignItems: "center", gap: 14, background: T.bg1, position: "sticky", top: 0, zIndex: 50 }}>
+        <div style={{ borderBottom: `1px solid ${T.border}`, padding: "12px 28px", display: "flex", alignItems: "center", gap: 14, background: T.bg1, position: "sticky", top: 0, zIndex: 300 }}>
           {/* Conditional nav — flex:1 so the theme toggle always sits at the far right */}
           <div style={{ display: "flex", alignItems: "center", gap: 14, flex: 1, minWidth: 0 }}>
             {active && activeSample ? (
@@ -3333,7 +4744,6 @@ export default function App() {
                 <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>ferroelectric oxide films</span>
                 <div style={{ flex: 1 }} />
                 <Btn variant="ghost" small onClick={() => setAddingFolder(true)}>+ Folder</Btn>
-                <Btn onClick={() => setAdding(true)}>+ New Sample</Btn>
                 <button onClick={() => setSettingsOpen(true)}
                   title="Settings"
                   style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "2px 4px", borderRadius: 4, display: "flex", alignItems: "center" }}>⚙</button>
@@ -3383,6 +4793,8 @@ export default function App() {
                 <div style={{ marginBottom: 18, display: "flex", alignItems: "baseline", gap: 12 }}>
                   <h1 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 26, color: T.textPrimary }}>Samples</h1>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{samples.length} total</span>
+                  <div style={{ flex: 1 }} />
+                  <Btn variant="primary" small onClick={() => setAdding(true)}>+ New Sample</Btn>
                 </div>
 
                 {/* Foldered groups */}
@@ -3425,20 +4837,49 @@ export default function App() {
                   <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.textPrimary }}>Analysis Books</h2>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{books.length}</span>
                   <div style={{ flex: 1 }} />
-                  <Btn variant="ghost" small onClick={() => setAddingBook(true)}>+ New Book</Btn>
+                  <Btn variant="primary" small onClick={() => setAddingBook(true)}>+ New Book</Btn>
                 </div>
-                {books.length > 0 ? (
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 12 }}>
-                    {books.map(b => (
-                      <AnalysisBookTile key={b.id} book={b} samples={samples}
-                        onClick={() => openBook(b.id)}
-                        onDelete={() => { if (window.confirm(`Delete book "${b.name}"?`)) deleteBook(b.id); }}
-                        onEdit={() => setEditingBook(b)} />
-                    ))}
-                  </div>
-                ) : (
-                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>No books yet.</div>
-                )}
+                {(() => {
+                  const bookFolders    = folders.filter(f => f.book_folder);
+                  const ungroupedBooks = books.filter(b => !b.folder_id || !bookFolders.find(f => f.id === b.folder_id));
+                  return (
+                    <>
+                      {bookFolders.map(f => (
+                        <BookFolderTile key={f.id} folder={f} books={books.filter(b => b.folder_id === f.id)}
+                          onOpenBook={openBook}
+                          onDeleteBook={deleteBook}
+                          onEditBook={b => setEditingBook(b)}
+                          onDrop={() => handleDropToBookFolder(f.id)}
+                          onDragStartBook={setDraggingBookId}
+                          onEdit={() => setEditingFolder(f)}
+                          onDelete={() => deleteFolder(f.id)} />
+                      ))}
+                      {(ungroupedBooks.length > 0 || (draggingBookId && bookFolders.length > 0)) && (
+                        <div
+                          onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setBookUngroupedDragOver(true); }}
+                          onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setBookUngroupedDragOver(false); }}
+                          onDrop={e => { e.preventDefault(); setBookUngroupedDragOver(false); handleDropToBookFolder(null); }}
+                          style={{ border: `2px solid ${bookUngroupedDragOver ? T.amber : "transparent"}`, borderRadius: 10, padding: bookUngroupedDragOver ? 10 : 0, transition: "all .12s", boxShadow: bookUngroupedDragOver ? `0 0 0 3px ${T.amberGlow}` : "none", marginTop: bookFolders.length ? 8 : 0 }}>
+                          {bookFolders.length > 0 && (
+                            <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: bookUngroupedDragOver ? T.amber : T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8, transition: "color .12s" }}>
+                              {bookUngroupedDragOver ? "Drop to ungroup" : "Ungrouped"}
+                            </div>
+                          )}
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 12 }}>
+                            {ungroupedBooks.map(b => (
+                              <AnalysisBookTile key={b.id} book={b}
+                                onClick={() => openBook(b.id)}
+                                onDelete={() => { if (window.confirm(`Delete book "${b.name}"?`)) deleteBook(b.id); }}
+                                onEdit={() => setEditingBook(b)}
+                                onDragStart={bookFolders.length > 0 ? setDraggingBookId : undefined} />
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {books.length === 0 && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>No books yet.</div>}
+                    </>
+                  );
+                })()}
               </div>
             </>
           )}
@@ -3452,7 +4893,7 @@ export default function App() {
         <AddFolderModal onSave={saveFolder} onClose={() => { setAddingFolder(false); setEditingFolder(null); }} existing={editingFolder} />
       )}
       {(addingBook || editingBook) && (
-        <AddBookModal onSave={saveBook} onClose={() => { setAddingBook(false); setEditingBook(null); }} existing={editingBook} samples={samples} />
+        <AddBookModal onSave={saveBook} onClose={() => { setAddingBook(false); setEditingBook(null); }} existing={editingBook} samples={samples} folders={folders} bookFolders={folders.filter(f => f.book_folder)} />
       )}
     </>
   );

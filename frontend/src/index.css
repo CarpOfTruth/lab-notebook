@@ -1,3 +1,8 @@
+/* Remove number input spinners globally */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+input[type="number"] { -moz-appearance: textfield; }
+
 /* Lift Plotly modebar into the 30 px strip reserved above the chart */
 .xrd-plot-wrap, .sci-plot-wrap { position: relative; }
 .xrd-plot-wrap .modebar-container,
