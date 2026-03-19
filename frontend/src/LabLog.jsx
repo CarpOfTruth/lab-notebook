@@ -561,16 +561,16 @@ function LinePlot({ data, cfg }) {
   );
 }
 
-function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain, plotStyle, showColorbar = false, points = [] }) {
+function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain, plotStyle, showColorbar = false, points = [], hideXLabels = false, hideYLabels = false, overridePxW = null, overridePxH = null }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const bins = ps.rsmBins || 256;
   const logIntensity = ps.rsmLogIntensity ?? true;
-  const bgSub = ps.rsmBgSub ?? false;
+  const bgMethod = ps.rsmBgMethod ?? null;
   const bgPct = ps.rsmBgPct ?? 5;
   const binned = useMemo(
-    () => binRSM(data, bins, bins, forcedXDomain || null, forcedYDomain || null, logIntensity, bgSub, bgPct),
+    () => binRSM(data, bins, bins, forcedXDomain || null, forcedYDomain || null, logIntensity, bgMethod, bgPct),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [data, bins, forcedXDomain?.[0], forcedXDomain?.[1], forcedYDomain?.[0], forcedYDomain?.[1], logIntensity, bgSub, bgPct]
+    [data, bins, forcedXDomain?.[0], forcedXDomain?.[1], forcedYDomain?.[0], forcedYDomain?.[1], logIntensity, bgMethod, bgPct]
   );
   if (!binned) return null;
   const xTicks = makeTicks(binned.xDomain[0], binned.xDomain[1], ps.xTick);
@@ -583,6 +583,7 @@ function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain, plotStyle, showColor
     type: "heatmap", x: binned.x, y: binned.y, z: binned.z,
     colorscale, showscale: showColorbar,
     connectgaps: false, zsmooth: false,
+    zauto: false, zmin: binned.zmin, zmax: binned.zmax,
     hovertemplate: `Qₓ: %{x:.4f}<br>Qz: %{y:.4f}<br>${zLabel}: %{z:.2f}<extra></extra>`,
   };
   const pointTraces = points.map(pt => ({
@@ -593,21 +594,28 @@ function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain, plotStyle, showColor
     hovertemplate: `${pt.label ? pt.label + "<br>" : ""}Qₓ: ${pt.qx.toFixed(4)}<br>Qz: ${pt.qz.toFixed(4)}<extra></extra>`,
   }));
   const spikeProps = { showspikes: true, spikemode: "across", spikecolor: T.textDim, spikethickness: 1, spikedash: "dot", spikesnap: "cursor" };
+  const tightMargin = (hideXLabels || hideYLabels) ? {
+    margin: { t: 4, r: 4, b: hideXLabels ? 4 : 50, l: hideYLabels ? 4 : 58, pad: 0 }
+  } : {};
   const layout = buildPlotLayout(ps,
     { showgrid: false, ...spikeProps,
       ...(xTicks ? { tickvals: xTicks, tickmode: "array" } : {}),
-      title: { text: `Qₓ (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+      ...(hideXLabels ? { showticklabels: false, ticklen: 0, title: { text: "" } }
+        : { title: { text: `Qₓ (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } }) },
     { showgrid: false, ...spikeProps,
       ...(yTicks ? { tickvals: yTicks, tickmode: "array" } : {}),
-      title: { text: `Qz (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
+      ...(hideYLabels ? { showticklabels: false, ticklen: 0, title: { text: "" } }
+        : { title: { text: `Qz (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } }) },
     [],
-    { uirevision: "rsm", hovermode: "closest" }
+    { uirevision: "rsm", hovermode: "closest", ...tightMargin }
   );
+  const plotW = overridePxW != null ? `${overridePxW}px` : (ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%");
+  const plotH = overridePxH != null ? `${overridePxH}px` : (ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "280px");
   return (
     <SciPlotWrap ps={ps} cursorLabel={c => `Qₓ=${c.x.toFixed(4)}, Qz=${c.y.toFixed(4)}`}>
       {setCursor => (
         <Plot data={[heatTrace, ...pointTraces]} layout={layout} config={buildPlotConfig("rsm", ps)}
-          style={{ width: "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "280px" }} useResizeHandler
+          style={{ width: plotW, height: plotH }} useResizeHandler
           onHover={e => { const pt = e.points?.[0]; if (pt) setCursor({ x: pt.x, y: pt.y }); }} />
       )}
     </SciPlotWrap>
@@ -701,7 +709,7 @@ function RsmCanvasPlot({ data, logIntensity = false }) {
   const bins = 400;
 
   const binned = useMemo(
-    () => binRSM(data, bins, bins, null, null, logIntensity, true, 5),
+    () => binRSM(data, bins, bins, null, null, logIntensity, "percentile", 5),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [data, logIntensity]
   );
@@ -720,10 +728,9 @@ function RsmCanvasPlot({ data, logIntensity = false }) {
     if (!binned || !canvasRef.current) return;
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
-    const { z } = binned;
+    const { z, zmin, zmax } = binned;
     const ny = z.length, nx = z[0].length;
-    let zMin = Infinity, zMax = -Infinity;
-    for (const row of z) for (const v of row) { if (v !== null) { if (v < zMin) zMin = v; if (v > zMax) zMax = v; } }
+    const zMin = zmin ?? 0, zMax = zmax ?? 1;
     const zRange = zMax - zMin || 1;
 
     const anchors = COLOR_SCALES.viridis;
@@ -1660,6 +1667,7 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
 function SettingsModal({ settings, onSave, onClose }) {
   const [draft, setDraft] = useState(() => JSON.parse(JSON.stringify(settings)));
   const [knownMaterials, setKnownMaterials] = useState([]);
+  const [libOpen, setLibOpen] = useState({ matSputter: false, matPld: false, struct: false });
   useEffect(() => { api("GET", "/materials").then(setKnownMaterials).catch(() => {}); }, []);
   const set = (path, v) => setDraft(p => {
     const d = JSON.parse(JSON.stringify(p));
@@ -1671,7 +1679,7 @@ function SettingsModal({ settings, onSave, onClose }) {
   });
 
   const sectionHdr = (label) => (
-    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2, borderBottom: `1px solid ${T.border}`, paddingBottom: 6, marginBottom: 10, marginTop: 4 }}>{label}</div>
+    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2, borderBottom: `1px solid ${T.border}`, paddingBottom: 4, marginBottom: 0, marginTop: 6 }}>{label}</div>
   );
   const fieldSm = (path, label, unit, w = 64, type = "text") => (
     <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -1840,9 +1848,9 @@ function SettingsModal({ settings, onSave, onClose }) {
   );
 
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "flex-start", justifyContent: "center", zIndex: 100, overflowY: "auto", padding: "40px 20px" }}>
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "flex-start", justifyContent: "center", zIndex: 100, overflowY: "auto", padding: "80px 20px 40px" }}>
       <style>{`.no-spin::-webkit-inner-spin-button,.no-spin::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}.no-spin{-moz-appearance:textfield}`}</style>
-      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 640, display: "flex", flexDirection: "column", gap: 18, marginBottom: 40 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: "20px 24px", width: 640, display: "flex", flexDirection: "column", gap: 10, marginBottom: 40 }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 22 }}>Settings</h2>
 
         {/* General */}
@@ -1880,20 +1888,38 @@ function SettingsModal({ settings, onSave, onClose }) {
           {fieldSm("pld.pulses",       "Pulses",   "",    72)}
         </div>
 
-        {/* Material library — Sputter */}
-        {sectionHdr("Material Library — Sputter")}
-        <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -10, marginBottom: 2 }}>Leave fields blank to use global sputter defaults for that material.</div>
-        {renderMatLib("sputter")}
+        {/* Material library — Sputter (collapsible) */}
+        <button onClick={() => setLibOpen(s => ({ ...s, matSputter: !s.matSputter }))}
+          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "none", border: "none", borderBottom: `1px solid ${T.border}`, paddingBottom: 4, marginBottom: 0, marginTop: 6, cursor: "pointer", width: "100%", textAlign: "left" }}>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2 }}>Material Library — Sputter</span>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, lineHeight: 1 }}>{libOpen.matSputter ? "▴" : "▾"}</span>
+        </button>
+        {libOpen.matSputter && <>
+          <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -2, marginBottom: 2 }}>Leave fields blank to use global sputter defaults for that material.</div>
+          {renderMatLib("sputter")}
+        </>}
 
-        {/* Material library — PLD */}
-        {sectionHdr("Material Library — PLD")}
-        <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -10, marginBottom: 2 }}>Leave fields blank to use global PLD defaults for that material.</div>
-        {renderMatLib("pld")}
+        {/* Material library — PLD (collapsible) */}
+        <button onClick={() => setLibOpen(s => ({ ...s, matPld: !s.matPld }))}
+          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "none", border: "none", borderBottom: `1px solid ${T.border}`, paddingBottom: 4, marginBottom: 0, marginTop: 6, cursor: "pointer", width: "100%", textAlign: "left" }}>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2 }}>Material Library — PLD</span>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, lineHeight: 1 }}>{libOpen.matPld ? "▴" : "▾"}</span>
+        </button>
+        {libOpen.matPld && <>
+          <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -2, marginBottom: 2 }}>Leave fields blank to use global PLD defaults for that material.</div>
+          {renderMatLib("pld")}
+        </>}
 
-        {/* Structure library */}
-        {sectionHdr("Structure Library")}
-        <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -10, marginBottom: 2 }}>Lattice parameters for peak prediction and strain calculations. Drop a .cif onto an entry to auto-fill.</div>
-        {renderStructLib()}
+        {/* Structure library (collapsible) */}
+        <button onClick={() => setLibOpen(s => ({ ...s, struct: !s.struct }))}
+          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "none", border: "none", borderBottom: `1px solid ${T.border}`, paddingBottom: 4, marginBottom: 0, marginTop: 6, cursor: "pointer", width: "100%", textAlign: "left" }}>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2 }}>Structure Library</span>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, lineHeight: 1 }}>{libOpen.struct ? "▴" : "▾"}</span>
+        </button>
+        {libOpen.struct && <>
+          <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -2, marginBottom: 2 }}>Lattice parameters for peak prediction and strain calculations. Drop a .cif onto an entry to auto-fill.</div>
+          {renderStructLib()}
+        </>}
 
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 4 }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
@@ -2474,7 +2500,8 @@ const DEFAULT_PLOT_STYLE = {
   plotWidth: null, plotHeight: null,
   rsmBins: 256, rsmColorbar: false, rsmLogIntensity: true,
   rsmXMin: null, rsmXMax: null, rsmYMin: null, rsmYMax: null,
-  rsmBgSub: true, rsmBgPct: 5, rsmWhiteFade: 0.15, rsmQ2pi: false,
+  rsmBgMethod: "percentile", rsmBgPct: 5, rsmWhiteFade: 0.15, rsmQ2pi: false,
+  rsmMaxCols: null, rsmTight: false,
   colorScale: "viridis", colorTrim: 5,
 };
 
@@ -2489,12 +2516,14 @@ function makeHeatmapColorscale(scaleName, bgFade = 0) {
   return [[0, T.bg0], ...compressed];
 }
 
-// Bin raw RSM points into an nx×ny grid, taking max-z per cell.
-// xRange/yRange: [min,max] from caller (already padded); null = auto from data.
-// logIntensity: apply log10 transform to z values.
-// bgSub: subtract the bgPct-th percentile of occupied cells before transform.
-// Returns { x, y, z, xDomain, yDomain } or null.
-function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true, bgSub = false, bgPct = 5) {
+// Bin raw RSM points into an nx×ny grid using average intensity per cell.
+// bgMethod: null | "percentile" | "median" | "plane"
+//   percentile — subtract bgPct-th percentile of occupied cells
+//   median     — subtract median (bgPct ignored)
+//   plane      — subtract a least-squares linear plane fit
+// Returns { x, y, z, zmin, zmax, xDomain, yDomain } where zmin/zmax are
+// robust 2nd–99.5th percentile bounds for colorscale clipping.
+function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true, bgMethod = null, bgPct = 5) {
   if (!data.length) return null;
   let xMin, xMax, yMin, yMax;
   if (xRange) { [xMin, xMax] = xRange; } else {
@@ -2508,34 +2537,92 @@ function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true,
     const yp = (yMax - yMin) * 0.05; yMin -= yp; yMax += yp;
   }
   const xStep = (xMax - xMin) / nx, yStep = (yMax - yMin) / ny;
-  const grid = new Float32Array(nx * ny);
+
+  // Accumulate sum + count per cell (average-per-cell, not max)
+  const sumG = new Float64Array(nx * ny);
+  const cntG = new Int32Array(nx * ny);
   for (const d of data) {
     if (d.x < xMin || d.x > xMax || d.y < yMin || d.y > yMax) continue;
     const xi = Math.min(nx - 1, Math.floor((d.x - xMin) / xStep));
     const yi = Math.min(ny - 1, Math.floor((d.y - yMin) / yStep));
     const idx = yi * nx + xi;
-    if (d.z > grid[idx]) grid[idx] = d.z;
+    sumG[idx] += d.z; cntG[idx]++;
   }
-  // Background subtraction: find Nth percentile of occupied cells and remove it.
-  if (bgSub) {
-    const occupied = [];
-    for (let i = 0; i < grid.length; i++) { if (grid[i] > 0) occupied.push(grid[i]); }
-    if (occupied.length > 0) {
-      occupied.sort((a, b) => a - b);
-      const bgVal = occupied[Math.min(Math.floor(occupied.length * bgPct / 100), occupied.length - 1)];
-      for (let i = 0; i < grid.length; i++) { if (grid[i] > 0) grid[i] = Math.max(0, grid[i] - bgVal); }
+  const grid = new Float64Array(nx * ny);
+  for (let i = 0; i < nx * ny; i++) grid[i] = cntG[i] > 0 ? sumG[i] / cntG[i] : 0;
+
+  // Background subtraction
+  if (bgMethod === "percentile" || bgMethod === "median") {
+    const pct = bgMethod === "median" ? 50 : bgPct;
+    const occ = [];
+    for (let i = 0; i < grid.length; i++) { if (cntG[i] > 0) occ.push(grid[i]); }
+    if (occ.length) {
+      occ.sort((a, b) => a - b);
+      const bg = occ[Math.min(Math.floor(occ.length * pct / 100), occ.length - 1)];
+      for (let i = 0; i < grid.length; i++) { if (cntG[i] > 0) grid[i] = Math.max(0, grid[i] - bg); }
+    }
+  } else if (bgMethod === "plane") {
+    // Least-squares linear plane fit on occupied cells (normalized coords 0..1)
+    let sx = 0, sy = 0, sz = 0, sxx = 0, sxy = 0, syy = 0, sxz = 0, syz = 0, n = 0;
+    for (let i = 0; i < nx * ny; i++) {
+      if (!cntG[i]) continue;
+      const xn = (i % nx) / nx, yn = Math.floor(i / nx) / ny, z = grid[i];
+      sx += xn; sy += yn; sz += z; sxx += xn*xn; sxy += xn*yn; syy += yn*yn;
+      sxz += xn*z; syz += yn*z; n++;
+    }
+    if (n >= 3) {
+      // Solve [n,sx,sy; sx,sxx,sxy; sy,sxy,syy] * [a,b,c] = [sz,sxz,syz]
+      const A = [[n,sx,sy],[sx,sxx,sxy],[sy,sxy,syy]];
+      const B = [sz, sxz, syz];
+      for (let c = 0; c < 3; c++) {
+        let maxR = c;
+        for (let r = c+1; r < 3; r++) if (Math.abs(A[r][c]) > Math.abs(A[maxR][c])) maxR = r;
+        [A[c], A[maxR]] = [A[maxR], A[c]]; [B[c], B[maxR]] = [B[maxR], B[c]];
+        for (let r = c+1; r < 3; r++) {
+          const f = A[r][c] / (A[c][c] || 1e-30);
+          B[r] -= f * B[c];
+          for (let k = c; k < 3; k++) A[r][k] -= f * A[c][k];
+        }
+      }
+      const coef = [0,0,0];
+      for (let i = 2; i >= 0; i--) {
+        coef[i] = B[i];
+        for (let j = i+1; j < 3; j++) coef[i] -= A[i][j] * coef[j];
+        coef[i] /= A[i][i] || 1e-30;
+      }
+      const [a, b, c] = coef;
+      for (let i = 0; i < nx * ny; i++) {
+        if (!cntG[i]) continue;
+        const bg = a + b * (i % nx) / nx + c * Math.floor(i / nx) / ny;
+        grid[i] = Math.max(0, grid[i] - bg);
+      }
     }
   }
-  const x = Array.from({ length: nx }, (_, i) => xMin + (i + 0.5) * xStep);
-  const y = Array.from({ length: ny }, (_, j) => yMin + (j + 0.5) * yStep);
+
+  // Build z array; collect occupied values for robust range
+  const occVals = [];
   const z = Array.from({ length: ny }, (_, j) =>
     Array.from({ length: nx }, (_, i) => {
+      if (!cntG[j * nx + i]) return null;
       const v = grid[j * nx + i];
       if (v <= 0) return null;
-      return logIntensity ? Math.log10(v) : v;
+      const out = logIntensity ? Math.log10(v) : v;
+      occVals.push(out);
+      return out;
     })
   );
-  return { x, y, z, xDomain: [xMin, xMax], yDomain: [yMin, yMax] };
+
+  // Robust 2nd–99.5th percentile range for colorscale
+  let zmin = null, zmax = null;
+  if (occVals.length) {
+    occVals.sort((a, b) => a - b);
+    zmin = occVals[Math.max(0, Math.floor(occVals.length * 0.02))];
+    zmax = occVals[Math.min(occVals.length - 1, Math.floor(occVals.length * 0.995))];
+  }
+
+  const x = Array.from({ length: nx }, (_, i) => xMin + (i + 0.5) * xStep);
+  const y = Array.from({ length: ny }, (_, j) => yMin + (j + 0.5) * yStep);
+  return { x, y, z, zmin, zmax, xDomain: [xMin, xMax], yDomain: [yMin, yMax] };
 }
 
 // Generate evenly-spaced ticks at a given interval across [lo, hi].
@@ -3318,16 +3405,42 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
     <div>
       {entries.length === 0 ? (
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No RSM data loaded for selected samples.</div>
-      ) : (
-        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", justifyContent: "center" }}>
-          {entries.map(e => (
-            <div key={e.sid} style={{ flex: "0 0 auto", width: ps.plotWidth ? Math.round(ps.plotWidth * 96) : 280 }}>
-              <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: e.color, marginBottom: 4, textAlign: "center" }}>{labels[e.sid] || e.sid}</div>
-              <RSMPlot data={e.data} cfg={rsmCfg} forcedXDomain={forcedXDomain} forcedYDomain={forcedYDomain} plotStyle={ps} showColorbar={ps.rsmColorbar} points={resolvedPoints} />
-            </div>
-          ))}
-        </div>
-      )}
+      ) : (() => {
+        const tight = ps.rsmTight ?? false;
+        const maxCols = ps.rsmMaxCols > 0 ? ps.rsmMaxCols : entries.length;
+        const cols = Math.min(maxCols, entries.length);
+        const rows = Math.ceil(entries.length / cols);
+        // In tight mode, W/H describe the whole grid; divide for per-panel px
+        const panelPxW = tight && ps.plotWidth  ? Math.round(ps.plotWidth  * 96 / cols) : (ps.plotWidth ? Math.round(ps.plotWidth * 96) : null);
+        const panelPxH = tight && ps.plotHeight ? Math.round(ps.plotHeight * 96 / rows) : (ps.plotHeight ? Math.round(ps.plotHeight * 96) : null);
+        const defaultPxW = panelPxW ?? 280;
+        return (
+          <div style={{
+            display: "grid",
+            gridTemplateColumns: `repeat(${cols}, ${defaultPxW}px)`,
+            gap: tight ? 0 : 14,
+            justifyContent: "center",
+          }}>
+            {entries.map((e, idx) => {
+              const col = idx % cols;
+              const row = Math.floor(idx / cols);
+              const isLeft   = col === 0;
+              const isBottom = row === rows - 1 || idx >= entries.length - (entries.length % cols || cols);
+              const hideY = tight && !isLeft;
+              const hideX = tight && !isBottom;
+              return (
+                <div key={e.sid} style={{ display: "flex", flexDirection: "column" }}>
+                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: e.color, marginBottom: tight ? 1 : 4, textAlign: "center" }}>{labels[e.sid] || e.sid}</div>
+                  <RSMPlot data={e.data} cfg={rsmCfg} forcedXDomain={forcedXDomain} forcedYDomain={forcedYDomain}
+                    plotStyle={ps} showColorbar={ps.rsmColorbar} points={resolvedPoints}
+                    hideXLabels={hideX} hideYLabels={hideY}
+                    overridePxW={panelPxW} overridePxH={panelPxH} />
+                </div>
+              );
+            })}
+          </div>
+        );
+      })()}
       {pointRows}
     </div>
   );
@@ -4177,10 +4290,12 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
     rsmXMax:        config.rsm_x_max         != null ? Number(config.rsm_x_max) : null,
     rsmYMin:        config.rsm_y_min         != null ? Number(config.rsm_y_min) : null,
     rsmYMax:        config.rsm_y_max         != null ? Number(config.rsm_y_max) : null,
-    rsmBgSub:       config.rsm_bg_sub        ?? false,
+    rsmBgMethod:    config.rsm_bg_method      ?? (config.rsm_bg_sub ? "percentile" : null),
     rsmBgPct:       config.rsm_bg_pct        != null ? Number(config.rsm_bg_pct) : 5,
     rsmWhiteFade:   config.rsm_white_fade    != null ? Number(config.rsm_white_fade) : 0.10,
     rsmQ2pi:        config.rsm_q2pi         ?? false,
+    rsmMaxCols:     config.rsm_max_cols      != null ? Number(config.rsm_max_cols) : null,
+    rsmTight:       config.rsm_tight         ?? false,
     colorScale:     bookColorScale,
     colorTrim:      config.color_trim        ?? 5,
     xMin:           config.x_min  != null ? Number(config.x_min)  : null,
@@ -4500,14 +4615,14 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>BG SUB</span>
                   <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
-                    {["off", "on"].map((opt, idx) => (
-                      <button key={opt} onClick={() => onUpdate({ rsm_bg_sub: opt === "on" })}
-                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (ps.rsmBgSub ? "on" : "off") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.rsmBgSub ? "on" : "off") === opt ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
-                        {opt}
+                    {[["none", null], ["%ile", "percentile"], ["med", "median"], ["plane", "plane"]].map(([label, val], idx, arr) => (
+                      <button key={label} onClick={() => onUpdate({ rsm_bg_method: val })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 8px", background: (ps.rsmBgMethod ?? null) === val ? T.bg3 : T.bg0, border: "none", borderRight: idx < arr.length - 1 ? `1px solid ${T.border}` : "none", color: (ps.rsmBgMethod ?? null) === val ? T.textPrimary : T.textDim, cursor: "pointer", letterSpacing: 0.5 }}>
+                        {label}
                       </button>
                     ))}
                   </div>
-                  {ps.rsmBgSub && <>
+                  {ps.rsmBgMethod === "percentile" && <>
                     <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>pct</span>
                     <DeferredInput type="number" value={ps.rsmBgPct} onChange={v => onUpdate({ rsm_bg_pct: Math.max(0, Math.min(49, Number(v) || 5)) })}
                       className="no-spin" min="0" max="49" step="1" placeholder="5"
@@ -4554,6 +4669,23 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                     <DeferredInput type="number" value={ps.rsmYMax ?? ""} onChange={v => onUpdate({ rsm_y_max: v === "" ? null : Number(v) })}
                       step="any" placeholder="auto"
                       style={{ width: 76, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>COLUMNS</span>
+                  <DeferredInput type="number" value={ps.rsmMaxCols ?? ""} onChange={v => onUpdate({ rsm_max_cols: v === "" ? null : Math.max(1, Math.round(Number(v))) })}
+                    className="no-spin" min="1" placeholder="auto"
+                    style={{ width: 56, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>TIGHT</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {["off", "on"].map((opt, idx) => (
+                      <button key={opt} onClick={() => onUpdate({ rsm_tight: opt === "on" })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (ps.rsmTight ? "on" : "off") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.rsmTight ? "on" : "off") === opt ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                        {opt}
+                      </button>
+                    ))}
                   </div>
                 </div>
               </>}
@@ -4711,7 +4843,7 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings }
 
 // ── Analysis Books (tile + folder tile + modal) ───────────────────────────────
 
-function BookFolderTile({ folder, books, onDeleteBook, onEditBook, onOpenBook, onDrop, onDragStartBook, onEdit, onDelete }) {
+function BookFolderTile({ folder, books, onDeleteBook, onEditBook, onDuplicateBook, onOpenBook, onDrop, onDragStartBook, onEdit, onDelete }) {
   const lsKey = `bookfolder-open-${folder.id}`;
   const [open, setOpen] = useState(() => { try { const v = localStorage.getItem(lsKey); return v === null ? false : v === "1"; } catch { return false; } });
   const toggleOpen = () => setOpen(v => { const next = !v; try { localStorage.setItem(lsKey, next ? "1" : "0"); } catch {} return next; });
@@ -4739,6 +4871,7 @@ function BookFolderTile({ folder, books, onDeleteBook, onEditBook, onOpenBook, o
               onClick={() => onOpenBook(b.id)}
               onDelete={() => { if (window.confirm(`Delete book "${b.name}"?`)) onDeleteBook(b.id); }}
               onEdit={() => onEditBook(b)}
+              onDuplicate={() => onDuplicateBook?.(b)}
               onDragStart={onDragStartBook} />
           ))}
           {!books.length && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: dragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>{dragOver ? "Drop to add" : "Empty folder"}</div>}
@@ -4748,7 +4881,7 @@ function BookFolderTile({ folder, books, onDeleteBook, onEditBook, onOpenBook, o
   );
 }
 
-function AnalysisBookTile({ book, onDelete, onEdit, onClick, onDragStart }) {
+function AnalysisBookTile({ book, onDelete, onEdit, onDuplicate, onClick, onDragStart }) {
   const orderedIds = book.config?.sample_order?.length ? book.config.sample_order : (book.sample_ids || []);
   const n = orderedIds.length;
   const scaleName  = book.config?.color_scale || "viridis";
@@ -4764,8 +4897,9 @@ function AnalysisBookTile({ book, onDelete, onEdit, onClick, onDragStart }) {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
         <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.blue }}>{book.name}</span>
         <div style={{ display: "flex", gap: 6 }}>
-          <button onClick={e => { e.stopPropagation(); onEdit(); }}   style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13 }}>✎</button>
-          <button onClick={e => { e.stopPropagation(); onDelete(); }} style={{ background: "none", border: "none", color: T.red,     cursor: "pointer", fontSize: 16 }}>×</button>
+          <button onClick={e => { e.stopPropagation(); onEdit(); }}      style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13 }}>✎</button>
+          <button onClick={e => { e.stopPropagation(); onDuplicate?.(); }} title="Duplicate" style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: "0 1px" }}>⧉</button>
+          <button onClick={e => { e.stopPropagation(); onDelete(); }}     style={{ background: "none", border: "none", color: T.red,     cursor: "pointer", fontSize: 16 }}>×</button>
         </div>
       </div>
       <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>
@@ -5075,6 +5209,13 @@ export default function App() {
     setActiveBook(prev => prev === id ? null : prev);
   };
 
+  const duplicateBook = async (book) => {
+    const newId = String(Date.now());
+    const copy = { ...book, id: newId, name: `${book.name} (copy)`, panels: JSON.parse(JSON.stringify(book.panels || [])) };
+    await api("POST", "/analysis-books", copy);
+    setBooks(p => [...p, copy]);
+  };
+
   const openBook = async (id) => {
     const book = books.find(b => b.id === id);
     if (!book) return;
@@ -5283,6 +5424,7 @@ export default function App() {
                           onOpenBook={openBook}
                           onDeleteBook={deleteBook}
                           onEditBook={b => setEditingBook(b)}
+                          onDuplicateBook={duplicateBook}
                           onDrop={() => handleDropToBookFolder(f.id)}
                           onDragStartBook={setDraggingBookId}
                           onEdit={() => setEditingFolder(f)}
@@ -5305,6 +5447,7 @@ export default function App() {
                                 onClick={() => openBook(b.id)}
                                 onDelete={() => { if (window.confirm(`Delete book "${b.name}"?`)) deleteBook(b.id); }}
                                 onEdit={() => setEditingBook(b)}
+                                onDuplicate={() => duplicateBook(b)}
                                 onDragStart={bookFolders.length > 0 ? setDraggingBookId : undefined} />
                             ))}
                           </div>
