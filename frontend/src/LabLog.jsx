@@ -3423,7 +3423,7 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
         const maxCols    = ps.rsmMaxCols > 0 ? ps.rsmMaxCols : entries.length;
         const cols       = Math.min(maxCols, entries.length);
         const rows       = Math.ceil(entries.length / cols);
-        const useSample  = (ps.rsmLabelColor ?? "sample") === "sample";
+        const labelStyle = ps.rsmLabelColor ?? "sample";
 
         // ── non-tight: individual RSMPlot components (original layout) ────────
         if (!tight) {
@@ -3432,7 +3432,7 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
             <div style={{ display: "flex", gap: 14, flexWrap: "wrap", justifyContent: "center" }}>
               {entries.map(e => (
                 <div key={e.sid} style={{ flex: "0 0 auto", width: panelW }}>
-                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: useSample ? e.color : T.textPrimary, marginBottom: 4, textAlign: "center" }}>{labels[e.sid] || e.sid}</div>
+                  {labelStyle !== "off" && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: labelStyle === "sample" ? e.color : T.textPrimary, marginBottom: 4, textAlign: "center" }}>{labels[e.sid] || e.sid}</div>}
                   <RSMPlot data={e.data} cfg={rsmCfg} forcedXDomain={forcedXDomain} forcedYDomain={forcedYDomain} plotStyle={ps} showColorbar={ps.rsmColorbar} points={resolvedPoints} />
                 </div>
               ))}
@@ -3526,13 +3526,15 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
           };
 
           // Sample label — inside, top-left of each panel
-          annotations.push({
-            text: `<b>${labels[e.sid] || e.sid}</b>`,
-            xref: `${xRef} domain`, yref: `${yRef} domain`,
-            x: 0.03, y: 0.97, xanchor: "left", yanchor: "top",
-            showarrow: false,
-            font: { size: ps.fontSize || 12, color: useSample ? e.color : T.textPrimary, family: ps.font },
-          });
+          if (labelStyle !== "off") {
+            annotations.push({
+              text: `<b>${labels[e.sid] || e.sid}</b>`,
+              xref: `${xRef} domain`, yref: `${yRef} domain`,
+              x: 0.03, y: 0.97, xanchor: "left", yanchor: "top",
+              showarrow: false,
+              font: { size: ps.fontSize || 12, color: labelStyle === "sample" ? e.color : T.textPrimary, family: ps.font },
+            });
+          }
 
           // Box outline per subplot
           if (ps.box !== "off") {
@@ -3567,12 +3569,14 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
         };
 
         return (
-          <Plot
-            data={plotlyTraces}
-            layout={plotLayout}
-            config={{ ...buildPlotConfig("rsm-comparison", ps), responsive: false }}
-            style={{ width: `${figW}px`, height: `${figH}px` }}
-          />
+          <div style={{ display: "flex", justifyContent: "center" }}>
+            <Plot
+              data={plotlyTraces}
+              layout={plotLayout}
+              config={{ ...buildPlotConfig("rsm-comparison", ps), responsive: false }}
+              style={{ width: `${figW}px`, height: `${figH}px` }}
+            />
+          </div>
         );
       })()}
       {pointRows}
@@ -4824,11 +4828,11 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                   </div>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>LABEL CLR</span>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>LABEL</span>
                   <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
-                    {[["sample", "sample"], ["black", "black"]].map(([val, label], idx) => (
+                    {[["sample", "colored"], ["black", "black"], ["off", "off"]].map(([val, label], idx, arr) => (
                       <button key={val} onClick={() => onUpdate({ rsm_label_color: val })}
-                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 8px", background: (ps.rsmLabelColor ?? "sample") === val ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.rsmLabelColor ?? "sample") === val ? T.textPrimary : T.textDim, cursor: "pointer", letterSpacing: 0.5 }}>
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 8px", background: (ps.rsmLabelColor ?? "sample") === val ? T.bg3 : T.bg0, border: "none", borderRight: idx < arr.length - 1 ? `1px solid ${T.border}` : "none", color: (ps.rsmLabelColor ?? "sample") === val ? T.textPrimary : T.textDim, cursor: "pointer", letterSpacing: 0.5 }}>
                         {label}
                       </button>
                     ))}
