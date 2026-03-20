@@ -2501,7 +2501,7 @@ const DEFAULT_PLOT_STYLE = {
   rsmBins: 256, rsmColorbar: false, rsmLogIntensity: true,
   rsmXMin: null, rsmXMax: null, rsmYMin: null, rsmYMax: null,
   rsmBgMethod: "percentile", rsmBgPct: 5, rsmWhiteFade: 0.15, rsmQ2pi: false,
-  rsmMaxCols: null, rsmTight: false,
+  rsmMaxCols: null, rsmTight: false, rsmLabelColor: "sample",
   colorScale: "viridis", colorTrim: 5,
 };
 
@@ -3419,31 +3419,44 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
       {entries.length === 0 ? (
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No RSM data loaded for selected samples.</div>
       ) : (() => {
-        const tight    = ps.rsmTight ?? false;
-        const maxCols  = ps.rsmMaxCols > 0 ? ps.rsmMaxCols : entries.length;
-        const cols     = Math.min(maxCols, entries.length);
-        const rows     = Math.ceil(entries.length / cols);
+        const tight      = ps.rsmTight ?? false;
+        const maxCols    = ps.rsmMaxCols > 0 ? ps.rsmMaxCols : entries.length;
+        const cols       = Math.min(maxCols, entries.length);
+        const rows       = Math.ceil(entries.length / cols);
+        const useSample  = (ps.rsmLabelColor ?? "sample") === "sample";
+
+        // ── non-tight: individual RSMPlot components (original layout) ────────
+        if (!tight) {
+          const panelW = ps.plotWidth ? Math.round(ps.plotWidth * 96) : 280;
+          return (
+            <div style={{ display: "flex", gap: 14, flexWrap: "wrap", justifyContent: "center" }}>
+              {entries.map(e => (
+                <div key={e.sid} style={{ flex: "0 0 auto", width: panelW }}>
+                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: useSample ? e.color : T.textPrimary, marginBottom: 4, textAlign: "center" }}>{labels[e.sid] || e.sid}</div>
+                  <RSMPlot data={e.data} cfg={rsmCfg} forcedXDomain={forcedXDomain} forcedYDomain={forcedYDomain} plotStyle={ps} showColorbar={ps.rsmColorbar} points={resolvedPoints} />
+                </div>
+              ))}
+            </div>
+          );
+        }
+
+        // ── tight: single Plotly figure with subplots ─────────────────────────
         const logIntensity = ps.rsmLogIntensity ?? true;
         const q2pi     = ps.rsmQ2pi ?? false;
         const qUnit    = q2pi ? "Å⁻¹" : "nm⁻¹";
         const zLabel   = logIntensity ? "log I" : "I";
         const colorscale = makeHeatmapColorscale(ps.colorScale || "viridis", ps.rsmWhiteFade ?? 0);
 
-        // Global robust color range — all panels share the same scale for direct comparison
+        // Global robust color range — shared across all panels for direct comparison
         const validBinned = allBinned.filter(Boolean);
         const globalZmin = validBinned.length ? Math.min(...validBinned.map(b => b.zmin).filter(v => v != null)) : null;
         const globalZmax = validBinned.length ? Math.max(...validBinned.map(b => b.zmax).filter(v => v != null)) : null;
 
-        // Figure pixel dimensions
+        // Figure pixel dimensions (W × H = whole collection)
         const defPW = 280, defPH = 280;
-        const figW = tight
-          ? (ps.plotWidth  ? Math.round(ps.plotWidth  * 96) : defPW * cols)
-          : (ps.plotWidth  ? Math.round(ps.plotWidth  * 96) : defPW) * cols;
-        const figH = tight
-          ? (ps.plotHeight ? Math.round(ps.plotHeight * 96) : defPH * rows)
-          : (ps.plotHeight ? Math.round(ps.plotHeight * 96) : defPH) * rows;
+        const figW = ps.plotWidth  ? Math.round(ps.plotWidth  * 96) : defPW * cols;
+        const figH = ps.plotHeight ? Math.round(ps.plotHeight * 96) : defPH * rows;
 
-        // Per-subplot axis base style
         const gridDash = { dotted: "dot", dashed: "dash", solid: "solid" }[ps.grid] || "dash";
         const axisBase = {
           showgrid: ps.grid !== "off", gridcolor: T.border, griddash: gridDash,
@@ -3470,10 +3483,8 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
           const row      = Math.floor(idx / cols);
           const isLeft   = col === 0;
           const isBottom = row === rows - 1 || idx >= entries.length - ((entries.length % cols) || cols);
-          const showXLabels = !tight || isBottom;
-          const showYLabels = !tight || isLeft;
-          const xTicks = makeTicks(binned.xDomain[0], binned.xDomain[1], ps.xTick);
-          const yTicks = makeTicks(binned.yDomain[0], binned.yDomain[1], ps.yTick);
+          const xTicks   = makeTicks(binned.xDomain[0], binned.xDomain[1], ps.xTick);
+          const yTicks   = makeTicks(binned.yDomain[0], binned.yDomain[1], ps.yTick);
 
           // Heatmap
           plotlyTraces.push({
@@ -3498,29 +3509,29 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
             });
           });
 
-          // Axes
+          // Axes — labels only on outer edges
           axesLayout[xAxisKey] = {
             ...axisBase, ...spikeProps,
             range: [binned.xDomain[0], binned.xDomain[1]],
             ...(xTicks ? { tickvals: xTicks, tickmode: "array" } : {}),
-            showticklabels: showXLabels,
-            ...(showXLabels ? { title: { text: `Qₓ (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } } : { title: { text: "" } }),
+            showticklabels: isBottom,
+            ...(isBottom ? { title: { text: `Qₓ (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } } : { title: { text: "" } }),
           };
           axesLayout[yAxisKey] = {
             ...axisBase, ...spikeProps,
             range: [binned.yDomain[0], binned.yDomain[1]],
             ...(yTicks ? { tickvals: yTicks, tickmode: "array" } : {}),
-            showticklabels: showYLabels, ticklabelstandoff: 4,
-            ...(showYLabels ? { title: { text: `Qz (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 6 } } : { title: { text: "" } }),
+            showticklabels: isLeft, ticklabelstandoff: 4,
+            ...(isLeft ? { title: { text: `Qz (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 6 } } : { title: { text: "" } }),
           };
 
-          // Sample label above each subplot
+          // Sample label — inside, top-left of each panel
           annotations.push({
-            text: labels[e.sid] || e.sid,
+            text: `<b>${labels[e.sid] || e.sid}</b>`,
             xref: `${xRef} domain`, yref: `${yRef} domain`,
-            x: 0.5, y: 1.0, xanchor: "center", yanchor: "bottom",
+            x: 0.03, y: 0.97, xanchor: "left", yanchor: "top",
             showarrow: false,
-            font: { size: ps.fontSize || 12, color: e.color, family: ps.font },
+            font: { size: ps.fontSize || 12, color: useSample ? e.color : T.textPrimary, family: ps.font },
           });
 
           // Box outline per subplot
@@ -3542,13 +3553,12 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
           autosize: false, width: figW, height: figH,
           paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
           font: { family: ps.font, size: ps.fontSize, color: T.textPrimary },
-          margin: { t: 28, r: 14, b: 58, l: 68, pad: 0 },
+          margin: { t: 14, r: 14, b: 58, l: 68, pad: 0 },
           grid: {
             rows, columns: cols,
             pattern: "independent",
             roworder: "top to bottom",
-            xgap: tight ? 0 : 0.05,
-            ygap: tight ? 0 : 0.06,
+            xgap: 0, ygap: 0,
           },
           annotations, shapes,
           uirevision: "rsm-grid",
@@ -4420,6 +4430,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
     rsmQ2pi:        config.rsm_q2pi         ?? false,
     rsmMaxCols:     config.rsm_max_cols      != null ? Number(config.rsm_max_cols) : null,
     rsmTight:       config.rsm_tight         ?? false,
+    rsmLabelColor:  config.rsm_label_color   ?? "sample",
     colorScale:     bookColorScale,
     colorTrim:      config.color_trim        ?? 5,
     xMin:           config.x_min  != null ? Number(config.x_min)  : null,
@@ -4808,6 +4819,17 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                       <button key={opt} onClick={() => onUpdate({ rsm_tight: opt === "on" })}
                         style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (ps.rsmTight ? "on" : "off") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.rsmTight ? "on" : "off") === opt ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
                         {opt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>LABEL CLR</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {[["sample", "sample"], ["black", "black"]].map(([val, label], idx) => (
+                      <button key={val} onClick={() => onUpdate({ rsm_label_color: val })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 8px", background: (ps.rsmLabelColor ?? "sample") === val ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.rsmLabelColor ?? "sample") === val ? T.textPrimary : T.textDim, cursor: "pointer", letterSpacing: 0.5 }}>
+                        {label}
                       </button>
                     ))}
                   </div>
