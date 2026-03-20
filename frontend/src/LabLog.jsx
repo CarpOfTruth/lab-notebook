@@ -3555,7 +3555,7 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
           autosize: false, width: figW, height: figH,
           paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
           font: { family: ps.font, size: ps.fontSize, color: T.textPrimary },
-          margin: { t: 14, r: 14, b: 58, l: 68, pad: 0 },
+          margin: { t: 40, r: 14, b: 58, l: 68, pad: 0 },
           grid: {
             rows, columns: cols,
             pattern: "independent",
