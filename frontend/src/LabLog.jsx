@@ -3401,44 +3401,168 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
       </div>
     );
 
+  // Memoize binning for all entries together so a single Plot can be built.
+  const entryKey = entries.map(e => `${e.sid}:${e.data.length}`).join(",");
+  const allBinned = useMemo(() => {
+    const bins = ps.rsmBins || 256;
+    const logIntensity = ps.rsmLogIntensity ?? true;
+    const bgMethod = ps.rsmBgMethod ?? null;
+    const bgPct = ps.rsmBgPct ?? 5;
+    return entries.map(e =>
+      binRSM(e.data, bins, bins, forcedXDomain || null, forcedYDomain || null, logIntensity, bgMethod, bgPct)
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entryKey, ps.rsmBins, forcedXDomain?.[0], forcedXDomain?.[1], forcedYDomain?.[0], forcedYDomain?.[1], ps.rsmLogIntensity, ps.rsmBgMethod, ps.rsmBgPct]);
+
   return (
     <div>
       {entries.length === 0 ? (
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No RSM data loaded for selected samples.</div>
       ) : (() => {
-        const tight = ps.rsmTight ?? false;
-        const maxCols = ps.rsmMaxCols > 0 ? ps.rsmMaxCols : entries.length;
-        const cols = Math.min(maxCols, entries.length);
-        const rows = Math.ceil(entries.length / cols);
-        // In tight mode, W/H describe the whole grid; divide for per-panel px
-        const panelPxW = tight && ps.plotWidth  ? Math.round(ps.plotWidth  * 96 / cols) : (ps.plotWidth ? Math.round(ps.plotWidth * 96) : null);
-        const panelPxH = tight && ps.plotHeight ? Math.round(ps.plotHeight * 96 / rows) : (ps.plotHeight ? Math.round(ps.plotHeight * 96) : null);
-        const defaultPxW = panelPxW ?? 280;
+        const tight    = ps.rsmTight ?? false;
+        const maxCols  = ps.rsmMaxCols > 0 ? ps.rsmMaxCols : entries.length;
+        const cols     = Math.min(maxCols, entries.length);
+        const rows     = Math.ceil(entries.length / cols);
+        const logIntensity = ps.rsmLogIntensity ?? true;
+        const q2pi     = ps.rsmQ2pi ?? false;
+        const qUnit    = q2pi ? "Å⁻¹" : "nm⁻¹";
+        const zLabel   = logIntensity ? "log I" : "I";
+        const colorscale = makeHeatmapColorscale(ps.colorScale || "viridis", ps.rsmWhiteFade ?? 0);
+
+        // Global robust color range — all panels share the same scale for direct comparison
+        const validBinned = allBinned.filter(Boolean);
+        const globalZmin = validBinned.length ? Math.min(...validBinned.map(b => b.zmin).filter(v => v != null)) : null;
+        const globalZmax = validBinned.length ? Math.max(...validBinned.map(b => b.zmax).filter(v => v != null)) : null;
+
+        // Figure pixel dimensions
+        const defPW = 280, defPH = 280;
+        const figW = tight
+          ? (ps.plotWidth  ? Math.round(ps.plotWidth  * 96) : defPW * cols)
+          : (ps.plotWidth  ? Math.round(ps.plotWidth  * 96) : defPW) * cols;
+        const figH = tight
+          ? (ps.plotHeight ? Math.round(ps.plotHeight * 96) : defPH * rows)
+          : (ps.plotHeight ? Math.round(ps.plotHeight * 96) : defPH) * rows;
+
+        // Per-subplot axis base style
+        const gridDash = { dotted: "dot", dashed: "dash", solid: "solid" }[ps.grid] || "dash";
+        const axisBase = {
+          showgrid: ps.grid !== "off", gridcolor: T.border, griddash: gridDash,
+          color: T.textDim, tickfont: { size: (ps.fontSize || 12) - 1, family: ps.font, color: T.textDim },
+          zeroline: false, showline: false,
+          ticks: "inside", ticklen: 4, mirror: "ticks",
+        };
+        const spikeProps = { showspikes: true, spikemode: "across", spikecolor: T.textDim, spikethickness: 1, spikedash: "dot", spikesnap: "cursor" };
+
+        const plotlyTraces = [];
+        const axesLayout   = {};
+        const annotations  = [];
+        const shapes       = [];
+
+        entries.forEach((e, idx) => {
+          const binned = allBinned[idx];
+          if (!binned) return;
+          const n        = idx + 1;
+          const xRef     = n === 1 ? "x"  : `x${n}`;
+          const yRef     = n === 1 ? "y"  : `y${n}`;
+          const xAxisKey = n === 1 ? "xaxis"  : `xaxis${n}`;
+          const yAxisKey = n === 1 ? "yaxis"  : `yaxis${n}`;
+          const col      = idx % cols;
+          const row      = Math.floor(idx / cols);
+          const isLeft   = col === 0;
+          const isBottom = row === rows - 1 || idx >= entries.length - ((entries.length % cols) || cols);
+          const showXLabels = !tight || isBottom;
+          const showYLabels = !tight || isLeft;
+          const xTicks = makeTicks(binned.xDomain[0], binned.xDomain[1], ps.xTick);
+          const yTicks = makeTicks(binned.yDomain[0], binned.yDomain[1], ps.yTick);
+
+          // Heatmap
+          plotlyTraces.push({
+            type: "heatmap", x: binned.x, y: binned.y, z: binned.z,
+            xaxis: xRef, yaxis: yRef,
+            colorscale, showscale: !!(ps.rsmColorbar && idx === entries.length - 1),
+            connectgaps: false, zsmooth: false,
+            zauto: false,
+            zmin: globalZmin != null ? globalZmin : binned.zmin,
+            zmax: globalZmax != null ? globalZmax : binned.zmax,
+            hovertemplate: `Qₓ: %{x:.4f}<br>Qz: %{y:.4f}<br>${zLabel}: %{z:.2f}<extra></extra>`,
+          });
+
+          // Reference point markers
+          resolvedPoints.forEach(pt => {
+            plotlyTraces.push({
+              type: "scatter", mode: "markers",
+              x: [pt.qx], y: [pt.qz], xaxis: xRef, yaxis: yRef,
+              marker: { color: pt.color, size: pt.markerSize ?? 9, symbol: pt.symbol || "cross", line: { color: "rgba(0,0,0,0.65)", width: 1.5 } },
+              showlegend: false,
+              hovertemplate: `${pt.label ? pt.label + "<br>" : ""}Qₓ: ${pt.qx.toFixed(4)}<br>Qz: ${pt.qz.toFixed(4)}<extra></extra>`,
+            });
+          });
+
+          // Axes
+          axesLayout[xAxisKey] = {
+            ...axisBase, ...spikeProps,
+            range: [binned.xDomain[0], binned.xDomain[1]],
+            ...(xTicks ? { tickvals: xTicks, tickmode: "array" } : {}),
+            showticklabels: showXLabels,
+            ...(showXLabels ? { title: { text: `Qₓ (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } } : { title: { text: "" } }),
+          };
+          axesLayout[yAxisKey] = {
+            ...axisBase, ...spikeProps,
+            range: [binned.yDomain[0], binned.yDomain[1]],
+            ...(yTicks ? { tickvals: yTicks, tickmode: "array" } : {}),
+            showticklabels: showYLabels, ticklabelstandoff: 4,
+            ...(showYLabels ? { title: { text: `Qz (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 6 } } : { title: { text: "" } }),
+          };
+
+          // Sample label above each subplot
+          annotations.push({
+            text: labels[e.sid] || e.sid,
+            xref: `${xRef} domain`, yref: `${yRef} domain`,
+            x: 0.5, y: 1.0, xanchor: "center", yanchor: "bottom",
+            showarrow: false,
+            font: { size: ps.fontSize || 12, color: e.color, family: ps.font },
+          });
+
+          // Box outline per subplot
+          if (ps.box !== "off") {
+            shapes.push({
+              type: "rect",
+              xref: `${xRef} domain`, yref: `${yRef} domain`,
+              x0: 0, y0: 0, x1: 1, y1: 1, layer: "above",
+              line: {
+                color: ps.box === "solid" ? T.textPrimary : T.borderBright,
+                width: ps.box === "solid" ? 1.5 : 1,
+                dash:  ps.box === "dashed" ? "dash" : "solid",
+              },
+            });
+          }
+        });
+
+        const plotLayout = {
+          autosize: false, width: figW, height: figH,
+          paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
+          font: { family: ps.font, size: ps.fontSize, color: T.textPrimary },
+          margin: { t: 28, r: 14, b: 58, l: 68, pad: 0 },
+          grid: {
+            rows, columns: cols,
+            pattern: "independent",
+            roworder: "top to bottom",
+            xgap: tight ? 0 : 0.05,
+            ygap: tight ? 0 : 0.06,
+          },
+          annotations, shapes,
+          uirevision: "rsm-grid",
+          hovermode: "closest",
+          ...axesLayout,
+        };
+
         return (
-          <div style={{
-            display: "grid",
-            gridTemplateColumns: `repeat(${cols}, ${defaultPxW}px)`,
-            gap: tight ? 0 : 14,
-            justifyContent: "center",
-          }}>
-            {entries.map((e, idx) => {
-              const col = idx % cols;
-              const row = Math.floor(idx / cols);
-              const isLeft   = col === 0;
-              const isBottom = row === rows - 1 || idx >= entries.length - (entries.length % cols || cols);
-              const hideY = tight && !isLeft;
-              const hideX = tight && !isBottom;
-              return (
-                <div key={e.sid} style={{ display: "flex", flexDirection: "column" }}>
-                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: e.color, marginBottom: tight ? 1 : 4, textAlign: "center" }}>{labels[e.sid] || e.sid}</div>
-                  <RSMPlot data={e.data} cfg={rsmCfg} forcedXDomain={forcedXDomain} forcedYDomain={forcedYDomain}
-                    plotStyle={ps} showColorbar={ps.rsmColorbar} points={resolvedPoints}
-                    hideXLabels={hideX} hideYLabels={hideY}
-                    overridePxW={panelPxW} overridePxH={panelPxH} />
-                </div>
-              );
-            })}
-          </div>
+          <Plot
+            data={plotlyTraces}
+            layout={plotLayout}
+            config={{ ...buildPlotConfig("rsm-comparison", ps), responsive: false }}
+            style={{ width: `${figW}px`, height: `${figH}px` }}
+          />
         );
       })()}
       {pointRows}
