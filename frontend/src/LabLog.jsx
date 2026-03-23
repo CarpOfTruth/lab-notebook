@@ -2010,7 +2010,10 @@ function FolderTile({ folder, samples, childContent = null, plotCache, depth = 0
     e.preventDefault();
     if (isFolderDrag(e)) {
       const rect = folderBoxRef.current?.getBoundingClientRect();
-      setInsertPos(rect && e.clientY < rect.top + rect.height / 2 ? "above" : "below");
+      if (rect) {
+        const pct = (e.clientY - rect.top) / rect.height;
+        setInsertPos(pct < 0.25 ? "above" : pct > 0.75 ? "below" : "inside");
+      }
       e.dataTransfer.dropEffect = "move";
     } else {
       e.dataTransfer.dropEffect = "move";
@@ -2027,25 +2030,37 @@ function FolderTile({ folder, samples, childContent = null, plotCache, depth = 0
     e.preventDefault();
     if (isFolderDrag(e)) {
       const fid = e.dataTransfer.getData("text/x-folder");
-      onDropFolder?.(fid, folder.id, insertPos ?? "below");
+      onDropFolder?.(fid, folder.id, insertPos ?? "inside");
     } else {
       onDropSample?.();
     }
     setSampleDragOver(false);
     setInsertPos(null);
   };
+  const folderDragInside = insertPos === "inside";
 
   return (
     <div onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}
       style={{ marginLeft: depth > 0 ? 20 : 0, marginBottom: 8 }}>
       {insertPos === "above" && <div style={{ height: 3, background: T.amber, borderRadius: 2, marginBottom: 4 }} />}
       <div ref={folderBoxRef}
-        style={{ border: `2px solid ${sampleDragOver ? T.amber : color}`, borderRadius: 10, overflow: "hidden", boxShadow: sampleDragOver ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
-        <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: sampleDragOver ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
+        style={{ border: `2px solid ${sampleDragOver || folderDragInside ? T.amber : color}`, borderRadius: 10, overflow: "hidden", boxShadow: sampleDragOver || folderDragInside ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
+        <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: sampleDragOver || folderDragInside ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
           onClick={toggleOpen}>
           <span
             draggable
-            onDragStart={e => { e.stopPropagation(); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/x-folder", folder.id); onDragStartFolder?.(folder.id); }}
+            onDragStart={e => {
+              e.stopPropagation();
+              e.dataTransfer.effectAllowed = "move";
+              e.dataTransfer.setData("text/x-folder", folder.id);
+              const ghost = document.createElement("div");
+              ghost.style.cssText = `position:fixed;top:-1000px;left:-1000px;background:${T.bg2};border:2px solid ${color};border-radius:8px;padding:7px 14px;display:flex;align-items:center;gap:8px;font-family:'Playfair Display',serif;font-size:14px;color:${T.textPrimary};white-space:nowrap;pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,.4)`;
+              ghost.innerHTML = `<span style="color:${T.textDim};font-size:14px;margin-right:2px">⠿</span><span style="width:10px;height:10px;border-radius:50%;background:${color};display:inline-block;flex-shrink:0"></span><span style="margin-left:4px">${folder.name}</span>`;
+              document.body.appendChild(ghost);
+              e.dataTransfer.setDragImage(ghost, 20, 18);
+              setTimeout(() => document.body.removeChild(ghost), 0);
+              onDragStartFolder?.(folder.id);
+            }}
             onClick={e => e.stopPropagation()}
             style={{ cursor: "grab", color: T.textDim, fontSize: 16, lineHeight: 1, padding: "0 2px", flexShrink: 0, userSelect: "none" }}>⠿</span>
           <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
@@ -5071,7 +5086,10 @@ function BookFolderTile({ folder, books, childContent = null, depth = 0,
     e.preventDefault();
     if (isFolderDrag(e)) {
       const rect = folderBoxRef.current?.getBoundingClientRect();
-      setInsertPos(rect && e.clientY < rect.top + rect.height / 2 ? "above" : "below");
+      if (rect) {
+        const pct = (e.clientY - rect.top) / rect.height;
+        setInsertPos(pct < 0.25 ? "above" : pct > 0.75 ? "below" : "inside");
+      }
       e.dataTransfer.dropEffect = "move";
     } else {
       e.dataTransfer.dropEffect = "move";
@@ -5088,25 +5106,37 @@ function BookFolderTile({ folder, books, childContent = null, depth = 0,
     e.preventDefault();
     if (isFolderDrag(e)) {
       const fid = e.dataTransfer.getData("text/x-folder");
-      onDropFolder?.(fid, folder.id, insertPos ?? "below");
+      onDropFolder?.(fid, folder.id, insertPos ?? "inside");
     } else {
       onDrop?.();
     }
     setBookDragOver(false);
     setInsertPos(null);
   };
+  const folderDragInside = insertPos === "inside";
 
   return (
     <div onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}
       style={{ marginLeft: depth > 0 ? 20 : 0, marginBottom: 8 }}>
       {insertPos === "above" && <div style={{ height: 3, background: T.amber, borderRadius: 2, marginBottom: 4 }} />}
       <div ref={folderBoxRef}
-        style={{ border: `2px solid ${bookDragOver ? T.amber : color}`, borderRadius: 10, overflow: "hidden", boxShadow: bookDragOver ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
-        <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: bookDragOver ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
+        style={{ border: `2px solid ${bookDragOver || folderDragInside ? T.amber : color}`, borderRadius: 10, overflow: "hidden", boxShadow: bookDragOver || folderDragInside ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
+        <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: bookDragOver || folderDragInside ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
           onClick={toggleOpen}>
           <span
             draggable
-            onDragStart={e => { e.stopPropagation(); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/x-folder", folder.id); onDragStartFolder?.(folder.id); }}
+            onDragStart={e => {
+              e.stopPropagation();
+              e.dataTransfer.effectAllowed = "move";
+              e.dataTransfer.setData("text/x-folder", folder.id);
+              const ghost = document.createElement("div");
+              ghost.style.cssText = `position:fixed;top:-1000px;left:-1000px;background:${T.bg2};border:2px solid ${color};border-radius:8px;padding:7px 14px;display:flex;align-items:center;gap:8px;font-family:'Playfair Display',serif;font-size:14px;color:${T.textPrimary};white-space:nowrap;pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,.4)`;
+              ghost.innerHTML = `<span style="color:${T.textDim};font-size:14px;margin-right:2px">⠿</span><span style="width:10px;height:10px;border-radius:50%;background:${color};display:inline-block;flex-shrink:0"></span><span style="margin-left:4px">${folder.name}</span>`;
+              document.body.appendChild(ghost);
+              e.dataTransfer.setDragImage(ghost, 20, 18);
+              setTimeout(() => document.body.removeChild(ghost), 0);
+              onDragStartFolder?.(folder.id);
+            }}
             onClick={e => e.stopPropagation()}
             style={{ cursor: "grab", color: T.textDim, fontSize: 16, lineHeight: 1, padding: "0 2px", flexShrink: 0, userSelect: "none" }}>⠿</span>
           <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
@@ -5528,6 +5558,25 @@ export default function App() {
     const dragged = folders.find(f => f.id === draggedId);
     const target  = folders.find(f => f.id === targetId);
     if (!dragged || !target) return;
+
+    if (pos === "inside") {
+      // Nest dragged folder inside target folder
+      // Guard against dropping a folder into one of its own descendants
+      const getDescIds = (id) => {
+        const s = new Set([id]);
+        folders.filter(f => f.parent_id === id).forEach(c => getDescIds(c.id).forEach(x => s.add(x)));
+        return s;
+      };
+      if (getDescIds(draggedId).has(targetId)) return;
+      const children = folders.filter(f => (f.parent_id ?? null) === targetId && f.id !== draggedId);
+      const sort_order = children.length;
+      const updates = [{ id: draggedId, sort_order, parent_id: targetId }];
+      setFolders(prev => prev.map(f => f.id === draggedId ? { ...f, parent_id: targetId, sort_order } : f));
+      setDraggingFolderId(null);
+      await api("POST", "/folders/reorder", updates);
+      return;
+    }
+
     // Reorder among siblings at target's level (same parent, same type)
     const newParent = target.parent_id ?? null;
     const siblings = [...folders]
