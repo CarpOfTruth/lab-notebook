@@ -361,16 +361,18 @@ def get_afm_data(sample_id: str):
                 c = np.polyfit(xs_row[mask], ch[r, mask], 1)
                 ch[r] -= np.polyval(c, xs_row)
 
-            # Global plane tilt removal on post-linewise residuals
+            # Global 2nd-order polynomial flatten on post-linewise residuals
             ys2, xs2 = np.mgrid[0:Hr, 0:Wr]
             flat2 = ch.ravel()
             ok2   = np.isfinite(flat2)
             q1b, q3b = np.percentile(flat2[ok2], [25, 75])
             iqr_b    = q3b - q1b
             ok2 &= (flat2 >= q1b - 3.0 * iqr_b) & (flat2 <= q3b + 3.0 * iqr_b)
-            A2 = np.stack([np.ones(ok2.sum()), xs2.ravel()[ok2], ys2.ravel()[ok2]], axis=1)
+            xf2, yf2 = xs2.ravel()[ok2], ys2.ravel()[ok2]
+            A2 = np.stack([np.ones(ok2.sum()), xf2, yf2, xf2**2, xf2*yf2, yf2**2], axis=1)
             c2, *_ = np.linalg.lstsq(A2, flat2[ok2], rcond=None)
-            ch -= c2[0] + c2[1] * xs2 + c2[2] * ys2
+            ch -= (c2[0] + c2[1]*xs2 + c2[2]*ys2
+                   + c2[3]*xs2**2 + c2[4]*xs2*ys2 + c2[5]*ys2**2)
 
             ch *= 1e9  # m → nm
 
