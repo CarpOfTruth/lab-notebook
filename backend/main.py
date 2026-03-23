@@ -337,21 +337,41 @@ def get_afm_data(sample_id: str):
         Hr, Wr = ch.shape
         ch_label = labels[i] if i < len(labels) else f"Ch{i}"
 
-        # Height channel: 2nd-order polynomial flatten on rotated data, then m → nm
+        # Height channel: linewise (row-by-row) flatten to remove scan-line Z-drift,
+        # followed by a global plane tilt removal, then m → nm.
         if "height" in ch_label.lower() or i == 0:
-            ys, xs = np.mgrid[0:Hr, 0:Wr]
-            flat = ch.ravel()
-            ok = np.isfinite(flat)
-            # IQR masking — exclude particles / outliers from the plane fit
-            q1, q3 = np.percentile(flat[ok], [25, 75])
-            iqr = q3 - q1
-            ok &= (flat >= q1 - 3.0 * iqr) & (flat <= q3 + 3.0 * iqr)
-            xf, yf = xs.ravel()[ok], ys.ravel()[ok]
-            A = np.stack([np.ones(ok.sum()), xf, yf, xf**2, xf*yf, yf**2], axis=1)
-            coeffs, *_ = np.linalg.lstsq(A, flat[ok], rcond=None)
-            ch -= (coeffs[0]
-                   + coeffs[1]*xs + coeffs[2]*ys
-                   + coeffs[3]*xs**2 + coeffs[4]*xs*ys + coeffs[5]*ys**2)
+            xs_row = np.arange(Wr, dtype=np.float64)
+
+            # Global IQR mask: exclude large features/outliers from all fits
+            flat_g = ch.ravel()
+            ok_g   = np.isfinite(flat_g)
+            q1g, q3g = np.percentile(flat_g[ok_g], [25, 75])
+            iqr_g    = q3g - q1g
+            global_mask = (np.isfinite(ch)
+                           & (ch >= q1g - 3.0 * iqr_g)
+                           & (ch <= q3g + 3.0 * iqr_g))
+
+            # Row-by-row 1st-order (linear) flatten — removes per-line Z drift
+            for r in range(Hr):
+                mask = global_mask[r]
+                if mask.sum() < 2:          # fallback if most of row is masked
+                    mask = np.isfinite(ch[r])
+                if mask.sum() < 2:
+                    continue
+                c = np.polyfit(xs_row[mask], ch[r, mask], 1)
+                ch[r] -= np.polyval(c, xs_row)
+
+            # Global plane tilt removal on post-linewise residuals
+            ys2, xs2 = np.mgrid[0:Hr, 0:Wr]
+            flat2 = ch.ravel()
+            ok2   = np.isfinite(flat2)
+            q1b, q3b = np.percentile(flat2[ok2], [25, 75])
+            iqr_b    = q3b - q1b
+            ok2 &= (flat2 >= q1b - 3.0 * iqr_b) & (flat2 <= q3b + 3.0 * iqr_b)
+            A2 = np.stack([np.ones(ok2.sum()), xs2.ravel()[ok2], ys2.ravel()[ok2]], axis=1)
+            c2, *_ = np.linalg.lstsq(A2, flat2[ok2], rcond=None)
+            ch -= c2[0] + c2[1] * xs2 + c2[2] * ys2
+
             ch *= 1e9  # m → nm
 
         # Percentile-clipped display range (robust against outliers for all channels)
