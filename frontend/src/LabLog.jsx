@@ -1941,7 +1941,7 @@ function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, 
   return (
     <div
       draggable
-      onDragStart={e => { wasDragged.current = true; e.dataTransfer.effectAllowed = "move"; onDragStart?.(sample.id); }}
+      onDragStart={e => { wasDragged.current = true; e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/x-sample", sample.id); onDragStart?.(sample.id); }}
       onDragEnd={() => { setTimeout(() => { wasDragged.current = false; }, 50); }}
       onClick={() => { if (wasDragged.current) return; onClick(); }}
       style={{ position: "relative", background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 18px", cursor: "grab", transition: "all .15s", display: "flex", flexDirection: "column", gap: 9 }}
@@ -1994,50 +1994,101 @@ function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, 
 
 const COLOR_OPTIONS = ["#4a5568", "#3182ce", "#38a169", "#d69e2e", "#9f7aea", "#ed64a6", "#fc8181", "#4fd1c5"];
 
-function FolderTile({ folder, samples, plotCache, onSelectSample, onDeleteSample, onDuplicateTemplate, onEdit, onDelete, onDropSample, onDragStartSample }) {
+function FolderTile({ folder, samples, childContent = null, plotCache, depth = 0,
+  onSelectSample, onDeleteSample, onDuplicateTemplate, onEdit, onDelete,
+  onDropSample, onDragStartSample, onDragStartFolder, onDropFolder }) {
   const lsKey = `folder-open-${folder.id}`;
   const [open, setOpen] = useState(() => { try { const v = localStorage.getItem(lsKey); return v === null ? false : v === "1"; } catch { return false; } });
   const toggleOpen = () => setOpen(v => { const next = !v; try { localStorage.setItem(lsKey, next ? "1" : "0"); } catch {} return next; });
-  const [dragOver, setDragOver] = useState(false);
+  const [sampleDragOver, setSampleDragOver] = useState(false);
+  const [insertPos, setInsertPos] = useState(null);
+  const folderBoxRef = useRef(null);
   const color = folder.color || T.borderBright;
+  const isFolderDrag = e => e.dataTransfer.types.includes("text/x-folder");
 
-  const handleDragOver = e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setDragOver(true); };
-  const handleDragLeave = e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false); };
-  const handleDrop = e => { e.preventDefault(); setDragOver(false); onDropSample?.(); };
+  const handleDragOver = e => {
+    e.preventDefault();
+    if (isFolderDrag(e)) {
+      const rect = folderBoxRef.current?.getBoundingClientRect();
+      setInsertPos(rect && e.clientY < rect.top + rect.height / 2 ? "above" : "below");
+      e.dataTransfer.dropEffect = "move";
+    } else {
+      e.dataTransfer.dropEffect = "move";
+      setSampleDragOver(true);
+    }
+  };
+  const handleDragLeave = e => {
+    if (!e.currentTarget.contains(e.relatedTarget)) {
+      setSampleDragOver(false);
+      setInsertPos(null);
+    }
+  };
+  const handleDrop = e => {
+    e.preventDefault();
+    if (isFolderDrag(e)) {
+      const fid = e.dataTransfer.getData("text/x-folder");
+      onDropFolder?.(fid, folder.id, insertPos ?? "below");
+    } else {
+      onDropSample?.();
+    }
+    setSampleDragOver(false);
+    setInsertPos(null);
+  };
 
   return (
-    <div
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
-      style={{ border: `2px solid ${dragOver ? T.amber : color}`, borderRadius: 10, overflow: "hidden", marginBottom: 16, boxShadow: dragOver ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
-      <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: dragOver ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
-        onClick={toggleOpen}>
-        <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
-        <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: T.textPrimary, flex: 1 }}>{folder.name}</span>
-        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>{samples.length}</span>
-        <span style={{ color: T.textDim, fontSize: 11 }}>{open ? "▾" : "▸"}</span>
-        <button onClick={e => { e.stopPropagation(); onEdit(); }} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: "0 3px" }}>✎</button>
-        <button onClick={e => { e.stopPropagation(); if (window.confirm(`Delete folder "${folder.name}"? Samples will become ungrouped.`)) onDelete(); }} style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, padding: "0 3px" }}>×</button>
-      </div>
-      {open && (
-        <div style={{ padding: 12, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(310px,1fr))", gap: 12, background: T.bg0 }}>
-          {samples.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => onSelectSample(s.id)} onDelete={onDeleteSample} onDuplicateTemplate={onDuplicateTemplate} onDragStart={onDragStartSample} />)}
-          {!samples.length && (
-            <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: dragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>
-              {dragOver ? "Drop to add to this folder" : "Empty folder"}
-            </div>
-          )}
+    <div onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}
+      style={{ marginLeft: depth > 0 ? 20 : 0, marginBottom: 8 }}>
+      {insertPos === "above" && <div style={{ height: 3, background: T.amber, borderRadius: 2, marginBottom: 4 }} />}
+      <div ref={folderBoxRef}
+        style={{ border: `2px solid ${sampleDragOver ? T.amber : color}`, borderRadius: 10, overflow: "hidden", boxShadow: sampleDragOver ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
+        <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: sampleDragOver ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
+          onClick={toggleOpen}>
+          <span
+            draggable
+            onDragStart={e => { e.stopPropagation(); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/x-folder", folder.id); onDragStartFolder?.(folder.id); }}
+            onClick={e => e.stopPropagation()}
+            style={{ cursor: "grab", color: T.textDim, fontSize: 16, lineHeight: 1, padding: "0 2px", flexShrink: 0, userSelect: "none" }}>⠿</span>
+          <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
+          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: T.textPrimary, flex: 1 }}>{folder.name}</span>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>{samples.length}</span>
+          <span style={{ color: T.textDim, fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+          <button onClick={e => { e.stopPropagation(); onEdit(); }} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: "0 3px" }}>✎</button>
+          <button onClick={e => { e.stopPropagation(); if (window.confirm(`Delete folder "${folder.name}"? Samples will become ungrouped.`)) onDelete(); }} style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, padding: "0 3px" }}>×</button>
         </div>
-      )}
+        {open && (
+          <div style={{ padding: 12, background: T.bg0 }}>
+            {childContent}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(310px,1fr))", gap: 12, marginTop: childContent ? 8 : 0 }}>
+              {samples.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => onSelectSample(s.id)} onDelete={onDeleteSample} onDuplicateTemplate={onDuplicateTemplate} onDragStart={onDragStartSample} />)}
+              {!samples.length && !childContent && (
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: sampleDragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>
+                  {sampleDragOver ? "Drop to add to this folder" : "Empty folder"}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+      {insertPos === "below" && <div style={{ height: 3, background: T.amber, borderRadius: 2, marginTop: 4 }} />}
     </div>
   );
 }
 
-function AddFolderModal({ onSave, onClose, existing }) {
-  const [name,    setName]    = useState(existing?.name || "");
-  const [color,   setColor]   = useState(existing?.color || COLOR_OPTIONS[0]);
+function AddFolderModal({ onSave, onClose, existing, allFolders = [] }) {
+  const [name,     setName]     = useState(existing?.name || "");
+  const [color,    setColor]    = useState(existing?.color || COLOR_OPTIONS[0]);
   const [forBooks, setForBooks] = useState(existing?.book_folder ?? false);
+  const [parentId, setParentId] = useState(existing?.parent_id || "");
+
+  // Prevent nesting a folder into itself or its descendants
+  const getDescendantIds = (id, set = new Set()) => {
+    set.add(id);
+    allFolders.filter(f => f.parent_id === id).forEach(c => getDescendantIds(c.id, set));
+    return set;
+  };
+  const excludeIds = existing ? getDescendantIds(existing.id) : new Set();
+  const parentOptions = allFolders.filter(f => !!f.book_folder === forBooks && !excludeIds.has(f.id));
+
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 360, display: "flex", flexDirection: "column", gap: 16 }}>
@@ -2046,7 +2097,7 @@ function AddFolderModal({ onSave, onClose, existing }) {
         {/* Samples / Analysis Books segmented toggle */}
         <div style={{ display: "flex", background: T.bg2, borderRadius: 8, padding: 3, gap: 2 }}>
           {[{ label: "Samples", value: false }, { label: "Analysis Books", value: true }].map(opt => (
-            <button key={String(opt.value)} onClick={() => setForBooks(opt.value)}
+            <button key={String(opt.value)} onClick={() => { setForBooks(opt.value); setParentId(""); }}
               style={{ flex: 1, padding: "6px 0", border: "none", borderRadius: 6, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 11, letterSpacing: 0.3, transition: "background .15s, color .15s",
                 background: forBooks === opt.value ? T.bg0 : "transparent",
                 color: forBooks === opt.value ? (opt.value ? T.blue : T.amber) : T.textDim,
@@ -2056,6 +2107,17 @@ function AddFolderModal({ onSave, onClose, existing }) {
             </button>
           ))}
         </div>
+        {/* Parent folder selector */}
+        {parentOptions.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <Label>Parent Folder</Label>
+            <select value={parentId} onChange={e => setParentId(e.target.value)}
+              style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "7px 10px", outline: "none" }}>
+              <option value="">— None (root level) —</option>
+              {parentOptions.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
+            </select>
+          </div>
+        )}
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           <Label>Color</Label>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -2067,7 +2129,7 @@ function AddFolderModal({ onSave, onClose, existing }) {
         </div>
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn onClick={() => { if (name.trim()) onSave({ name: name.trim(), color, book_folder: forBooks }); }} disabled={!name.trim()}>
+          <Btn onClick={() => { if (name.trim()) onSave({ name: name.trim(), color, book_folder: forBooks, parent_id: parentId || null }); }} disabled={!name.trim()}>
             {existing ? "Save" : "Create"}
           </Btn>
         </div>
@@ -4993,40 +5055,85 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings }
 
 // ── Analysis Books (tile + folder tile + modal) ───────────────────────────────
 
-function BookFolderTile({ folder, books, onDeleteBook, onEditBook, onDuplicateBook, onOpenBook, onDrop, onDragStartBook, onEdit, onDelete }) {
+function BookFolderTile({ folder, books, childContent = null, depth = 0,
+  onDeleteBook, onEditBook, onDuplicateBook, onOpenBook,
+  onDrop, onDragStartBook, onEdit, onDelete, onDragStartFolder, onDropFolder }) {
   const lsKey = `bookfolder-open-${folder.id}`;
   const [open, setOpen] = useState(() => { try { const v = localStorage.getItem(lsKey); return v === null ? false : v === "1"; } catch { return false; } });
   const toggleOpen = () => setOpen(v => { const next = !v; try { localStorage.setItem(lsKey, next ? "1" : "0"); } catch {} return next; });
-  const [dragOver, setDragOver] = useState(false);
+  const [bookDragOver, setBookDragOver] = useState(false);
+  const [insertPos, setInsertPos] = useState(null);
+  const folderBoxRef = useRef(null);
   const color = folder.color || T.borderBright;
+  const isFolderDrag = e => e.dataTransfer.types.includes("text/x-folder");
+
+  const handleDragOver = e => {
+    e.preventDefault();
+    if (isFolderDrag(e)) {
+      const rect = folderBoxRef.current?.getBoundingClientRect();
+      setInsertPos(rect && e.clientY < rect.top + rect.height / 2 ? "above" : "below");
+      e.dataTransfer.dropEffect = "move";
+    } else {
+      e.dataTransfer.dropEffect = "move";
+      setBookDragOver(true);
+    }
+  };
+  const handleDragLeave = e => {
+    if (!e.currentTarget.contains(e.relatedTarget)) {
+      setBookDragOver(false);
+      setInsertPos(null);
+    }
+  };
+  const handleDrop = e => {
+    e.preventDefault();
+    if (isFolderDrag(e)) {
+      const fid = e.dataTransfer.getData("text/x-folder");
+      onDropFolder?.(fid, folder.id, insertPos ?? "below");
+    } else {
+      onDrop?.();
+    }
+    setBookDragOver(false);
+    setInsertPos(null);
+  };
+
   return (
-    <div
-      onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setDragOver(true); }}
-      onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false); }}
-      onDrop={e => { e.preventDefault(); setDragOver(false); onDrop?.(); }}
-      style={{ border: `2px solid ${dragOver ? T.amber : color}`, borderRadius: 10, overflow: "hidden", marginBottom: 12, boxShadow: dragOver ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
-      <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: dragOver ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
-        onClick={toggleOpen}>
-        <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
-        <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: T.textPrimary, flex: 1 }}>{folder.name}</span>
-        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>{books.length}</span>
-        <span style={{ color: T.textDim, fontSize: 11 }}>{open ? "▾" : "▸"}</span>
-        <button onClick={e => { e.stopPropagation(); onEdit?.(); }} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: "0 3px" }}>✎</button>
-        <button onClick={e => { e.stopPropagation(); if (window.confirm(`Delete folder "${folder.name}"? Books will become ungrouped.`)) onDelete?.(); }} style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, padding: "0 3px" }}>×</button>
-      </div>
-      {open && (
-        <div style={{ padding: 12, display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(310px,1fr))", gap: 12, background: T.bg0 }}>
-          {books.map(b => (
-            <AnalysisBookTile key={b.id} book={b}
-              onClick={() => onOpenBook(b.id)}
-              onDelete={() => { if (window.confirm(`Delete book "${b.name}"?`)) onDeleteBook(b.id); }}
-              onEdit={() => onEditBook(b)}
-              onDuplicate={() => onDuplicateBook?.(b)}
-              onDragStart={onDragStartBook} />
-          ))}
-          {!books.length && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: dragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>{dragOver ? "Drop to add" : "Empty folder"}</div>}
+    <div onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}
+      style={{ marginLeft: depth > 0 ? 20 : 0, marginBottom: 8 }}>
+      {insertPos === "above" && <div style={{ height: 3, background: T.amber, borderRadius: 2, marginBottom: 4 }} />}
+      <div ref={folderBoxRef}
+        style={{ border: `2px solid ${bookDragOver ? T.amber : color}`, borderRadius: 10, overflow: "hidden", boxShadow: bookDragOver ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
+        <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: bookDragOver ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
+          onClick={toggleOpen}>
+          <span
+            draggable
+            onDragStart={e => { e.stopPropagation(); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/x-folder", folder.id); onDragStartFolder?.(folder.id); }}
+            onClick={e => e.stopPropagation()}
+            style={{ cursor: "grab", color: T.textDim, fontSize: 16, lineHeight: 1, padding: "0 2px", flexShrink: 0, userSelect: "none" }}>⠿</span>
+          <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
+          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: T.textPrimary, flex: 1 }}>{folder.name}</span>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>{books.length}</span>
+          <span style={{ color: T.textDim, fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+          <button onClick={e => { e.stopPropagation(); onEdit?.(); }} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: "0 3px" }}>✎</button>
+          <button onClick={e => { e.stopPropagation(); if (window.confirm(`Delete folder "${folder.name}"? Books will become ungrouped.`)) onDelete?.(); }} style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, padding: "0 3px" }}>×</button>
         </div>
-      )}
+        {open && (
+          <div style={{ padding: 12, background: T.bg0 }}>
+            {childContent}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(310px,1fr))", gap: 12, marginTop: childContent ? 8 : 0 }}>
+              {books.map(b => (
+                <AnalysisBookTile key={b.id} book={b}
+                  onClick={() => onOpenBook(b.id)}
+                  onDelete={() => { if (window.confirm(`Delete book "${b.name}"?`)) onDeleteBook(b.id); }}
+                  onEdit={() => onEditBook(b)}
+                  onDuplicate={() => onDuplicateBook?.(b)}
+                  onDragStart={onDragStartBook} />
+              ))}
+              {!books.length && !childContent && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: bookDragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>{bookDragOver ? "Drop to add" : "Empty folder"}</div>}
+            </div>
+          </div>
+        )}
+      </div>
+      {insertPos === "below" && <div style={{ height: 3, background: T.amber, borderRadius: 2, marginTop: 4 }} />}
     </div>
   );
 }
@@ -5041,7 +5148,7 @@ function AnalysisBookTile({ book, onDelete, onEdit, onDuplicate, onClick, onDrag
   return (
     <div
       draggable={!!onDragStart}
-      onDragStart={onDragStart ? e => { e.dataTransfer.effectAllowed = "move"; onDragStart(book.id); } : undefined}
+      onDragStart={onDragStart ? e => { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/x-book", book.id); onDragStart(book.id); } : undefined}
       onClick={onClick}
       style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 18px", display: "flex", flexDirection: "column", gap: 8, cursor: onClick ? "pointer" : "default" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -5160,6 +5267,7 @@ export default function App() {
   const [templateSample, setTemplateSample] = useState(null); // sample to duplicate
   const [draggingSampleId, setDraggingSampleId] = useState(null);
   const [draggingBookId,   setDraggingBookId]   = useState(null);
+  const [draggingFolderId, setDraggingFolderId] = useState(null);
   const [addingFolder, setAddingFolder] = useState(false);
   const [editingFolder, setEditingFolder] = useState(null); // folder object
   const [addingBook,    setAddingBook]    = useState(false);
@@ -5316,8 +5424,11 @@ export default function App() {
 
   const createFolder = async (data) => {
     const id = String(Date.now());
-    await api("POST", "/folders", { id, ...data });
-    setFolders(p => [...p, { id, ...data }]);
+    const siblings = folders.filter(f => !!f.book_folder === !!data.book_folder && (f.parent_id ?? null) === (data.parent_id ?? null));
+    const sort_order = siblings.length;
+    const folder = { id, sort_order, ...data };
+    await api("POST", "/folders", folder);
+    setFolders(p => [...p, folder]);
     setAddingFolder(false);
   };
 
@@ -5412,6 +5523,28 @@ export default function App() {
     await updateSample({ ...sample, folder_id: newFolderId });
   };
 
+  const handleFolderReorder = async (draggedId, targetId, pos) => {
+    if (!draggedId || draggedId === targetId) return;
+    const dragged = folders.find(f => f.id === draggedId);
+    const target  = folders.find(f => f.id === targetId);
+    if (!dragged || !target) return;
+    // Reorder among siblings at target's level (same parent, same type)
+    const newParent = target.parent_id ?? null;
+    const siblings = [...folders]
+      .filter(f => !!f.book_folder === !!target.book_folder && (f.parent_id ?? null) === newParent && f.id !== draggedId)
+      .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.name.localeCompare(b.name));
+    const targetIdx = siblings.findIndex(f => f.id === targetId);
+    const insertIdx = pos === "above" ? targetIdx : targetIdx + 1;
+    siblings.splice(insertIdx, 0, dragged);
+    const updates = siblings.map((f, i) => ({ id: f.id, sort_order: i, parent_id: f.id === draggedId ? newParent : (f.parent_id ?? null) }));
+    setFolders(prev => prev.map(f => {
+      const u = updates.find(u => u.id === f.id);
+      return u ? { ...f, sort_order: u.sort_order, parent_id: u.parent_id } : f;
+    }));
+    setDraggingFolderId(null);
+    await api("POST", "/folders/reorder", updates);
+  };
+
   // reset edit mode whenever the active sample changes
   useEffect(() => { setEditingMeta(false); }, [active]);
 
@@ -5422,9 +5555,10 @@ export default function App() {
   const hasFilesForActive = activeSample ? Object.keys(activeSample.filenames || {}).length > 0 : false;
 
   const byId = (a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" });
-  const sampleFolders = folders.filter(f => !f.book_folder);
-  const grouped   = sampleFolders.map(f => ({ folder: f, samples: samples.filter(s => s.folder_id === f.id).sort(byId) }));
-  const ungrouped = samples.filter(s => !s.folder_id || !sampleFolders.find(f => f.id === s.folder_id)).sort(byId);
+  const sortedFolders = [...folders].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.name.localeCompare(b.name));
+  const getSiblings = (parentId, isBook) => sortedFolders.filter(f => !!f.book_folder === isBook && (f.parent_id ?? null) === parentId);
+  const allSampleFolders = folders.filter(f => !f.book_folder);
+  const ungrouped = samples.filter(s => !s.folder_id || !allSampleFolders.find(f => f.id === s.folder_id)).sort(byId);
   const [ungroupedDragOver,     setUngroupedDragOver]     = useState(false);
   const [bookUngroupedDragOver, setBookUngroupedDragOver] = useState(false);
 
@@ -5522,16 +5656,25 @@ export default function App() {
                   <Btn variant="primary" small onClick={() => setAdding(true)}>+ New Sample</Btn>
                 </div>
 
-                {/* Foldered groups */}
-                {grouped.map(({ folder, samples: fs }) => (
-                  <FolderTile key={folder.id} folder={folder} samples={fs} plotCache={plotCache}
-                    onSelectSample={openSample} onDeleteSample={deleteSample}
-                    onDuplicateTemplate={setTemplateSample}
-                    onEdit={() => setEditingFolder(folder)}
-                    onDelete={() => deleteFolder(folder.id)}
-                    onDropSample={() => handleDropToFolder(folder.id)}
-                    onDragStartSample={setDraggingSampleId} />
-                ))}
+                {/* Foldered groups — recursive tree */}
+                {(() => {
+                  const renderSampleFolders = (parentId, depth = 0) =>
+                    getSiblings(parentId, false).map(folder => (
+                      <FolderTile key={folder.id} folder={folder} depth={depth}
+                        samples={samples.filter(s => s.folder_id === folder.id).sort(byId)}
+                        childContent={renderSampleFolders(folder.id, depth + 1)}
+                        plotCache={plotCache}
+                        onSelectSample={openSample} onDeleteSample={deleteSample}
+                        onDuplicateTemplate={setTemplateSample}
+                        onEdit={() => setEditingFolder(folder)}
+                        onDelete={() => deleteFolder(folder.id)}
+                        onDropSample={() => handleDropToFolder(folder.id)}
+                        onDragStartSample={setDraggingSampleId}
+                        onDragStartFolder={setDraggingFolderId}
+                        onDropFolder={handleFolderReorder} />
+                    ));
+                  return renderSampleFolders(null);
+                })()}
 
                 {/* Ungrouped */}
                 {(ungrouped.length > 0 || (draggingSampleId && folders.length > 0)) && (
@@ -5565,28 +5708,34 @@ export default function App() {
                   <Btn variant="primary" small onClick={() => setAddingBook(true)}>+ New Book</Btn>
                 </div>
                 {(() => {
-                  const bookFolders    = folders.filter(f => f.book_folder);
-                  const ungroupedBooks = books.filter(b => !b.folder_id || !bookFolders.find(f => f.id === b.folder_id));
+                  const allBookFolders = folders.filter(f => f.book_folder);
+                  const ungroupedBooks = books.filter(b => !b.folder_id || !allBookFolders.find(f => f.id === b.folder_id));
+                  const renderBookFolders = (parentId, depth = 0) =>
+                    getSiblings(parentId, true).map(f => (
+                      <BookFolderTile key={f.id} folder={f} depth={depth}
+                        books={books.filter(b => b.folder_id === f.id)}
+                        childContent={renderBookFolders(f.id, depth + 1)}
+                        onOpenBook={openBook}
+                        onDeleteBook={deleteBook}
+                        onEditBook={b => setEditingBook(b)}
+                        onDuplicateBook={duplicateBook}
+                        onDrop={() => handleDropToBookFolder(f.id)}
+                        onDragStartBook={setDraggingBookId}
+                        onEdit={() => setEditingFolder(f)}
+                        onDelete={() => deleteFolder(f.id)}
+                        onDragStartFolder={setDraggingFolderId}
+                        onDropFolder={handleFolderReorder} />
+                    ));
                   return (
                     <>
-                      {bookFolders.map(f => (
-                        <BookFolderTile key={f.id} folder={f} books={books.filter(b => b.folder_id === f.id)}
-                          onOpenBook={openBook}
-                          onDeleteBook={deleteBook}
-                          onEditBook={b => setEditingBook(b)}
-                          onDuplicateBook={duplicateBook}
-                          onDrop={() => handleDropToBookFolder(f.id)}
-                          onDragStartBook={setDraggingBookId}
-                          onEdit={() => setEditingFolder(f)}
-                          onDelete={() => deleteFolder(f.id)} />
-                      ))}
-                      {(ungroupedBooks.length > 0 || (draggingBookId && bookFolders.length > 0)) && (
+                      {renderBookFolders(null)}
+                      {(ungroupedBooks.length > 0 || (draggingBookId && allBookFolders.length > 0)) && (
                         <div
                           onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setBookUngroupedDragOver(true); }}
                           onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setBookUngroupedDragOver(false); }}
                           onDrop={e => { e.preventDefault(); setBookUngroupedDragOver(false); handleDropToBookFolder(null); }}
-                          style={{ border: `2px solid ${bookUngroupedDragOver ? T.amber : "transparent"}`, borderRadius: 10, padding: bookUngroupedDragOver ? 10 : 0, transition: "all .12s", boxShadow: bookUngroupedDragOver ? `0 0 0 3px ${T.amberGlow}` : "none", marginTop: bookFolders.length ? 8 : 0 }}>
-                          {bookFolders.length > 0 && (
+                          style={{ border: `2px solid ${bookUngroupedDragOver ? T.amber : "transparent"}`, borderRadius: 10, padding: bookUngroupedDragOver ? 10 : 0, transition: "all .12s", boxShadow: bookUngroupedDragOver ? `0 0 0 3px ${T.amberGlow}` : "none", marginTop: allBookFolders.length ? 8 : 0 }}>
+                          {allBookFolders.length > 0 && (
                             <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: bookUngroupedDragOver ? T.amber : T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8, transition: "color .12s" }}>
                               {bookUngroupedDragOver ? "Drop to ungroup" : "Ungrouped"}
                             </div>
@@ -5598,7 +5747,7 @@ export default function App() {
                                 onDelete={() => { if (window.confirm(`Delete book "${b.name}"?`)) deleteBook(b.id); }}
                                 onEdit={() => setEditingBook(b)}
                                 onDuplicate={() => duplicateBook(b)}
-                                onDragStart={bookFolders.length > 0 ? setDraggingBookId : undefined} />
+                                onDragStart={allBookFolders.length > 0 ? setDraggingBookId : undefined} />
                             ))}
                           </div>
                         </div>
@@ -5617,7 +5766,7 @@ export default function App() {
       {templateSample && <AddSampleModal onAdd={s => { addSample(s); setTemplateSample(null); }} onClose={() => setTemplateSample(null)} folders={folders} template={templateSample} settings={settings} />}
       {settingsOpen && <SettingsModal settings={settings} onSave={handleSaveSettings} onClose={() => setSettingsOpen(false)} />}
       {(addingFolder || editingFolder) && (
-        <AddFolderModal onSave={saveFolder} onClose={() => { setAddingFolder(false); setEditingFolder(null); }} existing={editingFolder} />
+        <AddFolderModal onSave={saveFolder} onClose={() => { setAddingFolder(false); setEditingFolder(null); }} existing={editingFolder} allFolders={folders} />
       )}
       {(addingBook || editingBook) && (
         <AddBookModal onSave={saveBook} onClose={() => { setAddingBook(false); setEditingBook(null); }} existing={editingBook} samples={samples} folders={folders} bookFolders={folders.filter(f => f.book_folder)} />
