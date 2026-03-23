@@ -89,6 +89,14 @@ def init_db():
             conn.execute("ALTER TABLE folders ADD COLUMN book_folder INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute("ALTER TABLE folders ADD COLUMN parent_id TEXT DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE folders ADD COLUMN sort_order INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
@@ -123,15 +131,15 @@ def row_to_book(row):
 @app.get("/api/folders")
 def list_folders():
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM folders ORDER BY name").fetchall()
+        rows = conn.execute("SELECT * FROM folders ORDER BY COALESCE(sort_order, 0), name").fetchall()
     return [row_to_dict(r) for r in rows]
 
 @app.post("/api/folders")
 def create_folder(folder: dict):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO folders (id, name, color, book_folder) VALUES (:id, :name, :color, :book_folder)",
-            {"id": folder["id"], "name": folder["name"], "color": folder.get("color", "#4a5568"), "book_folder": 1 if folder.get("book_folder") else 0},
+            "INSERT INTO folders (id, name, color, book_folder, parent_id, sort_order) VALUES (:id, :name, :color, :book_folder, :parent_id, :sort_order)",
+            {"id": folder["id"], "name": folder["name"], "color": folder.get("color", "#4a5568"), "book_folder": 1 if folder.get("book_folder") else 0, "parent_id": folder.get("parent_id") or None, "sort_order": folder.get("sort_order", 0)},
         )
         conn.commit()
     return {"ok": True, "id": folder["id"]}
@@ -140,8 +148,8 @@ def create_folder(folder: dict):
 def update_folder(folder_id: str, folder: dict):
     with get_db() as conn:
         conn.execute(
-            "UPDATE folders SET name=:name, color=:color, book_folder=:book_folder WHERE id=:id",
-            {"id": folder_id, "name": folder["name"], "color": folder.get("color", "#4a5568"), "book_folder": 1 if folder.get("book_folder") else 0},
+            "UPDATE folders SET name=:name, color=:color, book_folder=:book_folder, parent_id=:parent_id, sort_order=:sort_order WHERE id=:id",
+            {"id": folder_id, "name": folder["name"], "color": folder.get("color", "#4a5568"), "book_folder": 1 if folder.get("book_folder") else 0, "parent_id": folder.get("parent_id") or None, "sort_order": folder.get("sort_order", 0)},
         )
         conn.commit()
     return {"ok": True}
@@ -149,9 +157,22 @@ def update_folder(folder_id: str, folder: dict):
 @app.delete("/api/folders/{folder_id}")
 def delete_folder(folder_id: str):
     with get_db() as conn:
-        # Unassign samples from this folder before deleting
+        # Promote children to the deleted folder's parent level
+        row = conn.execute("SELECT parent_id FROM folders WHERE id=?", (folder_id,)).fetchone()
+        new_parent = row["parent_id"] if row else None
+        conn.execute("UPDATE folders SET parent_id=? WHERE parent_id=?", (new_parent, folder_id))
         conn.execute("UPDATE samples SET folder_id=NULL WHERE folder_id=?", (folder_id,))
+        conn.execute("UPDATE analysis_books SET folder_id=NULL WHERE folder_id=?", (folder_id,))
         conn.execute("DELETE FROM folders WHERE id=?", (folder_id,))
+        conn.commit()
+    return {"ok": True}
+
+@app.post("/api/folders/reorder")
+def reorder_folders(updates: list):
+    with get_db() as conn:
+        for u in updates:
+            conn.execute("UPDATE folders SET sort_order=?, parent_id=? WHERE id=?",
+                         (u.get("sort_order", 0), u.get("parent_id") or None, u["id"]))
         conn.commit()
     return {"ok": True}
 
