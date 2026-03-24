@@ -2041,7 +2041,7 @@ function FolderTile({ folder, samples, childContent = null, plotCache, depth = 0
 
   return (
     <div onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}
-      style={{ marginLeft: depth > 0 ? 20 : 0, marginBottom: 8 }}>
+      style={{ marginLeft: depth > 0 ? 10 : 0, marginBottom: 8 }}>
       {insertPos === "above" && <div style={{ height: 3, background: T.amber, borderRadius: 2, marginBottom: 4 }} />}
       <div ref={folderBoxRef}
         style={{ border: `2px solid ${sampleDragOver || folderDragInside ? T.amber : color}`, borderRadius: 10, overflow: "hidden", boxShadow: sampleDragOver || folderDragInside ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
@@ -5117,7 +5117,7 @@ function BookFolderTile({ folder, books, childContent = null, depth = 0,
 
   return (
     <div onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}
-      style={{ marginLeft: depth > 0 ? 20 : 0, marginBottom: 8 }}>
+      style={{ marginLeft: depth > 0 ? 10 : 0, marginBottom: 8 }}>
       {insertPos === "above" && <div style={{ height: 3, background: T.amber, borderRadius: 2, marginBottom: 4 }} />}
       <div ref={folderBoxRef}
         style={{ border: `2px solid ${bookDragOver || folderDragInside ? T.amber : color}`, borderRadius: 10, overflow: "hidden", boxShadow: bookDragOver || folderDragInside ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 import sqlite3, json, os, shutil
 from pathlib import Path
@@ -168,7 +168,8 @@ def delete_folder(folder_id: str):
     return {"ok": True}
 
 @app.post("/api/folders/reorder")
-def reorder_folders(updates: list):
+async def reorder_folders(request: Request):
+    updates = await request.json()
     with get_db() as conn:
         for u in updates:
             conn.execute("UPDATE folders SET sort_order=?, parent_id=? WHERE id=?",
