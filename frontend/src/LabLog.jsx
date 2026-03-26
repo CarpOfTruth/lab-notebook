@@ -1715,12 +1715,33 @@ function nelderMead(fn, x0, { maxIter = 3000, tol = 1e-12 } = {}) {
   return S[0];
 }
 
-// Pseudo-Voigt profile — unity peak at x=x0
-function pseudoVoigt(x, x0, fwhm, eta) {
-  const dx = x - x0, f2 = fwhm * fwhm;
+// Thompson–Cox–Hastings pseudo-Voigt (J. Appl. Cryst. 1987).
+// Takes SEPARATE Gaussian (fG) and Lorentzian (fL) FWHMs; total FWHM f and
+// mixing ratio η are derived analytically — NOT fit as free parameters.
+// Accurate to ~1% vs the true Voigt convolution integral.
+//
+//  f  = [fG⁵ + 2.69269 fG⁴fL + 2.42843 fG³fL² + 4.47163 fG²fL³
+//             + 0.07842 fG fL⁴ + fL⁵]^(1/5)
+//  η  = 1.36603(fL/f) − 0.47719(fL/f)² + 0.11116(fL/f)³
+function pseudoVoigt(x, x0, fG, fL) {
+  const f5 = fG**5 + 2.69269*fG**4*fL + 2.42843*fG**3*fL**2
+           + 4.47163*fG**2*fL**3 + 0.07842*fG*fL**4 + fL**5;
+  const f  = Math.pow(Math.max(f5, 1e-30), 0.2);
+  const r  = fL / f;
+  const eta = 1.36603*r - 0.47719*r*r + 0.11116*r*r*r;
+  const dx = x - x0, f2 = f * f;
   const G = Math.exp(-4 * Math.LN2 * dx * dx / f2);
   const L = 1 / (1 + 4 * dx * dx / f2);
-  return Math.max(0, eta) * L + Math.max(0, 1 - eta) * G;
+  return eta * L + (1 - eta) * G;
+}
+
+// Helper: derive total FWHM and η from TCH fG, fL
+function tchParams(fG, fL) {
+  const f5 = fG**5 + 2.69269*fG**4*fL + 2.42843*fG**3*fL**2
+           + 4.47163*fG**2*fL**3 + 0.07842*fG*fL**4 + fL**5;
+  const f = Math.pow(Math.max(f5, 1e-30), 0.2);
+  const r = fL / f;
+  return { f, eta: 1.36603*r - 0.47719*r*r + 0.11116*r*r*r };
 }
 
 // Evaluate a Chebyshev polynomial series at x ∈ [-1, 1].
@@ -1894,14 +1915,23 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow, bgResult = null) {
     return Math.log(Math.max(above.length >= 2 ? above[above.length - 1].x - above[0].x : 0.1, 0.03));
   });
 
-  // [logAmp, rawCen, logFwhm, logitEta] × nPeaks
-  const p0 = peaks.flatMap((_, i) => [initLogAmps[i], 0, initLogFwhms[i], 0]);
+  // TCH parameterisation: [logAmp, rawCen, logFwhmG, logFwhmL] × nPeaks
+  //   fG = exp(logFwhmG)  — Gaussian FWHM component, always > 0
+  //   fL = exp(logFwhmL)  — Lorentzian FWHM component, always > 0
+  //   Total FWHM f and mixing η are derived via the TCH formulas — NOT free params.
+  // Start mostly Gaussian (instrumental broadening dominates in XRD):
+  //   fG_init ≈ estimated FWHM,  fL_init ≈ 10% of that
+  const p0 = peaks.flatMap((_, i) => [
+    initLogAmps[i], 0,
+    initLogFwhms[i],              // logFwhmG
+    initLogFwhms[i] - Math.log(10), // logFwhmL  (fL = fG/10 → mostly Gaussian start)
+  ]);
 
   const decodePeaks = params => peaks.map((pk, i) => ({
-    amp:  Math.exp(params[i * 4]),
-    cen:  pk.center + pk.width * Math.tanh(params[i * 4 + 1]),
-    fwhm: Math.exp(params[i * 4 + 2]),
-    eta:  1 / (1 + Math.exp(-params[i * 4 + 3])),
+    amp: Math.exp(params[i * 4]),
+    cen: pk.center + pk.width * Math.tanh(params[i * 4 + 1]),
+    fG:  Math.exp(params[i * 4 + 2]),
+    fL:  Math.exp(params[i * 4 + 3]),
   }));
 
   // Poisson NLL with fixed background
@@ -1910,7 +1940,7 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow, bgResult = null) {
     let s = 0;
     for (let i = 0; i < xs.length; i++) {
       let model = bgAtPts[i];
-      for (const pk of peakP) model += pk.amp * pseudoVoigt(xs[i], pk.cen, pk.fwhm, pk.eta);
+      for (const pk of peakP) model += pk.amp * pseudoVoigt(xs[i], pk.cen, pk.fG, pk.fL);
       model = Math.max(model, 1e-10);
       s += model - ys[i] * Math.log(model);
     }
@@ -1922,12 +1952,13 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow, bgResult = null) {
   // ── Output ────────────────────────────────────────────────────────────────
   const results = {};
   peaks.forEach((pk, i) => {
-    const p        = peakP[i];
-    const theta    = p.cen * Math.PI / 360;
-    const dSpacing = LAMBDA / (2 * Math.sin(theta));
-    const dRef     = LAMBDA / (2 * Math.sin(pk.center * Math.PI / 360));
+    const p           = peakP[i];
+    const { f, eta }  = tchParams(p.fG, p.fL);
+    const theta       = p.cen * Math.PI / 360;
+    const dSpacing    = LAMBDA / (2 * Math.sin(theta));
+    const dRef        = LAMBDA / (2 * Math.sin(pk.center * Math.PI / 360));
     results[pk.id] = {
-      amplitude: p.amp, center: p.cen, fwhm: p.fwhm, eta: p.eta,
+      amplitude: p.amp, center: p.cen, fwhmG: p.fG, fwhmL: p.fL, fwhm: f, eta,
       dSpacing, dRef, strain: (dSpacing - dRef) / dRef,
     };
   });
@@ -1936,12 +1967,12 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow, bgResult = null) {
   const fittedX = Array.from({ length: nFine }, (_, k) => xMin + k * (xMax - xMin) / (nFine - 1));
   const bgY     = fittedX.map(x => Math.max(evalBg(x), 0));
   const fittedY = fittedX.map((x, i) =>
-    bgY[i] + peakP.reduce((s, pk) => s + pk.amp * pseudoVoigt(x, pk.cen, pk.fwhm, pk.eta), 0)
+    bgY[i] + peakP.reduce((s, pk) => s + pk.amp * pseudoVoigt(x, pk.cen, pk.fG, pk.fL), 0)
   );
   const peakCurves = peaks.map((pk, i) => ({
     id: pk.id,
     x:  fittedX,
-    y:  fittedX.map(x => peakP[i].amp * pseudoVoigt(x, peakP[i].cen, peakP[i].fwhm, peakP[i].eta)),
+    y:  fittedX.map(x => peakP[i].amp * pseudoVoigt(x, peakP[i].cen, peakP[i].fG, peakP[i].fL)),
   }));
 
   return { results, fittedX, fittedY, bgY, peakCurves };
@@ -1961,7 +1992,8 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
     const r = {};
     savedLines.forEach(ln => {
       if (ln.fitted_center != null) r[ln.id] = {
-        center: ln.fitted_center, fwhm: ln.fitted_fwhm, eta: ln.fitted_eta,
+        center: ln.fitted_center, fwhmG: ln.fitted_fwhmG, fwhmL: ln.fitted_fwhmL,
+        fwhm: ln.fitted_fwhm, eta: ln.fitted_eta,
         dSpacing: ln.fitted_d, dRef: ln.d_ref, strain: ln.strain, amplitude: ln.amplitude,
       };
     });
@@ -2086,7 +2118,9 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   const handleSave = () => {
     const savedLines = lines.map(ln => {
       const r = fitResults[ln.id];
-      return r ? { ...ln, fitted_center: r.center, fitted_fwhm: r.fwhm, fitted_eta: r.eta,
+      return r ? { ...ln, fitted_center: r.center,
+                         fitted_fwhmG: r.fwhmG, fitted_fwhmL: r.fwhmL,
+                         fitted_fwhm: r.fwhm, fitted_eta: r.eta,
                          fitted_d: r.dSpacing, d_ref: r.dRef, strain: r.strain, amplitude: r.amplitude } : ln;
     });
     onSave({ lines: savedLines, fitWindow, fittedCurve, peakCurves, bgCurve, nBgTerms });
@@ -2301,7 +2335,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
                   )}
                   {res && (
                     <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>
-                      {res.center.toFixed(4)}° · {(res.dSpacing * 10).toFixed(4)} Å · FWHM {res.fwhm.toFixed(4)}°
+                      {res.center.toFixed(4)}° · {(res.dSpacing * 10).toFixed(4)} Å · f {res.fwhm.toFixed(4)}° (fG {res.fwhmG?.toFixed(4)}° fL {res.fwhmL?.toFixed(4)}°) · η {res.eta?.toFixed(3)}
                     </span>
                   )}
                   <div style={{ flex: 1 }} />
