@@ -1520,6 +1520,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
             <XRDAnalysisModal
               sample={sample}
               xrdData={pd?.xrd_ot || []}
+              structures={settings?.structures || []}
               onSave={peaks => onUpdate({ ...sample, xrd_peaks: peaks })}
               onClose={() => setXrdAnalysisOpen(false)} />
           )}
@@ -1784,78 +1785,96 @@ function fitPeaksVoigt(xrdData, peaks) {
 
 const PEAK_COLORS = ["#4a9eff", "#ff6b6b", "#51cf66", "#ffd43b", "#cc5de8", "#ff922b", "#20c997"];
 
-function XRDAnalysisModal({ sample, xrdData, onSave, onClose }) {
-  const LAMBDA = 0.15406;
-  const [peaks, setPeaks] = useState(() => (sample.xrd_peaks || []).map(p => ({ ...p })));
-  const [fitResults, setFitResults] = useState({});
+function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
+  const [lines,       setLines]       = useState(() => (sample.xrd_peaks || []).map(p => ({ ...p })));
+  const [fitResults,  setFitResults]  = useState({});
   const [fittedCurve, setFittedCurve] = useState(null);
-  const [fitting, setFitting] = useState(false);
-  const [fitError, setFitError] = useState(null);
+  const [fitting,     setFitting]     = useState(false);
+  const [fitError,    setFitError]    = useState(null);
+  const [openPicker,  setOpenPicker]  = useState(null); // { id, type: "color"|"style"|"strainCfg" }
+  const [dragLineIdx, setDragLineIdx] = useState(null);
+  const [dragOverIdx, setDragOverIdx] = useState(null);
 
-  // Restore fitted curve from saved peaks if they have result data
-  useEffect(() => {
-    const saved = sample.xrd_peaks || [];
-    const hasResults = saved.some(p => p.fitted_center != null);
-    if (hasResults) {
-      const r = {};
-      saved.forEach(p => {
-        if (p.fitted_center != null) r[p.id] = { center: p.fitted_center, fwhm: p.fitted_fwhm, eta: p.fitted_eta, dSpacing: p.fitted_d, dRef: p.d_ref, strain: p.strain };
-      });
-      setFitResults(r);
-    }
-  }, []);
+  const addLine = () => setLines(p => [...p, {
+    id: String(Date.now()), material: structures[0]?.name || "", hkl: "",
+    style: "solid", color: LINE_COLORS[p.length % LINE_COLORS.length] || "#888888",
+    mode: "bulk", substrate: "", tolerance: 0.5,
+  }]);
+  const updateLine = (id, patch) => setLines(p => p.map(l => l.id === id ? { ...l, ...patch } : l));
+  const removeLine = id => { setLines(p => p.filter(l => l.id !== id)); setFitResults(r => { const n = { ...r }; delete n[id]; return n; }); };
 
-  const addPeak = () => {
-    const mid = xrdData.length ? (xrdData[Math.floor(xrdData.length / 2)].x) : 40;
-    setPeaks(p => [...p, { id: String(Date.now()), label: "", center: Math.round(mid * 100) / 100, width: 0.5, color: PEAK_COLORS[p.length % PEAK_COLORS.length] }]);
+  const reorderLines = (fromIdx, toIdx) => {
+    if (fromIdx === toIdx) return;
+    const order = [...Array(lines.length).keys()];
+    const [moved] = order.splice(fromIdx, 1);
+    order.splice(toIdx, 0, moved);
+    const oldToNew = new Array(lines.length);
+    order.forEach((oldIdx, newIdx) => { oldToNew[oldIdx] = newIdx; });
+    setLines(order.map(oldIdx => {
+      const ln = lines[oldIdx];
+      if (!ln.substrate?.startsWith("entry:")) return ln;
+      const newRef = oldToNew[parseInt(ln.substrate.slice(6))];
+      return newRef != null ? { ...ln, substrate: `entry:${newRef}` } : ln;
+    }));
   };
-  const updatePeak = (id, patch) => setPeaks(p => p.map(pk => pk.id === id ? { ...pk, ...patch } : pk));
-  const removePeak = id => { setPeaks(p => p.filter(pk => pk.id !== id)); setFitResults(r => { const n = { ...r }; delete n[id]; return n; }); };
 
-  // Shapes: [rect, line] per peak — lines at odd indices are editable/draggable
-  const peakShapes = peaks.flatMap(pk => [
-    { type: "rect", xref: "x", yref: "paper", x0: pk.center - pk.width, x1: pk.center + pk.width, y0: 0, y1: 1, fillcolor: pk.color + "22", line: { width: 0 }, layer: "below" },
-    { type: "line", xref: "x", yref: "paper", x0: pk.center, x1: pk.center, y0: 0, y1: 1, line: { color: pk.color, width: 1.5, dash: "dash" }, editable: true, layer: "above" },
-  ]);
-
-  const peaksRef = useRef(peaks);
-  useEffect(() => { peaksRef.current = peaks; }, [peaks]);
-
-  const handleRelayout = useCallback(ev => {
-    const updates = {};
-    for (const [key, val] of Object.entries(ev)) {
-      const m = key.match(/^shapes\[(\d+)\]\.x0$/);
-      if (m) {
-        const si = parseInt(m[1]);
-        if (si % 2 === 1) { // line shapes are at odd indices
-          const pk = peaksRef.current[Math.floor(si / 2)];
-          if (pk) updates[pk.id] = Math.round(Number(val) * 10000) / 10000;
-        }
+  // Effective structures (bulk or strained) — same logic as XRD comparison panel
+  const lineEffStructs = useMemo(() => {
+    const eff = new Array(lines.length).fill(null);
+    const compute = (ln, i) => {
+      const film = structures.find(s => s.name === ln.material);
+      let sub;
+      if (ln.substrate?.startsWith("entry:")) {
+        const ref = parseInt(ln.substrate.slice(6));
+        sub = (ref >= 0 && ref < lines.length && ref !== i) ? eff[ref] : null;
+      } else {
+        sub = structures.find(s => s.name === ln.substrate) || null;
       }
-    }
-    if (Object.keys(updates).length) setPeaks(p => p.map(pk => updates[pk.id] != null ? { ...pk, center: updates[pk.id] } : pk));
-  }, []);
+      return ln.mode === "strained" && film ? (calcStrainedStruct(film, sub, ln) || null) : (film || null);
+    };
+    lines.forEach((ln, i) => { eff[i] = compute(ln, i); });
+    lines.forEach((ln, i) => { if (ln.substrate?.startsWith("entry:")) eff[i] = compute(ln, i); });
+    return eff;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lines, structures]);
+
+  // Shapes: shaded tolerance window + reference line per peak
+  const lineShapes = lines.flatMap((ln, i) => {
+    const effStruct = lineEffStructs[i];
+    const tt = effStruct ? calcTwoTheta(effStruct, ln.hkl) : null;
+    if (tt == null) return [];
+    const tol = ln.tolerance ?? 0.5;
+    const dash = ln.style === "dashed" ? "dash" : ln.style === "dotted" ? "dot" : "solid";
+    return [
+      { type: "rect",  xref: "x", yref: "paper", x0: tt - tol, x1: tt + tol, y0: 0, y1: 1, fillcolor: ln.color + "22", line: { width: 0 }, layer: "below" },
+      { type: "line",  xref: "x", yref: "paper", x0: tt, x1: tt, y0: 0, y1: 1, line: { color: ln.color, width: 1.5, dash }, layer: "above" },
+      ...(fitResults[ln.id] ? [{ type: "line", xref: "x", yref: "paper", x0: fitResults[ln.id].center, x1: fitResults[ln.id].center, y0: 0, y1: 1, line: { color: ln.color, width: 2, dash: "solid" }, layer: "above" }] : []),
+    ];
+  });
 
   const runFit = useCallback(() => {
-    if (!peaks.length || !xrdData.length) return;
+    const fittable = lines.map((ln, i) => {
+      const tt = lineEffStructs[i] ? calcTwoTheta(lineEffStructs[i], ln.hkl) : null;
+      return tt != null ? { id: ln.id, center: tt, width: ln.tolerance ?? 0.5 } : null;
+    }).filter(Boolean);
+    if (!fittable.length || !xrdData.length) return;
     setFitting(true); setFitError(null);
     setTimeout(() => {
       try {
-        const res = fitPeaksVoigt(xrdData, peaks);
+        const res = fitPeaksVoigt(xrdData, fittable);
         if (res) { setFitResults(res.results); setFittedCurve({ x: res.fittedX, y: res.fittedY }); }
-        else setFitError("Not enough data points in the peak windows. Try widening the windows.");
+        else setFitError("Not enough data in peak windows — try widening the tolerance.");
       } catch (e) { setFitError(String(e.message || e)); }
       setFitting(false);
     }, 20);
-  }, [peaks, xrdData]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lines, lineEffStructs, xrdData]);
 
   const handleSave = () => {
-    // Merge fit results into peak objects for persistence
-    const toSave = peaks.map(pk => {
-      const r = fitResults[pk.id];
-      return r ? { ...pk, fitted_center: r.center, fitted_fwhm: r.fwhm, fitted_eta: r.eta, fitted_d: r.dSpacing, d_ref: r.dRef, strain: r.strain } : pk;
-    });
-    onSave(toSave);
+    onSave(lines.map(ln => {
+      const r = fitResults[ln.id];
+      return r ? { ...ln, fitted_center: r.center, fitted_fwhm: r.fwhm, fitted_eta: r.eta, fitted_d: r.dSpacing, d_ref: r.dRef, strain: r.strain } : ln;
+    }));
     onClose();
   };
 
@@ -1872,15 +1891,17 @@ function XRDAnalysisModal({ sample, xrdData, onSave, onClose }) {
     paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
     font: { family: "'DM Mono', monospace", size: 11, color: T.textPrimary },
     margin: { t: 12, r: 20, b: 52, l: 72, pad: 0 },
-    xaxis: { title: { text: "2θ (°)", font: { size: 12, color: T.textSecondary }, standoff: 10 }, gridcolor: T.border, color: T.textSecondary, linecolor: T.border, zerolinecolor: T.border },
+    xaxis: { title: { text: "2θ (°)", font: { size: 12, color: T.textSecondary }, standoff: 10 }, gridcolor: T.border, color: T.textSecondary },
     yaxis: { type: "log", range: [Math.log10(Math.max(yMin * 0.8, 1)), Math.log10(yMax * 3)], title: { text: "Intensity (arb.)", font: { size: 12, color: T.textSecondary }, standoff: 8 }, showticklabels: false, gridcolor: T.border, color: T.textSecondary },
-    shapes: peakShapes,
-    hovermode: "closest", dragmode: "pan",
-    uirevision: "xrd-analysis",
+    shapes: lineShapes, hovermode: "x", dragmode: "zoom", uirevision: "xrd-analysis",
   };
 
+  const rc = { fontFamily: "'DM Mono', monospace", fontSize: 11, borderRadius: 4, padding: "4px 8px", boxSizing: "border-box", outline: "none", cursor: "pointer" };
+  const hasFittable = lines.some((ln, i) => lineEffStructs[i] && calcTwoTheta(lineEffStructs[i], ln.hkl) != null);
+
   return (
-    <div style={{ position: "fixed", inset: 0, background: T.bg0, zIndex: 400, display: "flex", flexDirection: "column" }}>
+    <div style={{ position: "fixed", inset: 0, background: T.bg0, zIndex: 400, display: "flex", flexDirection: "column" }}
+      onClick={() => setOpenPicker(null)}>
       {/* Header */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 20px", borderBottom: `1px solid ${T.border}`, background: T.bg1, flexShrink: 0 }}>
         <button onClick={handleSave} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 20, lineHeight: 1, padding: 0 }}>←</button>
@@ -1890,102 +1911,187 @@ function XRDAnalysisModal({ sample, xrdData, onSave, onClose }) {
         <Btn variant="primary" onClick={handleSave}>Save & Close</Btn>
       </div>
 
-      {/* Body */}
-      <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+      {/* Body: plot above, line panel below */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", padding: "12px 20px 0" }}>
         {/* Plot */}
-        <div style={{ flex: 1, padding: 12 }}>
-          <Plot data={traces} layout={layout}
-            config={{ displayModeBar: true, modeBarButtonsToRemove: ["select2d", "lasso2d", "autoScale2d"], scrollZoom: true }}
-            style={{ width: "100%", height: "100%" }} useResizeHandler
-            onRelayout={handleRelayout} />
+        <div style={{ flex: 1, minHeight: 0 }}>
+          <Plot data={traces} layout={layout} config={buildPlotConfig(`xrd_${sample.id}`)}
+            style={{ width: "100%", height: "100%" }} useResizeHandler />
         </div>
 
-        {/* Right panel */}
-        <div style={{ width: 290, borderLeft: `1px solid ${T.border}`, display: "flex", flexDirection: "column", overflow: "hidden", background: T.bg1 }}>
-          <div style={{ padding: "12px 14px", borderBottom: `1px solid ${T.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1.5 }}>Peaks to Fit</span>
-            <Btn small onClick={addPeak}>+ Add Peak</Btn>
-          </div>
-
-          <div style={{ flex: 1, overflowY: "auto", padding: "10px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
-            {peaks.length === 0 && (
-              <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textAlign: "center", paddingTop: 20 }}>
-                Add peaks to fit using<br />+ Add Peak above.
-              </div>
-            )}
-            {peaks.map(pk => (
-              <XRDPeakRow key={pk.id} peak={pk} result={fitResults[pk.id]}
-                onChange={patch => updatePeak(pk.id, patch)}
-                onRemove={() => removePeak(pk.id)}
-                lambda={LAMBDA} />
-            ))}
-          </div>
-
-          {peaks.length > 0 && (
-            <div style={{ padding: "12px 14px", borderTop: `1px solid ${T.border}`, display: "flex", flexDirection: "column", gap: 8 }}>
-              {fitError && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "#ff6b6b" }}>{fitError}</div>}
-              <Btn variant="primary" onClick={runFit} disabled={fitting} style={{ width: "100%" }}>
-                {fitting ? "Fitting…" : "Fit All Peaks"}
-              </Btn>
+        {/* Line panel — same as analysis notebook */}
+        <div style={{ flexShrink: 0, borderTop: `1px solid ${T.border}`, paddingTop: 10, paddingBottom: 12, maxHeight: "38vh", overflowY: "auto" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {lines.map((ln, i) => {
+              const effStruct  = lineEffStructs[i];
+              const twoTheta   = effStruct ? calcTwoTheta(effStruct, ln.hkl) : null;
+              const curStyle   = LINE_STYLES.find(s => s.id === ln.style) || LINE_STYLES[0];
+              const colorOpen  = openPicker?.id === ln.id && openPicker?.type === "color";
+              const styleOpen  = openPicker?.id === ln.id && openPicker?.type === "style";
+              const cfgOpen    = openPicker?.id === ln.id && openPicker?.type === "strainCfg";
+              const isStrained = ln.mode === "strained";
+              const smode      = ln.strain_mode || "substrate";
+              const anyOpen    = colorOpen || styleOpen || cfgOpen;
+              const res        = fitResults[ln.id];
+              return (
+                <div key={ln.id}
+                  draggable
+                  onDragStart={e => { e.dataTransfer.effectAllowed = "move"; setDragLineIdx(i); }}
+                  onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setDragOverIdx(i); }}
+                  onDragLeave={() => setDragOverIdx(null)}
+                  onDrop={e => { e.preventDefault(); reorderLines(dragLineIdx, i); setDragLineIdx(null); setDragOverIdx(null); }}
+                  onDragEnd={() => { setDragLineIdx(null); setDragOverIdx(null); }}
+                  style={{ display: "flex", alignItems: "center", gap: 6, position: "relative", zIndex: anyOpen ? 100 : "auto",
+                    opacity: dragLineIdx === i ? 0.4 : 1,
+                    outline: dragOverIdx === i && dragLineIdx !== i ? `2px solid ${T.teal}` : "2px solid transparent",
+                    borderRadius: 5 }}>
+                  {/* Row number / drag handle */}
+                  <span title="Drag to reorder" style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, minWidth: 16, textAlign: "right", flexShrink: 0, cursor: "grab", userSelect: "none" }}>{i + 1}</span>
+                  {/* Material */}
+                  <select value={ln.material} onChange={e => updateLine(ln.id, { material: e.target.value })} onClick={e => e.stopPropagation()}
+                    style={{ ...rc, background: T.bg0, border: `1px solid ${T.border}`, color: T.textSecondary }}>
+                    <option value="">— material —</option>
+                    {structures.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
+                  </select>
+                  {/* HKL */}
+                  <DeferredInput value={ln.hkl} onChange={v => updateLine(ln.id, { hkl: v })} placeholder="hkl"
+                    style={{ ...rc, width: 64, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center" }} />
+                  {/* Configure */}
+                  <div style={{ position: "relative", zIndex: 50 }}>
+                    <button onClick={e => { e.stopPropagation(); setOpenPicker(cfgOpen ? null : { id: ln.id, type: "strainCfg" }); }}
+                      style={{ ...rc, background: cfgOpen ? T.bg3 : T.bg0, border: `1px solid ${cfgOpen ? T.borderBright : isStrained ? T.teal : T.border}`, color: isStrained ? T.teal : T.textSecondary }}>
+                      Configure
+                    </button>
+                    {cfgOpen && (
+                      <div onClick={e => e.stopPropagation()}
+                        style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 500, boxShadow: "0 4px 16px rgba(0,0,0,.55)", minWidth: 280, display: "flex", flexDirection: "column", gap: 12 }}>
+                        <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}`, alignSelf: "flex-start" }}>
+                          {["bulk", "strained"].map(m => (
+                            <button key={m} onClick={() => updateLine(ln.id, { mode: m })}
+                              style={{ ...rc, background: ln.mode === m ? T.bg3 : T.bg0, border: "none", borderRight: m === "bulk" ? `1px solid ${T.border}` : "none", color: ln.mode === m ? T.textPrimary : T.textDim, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                              {m}
+                            </button>
+                          ))}
+                        </div>
+                        {isStrained && [
+                          { id: "substrate",         label: "Strain based on substrate" },
+                          { id: "arbitrary_strain",  label: "Arbitrary strain (biaxial)" },
+                          { id: "arbitrary_lattice", label: "Arbitrary lattice parameter" },
+                        ].map(opt => (
+                          <div key={opt.id} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                            <div onClick={() => updateLine(ln.id, { strain_mode: opt.id })} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                              <div style={{ width: 14, height: 14, borderRadius: "50%", border: `2px solid ${smode === opt.id ? T.teal : T.border}`, background: smode === opt.id ? T.teal : "transparent", flexShrink: 0 }} />
+                              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: smode === opt.id ? T.textPrimary : T.textDim }}>{opt.label}</span>
+                            </div>
+                            {smode === opt.id && opt.id === "substrate" && (
+                              <select value={ln.substrate} onChange={e => updateLine(ln.id, { substrate: e.target.value })}
+                                style={{ ...rc, marginLeft: 22, background: T.bg0, border: `1px solid ${T.border}`, color: T.textSecondary }}>
+                                <option value="">— substrate —</option>
+                                {structures.filter(s => s.name !== ln.material).map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
+                                {lines.map((other, j) => j !== i && <option key={`entry:${j}`} value={`entry:${j}`}>Entry {j + 1}</option>)}
+                              </select>
+                            )}
+                            {smode === opt.id && opt.id === "arbitrary_strain" && (
+                              <div style={{ display: "flex", gap: 10, marginLeft: 22 }}>
+                                {[["strain_eps_xx","ε_xx"],["strain_eps_yy","ε_yy"]].map(([k,lbl]) => (
+                                  <div key={k} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                                    <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{lbl}</span>
+                                    <DeferredInput type="number" value={ln[k] ?? ""} placeholder="0.000" onChange={v => updateLine(ln.id, { [k]: v })}
+                                      style={{ ...rc, width: 88, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text" }} />
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            {smode === opt.id && opt.id === "arbitrary_lattice" && (
+                              <div style={{ display: "flex", gap: 10, marginLeft: 22 }}>
+                                {[["strain_a","a (Å)"],["strain_b","b (Å)"]].map(([k,lbl]) => (
+                                  <div key={k} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                                    <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{lbl}</span>
+                                    <DeferredInput type="number" value={ln[k] ?? ""} placeholder="—" onChange={v => updateLine(ln.id, { [k]: v })}
+                                      style={{ ...rc, width: 88, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text" }} />
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {/* Calculated 2θ */}
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: twoTheta != null ? T.teal : T.textDim, minWidth: 62 }}>
+                    {twoTheta != null ? `${twoTheta.toFixed(3)}°` : "—"}
+                  </span>
+                  {/* Tolerance (±) */}
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, flexShrink: 0 }}>±</span>
+                  <DeferredInput type="number" value={ln.tolerance ?? 0.5} step={0.1} min={0.05}
+                    onChange={v => updateLine(ln.id, { tolerance: Math.max(0.05, Number(v)) })}
+                    style={{ ...rc, width: 52, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text", padding: "4px 4px" }} />
+                  {/* Fit result — strain badge */}
+                  {res && (
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: res.strain >= 0 ? "#51cf66" : "#ff6b6b", minWidth: 72 }}>
+                      {res.strain >= 0 ? "+" : ""}{(res.strain * 100).toFixed(3)}%
+                    </span>
+                  )}
+                  {res && (
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>
+                      {res.center.toFixed(4)}° · {(res.dSpacing * 10).toFixed(4)} Å · FWHM {res.fwhm.toFixed(4)}°
+                    </span>
+                  )}
+                  <div style={{ flex: 1 }} />
+                  {/* Color picker */}
+                  <div style={{ position: "relative", zIndex: 50 }}>
+                    <div onClick={e => { e.stopPropagation(); setOpenPicker(colorOpen ? null : { id: ln.id, type: "color" }); }}
+                      style={{ width: 28, height: 28, borderRadius: 4, background: ln.color, border: `2px solid ${colorOpen ? T.amber : T.border}`, cursor: "pointer", flexShrink: 0 }} />
+                    {colorOpen && (
+                      <div onClick={e => e.stopPropagation()}
+                        style={{ position: "absolute", right: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, padding: 6, display: "flex", gap: 4, zIndex: 500, boxShadow: "0 4px 12px rgba(0,0,0,.5)" }}>
+                        {LINE_COLORS.map(c => (
+                          <div key={c} onClick={() => { updateLine(ln.id, { color: c }); setOpenPicker(null); }}
+                            style={{ width: 22, height: 22, borderRadius: 3, background: c, border: `2px solid ${ln.color === c ? T.amber : "transparent"}`, cursor: "pointer" }} />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {/* Style picker */}
+                  <div style={{ position: "relative", zIndex: 50 }}>
+                    <button onClick={e => { e.stopPropagation(); setOpenPicker(styleOpen ? null : { id: ln.id, type: "style" }); }}
+                      style={{ ...rc, background: T.bg0, border: `1px solid ${styleOpen ? T.borderBright : T.border}`, color: T.textPrimary, minWidth: 40 }}>
+                      {curStyle.label}
+                    </button>
+                    {styleOpen && (
+                      <div onClick={e => e.stopPropagation()}
+                        style={{ position: "absolute", right: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, padding: 4, display: "flex", flexDirection: "column", gap: 2, zIndex: 500, boxShadow: "0 4px 12px rgba(0,0,0,.5)" }}>
+                        {LINE_STYLES.map(s => (
+                          <button key={s.id} onClick={() => { updateLine(ln.id, { style: s.id }); setOpenPicker(null); }}
+                            style={{ ...rc, background: ln.style === s.id ? T.bg3 : "none", border: "none", color: ln.style === s.id ? T.textPrimary : T.textDim, textAlign: "left", whiteSpace: "nowrap" }}>
+                            {s.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {/* Remove */}
+                  <button onClick={() => removeLine(ln.id)}
+                    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px" }}>×</button>
+                </div>
+              );
+            })}
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: lines.length ? 2 : 0 }}>
+              <button onClick={e => { e.stopPropagation(); addLine(); }}
+                style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+                + Add line
+              </button>
+              {hasFittable && (
+                <>
+                  <Btn variant="primary" onClick={runFit} disabled={fitting}>{fitting ? "Fitting…" : "Fit All"}</Btn>
+                  {fitError && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "#ff6b6b" }}>{fitError}</span>}
+                </>
+              )}
             </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function XRDPeakRow({ peak, result, onChange, onRemove, lambda }) {
-  const dRef = lambda / (2 * Math.sin(peak.center * Math.PI / 360));
-  return (
-    <div style={{ background: T.bg2, borderRadius: 6, padding: 10, border: `1px solid ${peak.color}55` }}>
-      {/* Label row */}
-      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
-        <div style={{ width: 10, height: 10, borderRadius: 2, background: peak.color, flexShrink: 0 }} />
-        <input value={peak.label} onChange={e => onChange({ label: e.target.value })}
-          placeholder="Label (e.g. BTO 002)"
-          style={{ flex: 1, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 6px", outline: "none" }} />
-        <button onClick={onRemove} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px" }}>×</button>
-      </div>
-      {/* Inputs */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-        {[["REF 2θ (°)", "center", 0.01], ["WINDOW (°)", "width", 0.1]].map(([lbl, key, step]) => (
-          <div key={key}>
-            <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim, marginBottom: 2, letterSpacing: 0.5 }}>{lbl}</div>
-            <DeferredInput type="number" value={peak[key]} step={step}
-              onChange={v => onChange({ [key]: key === "width" ? Math.max(0.05, Number(v)) : Number(v) })}
-              style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 0", outline: "none", textAlign: "center" }} />
-          </div>
-        ))}
-      </div>
-      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim, marginTop: 5 }}>
-        d_ref = {(dRef * 10).toFixed(4)} Å
-      </div>
-      {/* Fit results */}
-      {result && (
-        <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${T.border}33` }}>
-          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim, letterSpacing: 1, marginBottom: 5, textTransform: "uppercase" }}>Fit Results</div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
-            {[
-              ["2θ", `${result.center.toFixed(4)}°`],
-              ["FWHM", `${result.fwhm.toFixed(4)}°`],
-              ["d", `${(result.dSpacing * 10).toFixed(4)} Å`],
-              ["η (Voigt)", result.eta.toFixed(3)],
-            ].map(([lbl, val]) => (
-              <div key={lbl}>
-                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim }}>{lbl}</div>
-                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textPrimary }}>{val}</div>
-              </div>
-            ))}
-          </div>
-          <div style={{ marginTop: 5, padding: "4px 8px", background: T.bg0, borderRadius: 4, display: "inline-block" }}>
-            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim }}>strain </span>
-            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: result.strain >= 0 ? "#51cf66" : "#ff6b6b", fontWeight: 600 }}>
-              {result.strain >= 0 ? "+" : ""}{(result.strain * 100).toFixed(3)}%
-            </span>
           </div>
         </div>
-      )}
+      </div>
     </div>
   );
 }
