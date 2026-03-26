@@ -1825,16 +1825,18 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow) {
   // Fine curves across fit range
   const nFine = 800;
   const fittedX = Array.from({ length: nFine }, (_, k) => xs[0] + k * (xs[xs.length - 1] - xs[0]) / (nFine - 1));
-  const fittedY = fittedX.map(evalLinear);
+  const fittedY  = fittedX.map(evalLinear);
+  const bgY      = fittedX.map(x => Math.max(bg_a + bg_b * (x - x0r), 0));
 
-  // Individual peak contribution curves (background-subtracted)
+  // Individual peak contribution curves — y is the Voigt-only amplitude (no background)
+  // bgY is stored alongside so rendering can fill from background up to bg+peak
   const peakCurves = peaks.map((pk, i) => ({
     id: pk.id,
     x: fittedX,
     y: fittedX.map(x => peakP[i].amp * pseudoVoigt(x, peakP[i].cen, peakP[i].fwhm, peakP[i].eta)),
   }));
 
-  return { results, fittedX, fittedY, peakCurves };
+  return { results, fittedX, fittedY, bgY, peakCurves };
 }
 
 const PEAK_COLORS = ["#4a9eff", "#ff6b6b", "#51cf66", "#ffd43b", "#cc5de8", "#ff922b", "#20c997"];
@@ -1940,7 +1942,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
     setTimeout(() => {
       try {
         const res = fitPeaksVoigt(xrdData, fittable, fitWindow);
-        if (res) { setFitResults(res.results); setFittedCurve({ x: res.fittedX, y: res.fittedY }); setPeakCurves(res.peakCurves || []); }
+        if (res) { setFitResults(res.results); setFittedCurve({ x: res.fittedX, y: res.fittedY, bgY: res.bgY }); setPeakCurves(res.peakCurves || []); }
         else setFitError("Not enough data in window — try widening the tolerance or fit window.");
       } catch (e) { setFitError(String(e.message || e)); }
       setFitting(false);
@@ -1964,11 +1966,18 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
 
   const traces = [
     { x: xrdData.map(p => p.x), y: xrdData.map(p => Math.max(p.y, 1)), type: "scatter", mode: "lines", line: { color: T.textSecondary, width: 1 }, showlegend: false, hovertemplate: "2θ=%{x:.3f}°<br>I=%{y:.0f}<extra></extra>" },
-    // Individual peak shaded profiles (background-subtracted Voigt for each peak)
-    ...peakCurves.map(pc => {
-      const ln = lines.find(l => l.id === pc.id);
+    // Individual peak shaded profiles — fill from background up to bg+peak using tonexty
+    ...peakCurves.flatMap(pc => {
+      const ln  = lines.find(l => l.id === pc.id);
       const col = ln?.color || "#888888";
-      return { x: pc.x, y: pc.y, type: "scatter", mode: "lines", fill: "tozeroy", fillcolor: col + "44", line: { color: col, width: 1 }, showlegend: false, hoverinfo: "skip" };
+      const bgY = fittedCurve?.bgY || pc.x.map(() => 0);
+      const topY = pc.y.map((v, i) => (bgY[i] ?? 0) + v);
+      return [
+        // Transparent background reference — acts as lower fill boundary
+        { x: pc.x, y: bgY, type: "scatter", mode: "lines", line: { color: "rgba(0,0,0,0)", width: 0 }, showlegend: false, hoverinfo: "skip" },
+        // Peak fill from background up to peak top
+        { x: pc.x, y: topY, type: "scatter", mode: "lines", fill: "tonexty", fillcolor: col + "44", line: { color: col, width: 1 }, showlegend: false, hoverinfo: "skip" },
+      ];
     }),
     ...(fittedCurve ? [{ x: fittedCurve.x, y: fittedCurve.y, type: "scatter", mode: "lines", line: { color: T.accent, width: 1.5 }, showlegend: false, hoverinfo: "skip" }] : []),
   ];
