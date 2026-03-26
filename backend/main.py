@@ -97,6 +97,10 @@ def init_db():
             conn.execute("ALTER TABLE folders ADD COLUMN sort_order INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute("ALTER TABLE samples ADD COLUMN xrd_peaks TEXT DEFAULT '[]'")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
@@ -117,6 +121,7 @@ def row_to_sample(row):
     d = dict(row)
     d["layers"]    = json.loads(d.get("layers")    or "[]")
     d["filenames"] = json.loads(d.get("filenames") or "{}")
+    d["xrd_peaks"] = json.loads(d.get("xrd_peaks") or "[]")
     return d
 
 def row_to_book(row):
@@ -202,16 +207,17 @@ def create_sample(sample: dict):
         conn.execute("""
             INSERT INTO samples
               (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
-               technique, folder_id, layers, filenames)
+               technique, folder_id, layers, filenames, xrd_peaks)
             VALUES
               (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
-               :technique, :folder_id, :layers, :filenames)
+               :technique, :folder_id, :layers, :filenames, :xrd_peaks)
         """, {
             **sample,
             "technique":  sample.get("technique", "sputter"),
             "folder_id":  sample.get("folder_id"),
             "layers":     json.dumps(sample.get("layers", [])),
             "filenames":  json.dumps(sample.get("filenames", {})),
+            "xrd_peaks":  json.dumps(sample.get("xrd_peaks", [])),
         })
         conn.commit()
     return {"ok": True, "id": sample["id"]}
@@ -224,7 +230,7 @@ def update_sample(sample_id: str, sample: dict):
               date=:date, substrate=:substrate, notes=:notes,
               thickness_nm=:thickness_nm, area_m2=:area_m2, area_correction=:area_correction,
               technique=:technique, folder_id=:folder_id,
-              layers=:layers, filenames=:filenames
+              layers=:layers, filenames=:filenames, xrd_peaks=:xrd_peaks
             WHERE id=:id
         """, {
             **sample,
@@ -233,6 +239,7 @@ def update_sample(sample_id: str, sample: dict):
             "folder_id":  sample.get("folder_id"),
             "layers":     json.dumps(sample.get("layers", [])),
             "filenames":  json.dumps(sample.get("filenames", {})),
+            "xrd_peaks":  json.dumps(sample.get("xrd_peaks", [])),
         })
         conn.commit()
     return {"ok": True}

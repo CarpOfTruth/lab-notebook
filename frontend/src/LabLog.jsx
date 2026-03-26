@@ -854,7 +854,7 @@ function fmtAreaMicron(m2) {
 
 // ── MeasCard ──────────────────────────────────────────────────────────────────
 
-function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange }) {
+function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze }) {
   const cfg = MEAS_TYPES[type];
   const [corrExpr,      setCorrExpr]      = useState(String(areaCorrFactor ?? 1.0));
   const [peLoop,        setPeLoop]        = useState("all"); // "all" | "second"
@@ -908,6 +908,12 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
                 ))}
               </div>
             </div>
+          )}
+          {type === "xrd_ot" && has && onAnalyze && (
+            <button onClick={onAnalyze}
+              style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "2px 8px", background: T.bg3, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, cursor: "pointer", letterSpacing: 0.5 }}>
+              Analyze
+            </button>
           )}
           {filename && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filename}</span>}
         </div>
@@ -1403,6 +1409,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
   const [dragIdx, setDragIdx]           = useState(null);
   const [overIdx, setOverIdx]           = useState(null);
   const [knownMaterials, setKnownMaterials] = useState([]);
+  const [xrdAnalysisOpen, setXrdAnalysisOpen] = useState(false);
 
   useEffect(() => {
     api("GET", "/materials").then(setKnownMaterials).catch(() => {});
@@ -1506,8 +1513,16 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
           {["xrd_ot", "xrr", "rsm"].map(t => (
             <MeasCard key={t} type={t} plotData={pd[t]} filename={sample.filenames?.[t]}
-              onFile={(measType, file) => handleFile(measType, file)} />
+              onFile={(measType, file) => handleFile(measType, file)}
+              onAnalyze={t === "xrd_ot" ? () => setXrdAnalysisOpen(true) : undefined} />
           ))}
+          {xrdAnalysisOpen && (
+            <XRDAnalysisModal
+              sample={sample}
+              xrdData={pd?.xrd_ot || []}
+              onSave={peaks => onUpdate({ ...sample, xrd_peaks: peaks })}
+              onClose={() => setXrdAnalysisOpen(false)} />
+          )}
         </div>
       </section>
 
@@ -1658,6 +1673,319 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
           }} disabled={!f.id.trim()}>Create</Btn>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── XRD Peak Fitting ──────────────────────────────────────────────────────────
+
+// Nelder-Mead simplex minimiser (no derivatives needed)
+function nelderMead(fn, x0, { maxIter = 3000, tol = 1e-12 } = {}) {
+  const n = x0.length;
+  const α = 1, γ = 2, ρ = 0.5, σ = 0.5;
+  let S = [x0.slice()];
+  for (let i = 0; i < n; i++) {
+    const v = x0.slice();
+    v[i] += Math.abs(v[i]) > 1e-6 ? Math.abs(v[i]) * 0.15 : 0.15;
+    S.push(v);
+  }
+  let fS = S.map(fn);
+  for (let iter = 0; iter < maxIter; iter++) {
+    const ord = [...Array(n + 1).keys()].sort((a, b) => fS[a] - fS[b]);
+    S = ord.map(i => S[i]); fS = ord.map(i => fS[i]);
+    if (fS[n] - fS[0] < tol) break;
+    const c = Array(n).fill(0);
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) c[j] += S[i][j] / n;
+    const xr = c.map((ci, j) => ci + α * (ci - S[n][j]));
+    const fr = fn(xr);
+    if (fr < fS[0]) {
+      const xe = c.map((ci, j) => ci + γ * (xr[j] - ci));
+      const fe = fn(xe);
+      if (fe < fr) { S[n] = xe; fS[n] = fe; } else { S[n] = xr; fS[n] = fr; }
+    } else if (fr < fS[n - 1]) {
+      S[n] = xr; fS[n] = fr;
+    } else {
+      const xc = c.map((ci, j) => ci + ρ * (S[n][j] - ci));
+      const fc = fn(xc);
+      if (fc < fS[n]) { S[n] = xc; fS[n] = fc; }
+      else { for (let i = 1; i <= n; i++) { S[i] = S[0].map((s, j) => s + σ * (S[i][j] - s)); fS[i] = fn(S[i]); } }
+    }
+  }
+  return S[0];
+}
+
+// Pseudo-Voigt profile — unity peak at x=x0
+function pseudoVoigt(x, x0, fwhm, eta) {
+  const dx = x - x0, f2 = fwhm * fwhm;
+  const G = Math.exp(-4 * Math.LN2 * dx * dx / f2);
+  const L = 1 / (1 + 4 * dx * dx / f2);
+  return Math.max(0, eta) * L + Math.max(0, 1 - eta) * G;
+}
+
+// Fit N pseudo-Voigt peaks simultaneously with a linear background.
+// peaks: [{ id, center, width }]   xrdData: [{ x, y }]
+// Returns { results: { [id]: { center, fwhm, eta, dSpacing, dRef, strain } }, fittedX, fittedY } or null.
+function fitPeaksVoigt(xrdData, peaks) {
+  const LAMBDA = 0.15406; // nm Cu Kα
+  const pts = xrdData
+    .filter(p => peaks.some(pk => p.x >= pk.center - pk.width && p.x <= pk.center + pk.width))
+    .sort((a, b) => a.x - b.x);
+  if (pts.length < peaks.length * 4 + 2) return null;
+
+  const xs = pts.map(p => p.x);
+  const ys = pts.map(p => Math.max(p.y, 0));
+  const x0r = xs[0];
+
+  // params: [bg_a, bg_b, amp0, cen0, fwhm0, eta0, amp1, ...]
+  const evalModel = (params, x) => {
+    let y = params[0] + params[1] * (x - x0r);
+    for (let i = 0; i < peaks.length; i++) {
+      const b = 2 + i * 4;
+      y += Math.max(0, params[b]) * pseudoVoigt(x, params[b + 1], Math.max(0.005, params[b + 2]), Math.min(1, Math.max(0, params[b + 3])));
+    }
+    return Math.max(0, y);
+  };
+
+  const residFn = params => {
+    let s = 0;
+    for (let i = 0; i < xs.length; i++) { const r = evalModel(params, xs[i]) - ys[i]; s += r * r; }
+    return s;
+  };
+
+  const bgA = Math.min(...ys);
+  const p0 = [bgA, 0];
+  for (const pk of peaks) {
+    const inPk = pts.filter(p => Math.abs(p.x - pk.center) <= pk.width);
+    const pkMax = inPk.length ? Math.max(...inPk.map(p => p.y)) : bgA + 100;
+    p0.push(Math.max(pkMax - bgA, 100), pk.center, pk.width * 0.4, 0.5);
+  }
+
+  const fitted = nelderMead(residFn, p0);
+
+  const results = {};
+  for (let i = 0; i < peaks.length; i++) {
+    const b = 2 + i * 4;
+    const center = fitted[b + 1];
+    const fwhm   = Math.abs(fitted[b + 2]);
+    const eta    = Math.min(1, Math.max(0, fitted[b + 3]));
+    const theta  = center * Math.PI / 360;
+    const dSpacing = LAMBDA / (2 * Math.sin(theta));
+    const dRef     = LAMBDA / (2 * Math.sin(peaks[i].center * Math.PI / 360));
+    results[peaks[i].id] = { amplitude: Math.max(0, fitted[b]), center, fwhm, eta, dSpacing, dRef, strain: (dSpacing - dRef) / dRef };
+  }
+
+  // Fine fitted curve across full data range
+  const [xMin, xMax] = [xs[0], xs[xs.length - 1]];
+  const nFine = 800;
+  const fittedX = Array.from({ length: nFine }, (_, i) => xMin + i * (xMax - xMin) / (nFine - 1));
+  const fittedY = fittedX.map(x => evalModel(fitted, x));
+  return { results, fittedX, fittedY };
+}
+
+const PEAK_COLORS = ["#4a9eff", "#ff6b6b", "#51cf66", "#ffd43b", "#cc5de8", "#ff922b", "#20c997"];
+
+function XRDAnalysisModal({ sample, xrdData, onSave, onClose }) {
+  const LAMBDA = 0.15406;
+  const [peaks, setPeaks] = useState(() => (sample.xrd_peaks || []).map(p => ({ ...p })));
+  const [fitResults, setFitResults] = useState({});
+  const [fittedCurve, setFittedCurve] = useState(null);
+  const [fitting, setFitting] = useState(false);
+  const [fitError, setFitError] = useState(null);
+
+  // Restore fitted curve from saved peaks if they have result data
+  useEffect(() => {
+    const saved = sample.xrd_peaks || [];
+    const hasResults = saved.some(p => p.fitted_center != null);
+    if (hasResults) {
+      const r = {};
+      saved.forEach(p => {
+        if (p.fitted_center != null) r[p.id] = { center: p.fitted_center, fwhm: p.fitted_fwhm, eta: p.fitted_eta, dSpacing: p.fitted_d, dRef: p.d_ref, strain: p.strain };
+      });
+      setFitResults(r);
+    }
+  }, []);
+
+  const addPeak = () => {
+    const mid = xrdData.length ? (xrdData[Math.floor(xrdData.length / 2)].x) : 40;
+    setPeaks(p => [...p, { id: String(Date.now()), label: "", center: Math.round(mid * 100) / 100, width: 0.5, color: PEAK_COLORS[p.length % PEAK_COLORS.length] }]);
+  };
+  const updatePeak = (id, patch) => setPeaks(p => p.map(pk => pk.id === id ? { ...pk, ...patch } : pk));
+  const removePeak = id => { setPeaks(p => p.filter(pk => pk.id !== id)); setFitResults(r => { const n = { ...r }; delete n[id]; return n; }); };
+
+  // Shapes: [rect, line] per peak — lines at odd indices are editable/draggable
+  const peakShapes = peaks.flatMap(pk => [
+    { type: "rect", xref: "x", yref: "paper", x0: pk.center - pk.width, x1: pk.center + pk.width, y0: 0, y1: 1, fillcolor: pk.color + "22", line: { width: 0 }, layer: "below" },
+    { type: "line", xref: "x", yref: "paper", x0: pk.center, x1: pk.center, y0: 0, y1: 1, line: { color: pk.color, width: 1.5, dash: "dash" }, editable: true, layer: "above" },
+  ]);
+
+  const peaksRef = useRef(peaks);
+  useEffect(() => { peaksRef.current = peaks; }, [peaks]);
+
+  const handleRelayout = useCallback(ev => {
+    const updates = {};
+    for (const [key, val] of Object.entries(ev)) {
+      const m = key.match(/^shapes\[(\d+)\]\.x0$/);
+      if (m) {
+        const si = parseInt(m[1]);
+        if (si % 2 === 1) { // line shapes are at odd indices
+          const pk = peaksRef.current[Math.floor(si / 2)];
+          if (pk) updates[pk.id] = Math.round(Number(val) * 10000) / 10000;
+        }
+      }
+    }
+    if (Object.keys(updates).length) setPeaks(p => p.map(pk => updates[pk.id] != null ? { ...pk, center: updates[pk.id] } : pk));
+  }, []);
+
+  const runFit = useCallback(() => {
+    if (!peaks.length || !xrdData.length) return;
+    setFitting(true); setFitError(null);
+    setTimeout(() => {
+      try {
+        const res = fitPeaksVoigt(xrdData, peaks);
+        if (res) { setFitResults(res.results); setFittedCurve({ x: res.fittedX, y: res.fittedY }); }
+        else setFitError("Not enough data points in the peak windows. Try widening the windows.");
+      } catch (e) { setFitError(String(e.message || e)); }
+      setFitting(false);
+    }, 20);
+  }, [peaks, xrdData]);
+
+  const handleSave = () => {
+    // Merge fit results into peak objects for persistence
+    const toSave = peaks.map(pk => {
+      const r = fitResults[pk.id];
+      return r ? { ...pk, fitted_center: r.center, fitted_fwhm: r.fwhm, fitted_eta: r.eta, fitted_d: r.dSpacing, d_ref: r.dRef, strain: r.strain } : pk;
+    });
+    onSave(toSave);
+    onClose();
+  };
+
+  const yRaw = xrdData.map(p => p.y).filter(y => y > 0);
+  const yMin = yRaw.length ? Math.min(...yRaw) : 1;
+  const yMax = yRaw.length ? Math.max(...yRaw) : 1e6;
+
+  const traces = [
+    { x: xrdData.map(p => p.x), y: xrdData.map(p => Math.max(p.y, 1)), type: "scatter", mode: "lines", line: { color: T.textSecondary, width: 1 }, showlegend: false, hovertemplate: "2θ=%{x:.3f}°<br>I=%{y:.0f}<extra></extra>" },
+    ...(fittedCurve ? [{ x: fittedCurve.x, y: fittedCurve.y, type: "scatter", mode: "lines", line: { color: T.accent, width: 1.5 }, showlegend: false, hoverinfo: "skip" }] : []),
+  ];
+
+  const layout = {
+    paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
+    font: { family: "'DM Mono', monospace", size: 11, color: T.textPrimary },
+    margin: { t: 12, r: 20, b: 52, l: 72, pad: 0 },
+    xaxis: { title: { text: "2θ (°)", font: { size: 12, color: T.textSecondary }, standoff: 10 }, gridcolor: T.border, color: T.textSecondary, linecolor: T.border, zerolinecolor: T.border },
+    yaxis: { type: "log", range: [Math.log10(Math.max(yMin * 0.8, 1)), Math.log10(yMax * 3)], title: { text: "Intensity (arb.)", font: { size: 12, color: T.textSecondary }, standoff: 8 }, showticklabels: false, gridcolor: T.border, color: T.textSecondary },
+    shapes: peakShapes,
+    hovermode: "closest", dragmode: "pan",
+    uirevision: "xrd-analysis",
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: T.bg0, zIndex: 400, display: "flex", flexDirection: "column" }}>
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 20px", borderBottom: `1px solid ${T.border}`, background: T.bg1, flexShrink: 0 }}>
+        <button onClick={handleSave} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 20, lineHeight: 1, padding: 0 }}>←</button>
+        <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 20, color: T.amber }}>XRD Analysis</span>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>{sample.id}</span>
+        <div style={{ flex: 1 }} />
+        <Btn variant="primary" onClick={handleSave}>Save & Close</Btn>
+      </div>
+
+      {/* Body */}
+      <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+        {/* Plot */}
+        <div style={{ flex: 1, padding: 12 }}>
+          <Plot data={traces} layout={layout}
+            config={{ displayModeBar: true, modeBarButtonsToRemove: ["select2d", "lasso2d", "autoScale2d"], scrollZoom: true }}
+            style={{ width: "100%", height: "100%" }} useResizeHandler
+            onRelayout={handleRelayout} />
+        </div>
+
+        {/* Right panel */}
+        <div style={{ width: 290, borderLeft: `1px solid ${T.border}`, display: "flex", flexDirection: "column", overflow: "hidden", background: T.bg1 }}>
+          <div style={{ padding: "12px 14px", borderBottom: `1px solid ${T.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1.5 }}>Peaks to Fit</span>
+            <Btn small onClick={addPeak}>+ Add Peak</Btn>
+          </div>
+
+          <div style={{ flex: 1, overflowY: "auto", padding: "10px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+            {peaks.length === 0 && (
+              <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textAlign: "center", paddingTop: 20 }}>
+                Add peaks to fit using<br />+ Add Peak above.
+              </div>
+            )}
+            {peaks.map(pk => (
+              <XRDPeakRow key={pk.id} peak={pk} result={fitResults[pk.id]}
+                onChange={patch => updatePeak(pk.id, patch)}
+                onRemove={() => removePeak(pk.id)}
+                lambda={LAMBDA} />
+            ))}
+          </div>
+
+          {peaks.length > 0 && (
+            <div style={{ padding: "12px 14px", borderTop: `1px solid ${T.border}`, display: "flex", flexDirection: "column", gap: 8 }}>
+              {fitError && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "#ff6b6b" }}>{fitError}</div>}
+              <Btn variant="primary" onClick={runFit} disabled={fitting} style={{ width: "100%" }}>
+                {fitting ? "Fitting…" : "Fit All Peaks"}
+              </Btn>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function XRDPeakRow({ peak, result, onChange, onRemove, lambda }) {
+  const dRef = lambda / (2 * Math.sin(peak.center * Math.PI / 360));
+  return (
+    <div style={{ background: T.bg2, borderRadius: 6, padding: 10, border: `1px solid ${peak.color}55` }}>
+      {/* Label row */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+        <div style={{ width: 10, height: 10, borderRadius: 2, background: peak.color, flexShrink: 0 }} />
+        <input value={peak.label} onChange={e => onChange({ label: e.target.value })}
+          placeholder="Label (e.g. BTO 002)"
+          style={{ flex: 1, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 6px", outline: "none" }} />
+        <button onClick={onRemove} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px" }}>×</button>
+      </div>
+      {/* Inputs */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+        {[["REF 2θ (°)", "center", 0.01], ["WINDOW (°)", "width", 0.1]].map(([lbl, key, step]) => (
+          <div key={key}>
+            <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim, marginBottom: 2, letterSpacing: 0.5 }}>{lbl}</div>
+            <DeferredInput type="number" value={peak[key]} step={step}
+              onChange={v => onChange({ [key]: key === "width" ? Math.max(0.05, Number(v)) : Number(v) })}
+              style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 0", outline: "none", textAlign: "center" }} />
+          </div>
+        ))}
+      </div>
+      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim, marginTop: 5 }}>
+        d_ref = {(dRef * 10).toFixed(4)} Å
+      </div>
+      {/* Fit results */}
+      {result && (
+        <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${T.border}33` }}>
+          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim, letterSpacing: 1, marginBottom: 5, textTransform: "uppercase" }}>Fit Results</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+            {[
+              ["2θ", `${result.center.toFixed(4)}°`],
+              ["FWHM", `${result.fwhm.toFixed(4)}°`],
+              ["d", `${(result.dSpacing * 10).toFixed(4)} Å`],
+              ["η (Voigt)", result.eta.toFixed(3)],
+            ].map(([lbl, val]) => (
+              <div key={lbl}>
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim }}>{lbl}</div>
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textPrimary }}>{val}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 5, padding: "4px 8px", background: T.bg0, borderRadius: 4, display: "inline-block" }}>
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim }}>strain </span>
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: result.strain >= 0 ? "#51cf66" : "#ff6b6b", fontWeight: 600 }}>
+              {result.strain >= 0 ? "+" : ""}{(result.strain * 100).toFixed(3)}%
+            </span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
