@@ -1900,27 +1900,29 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   const hasFittable = lines.some((ln, i) => lineEffStructs[i] && calcTwoTheta(lineEffStructs[i], ln.hkl) != null);
 
   return (
-    <div style={{ position: "fixed", inset: 0, background: T.bg0, zIndex: 400, display: "flex", flexDirection: "column" }}
+    <div style={{ position: "fixed", inset: 0, background: T.bg0, zIndex: 400, display: "flex", flexDirection: "column", overflowY: "auto" }}
       onClick={() => setOpenPicker(null)}>
-      {/* Header */}
-      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 20px", borderBottom: `1px solid ${T.border}`, background: T.bg1, flexShrink: 0 }}>
-        <button onClick={handleSave} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 20, lineHeight: 1, padding: 0 }}>←</button>
-        <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 20, color: T.amber }}>XRD Analysis</span>
-        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>{sample.id}</span>
-        <div style={{ flex: 1 }} />
-        <Btn variant="primary" onClick={handleSave}>Save & Close</Btn>
+      {/* Header — matches main app navbar */}
+      <div style={{ borderBottom: `1px solid ${T.border}`, background: T.bg1, position: "sticky", top: 0, zIndex: 10, flexShrink: 0 }}>
+        <div style={{ maxWidth: 1600, margin: "0 auto", padding: "12px 20px", display: "flex", alignItems: "center", gap: 14 }}>
+          <button onClick={handleSave} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 20, lineHeight: 1, padding: 0 }}>←</button>
+          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.amber }}>XRD Analysis</span>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>{sample.id}</span>
+          <div style={{ flex: 1 }} />
+          <Btn variant="primary" onClick={handleSave}>Save & Close</Btn>
+        </div>
       </div>
 
-      {/* Body: plot above, line panel below */}
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", padding: "12px 20px 0" }}>
+      {/* Body — constrained width, same as main content area */}
+      <div style={{ maxWidth: 1600, margin: "0 auto", width: "100%", padding: "24px 20px", display: "flex", flexDirection: "column", flex: 1, boxSizing: "border-box" }}>
         {/* Plot */}
-        <div style={{ flex: 1, minHeight: 0 }}>
+        <div style={{ height: "52vh", minHeight: 280 }}>
           <Plot data={traces} layout={layout} config={buildPlotConfig(`xrd_${sample.id}`)}
             style={{ width: "100%", height: "100%" }} useResizeHandler />
         </div>
 
         {/* Line panel — same as analysis notebook */}
-        <div style={{ flexShrink: 0, borderTop: `1px solid ${T.border}`, paddingTop: 10, paddingBottom: 12, maxHeight: "38vh", overflowY: "auto" }}>
+        <div style={{ marginTop: 20, borderTop: `1px solid ${T.border}`, paddingTop: 16, paddingBottom: 16 }}>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {lines.map((ln, i) => {
               const effStruct  = lineEffStructs[i];
@@ -2096,7 +2098,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   );
 }
 
-// ── ExportModal ───────────────────────────────────────────────────────────────
+// ── ExportModal ────────────────────────────────────────────────────────────────
 
 function ExportModal({ samples, onClose }) {
   const sampleTechnique = s => s.technique || "";
