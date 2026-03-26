@@ -2126,7 +2126,9 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
   };
 
   const loadConfigFromLibrary = cfg => {
-    if (cfg.lines) setLines(cfg.lines.map(ln => ({ ...ln, id: String(Date.now() + Math.random()) })));
+    const ts = Date.now();
+    if (Array.isArray(cfg.lines))
+      setLines(cfg.lines.map((ln, i) => ({ ...ln, id: `${ts}-${i}-${Math.random().toString(36).slice(2)}` })));
     if (cfg.fitWindow !== undefined) setFitWindow(cfg.fitWindow);
     if (cfg.nBgTerms) setNBgTerms(cfg.nBgTerms);
     setFitResults({}); setFittedCurve(null); setPeakCurves([]); setBgCurve(null);
