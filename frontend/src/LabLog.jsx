@@ -1775,16 +1775,19 @@ function solveLinear(A, b) {
 
 // Fit a smooth Chebyshev polynomial background to the full XRD spectrum.
 //
-// Key design choice — fit in LOG-intensity space:
-//   log(y) = Σ B_m T_m(x)  →  y_bg = exp(Σ B_m T_m(x))
-// This means:
-//   • Result is always positive (no shift needed)
-//   • A 10 000-count substrate peak is only ~2× heavier than a 100-count
-//     background point in log-space (vs 100× in linear), so the huge substrate
-//     peak cannot dominate even if it isn't fully excluded.
+// Fitting is done in LOG-intensity space:
+//   log(y) = Σ B_m T_m(x)   →   y_bg = exp(polynomial) — always positive.
+// Log-space means a 10 000-count substrate peak is only ~2× noisier than a
+// 100-count background point (vs 100× in linear), drastically reducing bias.
 //
-// peaks:    optional [{center, width}] — ±1.5×width excluded from the fit
-// nBgTerms: Chebyshev terms (try 4–12; more → can follow diffuse scatter humps)
+// Robustness via iterative upward sigma-clipping:
+//   After each fit, residuals = log(data) − log(bg) are computed.
+//   Negative residuals are pure noise → their RMS estimates the noise level σ.
+//   Points more than 2.5σ above the fit are peak tails → excluded, re-fit.
+//   5 iterations are enough for even broad peak tails to be fully rejected.
+//
+// peaks:    optional [{center, width}] — ±1.5×width hard-excluded first
+// nBgTerms: Chebyshev terms (4–12; more terms = more flexible background shape)
 // Returns { x, y, coeffs, xMin, xMax } or null
 function fitBackground(xrdData, peaks = [], nBgTerms = 6) {
   const allPts = [...xrdData].sort((a, b) => a.x - b.x);
@@ -1793,27 +1796,46 @@ function fitBackground(xrdData, peaks = [], nBgTerms = 6) {
   if (xMax === xMin) return null;
   const toCheb = x => 2 * (x - xMin) / (xMax - xMin) - 1;
 
-  // Exclude ±1.5× tolerance around each peak centre
-  let bgPts = peaks.length
-    ? allPts.filter(p => peaks.every(pk => Math.abs(p.x - pk.center) > pk.width * 1.5))
+  // Hard exclusion: ±1.5× tolerance around each peak centre (skip if width = 0)
+  let bgPts = peaks.some(pk => pk.width > 0)
+    ? allPts.filter(p => peaks.every(pk => pk.width <= 0 || Math.abs(p.x - pk.center) > pk.width * 1.5))
     : allPts;
   if (bgPts.length < nBgTerms) bgPts = allPts; // fallback
 
-  // Normal equations for log(y): X^T X β = X^T log(y)
-  const XtX = Array.from({ length: nBgTerms }, () => new Array(nBgTerms).fill(0));
-  const Xty = new Array(nBgTerms).fill(0);
-  for (const pt of bgPts) {
-    const basis = chebyshevBasis(toCheb(pt.x), nBgTerms);
-    const logY  = Math.log(Math.max(pt.y, 1));
-    for (let m = 0; m < nBgTerms; m++) {
-      Xty[m] += basis[m] * logY;
-      for (let k = 0; k < nBgTerms; k++) XtX[m][k] += basis[m] * basis[k];
+  // Solve normal equations X^T X β = X^T log(y) for a given point set
+  const solveCoeffs = pts => {
+    const XtX = Array.from({ length: nBgTerms }, () => new Array(nBgTerms).fill(0));
+    const Xty = new Array(nBgTerms).fill(0);
+    for (const pt of pts) {
+      const basis = chebyshevBasis(toCheb(pt.x), nBgTerms);
+      const logY  = Math.log(Math.max(pt.y, 1));
+      for (let m = 0; m < nBgTerms; m++) {
+        Xty[m] += basis[m] * logY;
+        for (let k = 0; k < nBgTerms; k++) XtX[m][k] += basis[m] * basis[k];
+      }
     }
-  }
-  const coeffs = solveLinear(XtX, Xty);
-  const evalBg = x => Math.exp(evalChebyshev(toCheb(x), coeffs));
+    return solveLinear(XtX, Xty);
+  };
 
-  const nFine = 1000;
+  // Iterative upward sigma-clipping (up to 5 passes)
+  let coeffs = solveCoeffs(bgPts);
+  for (let iter = 0; iter < 5; iter++) {
+    const residuals = bgPts.map(pt =>
+      Math.log(Math.max(pt.y, 1)) - evalChebyshev(toCheb(pt.x), coeffs)
+    );
+    // Noise estimate from one-sided negative residuals (data below fit = noise only)
+    const negRes = residuals.filter(r => r < 0);
+    const sigma  = negRes.length > 3
+      ? Math.sqrt(negRes.reduce((s, r) => s + r * r, 0) / negRes.length)
+      : 0.5;
+    const clipped = bgPts.filter((_, j) => residuals[j] < 2.5 * sigma);
+    if (clipped.length < nBgTerms || clipped.length === bgPts.length) break;
+    bgPts  = clipped;
+    coeffs = solveCoeffs(bgPts);
+  }
+
+  const evalBg = x => Math.exp(evalChebyshev(toCheb(x), coeffs));
+  const nFine  = 1000;
   const xs = Array.from({ length: nFine }, (_, k) => xMin + k * (xMax - xMin) / (nFine - 1));
   return { x: xs, y: xs.map(x => evalBg(x)), coeffs, xMin, xMax };
 }
@@ -2268,8 +2290,8 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
                   )}
                   {/* Tolerance (±) */}
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, flexShrink: 0 }}>±</span>
-                  <DeferredInput type="number" value={ln.tolerance ?? 0.5} step={0.1} min={0.05}
-                    onChange={v => updateLine(ln.id, { tolerance: Math.max(0.05, Number(v)) })}
+                  <DeferredInput type="number" value={ln.tolerance ?? 0.5} step={0.1} min={0}
+                    onChange={v => updateLine(ln.id, { tolerance: Math.max(0, Number(v)) })}
                     style={{ ...rc, width: 52, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text", padding: "4px 4px" }} />
                   {/* Fit result — strain badge */}
                   {res && (
