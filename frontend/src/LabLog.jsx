@@ -1403,7 +1403,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
 
 // ── SampleDetail ──────────────────────────────────────────────────────────────
 
-function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete, editingMeta, setEditingMeta, settings }) {
+function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings }) {
   const [addingLayer, setAddingLayer]   = useState(false);
   const [meta, setMeta]                 = useState({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
   const [dragIdx, setDragIdx]           = useState(null);
@@ -1521,6 +1521,8 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               sample={sample}
               xrdData={pd?.xrd_ot || []}
               structures={settings?.structures || []}
+              xrdConfigs={settings?.xrd_configs || []}
+              onSaveXrdConfigs={configs => onSaveSettings?.({ ...settings, xrd_configs: configs })}
               onSave={peaks => onUpdate({ ...sample, xrd_peaks: peaks })}
               onClose={() => setXrdAnalysisOpen(false)} />
           )}
@@ -2001,7 +2003,7 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow, bgResult = null, quick = false
 
 const PEAK_COLORS = ["#4a9eff", "#ff6b6b", "#51cf66", "#ffd43b", "#cc5de8", "#ff922b", "#20c997"];
 
-function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
+function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSaveXrdConfigs, onSave, onClose }) {
   // xrd_peaks may be the old array format or the new { lines, fitWindow, fittedCurve, peakCurves } object
   const saved = sample.xrd_peaks;
   const isObj = saved && !Array.isArray(saved);
@@ -2035,6 +2037,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   const [dragLineIdx,     setDragLineIdx]     = useState(null);
   const [dragOverIdx,     setDragOverIdx]     = useState(null);
   const [configMenuOpen,  setConfigMenuOpen]  = useState(false);
+  const [configName,      setConfigName]      = useState("");
   const configFileRef = useRef(null);
 
   const addLine = () => setLines(p => [...p, {
@@ -2098,21 +2101,45 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
     }),
   ];
 
-  // Fields that are fit results, not config — stripped on export, regenerated on fit
+  // Fields that are fit results, not config — stripped on export/save
   const FIT_RESULT_FIELDS = ['id', 'fitted_center', 'fitted_fwhm', 'fitted_fwhmG',
     'fitted_fwhmL', 'fitted_eta', 'fitted_d', 'd_ref', 'strain', 'amplitude'];
 
-  const exportConfig = () => {
-    const cfg = {
-      version: 1,
-      fitWindow,
-      nBgTerms,
-      lines: lines.map(ln => {
-        const clean = { ...ln };
-        FIT_RESULT_FIELDS.forEach(f => delete clean[f]);
-        return clean;
-      }),
-    };
+  const buildConfigPayload = () => ({
+    fitWindow,
+    nBgTerms,
+    lines: lines.map(ln => {
+      const clean = { ...ln };
+      FIT_RESULT_FIELDS.forEach(f => delete clean[f]);
+      return clean;
+    }),
+  });
+
+  const saveConfigToLibrary = () => {
+    const name = configName.trim();
+    if (!name) return;
+    const entry = { id: String(Date.now()), name, savedAt: new Date().toISOString(), ...buildConfigPayload() };
+    // Replace any existing config with the same name, otherwise append
+    onSaveXrdConfigs?.([...xrdConfigs.filter(c => c.name !== name), entry]);
+    setConfigName("");
+    setConfigMenuOpen(false);
+  };
+
+  const loadConfigFromLibrary = cfg => {
+    if (cfg.lines) setLines(cfg.lines.map(ln => ({ ...ln, id: String(Date.now() + Math.random()) })));
+    if (cfg.fitWindow !== undefined) setFitWindow(cfg.fitWindow);
+    if (cfg.nBgTerms) setNBgTerms(cfg.nBgTerms);
+    setFitResults({}); setFittedCurve(null); setPeakCurves([]); setBgCurve(null);
+    setConfigMenuOpen(false);
+  };
+
+  const deleteConfigFromLibrary = (id, e) => {
+    e.stopPropagation();
+    onSaveXrdConfigs?.(xrdConfigs.filter(c => c.id !== id));
+  };
+
+  const exportConfigFile = () => {
+    const cfg = { version: 1, ...buildConfigPayload() };
     const blob = new Blob([JSON.stringify(cfg, null, 2)], { type: 'application/json' });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
@@ -2130,18 +2157,13 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
       try {
         const cfg = JSON.parse(ev.target.result);
         if (!cfg.version) throw new Error('Not a valid XRD config file');
-        if (cfg.lines) setLines(cfg.lines.map(ln => ({ ...ln, id: String(Date.now() + Math.random()) })));
-        if (cfg.fitWindow !== undefined) setFitWindow(cfg.fitWindow);
-        if (cfg.nBgTerms)  setNBgTerms(cfg.nBgTerms);
-        // Clear fit results — they don't belong to the imported config
-        setFitResults({}); setFittedCurve(null); setPeakCurves([]); setBgCurve(null);
+        loadConfigFromLibrary(cfg);
       } catch (err) {
         alert(`Could not load config: ${err.message}`);
       }
     };
     reader.readAsText(file);
     e.target.value = '';
-    setConfigMenuOpen(false);
   };
 
   const getFittablePeaks = useCallback(() =>
@@ -2461,22 +2483,55 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
                 style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
                 + Add line
               </button>
-              {/* Config save / load */}
+              {/* Config library */}
               <div style={{ position: "relative" }} onClick={e => e.stopPropagation()}>
                 <button onClick={() => setConfigMenuOpen(v => !v)}
                   style={{ background: configMenuOpen ? T.bg3 : "none", border: `1px solid ${configMenuOpen ? T.borderBright : T.border}`, borderRadius: 5, color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
                   Config ▾
                 </button>
                 {configMenuOpen && (
-                  <div style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 7, padding: "4px 0", zIndex: 500, boxShadow: "0 4px 16px rgba(0,0,0,.55)", minWidth: 160, display: "flex", flexDirection: "column" }}>
-                    <button onClick={exportConfig}
-                      style={{ background: "none", border: "none", color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "7px 14px", cursor: "pointer", textAlign: "left" }}>
-                      ↓ Save config…
-                    </button>
-                    <button onClick={() => configFileRef.current?.click()}
-                      style={{ background: "none", border: "none", color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "7px 14px", cursor: "pointer", textAlign: "left" }}>
-                      ↑ Load config…
-                    </button>
+                  <div style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "10px 12px", zIndex: 500, boxShadow: "0 4px 16px rgba(0,0,0,.55)", minWidth: 260, display: "flex", flexDirection: "column", gap: 8 }}>
+                    {/* Save current config */}
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <input value={configName} onChange={e => setConfigName(e.target.value)}
+                        onKeyDown={e => { if (e.key === "Enter") saveConfigToLibrary(); e.stopPropagation(); }}
+                        placeholder="Config name…"
+                        style={{ flex: 1, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 8px", borderRadius: 4, border: `1px solid ${T.border}`, background: T.bg0, color: T.textPrimary, outline: "none" }} />
+                      <button onClick={saveConfigToLibrary} disabled={!configName.trim()}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", borderRadius: 4, border: "none", background: configName.trim() ? T.accent : T.bg3, color: configName.trim() ? "#fff" : T.textDim, cursor: configName.trim() ? "pointer" : "default" }}>
+                        Save
+                      </button>
+                    </div>
+                    {/* Saved configs list */}
+                    {xrdConfigs.length > 0 && (
+                      <>
+                        <div style={{ borderTop: `1px solid ${T.border}`, margin: "2px 0" }} />
+                        <div style={{ display: "flex", flexDirection: "column", gap: 2, maxHeight: 220, overflowY: "auto" }}>
+                          {xrdConfigs.map(cfg => (
+                            <div key={cfg.id} onClick={() => loadConfigFromLibrary(cfg)}
+                              style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 8px", borderRadius: 5, cursor: "pointer", background: "transparent" }}
+                              onMouseEnter={e => e.currentTarget.style.background = T.bg3}
+                              onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                              <span style={{ flex: 1, fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textPrimary }}>{cfg.name}</span>
+                              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim }}>{cfg.lines?.length ?? 0} lines</span>
+                              <button onClick={e => deleteConfigFromLibrary(cfg.id, e)}
+                                style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, lineHeight: 1, padding: "0 2px" }}>×</button>
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                    {/* JSON export / import */}
+                    <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 6, display: "flex", gap: 8 }}>
+                      <button onClick={exportConfigFile}
+                        style={{ background: "none", border: "none", color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "2px 0", cursor: "pointer" }}>
+                        ↓ Export JSON
+                      </button>
+                      <button onClick={() => configFileRef.current?.click()}
+                        style={{ background: "none", border: "none", color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "2px 0", cursor: "pointer" }}>
+                        ↑ Import JSON
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -6708,7 +6763,8 @@ export default function App() {
               onDelete={deleteSample}
               editingMeta={editingMeta}
               setEditingMeta={setEditingMeta}
-              settings={settings} />
+              settings={settings}
+              onSaveSettings={handleSaveSettings} />
           ) : activeBook && activeBookObj ? (
             <AnalysisBookDetail
               book={activeBookObj}
