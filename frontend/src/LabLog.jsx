@@ -1840,13 +1840,28 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow) {
 const PEAK_COLORS = ["#4a9eff", "#ff6b6b", "#51cf66", "#ffd43b", "#cc5de8", "#ff922b", "#20c997"];
 
 function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
-  const [lines,       setLines]       = useState(() => (sample.xrd_peaks || []).map(p => ({ ...p })));
-  const [fitResults,  setFitResults]  = useState({});
-  const [fittedCurve, setFittedCurve] = useState(null);
-  const [peakCurves,  setPeakCurves]  = useState([]);
+  // xrd_peaks may be the old array format or the new { lines, fitWindow, fittedCurve, peakCurves } object
+  const saved = sample.xrd_peaks;
+  const isObj = saved && !Array.isArray(saved);
+  const savedLines = isObj ? (saved.lines || []) : (saved || []);
+
+  const [lines,       setLines]       = useState(() => savedLines.map(p => ({ ...p })));
+  const [fitResults,  setFitResults]  = useState(() => {
+    // Reconstruct fitResults map from saved lines that carry fitted_* fields
+    const r = {};
+    savedLines.forEach(ln => {
+      if (ln.fitted_center != null) r[ln.id] = {
+        center: ln.fitted_center, fwhm: ln.fitted_fwhm, eta: ln.fitted_eta,
+        dSpacing: ln.fitted_d, dRef: ln.d_ref, strain: ln.strain, amplitude: ln.amplitude,
+      };
+    });
+    return r;
+  });
+  const [fittedCurve, setFittedCurve] = useState(() => isObj ? (saved.fittedCurve || null) : null);
+  const [peakCurves,  setPeakCurves]  = useState(() => isObj ? (saved.peakCurves  || [])  : []);
   const [fitting,     setFitting]     = useState(false);
   const [fitError,        setFitError]        = useState(null);
-  const [fitWindow,       setFitWindow]       = useState(null);  // [x0, x1] | null
+  const [fitWindow,       setFitWindow]       = useState(() => isObj ? (saved.fitWindow || null) : null);  // [x0, x1] | null
   const [selectingWindow, setSelectingWindow] = useState(false);
   const [openPicker,      setOpenPicker]      = useState(null); // { id, type: "color"|"style"|"strainCfg" }
   const [dragLineIdx,     setDragLineIdx]     = useState(null);
@@ -1934,10 +1949,12 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   }, [lines, lineEffStructs, xrdData, fitWindow]);
 
   const handleSave = () => {
-    onSave(lines.map(ln => {
+    const savedLines = lines.map(ln => {
       const r = fitResults[ln.id];
-      return r ? { ...ln, fitted_center: r.center, fitted_fwhm: r.fwhm, fitted_eta: r.eta, fitted_d: r.dSpacing, d_ref: r.dRef, strain: r.strain } : ln;
-    }));
+      return r ? { ...ln, fitted_center: r.center, fitted_fwhm: r.fwhm, fitted_eta: r.eta,
+                         fitted_d: r.dSpacing, d_ref: r.dRef, strain: r.strain, amplitude: r.amplitude } : ln;
+    });
+    onSave({ lines: savedLines, fitWindow, fittedCurve, peakCurves });
     onClose();
   };
 
