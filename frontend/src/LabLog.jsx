@@ -1773,54 +1773,75 @@ function solveLinear(A, b) {
   return x;
 }
 
-// Two-stage pseudo-Voigt peak fitting with global Chebyshev background.
+// Fit a smooth Chebyshev polynomial background to the full XRD spectrum.
 //
-// Stage 1 — Background (linear least-squares, no optimizer):
-//   Fit a Chebyshev polynomial to the FULL spectrum, excluding ±2×tolerance
-//   around each peak centre. With many background-only points this is uniquely
-//   determined and physically smooth. Uses normal equations X^T X β = X^T y.
+// Key design choice — fit in LOG-intensity space:
+//   log(y) = Σ B_m T_m(x)  →  y_bg = exp(Σ B_m T_m(x))
+// This means:
+//   • Result is always positive (no shift needed)
+//   • A 10 000-count substrate peak is only ~2× heavier than a 100-count
+//     background point in log-space (vs 100× in linear), so the huge substrate
+//     peak cannot dominate even if it isn't fully excluded.
+//
+// peaks:    optional [{center, width}] — ±1.5×width excluded from the fit
+// nBgTerms: Chebyshev terms (try 4–12; more → can follow diffuse scatter humps)
+// Returns { x, y, coeffs, xMin, xMax } or null
+function fitBackground(xrdData, peaks = [], nBgTerms = 6) {
+  const allPts = [...xrdData].sort((a, b) => a.x - b.x);
+  if (allPts.length < nBgTerms + 1) return null;
+  const xMin = allPts[0].x, xMax = allPts[allPts.length - 1].x;
+  if (xMax === xMin) return null;
+  const toCheb = x => 2 * (x - xMin) / (xMax - xMin) - 1;
+
+  // Exclude ±1.5× tolerance around each peak centre
+  let bgPts = peaks.length
+    ? allPts.filter(p => peaks.every(pk => Math.abs(p.x - pk.center) > pk.width * 1.5))
+    : allPts;
+  if (bgPts.length < nBgTerms) bgPts = allPts; // fallback
+
+  // Normal equations for log(y): X^T X β = X^T log(y)
+  const XtX = Array.from({ length: nBgTerms }, () => new Array(nBgTerms).fill(0));
+  const Xty = new Array(nBgTerms).fill(0);
+  for (const pt of bgPts) {
+    const basis = chebyshevBasis(toCheb(pt.x), nBgTerms);
+    const logY  = Math.log(Math.max(pt.y, 1));
+    for (let m = 0; m < nBgTerms; m++) {
+      Xty[m] += basis[m] * logY;
+      for (let k = 0; k < nBgTerms; k++) XtX[m][k] += basis[m] * basis[k];
+    }
+  }
+  const coeffs = solveLinear(XtX, Xty);
+  const evalBg = x => Math.exp(evalChebyshev(toCheb(x), coeffs));
+
+  const nFine = 1000;
+  const xs = Array.from({ length: nFine }, (_, k) => xMin + k * (xMax - xMin) / (nFine - 1));
+  return { x: xs, y: xs.map(x => evalBg(x)), coeffs, xMin, xMax };
+}
+
+// Two-stage pseudo-Voigt peak fitting.
+//
+// Stage 1 — Background:
+//   If a bgResult (from fitBackground / "Fit BG" button) is provided, use it
+//   directly. Otherwise run fitBackground internally (log-space Chebyshev).
 //
 // Stage 2 — Peaks (Nelder-Mead, Poisson NLL):
-//   Background is fixed from Stage 1. Only peak parameters are optimised within
-//   the fit window, so the optimizer has a much smaller, well-conditioned space.
+//   Background fixed from Stage 1. Only peak parameters optimised inside the
+//   fit window — smaller search space → faster, more reliable convergence.
 //
-// peaks:     [{ id, center, width }]  center = reference 2θ, width = tolerance
-// fitWindow: [x0, x1] | null          restrict peak fitting to this 2θ range
-// nBgTerms:  Chebyshev terms (default 6 = quintic, safe over full spectrum)
-function fitPeaksVoigt(xrdData, peaks, fitWindow, nBgTerms = 6) {
+// peaks:     [{ id, center, width }]
+// fitWindow: [x0, x1] | null
+// bgResult:  return value of fitBackground | null
+function fitPeaksVoigt(xrdData, peaks, fitWindow, bgResult = null) {
   const LAMBDA = 0.15406; // nm  Cu Kα
 
   const allPts = [...xrdData].sort((a, b) => a.x - b.x);
   if (!allPts.length) return null;
 
-  // Global 2θ range — used for Chebyshev normalisation throughout
-  const xGlobalMin = allPts[0].x;
-  const xGlobalMax = allPts[allPts.length - 1].x;
-  const toCheb = x => 2 * (x - xGlobalMin) / (xGlobalMax - xGlobalMin) - 1;
-
-  // ── Stage 1: global background via linear least-squares ───────────────────
-  // Exclude ±2×tolerance around every peak centre
-  let bgPts = allPts.filter(p => peaks.every(pk => Math.abs(p.x - pk.center) > pk.width * 2));
-  if (bgPts.length < nBgTerms) bgPts = allPts; // fallback: use everything
-
-  // Accumulate normal equations X^T X β = X^T y
-  const XtX = Array.from({ length: nBgTerms }, () => new Array(nBgTerms).fill(0));
-  const Xty = new Array(nBgTerms).fill(0);
-  for (const pt of bgPts) {
-    const basis = chebyshevBasis(toCheb(pt.x), nBgTerms);
-    const yi    = Math.max(pt.y, 0);
-    for (let m = 0; m < nBgTerms; m++) {
-      Xty[m] += basis[m] * yi;
-      for (let k = 0; k < nBgTerms; k++) XtX[m][k] += basis[m] * basis[k];
-    }
-  }
-  const bgCoeffs = solveLinear(XtX, Xty);
-
-  // If the solved polynomial dips below zero anywhere in the data range, shift
-  // the constant term (B_0) up just enough to keep background non-negative.
-  const evalBg  = x => evalChebyshev(toCheb(x), bgCoeffs);
-  const minBg   = Math.min(...allPts.map(p => evalBg(p.x)));
-  if (minBg < 0) bgCoeffs[0] -= minBg;
+  // ── Stage 1: background ───────────────────────────────────────────────────
+  const bg = bgResult || fitBackground(xrdData, peaks);
+  if (!bg) return null;
+  const bgToCheb = x => 2 * (x - bg.xMin) / (bg.xMax - bg.xMin) - 1;
+  const evalBg   = x => Math.exp(evalChebyshev(bgToCheb(x), bg.coeffs));
 
   // ── Stage 2: peak optimisation (background fixed) ─────────────────────────
   const pts = (fitWindow
@@ -1835,7 +1856,7 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow, nBgTerms = 6) {
   const bgAtPts = xs.map(x => Math.max(evalBg(x), 0));
   const bgFloor = Math.max(bgAtPts.reduce((s, v) => s + v, 0) / bgAtPts.length, 1);
 
-  // Per-peak initialisation using Stage-1 background as the baseline
+  // Per-peak initialisation using background as baseline
   const initLogAmps = peaks.map(pk => {
     const nearby = pts.filter(p => Math.abs(p.x - pk.center) <= pk.width);
     const bgHere = nearby.length
@@ -1851,11 +1872,7 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow, nBgTerms = 6) {
     return Math.log(Math.max(above.length >= 2 ? above[above.length - 1].x - above[0].x : 0.1, 0.03));
   });
 
-  // Parameters: [logAmp, rawCen, logFwhm, logitEta] × nPeaks
-  //   amp  = exp(logAmp)               → always > 0
-  //   cen  = center + width·tanh(raw)  → hard-bounded within ±tolerance
-  //   fwhm = exp(logFwhm)              → always > 0
-  //   eta  = sigmoid(logitEta)         → always in (0, 1)
+  // [logAmp, rawCen, logFwhm, logitEta] × nPeaks
   const p0 = peaks.flatMap((_, i) => [initLogAmps[i], 0, initLogFwhms[i], 0]);
 
   const decodePeaks = params => peaks.map((pk, i) => ({
@@ -1930,9 +1947,13 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   });
   const [fittedCurve, setFittedCurve] = useState(() => isObj ? (saved.fittedCurve || null) : null);
   const [peakCurves,  setPeakCurves]  = useState(() => isObj ? (saved.peakCurves  || [])  : []);
+  const [bgCurve,     setBgCurve]     = useState(() => isObj ? (saved.bgCurve     || null) : null);
   const [fitting,     setFitting]     = useState(false);
+  const [fittingBg,   setFittingBg]   = useState(false);
   const [logScale,    setLogScale]    = useState(true);
   const [fitError,        setFitError]        = useState(null);
+  const [bgError,         setBgError]         = useState(null);
+  const [nBgTerms,        setNBgTerms]        = useState(() => isObj ? (saved.nBgTerms || 6) : 6);
   const [fitWindow,       setFitWindow]       = useState(() => isObj ? (saved.fitWindow || null) : null);  // [x0, x1] | null
   const [selectingWindow, setSelectingWindow] = useState(false);
   const [openPicker,      setOpenPicker]      = useState(null); // { id, type: "color"|"style"|"strainCfg" }
@@ -2000,25 +2021,45 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
     }),
   ];
 
-  const runFit = useCallback(() => {
-    const fittable = lines.map((ln, i) => {
+  const getFittablePeaks = useCallback(() =>
+    lines.map((ln, i) => {
       const tt = ln.material === "__arbitrary__"
         ? (ln.arbitrary_2theta ?? null)
         : (lineEffStructs[i] ? calcTwoTheta(lineEffStructs[i], ln.hkl) : null);
       return tt != null ? { id: ln.id, center: tt, width: ln.tolerance ?? 0.5 } : null;
-    }).filter(Boolean);
+    }).filter(Boolean),
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [lines, lineEffStructs]);
+
+  const runFitBg = useCallback(() => {
+    if (!xrdData.length) return;
+    setFittingBg(true); setBgError(null);
+    setTimeout(() => {
+      try {
+        const peaks = getFittablePeaks();
+        const res = fitBackground(xrdData, peaks, nBgTerms);
+        if (res) setBgCurve(res);
+        else setBgError("Background fit failed — check data.");
+      } catch (e) { setBgError(String(e.message || e)); }
+      setFittingBg(false);
+    }, 20);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [xrdData, nBgTerms, getFittablePeaks]);
+
+  const runFit = useCallback(() => {
+    const fittable = getFittablePeaks();
     if (!fittable.length || !xrdData.length) return;
     setFitting(true); setFitError(null);
     setTimeout(() => {
       try {
-        const res = fitPeaksVoigt(xrdData, fittable, fitWindow);
+        const res = fitPeaksVoigt(xrdData, fittable, fitWindow, bgCurve || undefined);
         if (res) { setFitResults(res.results); setFittedCurve({ x: res.fittedX, y: res.fittedY, bgY: res.bgY }); setPeakCurves(res.peakCurves || []); }
         else setFitError("Not enough data in window — try widening the tolerance or fit window.");
       } catch (e) { setFitError(String(e.message || e)); }
       setFitting(false);
     }, 20);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lines, lineEffStructs, xrdData, fitWindow]);
+  }, [getFittablePeaks, xrdData, fitWindow, bgCurve]);
 
   const handleSave = () => {
     const savedLines = lines.map(ln => {
@@ -2026,7 +2067,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
       return r ? { ...ln, fitted_center: r.center, fitted_fwhm: r.fwhm, fitted_eta: r.eta,
                          fitted_d: r.dSpacing, d_ref: r.dRef, strain: r.strain, amplitude: r.amplitude } : ln;
     });
-    onSave({ lines: savedLines, fitWindow, fittedCurve, peakCurves });
+    onSave({ lines: savedLines, fitWindow, fittedCurve, peakCurves, bgCurve, nBgTerms });
     onClose();
   };
 
@@ -2036,8 +2077,9 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
 
   const traces = [
     { x: xrdData.map(p => p.x), y: xrdData.map(p => Math.max(p.y, 1)), type: "scatter", mode: "lines", line: { color: T.textSecondary, width: 1 }, showlegend: false, hovertemplate: "2θ=%{x:.3f}°<br>I=%{y:.0f}<extra></extra>" },
-    // SNIP background — dotted line so user can see what was subtracted
-    ...(fittedCurve?.bgY ? [{ x: fittedCurve.x, y: fittedCurve.bgY, type: "scatter", mode: "lines", line: { color: T.textDim, width: 1, dash: "dot" }, showlegend: false, hoverinfo: "skip" }] : []),
+    // Background curve — bgCurve (standalone) takes priority over peak-fit bgY
+    ...(bgCurve ? [{ x: bgCurve.x, y: bgCurve.y, type: "scatter", mode: "lines", line: { color: T.amber, width: 1.5, dash: "dash" }, showlegend: false, hoverinfo: "skip" }] :
+        fittedCurve?.bgY ? [{ x: fittedCurve.x, y: fittedCurve.bgY, type: "scatter", mode: "lines", line: { color: T.textDim, width: 1, dash: "dot" }, showlegend: false, hoverinfo: "skip" }] : []),
     // Individual peak fills — closed polygon (toself) works on both log and linear axes.
     // Path: top edge (bg+peak) left→right, bottom edge (bg) right→left.
     ...peakCurves.map(pc => {
@@ -2294,9 +2336,20 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
                   <button onClick={() => setFitWindow(null)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", marginLeft: 4, fontSize: 13, lineHeight: 1, padding: 0 }}>×</button>
                 </span>
               )}
+              {xrdData.length > 0 && (
+                <>
+                  <select value={nBgTerms} onChange={e => setNBgTerms(Number(e.target.value))} onClick={e => e.stopPropagation()}
+                    title="Chebyshev background terms"
+                    style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 6px", borderRadius: 4, border: `1px solid ${T.border}`, background: T.bg0, color: T.textSecondary, cursor: "pointer" }}>
+                    {[4, 6, 8, 10, 12].map(n => <option key={n} value={n}>{n} bg terms</option>)}
+                  </select>
+                  <Btn onClick={runFitBg} disabled={fittingBg}>{fittingBg ? "Fitting…" : "Fit BG"}</Btn>
+                  {bgError && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "#ff6b6b" }}>{bgError}</span>}
+                </>
+              )}
               {hasFittable && (
                 <>
-                  <Btn variant="primary" onClick={runFit} disabled={fitting}>{fitting ? "Fitting…" : "Fit All"}</Btn>
+                  <Btn variant="primary" onClick={runFit} disabled={fitting || fittingBg}>{fitting ? "Fitting…" : "Fit All"}</Btn>
                   {fitError && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "#ff6b6b" }}>{fitError}</span>}
                 </>
               )}
