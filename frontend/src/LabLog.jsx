@@ -2038,7 +2038,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   const addLine = () => setLines(p => [...p, {
     id: String(Date.now()), material: structures[0]?.name || "__arbitrary__", hkl: "",
     style: "solid", color: PEAK_COLORS[p.length % PEAK_COLORS.length] || "#4a9eff",
-    mode: "bulk", substrate: "", tolerance: 0.5, arbitrary_2theta: null,
+    mode: "bulk", substrate: "", tolerance: 0.5, arbitrary_2theta: null, primary: true,
   }]);
   const updateLine = (id, patch) => setLines(p => p.map(l => l.id === id ? { ...l, ...patch } : l));
   const removeLine = id => { setLines(p => p.filter(l => l.id !== id)); setFitResults(r => { const n = { ...r }; delete n[id]; return n; }); };
@@ -2252,7 +2252,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
                   onDrop={e => { e.preventDefault(); reorderLines(dragLineIdx, i); setDragLineIdx(null); setDragOverIdx(null); }}
                   onDragEnd={() => { setDragLineIdx(null); setDragOverIdx(null); }}
                   style={{ display: "flex", alignItems: "center", gap: 6, position: "relative", zIndex: anyOpen ? 100 : "auto",
-                    opacity: dragLineIdx === i ? 0.4 : 1,
+                    opacity: dragLineIdx === i ? 0.4 : (ln.primary === false ? 0.55 : 1),
                     outline: dragOverIdx === i && dragLineIdx !== i ? `2px solid ${T.teal}` : "2px solid transparent",
                     borderRadius: 5 }}>
                   {/* Row number / drag handle */}
@@ -2360,6 +2360,14 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
                     </span>
                   )}
                   <div style={{ flex: 1 }} />
+                  {/* Primary / secondary toggle */}
+                  <button
+                    title={ln.primary === false ? "Secondary layer — click to mark as primary" : "Primary layer (used in analysis) — click to mark as secondary"}
+                    onClick={e => { e.stopPropagation(); updateLine(ln.id, { primary: ln.primary === false ? true : false }); }}
+                    style={{ background: "none", border: "none", cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px",
+                      color: ln.primary === false ? T.textDim : T.amber }}>
+                    {ln.primary === false ? "☆" : "★"}
+                  </button>
                   {/* Color picker */}
                   <div style={{ position: "relative", zIndex: 50 }}>
                     <div onClick={e => { e.stopPropagation(); setOpenPicker(colorOpen ? null : { id: ln.id, type: "color" }); }}
