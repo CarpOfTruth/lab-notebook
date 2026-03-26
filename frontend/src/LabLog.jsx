@@ -1874,7 +1874,9 @@ function fitBackground(xrdData, peaks = [], nBgTerms = 6) {
 // peaks:     [{ id, center, width }]
 // fitWindow: [x0, x1] | null
 // bgResult:  return value of fitBackground | null
-function fitPeaksVoigt(xrdData, peaks, fitWindow, bgResult = null) {
+// quick:     true → pure-Gaussian fit (3 params/peak, 3 000 iters) for fast preview
+//            false → full TCH pseudo-Voigt (4 params/peak, 15 000 iters)
+function fitPeaksVoigt(xrdData, peaks, fitWindow, bgResult = null, quick = false) {
   const LAMBDA = 0.15406; // nm  Cu Kα
 
   const allPts = [...xrdData].sort((a, b) => a.x - b.x);
@@ -1915,39 +1917,58 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow, bgResult = null) {
     return Math.log(Math.max(above.length >= 2 ? above[above.length - 1].x - above[0].x : 0.1, 0.03));
   });
 
-  // TCH parameterisation: [logAmp, rawCen, logFwhmG, logFwhmL] × nPeaks
-  //   fG = exp(logFwhmG)  — Gaussian FWHM component, always > 0
-  //   fL = exp(logFwhmL)  — Lorentzian FWHM component, always > 0
-  //   Total FWHM f and mixing η are derived via the TCH formulas — NOT free params.
-  // Start mostly Gaussian (instrumental broadening dominates in XRD):
-  //   fG_init ≈ estimated FWHM,  fL_init ≈ 10% of that
-  const p0 = peaks.flatMap((_, i) => [
-    initLogAmps[i], 0,
-    initLogFwhms[i],              // logFwhmG
-    initLogFwhms[i] - Math.log(10), // logFwhmL  (fL = fG/10 → mostly Gaussian start)
-  ]);
-
-  const decodePeaks = params => peaks.map((pk, i) => ({
-    amp: Math.exp(params[i * 4]),
-    cen: pk.center + pk.width * Math.tanh(params[i * 4 + 1]),
-    fG:  Math.exp(params[i * 4 + 2]),
-    fL:  Math.exp(params[i * 4 + 3]),
-  }));
-
-  // Poisson NLL with fixed background
-  const loss = params => {
-    const peakP = decodePeaks(params);
-    let s = 0;
-    for (let i = 0; i < xs.length; i++) {
-      let model = bgAtPts[i];
-      for (const pk of peakP) model += pk.amp * pseudoVoigt(xs[i], pk.cen, pk.fG, pk.fL);
-      model = Math.max(model, 1e-10);
-      s += model - ys[i] * Math.log(model);
-    }
-    return s;
-  };
-
-  const peakP = decodePeaks(nelderMead(loss, p0, { maxIter: 15000, tol: 1e-14 }));
+  let peakP;
+  if (quick) {
+    // ── Quick fit: pure Gaussian, [logAmp, rawCen, logFwhmG] × nPeaks ────────
+    // fL is fixed at ~0 so η ≈ 0 and the profile is purely Gaussian.
+    // 3 params/peak → much smaller search space → converges in ~3 000 iters.
+    const p0q = peaks.flatMap((_, i) => [initLogAmps[i], 0, initLogFwhms[i]]);
+    const decodeQ = params => peaks.map((pk, i) => ({
+      amp: Math.exp(params[i * 3]),
+      cen: pk.center + pk.width * Math.tanh(params[i * 3 + 1]),
+      fG:  Math.exp(params[i * 3 + 2]),
+      fL:  1e-6,
+    }));
+    const lossQ = params => {
+      const pp = decodeQ(params);
+      let s = 0;
+      for (let i = 0; i < xs.length; i++) {
+        let model = bgAtPts[i];
+        for (const pk of pp) model += pk.amp * pseudoVoigt(xs[i], pk.cen, pk.fG, pk.fL);
+        model = Math.max(model, 1e-10);
+        s += model - ys[i] * Math.log(model);
+      }
+      return s;
+    };
+    peakP = decodeQ(nelderMead(lossQ, p0q, { maxIter: 3000, tol: 1e-8 }));
+  } else {
+    // ── Full TCH fit: [logAmp, rawCen, logFwhmG, logFwhmL] × nPeaks ──────────
+    // fG and fL fitted independently; total FWHM f and η derived via TCH.
+    // Start mostly Gaussian (fL = fG/10) as expected for XRD instruments.
+    const p0 = peaks.flatMap((_, i) => [
+      initLogAmps[i], 0,
+      initLogFwhms[i],
+      initLogFwhms[i] - Math.log(10),
+    ]);
+    const decodeFull = params => peaks.map((pk, i) => ({
+      amp: Math.exp(params[i * 4]),
+      cen: pk.center + pk.width * Math.tanh(params[i * 4 + 1]),
+      fG:  Math.exp(params[i * 4 + 2]),
+      fL:  Math.exp(params[i * 4 + 3]),
+    }));
+    const lossFull = params => {
+      const pp = decodeFull(params);
+      let s = 0;
+      for (let i = 0; i < xs.length; i++) {
+        let model = bgAtPts[i];
+        for (const pk of pp) model += pk.amp * pseudoVoigt(xs[i], pk.cen, pk.fG, pk.fL);
+        model = Math.max(model, 1e-10);
+        s += model - ys[i] * Math.log(model);
+      }
+      return s;
+    };
+    peakP = decodeFull(nelderMead(lossFull, p0, { maxIter: 15000, tol: 1e-14 }));
+  }
 
   // ── Output ────────────────────────────────────────────────────────────────
   const results = {};
@@ -2002,7 +2023,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   const [fittedCurve, setFittedCurve] = useState(() => isObj ? (saved.fittedCurve || null) : null);
   const [peakCurves,  setPeakCurves]  = useState(() => isObj ? (saved.peakCurves  || [])  : []);
   const [bgCurve,     setBgCurve]     = useState(() => isObj ? (saved.bgCurve     || null) : null);
-  const [fitting,     setFitting]     = useState(false);
+  const [fitting,     setFitting]     = useState(false); // false | "quick" | "full"
   const [fittingBg,   setFittingBg]   = useState(false);
   const [logScale,    setLogScale]    = useState(true);
   const [fitError,        setFitError]        = useState(null);
@@ -2100,13 +2121,13 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [xrdData, nBgTerms, getFittablePeaks]);
 
-  const runFit = useCallback(() => {
+  const runFit = useCallback((quick = false) => {
     const fittable = getFittablePeaks();
     if (!fittable.length || !xrdData.length) return;
-    setFitting(true); setFitError(null);
+    setFitting(quick ? "quick" : "full"); setFitError(null);
     setTimeout(() => {
       try {
-        const res = fitPeaksVoigt(xrdData, fittable, fitWindow, bgCurve || undefined);
+        const res = fitPeaksVoigt(xrdData, fittable, fitWindow, bgCurve || undefined, quick);
         if (res) { setFitResults(res.results); setFittedCurve({ x: res.fittedX, y: res.fittedY, bgY: res.bgY }); setPeakCurves(res.peakCurves || []); }
         else setFitError("Not enough data in window — try widening the tolerance or fit window.");
       } catch (e) { setFitError(String(e.message || e)); }
@@ -2405,7 +2426,12 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
               )}
               {hasFittable && (
                 <>
-                  <Btn variant="primary" onClick={runFit} disabled={fitting || fittingBg}>{fitting ? "Fitting…" : "Fit All"}</Btn>
+                  <Btn onClick={() => runFit(true)} disabled={!!fitting || fittingBg}>
+                    {fitting === "quick" ? "Fitting…" : "Quick Fit"}
+                  </Btn>
+                  <Btn variant="primary" onClick={() => runFit(false)} disabled={!!fitting || fittingBg}>
+                    {fitting === "full" ? "Fitting…" : "Fit TCH"}
+                  </Btn>
                   {fitError && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "#ff6b6b" }}>{fitError}</span>}
                 </>
               )}
