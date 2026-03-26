@@ -5364,6 +5364,54 @@ export default function App() {
     setActive(prev => (prev === id ? null : prev));
   };
 
+  // ── CSV export ──────────────────────────────────────────────────────────
+  const exportCSV = () => {
+    const esc = v => {
+      const s = v == null ? "" : String(v);
+      return s.includes(",") || s.includes('"') || s.includes("\n")
+        ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const cols = [
+      "Sample ID", "Name", "Date", "Substrate", "Technique",
+      "Layer #", "Material(s)", "Temp (°C)", "Pressure (mTorr)",
+      "O2 (%)", "Power (W)", "Energy (mJ)", "Frequency (Hz)",
+      "Time (s)", "Pulses", "Thickness (nm)", "Notes",
+    ];
+    const rows = [cols.map(esc).join(",")];
+    const sampleBase = s => [s.id, s.name || s.id, s.date || "", s.substrate || ""];
+    for (const s of samples) {
+      const layers = s.layers || [];
+      if (!layers.length) {
+        rows.push([...sampleBase(s), "", "", "", "", "", "", "", "", "", "", s.thickness_nm ?? "", s.notes || ""].map(esc).join(","));
+        continue;
+      }
+      layers.forEach((l, li) => {
+        const technique = l.technique || (l.targets?.[0]?.power_W != null ? "sputter" : l.targets?.[0]?.energy_mJ != null ? "pld" : "");
+        const mats = (l.targets || []).map(t => t.material).filter(Boolean).join(" + ");
+        const t0 = l.targets?.[0] || {};
+        const powerW   = technique === "sputter" ? (l.targets || []).map(t => t.power_W).filter(v => v != null).join(" + ") : "";
+        const energymJ = technique === "pld"     ? t0.energy_mJ ?? "" : "";
+        const freqHz   = technique === "pld"     ? l.frequency_hz ?? "" : "";
+        const timeS    = technique === "sputter" ? t0.time_s ?? "" : "";
+        const pulses   = technique === "pld"     ? (l.targets || []).map(t => t.pulses).filter(v => v != null).join(" + ") : "";
+        const o2       = technique === "sputter" ? t0.oxygen_pct ?? "" : "";
+        rows.push([
+          ...sampleBase(s),
+          technique, li + 1, mats,
+          l.temp ?? "", l.pressure ?? "",
+          o2, powerW, energymJ, freqHz, timeS, pulses,
+          li === 0 ? (s.thickness_nm ?? "") : "",
+          li === 0 ? (s.notes || "")        : "",
+        ].map(esc).join(","));
+      });
+    }
+    const blob = new Blob([rows.join("\n")], { type: "text/csv" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href = url; a.download = "samples.csv"; a.click();
+    URL.revokeObjectURL(url);
+  };
+
   // ── File upload + plotCache ──────────────────────────────────────────────
 
   const handleUploadFile = async (measType, file, parsed, peArea) => {
@@ -5650,6 +5698,7 @@ export default function App() {
                 <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.amber, letterSpacing: 1 }}>LabLog</span>
                 <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>ferroelectric oxide films</span>
                 <div style={{ flex: 1 }} />
+                <Btn variant="ghost" small onClick={exportCSV}>Export</Btn>
                 <Btn variant="ghost" small onClick={() => setAddingFolder(true)}>+ Folder</Btn>
                 <button onClick={() => setSettingsOpen(true)}
                   title="Settings"
