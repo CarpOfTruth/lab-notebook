@@ -1868,6 +1868,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   const [fittedCurve, setFittedCurve] = useState(() => isObj ? (saved.fittedCurve || null) : null);
   const [peakCurves,  setPeakCurves]  = useState(() => isObj ? (saved.peakCurves  || [])  : []);
   const [fitting,     setFitting]     = useState(false);
+  const [logScale,    setLogScale]    = useState(true);
   const [fitError,        setFitError]        = useState(null);
   const [fitWindow,       setFitWindow]       = useState(() => isObj ? (saved.fitWindow || null) : null);  // [x0, x1] | null
   const [selectingWindow, setSelectingWindow] = useState(false);
@@ -1972,18 +1973,20 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
 
   const traces = [
     { x: xrdData.map(p => p.x), y: xrdData.map(p => Math.max(p.y, 1)), type: "scatter", mode: "lines", line: { color: T.textSecondary, width: 1 }, showlegend: false, hovertemplate: "2θ=%{x:.3f}°<br>I=%{y:.0f}<extra></extra>" },
-    // Individual peak shaded profiles — fill from background up to bg+peak using tonexty
-    ...peakCurves.flatMap(pc => {
+    // SNIP background — dotted line so user can see what was subtracted
+    ...(fittedCurve?.bgY ? [{ x: fittedCurve.x, y: fittedCurve.bgY, type: "scatter", mode: "lines", line: { color: T.textDim, width: 1, dash: "dot" }, showlegend: false, hoverinfo: "skip" }] : []),
+    // Individual peak fills — closed polygon (toself) works on both log and linear axes.
+    // Path: top edge (bg+peak) left→right, bottom edge (bg) right→left.
+    ...peakCurves.map(pc => {
       const ln  = lines.find(l => l.id === pc.id);
       const col = ln?.color || "#888888";
-      const bgY = fittedCurve?.bgY || pc.x.map(() => 0);
-      const topY = pc.y.map((v, i) => (bgY[i] ?? 0) + v);
-      return [
-        // Transparent background reference — acts as lower fill boundary
-        { x: pc.x, y: bgY, type: "scatter", mode: "lines", line: { color: "rgba(0,0,0,0)", width: 0 }, showlegend: false, hoverinfo: "skip" },
-        // Peak fill from background up to peak top
-        { x: pc.x, y: topY, type: "scatter", mode: "lines", fill: "tonexty", fillcolor: col + "44", line: { color: col, width: 1 }, showlegend: false, hoverinfo: "skip" },
-      ];
+      const bgY = fittedCurve?.bgY || pc.x.map(() => 1);
+      const topY = pc.y.map((v, i) => Math.max((bgY[i] ?? 1) + v, 1));
+      const bgFloor = bgY.map(v => Math.max(v, 1));
+      // Closed polygon: top L→R then bottom R→L
+      const xPath = [...pc.x, ...pc.x.slice().reverse()];
+      const yPath = [...topY, ...bgFloor.slice().reverse()];
+      return { x: xPath, y: yPath, type: "scatter", mode: "lines", fill: "toself", fillcolor: col + "40", line: { color: col, width: 1 }, showlegend: false, hoverinfo: "skip" };
     }),
     ...(fittedCurve ? [{ x: fittedCurve.x, y: fittedCurve.y, type: "scatter", mode: "lines", line: { color: T.accent, width: 1.5 }, showlegend: false, hoverinfo: "skip" }] : []),
   ];
@@ -1993,7 +1996,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
     font: { family: "'DM Mono', monospace", size: 11, color: T.textPrimary },
     margin: { t: 12, r: 20, b: 52, l: 72, pad: 0 },
     xaxis: { title: { text: "2θ (°)", font: { size: 12, color: T.textSecondary }, standoff: 10 }, gridcolor: T.border, color: T.textSecondary },
-    yaxis: { type: "log", range: [Math.log10(Math.max(yMin * 0.8, 1)), Math.log10(yMax * 3)], title: { text: "Intensity (arb.)", font: { size: 12, color: T.textSecondary }, standoff: 8 }, showticklabels: false, gridcolor: T.border, color: T.textSecondary },
+    yaxis: { ...(logScale ? { type: "log", range: [Math.log10(Math.max(yMin * 0.8, 1)), Math.log10(yMax * 3)] } : { range: [0, yMax * 1.1] }), title: { text: "Intensity (arb.)", font: { size: 12, color: T.textSecondary }, standoff: 8 }, showticklabels: false, gridcolor: T.border, color: T.textSecondary },
     shapes: lineShapes, hovermode: "x", dragmode: selectingWindow ? "select" : "zoom",
     uirevision: selectingWindow ? "xrd-select" : "xrd-analysis",
     selectdirection: "h",
@@ -2016,6 +2019,14 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
           <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.amber }}>XRD Analysis</span>
           <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>{sample.id}</span>
           <div style={{ flex: 1 }} />
+          <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+            {["log", "linear"].map(opt => (
+              <button key={opt} onClick={() => setLogScale(opt === "log")}
+                style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 8px", border: "none", cursor: "pointer", background: (opt === "log") === logScale ? T.bg3 : T.bg1, color: (opt === "log") === logScale ? T.textPrimary : T.textDim }}>
+                {opt}
+              </button>
+            ))}
+          </div>
           <Btn variant="primary" onClick={handleSave}>Save & Close</Btn>
         </div>
       </div>
