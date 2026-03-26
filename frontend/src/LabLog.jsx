@@ -1723,13 +1723,34 @@ function pseudoVoigt(x, x0, fwhm, eta) {
   return Math.max(0, eta) * L + Math.max(0, 1 - eta) * G;
 }
 
-// Fit N pseudo-Voigt peaks simultaneously against a linear background.
+// SNIP background estimation (Statistics-sensitive Non-linear Iterative Peak-clipping).
+// Standard XRD background algorithm used in FullProf/GSAS/JADE.
+// Works in sqrt-intensity space (correct for Poisson/counting statistics).
+// Each iteration m erodes features narrower than ~2m data points; running
+// m = 1..iterations strips all peaks, leaving only the slowly-varying background.
+function snipBackground(ys, iterations) {
+  let w = ys.map(y => Math.sqrt(Math.max(y, 0)));
+  for (let m = 1; m <= iterations; m++) {
+    const prev = w.slice();
+    for (let i = m; i < w.length - m; i++) {
+      w[i] = Math.min(prev[i], (prev[i - m] + prev[i + m]) / 2);
+    }
+  }
+  // Light smoothing pass to suppress residual noise on the background estimate
+  const bg = w.map(v => v * v);
+  return bg.map((_, i) => {
+    const s = bg.slice(Math.max(0, i - 2), i + 3);
+    return s.reduce((a, b) => a + b, 0) / s.length;
+  });
+}
+
+// Fit N pseudo-Voigt peaks with SNIP background pre-subtraction + Poisson NLL.
+// Background is estimated non-parametrically via SNIP before fitting — it is NOT
+// a free parameter in the optimiser, so peaks and background cannot trade off.
 // peaks: [{ id, center, width }]  — center=reference 2θ, width=tolerance (hard bounds)
 // fitWindow: [x0, x1] | null      — if provided, only data in this range is used
-// Loss: Poisson NLL = Σ(model - data·log(model)), statistically optimal for XRD counts.
-// At high counts this behaves like linear chi-squared (sensitive to bright peak shapes).
-// Centers hard-bounded via tanh, FWHM via log transform, eta via sigmoid.
-function fitPeaksVoigt(xrdData, peaks, fitWindow) {
+// snipIter: SNIP iterations (default 40; increase for broader peaks / slower background)
+function fitPeaksVoigt(xrdData, peaks, fitWindow, snipIter = 40) {
   const LAMBDA = 0.15406; // nm Cu Kα
   const pts = (fitWindow
     ? xrdData.filter(p => p.x >= fitWindow[0] && p.x <= fitWindow[1])
@@ -1738,81 +1759,69 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow) {
 
   if (pts.length < peaks.length * 3 + 3) return null;
 
-  const xs  = pts.map(p => p.x);
-  const ys  = pts.map(p => Math.max(p.y, 0));   // raw counts
-  const x0r = xs[0];
+  const xs = pts.map(p => p.x);
+  const ys = pts.map(p => Math.max(p.y, 0));
 
-  // Background: estimated as the minimum of a smoothed version of the data
-  const bgEst = Math.min(...ys.map((_, i) => {
-    const window = ys.slice(Math.max(0, i - 3), i + 4);
-    return window.reduce((a, b) => a + b, 0) / window.length;
-  }));
-  const bgFloor = Math.max(bgEst, 1);
+  // ── SNIP background (non-parametric, not optimised) ──────────────────────────
+  const bgSmooth = snipBackground(ys, snipIter);
+  const ysSub    = ys.map((y, i) => Math.max(y - bgSmooth[i], 0));
 
-  // Per-peak amplitude init: local max minus background, near reference 2θ
-  // Also estimate initial FWHM from local half-max width in the data
+  // Linear interpolation of SNIP background to arbitrary x within range
+  const interpBg = x => {
+    let lo = 0, hi = xs.length - 1;
+    while (lo < hi - 1) { const mid = (lo + hi) >> 1; if (xs[mid] <= x) lo = mid; else hi = mid; }
+    if (xs[hi] === xs[lo]) return bgSmooth[lo];
+    const t = (x - xs[lo]) / (xs[hi] - xs[lo]);
+    return Math.max(bgSmooth[lo] + t * (bgSmooth[hi] - bgSmooth[lo]), 0);
+  };
+
+  // ── Initial parameter estimates from background-subtracted data ───────────────
   const initLogAmps = peaks.map(pk => {
-    const nearby = pts.filter(p => Math.abs(p.x - pk.center) <= pk.width);
-    const pkMax = nearby.length ? Math.max(...nearby.map(p => p.y)) : bgFloor + 100;
-    return Math.log(Math.max(pkMax - bgFloor, 10));
+    const nearby = pts.map((p, i) => ({ x: p.x, y: ysSub[i] })).filter(p => Math.abs(p.x - pk.center) <= pk.width);
+    return Math.log(Math.max(nearby.length ? Math.max(...nearby.map(p => p.y)) : 100, 10));
   });
 
   const initLogFwhms = peaks.map(pk => {
-    const nearby = pts.filter(p => Math.abs(p.x - pk.center) <= pk.width);
+    const nearby = pts.map((p, i) => ({ x: p.x, y: ysSub[i] })).filter(p => Math.abs(p.x - pk.center) <= pk.width);
     if (nearby.length < 4) return Math.log(0.1);
-    const pkMax = Math.max(...nearby.map(p => p.y));
-    const halfMax = bgFloor + (pkMax - bgFloor) * 0.5;
-    const above = nearby.filter(p => p.y >= halfMax);
-    const fwhmEst = above.length >= 2
-      ? (above[above.length - 1].x - above[0].x)
-      : 0.1;
-    return Math.log(Math.max(fwhmEst, 0.03));
+    const half = Math.max(...nearby.map(p => p.y)) * 0.5;
+    const above = nearby.filter(p => p.y >= half);
+    return Math.log(Math.max(above.length >= 2 ? above[above.length - 1].x - above[0].x : 0.1, 0.03));
   });
 
-  // Transformed params: [bg_a, bg_b, logAmp0, rawCen0, logFwhm0, logitEta0, ...]
-  //   cen  = pk.center + pk.width * tanh(rawCen)  → strictly in (center-width, center+width)
-  //   fwhm = exp(logFwhm)                          → always > 0
-  //   amp  = exp(logAmp)                           → always > 0
-  //   eta  = sigmoid(logitEta)                     → always in (0,1)
-  const p0 = [bgFloor, 0, ...peaks.flatMap((pk, i) => [initLogAmps[i], 0, initLogFwhms[i], 0])];
+  // ── Optimiser — 4 params per peak only, background is fixed ──────────────────
+  // param layout: [logAmp, rawCen, logFwhm, logitEta] × nPeaks
+  //   amp  = exp(logAmp)                              → always > 0
+  //   cen  = center + width·tanh(rawCen)              → hard-bounded in ±tolerance
+  //   fwhm = exp(logFwhm)                             → always > 0
+  //   eta  = sigmoid(logitEta)                        → always in (0, 1)
+  const p0 = peaks.flatMap((pk, i) => [initLogAmps[i], 0, initLogFwhms[i], 0]);
 
-  const decode = params => {
-    const bg_a = params[0], bg_b = params[1];
-    const peakP = peaks.map((pk, i) => {
-      const b = 2 + i * 4;
-      return {
-        amp:  Math.exp(params[b]),
-        cen:  pk.center + pk.width * Math.tanh(params[b + 1]),
-        fwhm: Math.exp(params[b + 2]),
-        eta:  1 / (1 + Math.exp(-params[b + 3])),
-      };
-    });
-    return { bg_a, bg_b, peakP };
-  };
+  const decode = params => peaks.map((pk, i) => {
+    const b = i * 4;
+    return {
+      amp:  Math.exp(params[b]),
+      cen:  pk.center + pk.width * Math.tanh(params[b + 1]),
+      fwhm: Math.exp(params[b + 2]),
+      eta:  1 / (1 + Math.exp(-params[b + 3])),
+    };
+  });
 
-  // Poisson NLL: Σ(model - data·log(model))
-  // Equivalent to linear chi-squared at high counts — properly weights bright peak shapes.
+  // Poisson NLL on background-subtracted data
   const loss = params => {
-    const { bg_a, bg_b, peakP } = decode(params);
+    const peakP = decode(params);
     let s = 0;
     for (let i = 0; i < xs.length; i++) {
-      let model = Math.max(bg_a + bg_b * (xs[i] - x0r), 1e-10);
+      let model = 1e-10;
       for (const pk of peakP) model += pk.amp * pseudoVoigt(xs[i], pk.cen, pk.fwhm, pk.eta);
-      model = Math.max(model, 1e-10);
-      s += model - ys[i] * Math.log(model);
+      s += model - ysSub[i] * Math.log(Math.max(model, 1e-10));
     }
     return s;
   };
 
-  const fitted = nelderMead(loss, p0, { maxIter: 10000, tol: 1e-14 });
-  const { bg_a, bg_b, peakP } = decode(fitted);
+  const peakP = decode(nelderMead(loss, p0, { maxIter: 10000, tol: 1e-14 }));
 
-  const evalLinear = x => {
-    let y = Math.max(bg_a + bg_b * (x - x0r), 0);
-    for (const pk of peakP) y += pk.amp * pseudoVoigt(x, pk.cen, pk.fwhm, pk.eta);
-    return y;
-  };
-
+  // ── Output ────────────────────────────────────────────────────────────────────
   const results = {};
   peaks.forEach((pk, i) => {
     const p = peakP[i];
@@ -1822,14 +1831,11 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow) {
     results[pk.id] = { amplitude: p.amp, center: p.cen, fwhm: p.fwhm, eta: p.eta, dSpacing, dRef, strain: (dSpacing - dRef) / dRef };
   });
 
-  // Fine curves across fit range
-  const nFine = 800;
+  const nFine   = 800;
   const fittedX = Array.from({ length: nFine }, (_, k) => xs[0] + k * (xs[xs.length - 1] - xs[0]) / (nFine - 1));
-  const fittedY  = fittedX.map(evalLinear);
-  const bgY      = fittedX.map(x => Math.max(bg_a + bg_b * (x - x0r), 0));
+  const bgY     = fittedX.map(interpBg);
+  const fittedY = fittedX.map((x, i) => bgY[i] + peakP.reduce((s, pk) => s + pk.amp * pseudoVoigt(x, pk.cen, pk.fwhm, pk.eta), 0));
 
-  // Individual peak contribution curves — y is the Voigt-only amplitude (no background)
-  // bgY is stored alongside so rendering can fill from background up to bg+peak
   const peakCurves = peaks.map((pk, i) => ({
     id: pk.id,
     x: fittedX,
