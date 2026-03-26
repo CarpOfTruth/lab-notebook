@@ -1723,63 +1723,89 @@ function pseudoVoigt(x, x0, fwhm, eta) {
   return Math.max(0, eta) * L + Math.max(0, 1 - eta) * G;
 }
 
-// Fit N pseudo-Voigt peaks simultaneously with a linear background.
-// peaks: [{ id, center, width }]   xrdData: [{ x, y }]
-// Returns { results: { [id]: { center, fwhm, eta, dSpacing, dRef, strain } }, fittedX, fittedY } or null.
-function fitPeaksVoigt(xrdData, peaks) {
+// Fit N pseudo-Voigt peaks simultaneously against a log-scale linear background.
+// peaks: [{ id, center, width }]  — center=reference 2θ, width=tolerance (hard bounds)
+// fitWindow: [x0, x1] | null      — if provided, only data in this range is used
+// Centers are bounded to [center-width, center+width] via tanh transform.
+// FWHM is unconstrained positive (log transform). Fit minimises log-scale residuals.
+function fitPeaksVoigt(xrdData, peaks, fitWindow) {
   const LAMBDA = 0.15406; // nm Cu Kα
-  const pts = xrdData
-    .filter(p => peaks.some(pk => p.x >= pk.center - pk.width && p.x <= pk.center + pk.width))
-    .sort((a, b) => a.x - b.x);
-  if (pts.length < peaks.length * 4 + 2) return null;
+  const pts = (fitWindow
+    ? xrdData.filter(p => p.x >= fitWindow[0] && p.x <= fitWindow[1])
+    : xrdData.filter(p => peaks.some(pk => p.x >= pk.center - pk.width && p.x <= pk.center + pk.width))
+  ).sort((a, b) => a.x - b.x);
 
-  const xs = pts.map(p => p.x);
-  const ys = pts.map(p => Math.max(p.y, 0));
-  const x0r = xs[0];
+  if (pts.length < peaks.length * 3 + 3) return null;
 
-  // params: [bg_a, bg_b, amp0, cen0, fwhm0, eta0, amp1, ...]
-  const evalModel = (params, x) => {
-    let y = params[0] + params[1] * (x - x0r);
-    for (let i = 0; i < peaks.length; i++) {
+  const xs    = pts.map(p => p.x);
+  const logYs = pts.map(p => Math.log(Math.max(p.y, 1)));
+  const x0r   = xs[0];
+
+  // Background: linear in log space, initialised from data minimum
+  const bgEst = Math.min(...logYs);
+
+  // Per-peak log-amplitude init: log of (local max above bg) near reference
+  const initLogAmps = peaks.map(pk => {
+    const nearby = pts.filter(p => Math.abs(p.x - pk.center) <= pk.width);
+    const maxLogY = nearby.length ? Math.max(...nearby.map(p => Math.log(Math.max(p.y, 1)))) : bgEst + 2;
+    return Math.max(maxLogY - bgEst, 0.5);
+  });
+
+  // Transformed params: [bg_a, bg_b, logAmp0, rawCen0, logFwhm0, logitEta0, ...]
+  //   cen  = pk.center + pk.width * tanh(rawCen)  → strictly in (center-width, center+width)
+  //   fwhm = exp(logFwhm)                          → always > 0
+  //   amp  = exp(logAmp)                           → always > 0
+  //   eta  = sigmoid(logitEta)                     → always in (0,1)
+  const p0 = [bgEst, 0, ...peaks.flatMap((pk, i) => [initLogAmps[i], 0, Math.log(0.08), 0])];
+
+  const decode = params => {
+    const bg_a = params[0], bg_b = params[1];
+    const peakP = peaks.map((pk, i) => {
       const b = 2 + i * 4;
-      y += Math.max(0, params[b]) * pseudoVoigt(x, params[b + 1], Math.max(0.005, params[b + 2]), Math.min(1, Math.max(0, params[b + 3])));
-    }
-    return Math.max(0, y);
+      return {
+        amp:  Math.exp(params[b]),
+        cen:  pk.center + pk.width * Math.tanh(params[b + 1]),
+        fwhm: Math.exp(params[b + 2]),
+        eta:  1 / (1 + Math.exp(-params[b + 3])),
+      };
+    });
+    return { bg_a, bg_b, peakP };
   };
 
-  const residFn = params => {
+  const loss = params => {
+    const { bg_a, bg_b, peakP } = decode(params);
     let s = 0;
-    for (let i = 0; i < xs.length; i++) { const r = evalModel(params, xs[i]) - ys[i]; s += r * r; }
+    for (let i = 0; i < xs.length; i++) {
+      let lin = Math.exp(bg_a + bg_b * (xs[i] - x0r));
+      for (const pk of peakP) lin += pk.amp * pseudoVoigt(xs[i], pk.cen, pk.fwhm, pk.eta);
+      const diff = logYs[i] - Math.log(Math.max(lin, 1e-30));
+      s += diff * diff;
+    }
     return s;
   };
 
-  const bgA = Math.min(...ys);
-  const p0 = [bgA, 0];
-  for (const pk of peaks) {
-    const inPk = pts.filter(p => Math.abs(p.x - pk.center) <= pk.width);
-    const pkMax = inPk.length ? Math.max(...inPk.map(p => p.y)) : bgA + 100;
-    p0.push(Math.max(pkMax - bgA, 100), pk.center, pk.width * 0.4, 0.5);
-  }
+  const fitted = nelderMead(loss, p0, { maxIter: 8000, tol: 1e-14 });
+  const { bg_a, bg_b, peakP } = decode(fitted);
 
-  const fitted = nelderMead(residFn, p0);
+  const evalLinear = x => {
+    let y = Math.exp(bg_a + bg_b * (x - x0r));
+    for (const pk of peakP) y += pk.amp * pseudoVoigt(x, pk.cen, pk.fwhm, pk.eta);
+    return y;
+  };
 
   const results = {};
-  for (let i = 0; i < peaks.length; i++) {
-    const b = 2 + i * 4;
-    const center = fitted[b + 1];
-    const fwhm   = Math.abs(fitted[b + 2]);
-    const eta    = Math.min(1, Math.max(0, fitted[b + 3]));
-    const theta  = center * Math.PI / 360;
+  peaks.forEach((pk, i) => {
+    const p = peakP[i];
+    const theta    = p.cen * Math.PI / 360;
     const dSpacing = LAMBDA / (2 * Math.sin(theta));
-    const dRef     = LAMBDA / (2 * Math.sin(peaks[i].center * Math.PI / 360));
-    results[peaks[i].id] = { amplitude: Math.max(0, fitted[b]), center, fwhm, eta, dSpacing, dRef, strain: (dSpacing - dRef) / dRef };
-  }
+    const dRef     = LAMBDA / (2 * Math.sin(pk.center * Math.PI / 360));
+    results[pk.id] = { amplitude: p.amp, center: p.cen, fwhm: p.fwhm, eta: p.eta, dSpacing, dRef, strain: (dSpacing - dRef) / dRef };
+  });
 
-  // Fine fitted curve across full data range
-  const [xMin, xMax] = [xs[0], xs[xs.length - 1]];
+  // Fine curve across fit range
   const nFine = 800;
-  const fittedX = Array.from({ length: nFine }, (_, i) => xMin + i * (xMax - xMin) / (nFine - 1));
-  const fittedY = fittedX.map(x => evalModel(fitted, x));
+  const fittedX = Array.from({ length: nFine }, (_, k) => xs[0] + k * (xs[xs.length - 1] - xs[0]) / (nFine - 1));
+  const fittedY = fittedX.map(evalLinear);
   return { results, fittedX, fittedY };
 }
 
@@ -1790,15 +1816,17 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   const [fitResults,  setFitResults]  = useState({});
   const [fittedCurve, setFittedCurve] = useState(null);
   const [fitting,     setFitting]     = useState(false);
-  const [fitError,    setFitError]    = useState(null);
-  const [openPicker,  setOpenPicker]  = useState(null); // { id, type: "color"|"style"|"strainCfg" }
-  const [dragLineIdx, setDragLineIdx] = useState(null);
-  const [dragOverIdx, setDragOverIdx] = useState(null);
+  const [fitError,        setFitError]        = useState(null);
+  const [fitWindow,       setFitWindow]       = useState(null);  // [x0, x1] | null
+  const [selectingWindow, setSelectingWindow] = useState(false);
+  const [openPicker,      setOpenPicker]      = useState(null); // { id, type: "color"|"style"|"strainCfg" }
+  const [dragLineIdx,     setDragLineIdx]     = useState(null);
+  const [dragOverIdx,     setDragOverIdx]     = useState(null);
 
   const addLine = () => setLines(p => [...p, {
-    id: String(Date.now()), material: structures[0]?.name || "", hkl: "",
+    id: String(Date.now()), material: structures[0]?.name || "__arbitrary__", hkl: "",
     style: "solid", color: LINE_COLORS[p.length % LINE_COLORS.length] || "#888888",
-    mode: "bulk", substrate: "", tolerance: 0.5,
+    mode: "bulk", substrate: "", tolerance: 0.5, arbitrary_2theta: null,
   }]);
   const updateLine = (id, patch) => setLines(p => p.map(l => l.id === id ? { ...l, ...patch } : l));
   const removeLine = id => { setLines(p => p.filter(l => l.id !== id)); setFitResults(r => { const n = { ...r }; delete n[id]; return n; }); };
@@ -1838,37 +1866,43 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lines, structures]);
 
-  // Shapes: shaded tolerance window + reference line per peak
-  const lineShapes = lines.flatMap((ln, i) => {
-    const effStruct = lineEffStructs[i];
-    const tt = effStruct ? calcTwoTheta(effStruct, ln.hkl) : null;
-    if (tt == null) return [];
-    const tol = ln.tolerance ?? 0.5;
-    const dash = ln.style === "dashed" ? "dash" : ln.style === "dotted" ? "dot" : "solid";
-    return [
-      { type: "rect",  xref: "x", yref: "paper", x0: tt - tol, x1: tt + tol, y0: 0, y1: 1, fillcolor: ln.color + "22", line: { width: 0 }, layer: "below" },
-      { type: "line",  xref: "x", yref: "paper", x0: tt, x1: tt, y0: 0, y1: 1, line: { color: ln.color, width: 1.5, dash }, layer: "above" },
-      ...(fitResults[ln.id] ? [{ type: "line", xref: "x", yref: "paper", x0: fitResults[ln.id].center, x1: fitResults[ln.id].center, y0: 0, y1: 1, line: { color: ln.color, width: 2, dash: "solid" }, layer: "above" }] : []),
-    ];
-  });
+  // Shapes: fit window + tolerance window + reference line + fitted center per peak
+  const lineShapes = [
+    ...(fitWindow ? [{ type: "rect", xref: "x", yref: "paper", x0: fitWindow[0], x1: fitWindow[1], y0: 0, y1: 1, fillcolor: T.teal + "18", line: { color: T.teal, width: 1, dash: "dot" }, layer: "below" }] : []),
+    ...lines.flatMap((ln, i) => {
+      const tt = ln.material === "__arbitrary__"
+        ? (ln.arbitrary_2theta ?? null)
+        : (lineEffStructs[i] ? calcTwoTheta(lineEffStructs[i], ln.hkl) : null);
+      if (tt == null) return [];
+      const tol  = ln.tolerance ?? 0.5;
+      const dash = ln.style === "dashed" ? "dash" : ln.style === "dotted" ? "dot" : "solid";
+      return [
+        { type: "rect", xref: "x", yref: "paper", x0: tt - tol, x1: tt + tol, y0: 0, y1: 1, fillcolor: ln.color + "22", line: { width: 0 }, layer: "below" },
+        { type: "line", xref: "x", yref: "paper", x0: tt, x1: tt, y0: 0, y1: 1, line: { color: ln.color, width: 1.5, dash }, layer: "above" },
+        ...(fitResults[ln.id] ? [{ type: "line", xref: "x", yref: "paper", x0: fitResults[ln.id].center, x1: fitResults[ln.id].center, y0: 0, y1: 1, line: { color: ln.color, width: 2, dash: "solid" }, layer: "above" }] : []),
+      ];
+    }),
+  ];
 
   const runFit = useCallback(() => {
     const fittable = lines.map((ln, i) => {
-      const tt = lineEffStructs[i] ? calcTwoTheta(lineEffStructs[i], ln.hkl) : null;
+      const tt = ln.material === "__arbitrary__"
+        ? (ln.arbitrary_2theta ?? null)
+        : (lineEffStructs[i] ? calcTwoTheta(lineEffStructs[i], ln.hkl) : null);
       return tt != null ? { id: ln.id, center: tt, width: ln.tolerance ?? 0.5 } : null;
     }).filter(Boolean);
     if (!fittable.length || !xrdData.length) return;
     setFitting(true); setFitError(null);
     setTimeout(() => {
       try {
-        const res = fitPeaksVoigt(xrdData, fittable);
+        const res = fitPeaksVoigt(xrdData, fittable, fitWindow);
         if (res) { setFitResults(res.results); setFittedCurve({ x: res.fittedX, y: res.fittedY }); }
-        else setFitError("Not enough data in peak windows — try widening the tolerance.");
+        else setFitError("Not enough data in window — try widening the tolerance or fit window.");
       } catch (e) { setFitError(String(e.message || e)); }
       setFitting(false);
     }, 20);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lines, lineEffStructs, xrdData]);
+  }, [lines, lineEffStructs, xrdData, fitWindow]);
 
   const handleSave = () => {
     onSave(lines.map(ln => {
@@ -1893,11 +1927,17 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
     margin: { t: 12, r: 20, b: 52, l: 72, pad: 0 },
     xaxis: { title: { text: "2θ (°)", font: { size: 12, color: T.textSecondary }, standoff: 10 }, gridcolor: T.border, color: T.textSecondary },
     yaxis: { type: "log", range: [Math.log10(Math.max(yMin * 0.8, 1)), Math.log10(yMax * 3)], title: { text: "Intensity (arb.)", font: { size: 12, color: T.textSecondary }, standoff: 8 }, showticklabels: false, gridcolor: T.border, color: T.textSecondary },
-    shapes: lineShapes, hovermode: "x", dragmode: "zoom", uirevision: "xrd-analysis",
+    shapes: lineShapes, hovermode: "x", dragmode: selectingWindow ? "select" : "zoom",
+    uirevision: selectingWindow ? "xrd-select" : "xrd-analysis",
+    selectdirection: "h",
   };
 
   const rc = { fontFamily: "'DM Mono', monospace", fontSize: 11, borderRadius: 4, padding: "4px 8px", boxSizing: "border-box", outline: "none", cursor: "pointer" };
-  const hasFittable = lines.some((ln, i) => lineEffStructs[i] && calcTwoTheta(lineEffStructs[i], ln.hkl) != null);
+  const hasFittable = lines.some((ln, i) =>
+    ln.material === "__arbitrary__"
+      ? ln.arbitrary_2theta != null
+      : (lineEffStructs[i] && calcTwoTheta(lineEffStructs[i], ln.hkl) != null)
+  );
 
   return (
     <div style={{ position: "fixed", inset: 0, background: T.bg0, zIndex: 400, display: "flex", flexDirection: "column", overflowY: "auto" }}
@@ -1918,7 +1958,13 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
         {/* Plot */}
         <div style={{ height: "52vh", minHeight: 280 }}>
           <Plot data={traces} layout={layout} config={buildPlotConfig(`xrd_${sample.id}`)}
-            style={{ width: "100%", height: "100%" }} useResizeHandler />
+            style={{ width: "100%", height: "100%" }} useResizeHandler
+            onSelected={e => {
+              if (selectingWindow && e?.range?.x) {
+                setFitWindow([e.range.x[0], e.range.x[1]]);
+                setSelectingWindow(false);
+              }
+            }} />
         </div>
 
         {/* Line panel — same as analysis notebook */}
@@ -1926,7 +1972,9 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {lines.map((ln, i) => {
               const effStruct  = lineEffStructs[i];
-              const twoTheta   = effStruct ? calcTwoTheta(effStruct, ln.hkl) : null;
+              const twoTheta   = ln.material === "__arbitrary__"
+                ? (ln.arbitrary_2theta ?? null)
+                : (effStruct ? calcTwoTheta(effStruct, ln.hkl) : null);
               const curStyle   = LINE_STYLES.find(s => s.id === ln.style) || LINE_STYLES[0];
               const colorOpen  = openPicker?.id === ln.id && openPicker?.type === "color";
               const styleOpen  = openPicker?.id === ln.id && openPicker?.type === "style";
@@ -1952,14 +2000,22 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
                   {/* Material */}
                   <select value={ln.material} onChange={e => updateLine(ln.id, { material: e.target.value })} onClick={e => e.stopPropagation()}
                     style={{ ...rc, background: T.bg0, border: `1px solid ${T.border}`, color: T.textSecondary }}>
+                    <option value="__arbitrary__">— arbitrary —</option>
                     <option value="">— material —</option>
                     {structures.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
                   </select>
-                  {/* HKL */}
-                  <DeferredInput value={ln.hkl} onChange={v => updateLine(ln.id, { hkl: v })} placeholder="hkl"
-                    style={{ ...rc, width: 64, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center" }} />
-                  {/* Configure */}
+                  {/* HKL or direct 2θ for arbitrary */}
+                  {ln.material === "__arbitrary__" ? (
+                    <DeferredInput type="number" value={ln.arbitrary_2theta ?? ""} placeholder="2θ (°)"
+                      onChange={v => updateLine(ln.id, { arbitrary_2theta: v === "" ? null : Number(v) })}
+                      style={{ ...rc, width: 80, background: T.bg0, border: `1px solid ${T.border}`, color: T.teal, textAlign: "center", cursor: "text" }} />
+                  ) : (
+                    <DeferredInput value={ln.hkl} onChange={v => updateLine(ln.id, { hkl: v })} placeholder="hkl"
+                      style={{ ...rc, width: 64, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center" }} />
+                  )}
+                  {/* Configure (only for non-arbitrary) */}
                   <div style={{ position: "relative", zIndex: 50 }}>
+                    {ln.material !== "__arbitrary__" && <>
                     <button onClick={e => { e.stopPropagation(); setOpenPicker(cfgOpen ? null : { id: ln.id, type: "strainCfg" }); }}
                       style={{ ...rc, background: cfgOpen ? T.bg3 : T.bg0, border: `1px solid ${cfgOpen ? T.borderBright : isStrained ? T.teal : T.border}`, color: isStrained ? T.teal : T.textSecondary }}>
                       Configure
@@ -2019,11 +2075,14 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
                         ))}
                       </div>
                     )}
+                    </>}
                   </div>
-                  {/* Calculated 2θ */}
+                  {/* Calculated 2θ — only shown for non-arbitrary (arbitrary shows it via the input) */}
+                  {ln.material !== "__arbitrary__" && (
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: twoTheta != null ? T.teal : T.textDim, minWidth: 62 }}>
                     {twoTheta != null ? `${twoTheta.toFixed(3)}°` : "—"}
                   </span>
+                  )}
                   {/* Tolerance (±) */}
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, flexShrink: 0 }}>±</span>
                   <DeferredInput type="number" value={ln.tolerance ?? 0.5} step={0.1} min={0.05}
@@ -2079,11 +2138,21 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
                 </div>
               );
             })}
-            <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: lines.length ? 2 : 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: lines.length ? 2 : 0, flexWrap: "wrap" }}>
               <button onClick={e => { e.stopPropagation(); addLine(); }}
                 style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
                 + Add line
               </button>
+              <button onClick={e => { e.stopPropagation(); setSelectingWindow(v => !v); }}
+                style={{ background: selectingWindow ? T.teal + "33" : "none", border: `1px solid ${selectingWindow ? T.teal : T.border}`, borderRadius: 5, color: selectingWindow ? T.teal : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+                {selectingWindow ? "drag on plot…" : "Select fit window"}
+              </button>
+              {fitWindow && (
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.teal }}>
+                  window: {fitWindow[0].toFixed(3)}° – {fitWindow[1].toFixed(3)}°
+                  <button onClick={() => setFitWindow(null)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", marginLeft: 4, fontSize: 13, lineHeight: 1, padding: 0 }}>×</button>
+                </span>
+              )}
               {hasFittable && (
                 <>
                   <Btn variant="primary" onClick={runFit} disabled={fitting}>{fitting ? "Fitting…" : "Fit All"}</Btn>
