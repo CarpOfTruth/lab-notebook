@@ -1662,6 +1662,175 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
   );
 }
 
+// ── ExportModal ───────────────────────────────────────────────────────────────
+
+function ExportModal({ samples, onClose }) {
+  const sampleTechnique = s => {
+    for (const l of s.layers || []) {
+      if (l.targets?.[0]?.power_W  != null) return "sputter";
+      if (l.targets?.[0]?.energy_mJ != null) return "pld";
+    }
+    return "";
+  };
+
+  const allSubstrates = [...new Set(samples.map(s => s.substrate).filter(Boolean))].sort();
+
+  const [technique,  setTechnique]  = useState("all");   // "all" | "sputter" | "pld"
+  const [dateFrom,   setDateFrom]   = useState("");
+  const [dateTo,     setDateTo]     = useState("");
+  const [substrate,  setSubstrate]  = useState("");
+
+  const filtered = samples
+    .filter(s => technique === "all" || sampleTechnique(s) === technique)
+    .filter(s => !dateFrom  || (s.date && s.date >= dateFrom))
+    .filter(s => !dateTo    || (s.date && s.date <= dateTo))
+    .filter(s => !substrate || s.substrate === substrate)
+    .slice()
+    .sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+
+  const doExport = () => {
+    const esc = v => {
+      const s = v == null ? "" : String(v);
+      return s.includes(",") || s.includes('"') || s.includes("\n")
+        ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const MAX_LAYERS = 5;
+
+    const layerInfo = (s, li) => {
+      const l = (s.layers || [])[li];
+      if (!l) return { mats:"", temp:"", pressure:"", o2:"", power:"", energy:"", freq:"", time:"", pulses:"" };
+      const t0 = l.targets?.[0] || {};
+      return {
+        mats:     (l.targets||[]).map(t => t.material).filter(Boolean).join(" + "),
+        temp:     l.temp     ?? "",
+        pressure: l.pressure ?? "",
+        o2:       t0.oxygen_pct ?? "",
+        power:    (l.targets||[]).map(t => t.power_W).filter(v => v != null).join(" + "),
+        energy:   t0.energy_mJ   ?? "",
+        freq:     l.frequency_hz ?? "",
+        time:     t0.time_s      ?? "",
+        pulses:   (l.targets||[]).map(t => t.pulses).filter(v => v != null).join(" + "),
+      };
+    };
+
+    const isSputter = technique === "sputter" || technique === "all";
+    const isPld     = technique === "pld"     || technique === "all";
+
+    const fieldRows = [
+      ["Sample ID",      s => s.id],
+      ["Name",           s => s.name || ""],
+      ["Date",           s => s.date || ""],
+      ["Substrate",      s => s.substrate || ""],
+      ["Thickness (nm)", s => s.thickness_nm ?? ""],
+      ["Notes",          s => s.notes || ""],
+      ...(technique === "all" ? [["Technique", s => sampleTechnique(s)]] : []),
+      ["", () => ""],
+    ];
+
+    for (let li = 0; li < MAX_LAYERS; li++) {
+      const n = `Layer ${li + 1}`;
+      fieldRows.push(
+        [`${n} — Material(s)`,      s => layerInfo(s, li).mats],
+        [`${n} — Temp (°C)`,        s => layerInfo(s, li).temp],
+        [`${n} — Pressure (mTorr)`, s => layerInfo(s, li).pressure],
+        ...(isSputter ? [
+          [`${n} — O2 (%)`,   s => layerInfo(s, li).o2],
+          [`${n} — Power (W)`,s => layerInfo(s, li).power],
+          [`${n} — Time (s)`, s => layerInfo(s, li).time],
+        ] : []),
+        ...(isPld ? [
+          [`${n} — Energy (mJ)`,    s => layerInfo(s, li).energy],
+          [`${n} — Frequency (Hz)`, s => layerInfo(s, li).freq],
+          [`${n} — Pulses`,         s => layerInfo(s, li).pulses],
+        ] : []),
+        ["", () => ""],
+      );
+    }
+
+    const csvRows = [["", ...filtered.map(s => s.name || s.id)].map(esc).join(",")];
+    for (const [label, getter] of fieldRows) {
+      csvRows.push([label, ...filtered.map(getter)].map(esc).join(","));
+    }
+
+    const blob = new Blob([csvRows.join("\n")], { type: "text/csv" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    const ts   = new Date().toISOString().replace(/[T:]/g, "-").slice(0, 16);
+    a.href = url; a.download = `samples_${ts}.csv`; a.click();
+    URL.revokeObjectURL(url);
+    onClose();
+  };
+
+  const labelSm = txt => (
+    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1.5, width: 80, flexShrink: 0 }}>{txt}</span>
+  );
+  const segBtn = (val, current, set, label) => (
+    <button key={val} onClick={() => set(val)}
+      style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 12px",
+        background: current === val ? T.bg3 : T.bg0,
+        border: "none", color: current === val ? T.textPrimary : T.textDim,
+        cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+      {label}
+    </button>
+  );
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.65)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: "24px 28px", width: 440, display: "flex", flexDirection: "column", gap: 16 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 20 }}>Export Samples</h2>
+
+        {/* Technique */}
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          {labelSm("Technique")}
+          <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+            {[["all","All"],["sputter","Sputter"],["pld","PLD"]].map(([v,l], i, arr) => (
+              <button key={v} onClick={() => setTechnique(v)}
+                style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 14px",
+                  background: technique === v ? T.bg3 : T.bg0, border: "none",
+                  borderRight: i < arr.length-1 ? `1px solid ${T.border}` : "none",
+                  color: technique === v ? T.textPrimary : T.textDim,
+                  cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                {l}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Date range */}
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          {labelSm("Date")}
+          <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)}
+            style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 8px", outline: "none" }} />
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>–</span>
+          <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)}
+            style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 8px", outline: "none" }} />
+        </div>
+
+        {/* Substrate */}
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          {labelSm("Substrate")}
+          <select value={substrate} onChange={e => setSubstrate(e.target.value)}
+            style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: substrate ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 8px", outline: "none" }}>
+            <option value="">All</option>
+            {allSubstrates.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+
+        {/* Count */}
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, borderTop: `1px solid ${T.border}`, paddingTop: 12 }}>
+          {filtered.length} sample{filtered.length !== 1 ? "s" : ""} will be exported
+        </div>
+
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn variant="primary" onClick={doExport} disabled={filtered.length === 0}>Export CSV</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── SettingsModal ─────────────────────────────────────────────────────────────
 
 function SettingsModal({ settings, onSave, onClose }) {
@@ -5306,6 +5475,7 @@ export default function App() {
   const [error,    setError]    = useState(null);
   const [settings, setSettings] = useState(() => JSON.parse(JSON.stringify(DEFAULT_SETTINGS)));
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [exportOpen,   setExportOpen]   = useState(false);
 
   const handleSaveSettings = (s) => {
     saveSettings(s);
@@ -5362,70 +5532,6 @@ export default function App() {
     setSamples(p => p.filter(x => x.id !== id));
     setPlotCache(p => { const c = { ...p }; delete c[id]; return c; });
     setActive(prev => (prev === id ? null : prev));
-  };
-
-  // ── CSV export ──────────────────────────────────────────────────────────
-  const exportCSV = () => {
-    const esc = v => {
-      const s = v == null ? "" : String(v);
-      return s.includes(",") || s.includes('"') || s.includes("\n")
-        ? `"${s.replace(/"/g, '""')}"` : s;
-    };
-    const MAX_LAYERS = 5;
-    const layerInfo = (s, li) => {
-      const l = (s.layers || [])[li];
-      if (!l) return { technique:"", mats:"", temp:"", pressure:"", o2:"", power:"", energy:"", freq:"", time:"", pulses:"" };
-      const technique = l.technique || (l.targets?.[0]?.power_W != null ? "sputter" : l.targets?.[0]?.energy_mJ != null ? "pld" : "");
-      const t0 = l.targets?.[0] || {};
-      return {
-        technique,
-        mats:     (l.targets||[]).map(t=>t.material).filter(Boolean).join(" + "),
-        temp:     l.temp     ?? "",
-        pressure: l.pressure ?? "",
-        o2:       technique === "sputter" ? (t0.oxygen_pct ?? "") : "",
-        power:    technique === "sputter" ? (l.targets||[]).map(t=>t.power_W).filter(v=>v!=null).join(" + ") : "",
-        energy:   technique === "pld"     ? (t0.energy_mJ ?? "") : "",
-        freq:     technique === "pld"     ? (l.frequency_hz ?? "") : "",
-        time:     technique === "sputter" ? (t0.time_s ?? "") : "",
-        pulses:   technique === "pld"     ? (l.targets||[]).map(t=>t.pulses).filter(v=>v!=null).join(" + ") : "",
-      };
-    };
-    // Row definitions: [label, valueGetter(sample)]
-    const fieldRows = [
-      ["Sample ID",      s => s.id],
-      ["Name",           s => s.name || ""],
-      ["Date",           s => s.date || ""],
-      ["Substrate",      s => s.substrate || ""],
-      ["Thickness (nm)", s => s.thickness_nm ?? ""],
-      ["Notes",          s => s.notes || ""],
-      ["", () => ""],
-    ];
-    for (let li = 0; li < MAX_LAYERS; li++) {
-      const n = `Layer ${li + 1}`;
-      fieldRows.push(
-        [`${n} — Technique`,        s => layerInfo(s, li).technique],
-        [`${n} — Material(s)`,      s => layerInfo(s, li).mats],
-        [`${n} — Temp (°C)`,        s => layerInfo(s, li).temp],
-        [`${n} — Pressure (mTorr)`, s => layerInfo(s, li).pressure],
-        [`${n} — O2 (%)`,           s => layerInfo(s, li).o2],
-        [`${n} — Power (W)`,        s => layerInfo(s, li).power],
-        [`${n} — Energy (mJ)`,      s => layerInfo(s, li).energy],
-        [`${n} — Frequency (Hz)`,   s => layerInfo(s, li).freq],
-        [`${n} — Time (s)`,         s => layerInfo(s, li).time],
-        [`${n} — Pulses`,           s => layerInfo(s, li).pulses],
-        ["", () => ""],
-      );
-    }
-    // Header: blank + one column per sample (in current list order)
-    const csvRows = [["", ...samples.map(s => s.name || s.id)].map(esc).join(",")];
-    for (const [label, getter] of fieldRows) {
-      csvRows.push([label, ...samples.map(getter)].map(esc).join(","));
-    }
-    const blob = new Blob([csvRows.join("\n")], { type: "text/csv" });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement("a");
-    a.href = url; a.download = "samples.csv"; a.click();
-    URL.revokeObjectURL(url);
   };
 
   // ── File upload + plotCache ──────────────────────────────────────────────
@@ -5714,7 +5820,7 @@ export default function App() {
                 <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.amber, letterSpacing: 1 }}>LabLog</span>
                 <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>ferroelectric oxide films</span>
                 <div style={{ flex: 1 }} />
-                <Btn variant="ghost" small onClick={exportCSV}>Export</Btn>
+                <Btn variant="ghost" small onClick={() => setExportOpen(true)}>Export</Btn>
                 <Btn variant="ghost" small onClick={() => setAddingFolder(true)}>+ Folder</Btn>
                 <button onClick={() => setSettingsOpen(true)}
                   title="Settings"
@@ -5878,6 +5984,7 @@ export default function App() {
 
       {adding && <AddSampleModal onAdd={addSample} onClose={() => setAdding(false)} folders={folders} settings={settings} />}
       {templateSample && <AddSampleModal onAdd={s => { addSample(s); setTemplateSample(null); }} onClose={() => setTemplateSample(null)} folders={folders} template={templateSample} settings={settings} />}
+      {exportOpen   && <ExportModal samples={samples} onClose={() => setExportOpen(false)} />}
       {settingsOpen && <SettingsModal settings={settings} onSave={handleSaveSettings} onClose={() => setSettingsOpen(false)} />}
       {(addingFolder || editingFolder) && (
         <AddFolderModal onSave={saveFolder} onClose={() => { setAddingFolder(false); setEditingFolder(null); }} existing={editingFolder} allFolders={folders} />
