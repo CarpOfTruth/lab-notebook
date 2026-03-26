@@ -1665,13 +1665,7 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
 // ── ExportModal ───────────────────────────────────────────────────────────────
 
 function ExportModal({ samples, onClose }) {
-  const sampleTechnique = s => {
-    for (const l of s.layers || []) {
-      if (l.targets?.[0]?.power_W  != null) return "sputter";
-      if (l.targets?.[0]?.energy_mJ != null) return "pld";
-    }
-    return "";
-  };
+  const sampleTechnique = s => s.technique || "";
 
   const allSubstrates = [...new Set(samples.map(s => s.substrate).filter(Boolean))].sort();
 
@@ -1704,11 +1698,11 @@ function ExportModal({ samples, onClose }) {
         mats:     (l.targets||[]).map(t => t.material).filter(Boolean).join(" + "),
         temp:     l.temp     ?? "",
         pressure: l.pressure ?? "",
-        o2:       t0.oxygen_pct ?? "",
+        o2:       l.oxygen_pct  ?? "",
         power:    (l.targets||[]).map(t => t.power_W).filter(v => v != null).join(" + "),
-        energy:   t0.energy_mJ   ?? "",
+        energy:   t0.energy_mJ  ?? "",
         freq:     l.frequency_hz ?? "",
-        time:     t0.time_s      ?? "",
+        time:     l.time_s      ?? "",
         pulses:   (l.targets||[]).map(t => t.pulses).filter(v => v != null).join(" + "),
       };
     };
@@ -1718,7 +1712,6 @@ function ExportModal({ samples, onClose }) {
 
     const fieldRows = [
       ["Sample ID",      s => s.id],
-      ["Name",           s => s.name || ""],
       ["Date",           s => s.date || ""],
       ["Substrate",      s => s.substrate || ""],
       ["Thickness (nm)", s => s.thickness_nm ?? ""],
@@ -1747,7 +1740,7 @@ function ExportModal({ samples, onClose }) {
       );
     }
 
-    const csvRows = [["", ...filtered.map(s => s.name || s.id)].map(esc).join(",")];
+    const csvRows = [["", ...filtered.map(s => s.id)].map(esc).join(",")];
     for (const [label, getter] of fieldRows) {
       csvRows.push([label, ...filtered.map(getter)].map(esc).join(","));
     }
