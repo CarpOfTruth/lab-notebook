@@ -2034,6 +2034,8 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   const [openPicker,      setOpenPicker]      = useState(null); // { id, type: "color"|"style"|"strainCfg" }
   const [dragLineIdx,     setDragLineIdx]     = useState(null);
   const [dragOverIdx,     setDragOverIdx]     = useState(null);
+  const [configMenuOpen,  setConfigMenuOpen]  = useState(false);
+  const configFileRef = useRef(null);
 
   const addLine = () => setLines(p => [...p, {
     id: String(Date.now()), material: structures[0]?.name || "__arbitrary__", hkl: "",
@@ -2095,6 +2097,52 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
       ];
     }),
   ];
+
+  // Fields that are fit results, not config — stripped on export, regenerated on fit
+  const FIT_RESULT_FIELDS = ['id', 'fitted_center', 'fitted_fwhm', 'fitted_fwhmG',
+    'fitted_fwhmL', 'fitted_eta', 'fitted_d', 'd_ref', 'strain', 'amplitude'];
+
+  const exportConfig = () => {
+    const cfg = {
+      version: 1,
+      fitWindow,
+      nBgTerms,
+      lines: lines.map(ln => {
+        const clean = { ...ln };
+        FIT_RESULT_FIELDS.forEach(f => delete clean[f]);
+        return clean;
+      }),
+    };
+    const blob = new Blob([JSON.stringify(cfg, null, 2)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = `xrd_config_${sample.id}.json`;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a); URL.revokeObjectURL(url);
+    setConfigMenuOpen(false);
+  };
+
+  const importConfig = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const cfg = JSON.parse(ev.target.result);
+        if (!cfg.version) throw new Error('Not a valid XRD config file');
+        if (cfg.lines) setLines(cfg.lines.map(ln => ({ ...ln, id: String(Date.now() + Math.random()) })));
+        if (cfg.fitWindow !== undefined) setFitWindow(cfg.fitWindow);
+        if (cfg.nBgTerms)  setNBgTerms(cfg.nBgTerms);
+        // Clear fit results — they don't belong to the imported config
+        setFitResults({}); setFittedCurve(null); setPeakCurves([]); setBgCurve(null);
+      } catch (err) {
+        alert(`Could not load config: ${err.message}`);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+    setConfigMenuOpen(false);
+  };
 
   const getFittablePeaks = useCallback(() =>
     lines.map((ln, i) => {
@@ -2193,7 +2241,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
 
   return (
     <div style={{ position: "fixed", inset: 0, background: T.bg0, zIndex: 400, display: "flex", flexDirection: "column", overflowY: "auto" }}
-      onClick={() => setOpenPicker(null)}>
+      onClick={() => { setOpenPicker(null); setConfigMenuOpen(false); }}>
       {/* Header — matches main app navbar */}
       <div style={{ borderBottom: `1px solid ${T.border}`, background: T.bg1, position: "sticky", top: 0, zIndex: 10, flexShrink: 0 }}>
         <div style={{ maxWidth: 1600, margin: "0 auto", padding: "12px 20px", display: "flex", alignItems: "center", gap: 14 }}>
@@ -2406,11 +2454,32 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
                 </div>
               );
             })}
+            {/* Hidden file input for config import */}
+            <input ref={configFileRef} type="file" accept=".json" style={{ display: "none" }} onChange={importConfig} />
             <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: lines.length ? 2 : 0, flexWrap: "wrap" }}>
               <button onClick={e => { e.stopPropagation(); addLine(); }}
                 style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
                 + Add line
               </button>
+              {/* Config save / load */}
+              <div style={{ position: "relative" }} onClick={e => e.stopPropagation()}>
+                <button onClick={() => setConfigMenuOpen(v => !v)}
+                  style={{ background: configMenuOpen ? T.bg3 : "none", border: `1px solid ${configMenuOpen ? T.borderBright : T.border}`, borderRadius: 5, color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+                  Config ▾
+                </button>
+                {configMenuOpen && (
+                  <div style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 7, padding: "4px 0", zIndex: 500, boxShadow: "0 4px 16px rgba(0,0,0,.55)", minWidth: 160, display: "flex", flexDirection: "column" }}>
+                    <button onClick={exportConfig}
+                      style={{ background: "none", border: "none", color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "7px 14px", cursor: "pointer", textAlign: "left" }}>
+                      ↓ Save config…
+                    </button>
+                    <button onClick={() => configFileRef.current?.click()}
+                      style={{ background: "none", border: "none", color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "7px 14px", cursor: "pointer", textAlign: "left" }}>
+                      ↑ Load config…
+                    </button>
+                  </div>
+                )}
+              </div>
               <button onClick={e => { e.stopPropagation(); setSelectingWindow(v => !v); }}
                 style={{ background: selectingWindow ? T.teal + "33" : "none", border: `1px solid ${selectingWindow ? T.teal : T.border}`, borderRadius: 5, color: selectingWindow ? T.teal : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
                 {selectingWindow ? "drag on plot…" : "Select fit window"}
