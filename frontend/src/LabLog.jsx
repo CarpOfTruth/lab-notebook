@@ -1723,103 +1723,104 @@ function pseudoVoigt(x, x0, fwhm, eta) {
   return Math.max(0, eta) * L + Math.max(0, 1 - eta) * G;
 }
 
-// SNIP background estimation (Statistics-sensitive Non-linear Iterative Peak-clipping).
-// Standard XRD background algorithm used in FullProf/GSAS/JADE.
-// Works in sqrt-intensity space (correct for Poisson/counting statistics).
-// Each iteration m erodes features narrower than ~2m data points; running
-// m = 1..iterations strips all peaks, leaving only the slowly-varying background.
-function snipBackground(ys, iterations) {
-  let w = ys.map(y => Math.sqrt(Math.max(y, 0)));
-  for (let m = 1; m <= iterations; m++) {
-    const prev = w.slice();
-    for (let i = m; i < w.length - m; i++) {
-      w[i] = Math.min(prev[i], (prev[i - m] + prev[i + m]) / 2);
-    }
+// Evaluate a Chebyshev polynomial series at x ∈ [-1, 1].
+// coeffs = [B_0, B_1, ..., B_{N-1}]; recurrence: t_0=1, t_1=x, t_{n+1}=2x·t_n − t_{n-1}
+// Standard background model in FullProf, GSAS, Topas, BGMN.
+function evalChebyshev(x, coeffs) {
+  if (!coeffs.length) return 0;
+  let t0 = 1, t1 = x, y = coeffs[0];
+  if (coeffs.length > 1) y += coeffs[1] * x;
+  for (let m = 2; m < coeffs.length; m++) {
+    const t2 = 2 * x * t1 - t0;
+    y += coeffs[m] * t2;
+    t0 = t1; t1 = t2;
   }
-  // Light smoothing pass to suppress residual noise on the background estimate
-  const bg = w.map(v => v * v);
-  return bg.map((_, i) => {
-    const s = bg.slice(Math.max(0, i - 2), i + 3);
-    return s.reduce((a, b) => a + b, 0) / s.length;
-  });
+  return y;
 }
 
-// Fit N pseudo-Voigt peaks with SNIP background pre-subtraction + Poisson NLL.
-// Background is estimated non-parametrically via SNIP before fitting — it is NOT
-// a free parameter in the optimiser, so peaks and background cannot trade off.
-// peaks: [{ id, center, width }]  — center=reference 2θ, width=tolerance (hard bounds)
-// fitWindow: [x0, x1] | null      — if provided, only data in this range is used
-// snipIter: SNIP iterations (default 40; increase for broader peaks / slower background)
-function fitPeaksVoigt(xrdData, peaks, fitWindow, snipIter = 40) {
+// Fit N pseudo-Voigt peaks with a Chebyshev polynomial background, simultaneously,
+// using Poisson NLL — the standard approach in Rietveld/profile-fitting XRD software.
+// peaks:     [{ id, center, width }]  center=reference 2θ, width=tolerance (hard bounds)
+// fitWindow: [x0, x1] | null          restrict to this 2θ range
+// nBgTerms:  number of Chebyshev coefficients (default 6 = degree-5 polynomial)
+function fitPeaksVoigt(xrdData, peaks, fitWindow, nBgTerms = 6) {
   const LAMBDA = 0.15406; // nm Cu Kα
   const pts = (fitWindow
     ? xrdData.filter(p => p.x >= fitWindow[0] && p.x <= fitWindow[1])
     : xrdData.filter(p => peaks.some(pk => p.x >= pk.center - pk.width && p.x <= pk.center + pk.width))
   ).sort((a, b) => a.x - b.x);
 
-  if (pts.length < peaks.length * 3 + 3) return null;
+  if (pts.length < peaks.length * 3 + nBgTerms + 1) return null;
 
-  const xs = pts.map(p => p.x);
-  const ys = pts.map(p => Math.max(p.y, 0));
+  const xs   = pts.map(p => p.x);
+  const ys   = pts.map(p => Math.max(p.y, 0));
+  const xMin = xs[0], xMax = xs[xs.length - 1];
 
-  // ── SNIP background (non-parametric, not optimised) ──────────────────────────
-  const bgSmooth = snipBackground(ys, snipIter);
-  const ysSub    = ys.map((y, i) => Math.max(y - bgSmooth[i], 0));
+  // Map 2θ → [-1, 1] for Chebyshev normalisation
+  const toCheb = x => 2 * (x - xMin) / (xMax - xMin) - 1;
+  const chebXs = xs.map(toCheb);
 
-  // Linear interpolation of SNIP background to arbitrary x within range
-  const interpBg = x => {
-    let lo = 0, hi = xs.length - 1;
-    while (lo < hi - 1) { const mid = (lo + hi) >> 1; if (xs[mid] <= x) lo = mid; else hi = mid; }
-    if (xs[hi] === xs[lo]) return bgSmooth[lo];
-    const t = (x - xs[lo]) / (xs[hi] - xs[lo]);
-    return Math.max(bgSmooth[lo] + t * (bgSmooth[hi] - bgSmooth[lo]), 0);
-  };
+  // ── Background initialisation ─────────────────────────────────────────────────
+  // B_0 from mean of edge data (well away from peak centres); B_1..N-1 = 0
+  const edgePts = pts.filter(p => peaks.every(pk => Math.abs(p.x - pk.center) > pk.width * 1.2));
+  const bgInit  = edgePts.length
+    ? edgePts.reduce((s, p) => s + p.y, 0) / edgePts.length
+    : Math.min(...ys) + 1;
+  const bgFloor = Math.max(bgInit, 1);
 
-  // ── Initial parameter estimates from background-subtracted data ───────────────
+  // ── Per-peak initialisation ───────────────────────────────────────────────────
   const initLogAmps = peaks.map(pk => {
-    const nearby = pts.map((p, i) => ({ x: p.x, y: ysSub[i] })).filter(p => Math.abs(p.x - pk.center) <= pk.width);
-    return Math.log(Math.max(nearby.length ? Math.max(...nearby.map(p => p.y)) : 100, 10));
+    const nearby = pts.filter(p => Math.abs(p.x - pk.center) <= pk.width);
+    return Math.log(Math.max(nearby.length ? Math.max(...nearby.map(p => p.y)) - bgFloor : 100, 10));
   });
-
   const initLogFwhms = peaks.map(pk => {
-    const nearby = pts.map((p, i) => ({ x: p.x, y: ysSub[i] })).filter(p => Math.abs(p.x - pk.center) <= pk.width);
+    const nearby = pts.filter(p => Math.abs(p.x - pk.center) <= pk.width);
     if (nearby.length < 4) return Math.log(0.1);
-    const half = Math.max(...nearby.map(p => p.y)) * 0.5;
+    const half = bgFloor + (Math.max(...nearby.map(p => p.y)) - bgFloor) * 0.5;
     const above = nearby.filter(p => p.y >= half);
     return Math.log(Math.max(above.length >= 2 ? above[above.length - 1].x - above[0].x : 0.1, 0.03));
   });
 
-  // ── Optimiser — 4 params per peak only, background is fixed ──────────────────
-  // param layout: [logAmp, rawCen, logFwhm, logitEta] × nPeaks
-  //   amp  = exp(logAmp)                              → always > 0
-  //   cen  = center + width·tanh(rawCen)              → hard-bounded in ±tolerance
-  //   fwhm = exp(logFwhm)                             → always > 0
-  //   eta  = sigmoid(logitEta)                        → always in (0, 1)
-  const p0 = peaks.flatMap((pk, i) => [initLogAmps[i], 0, initLogFwhms[i], 0]);
+  // ── Parameter layout ──────────────────────────────────────────────────────────
+  // [B_0 .. B_{N-1},  logAmp_0, rawCen_0, logFwhm_0, logitEta_0, ...]
+  //  ─ Chebyshev bg ─  ───────────────── peaks × 4 ──────────────────
+  //   amp  = exp(logAmp)                → always > 0
+  //   cen  = center + width·tanh(raw)  → hard-bounded within ±tolerance
+  //   fwhm = exp(logFwhm)              → always > 0
+  //   eta  = sigmoid(logitEta)         → always in (0, 1)
+  const p0 = [
+    bgFloor, ...new Array(nBgTerms - 1).fill(0),
+    ...peaks.flatMap((pk, i) => [initLogAmps[i], 0, initLogFwhms[i], 0]),
+  ];
 
-  const decode = params => peaks.map((pk, i) => {
-    const b = i * 4;
-    return {
-      amp:  Math.exp(params[b]),
-      cen:  pk.center + pk.width * Math.tanh(params[b + 1]),
-      fwhm: Math.exp(params[b + 2]),
-      eta:  1 / (1 + Math.exp(-params[b + 3])),
-    };
-  });
+  const decode = params => {
+    const bgCoeffs = params.slice(0, nBgTerms);
+    const peakP = peaks.map((pk, i) => {
+      const b = nBgTerms + i * 4;
+      return {
+        amp:  Math.exp(params[b]),
+        cen:  pk.center + pk.width * Math.tanh(params[b + 1]),
+        fwhm: Math.exp(params[b + 2]),
+        eta:  1 / (1 + Math.exp(-params[b + 3])),
+      };
+    });
+    return { bgCoeffs, peakP };
+  };
 
-  // Poisson NLL on background-subtracted data
+  // Poisson NLL: Σ(model − data·log(model)) — optimal for counting data
   const loss = params => {
-    const peakP = decode(params);
+    const { bgCoeffs, peakP } = decode(params);
     let s = 0;
     for (let i = 0; i < xs.length; i++) {
-      let model = 1e-10;
+      let model = Math.max(evalChebyshev(chebXs[i], bgCoeffs), 0);
       for (const pk of peakP) model += pk.amp * pseudoVoigt(xs[i], pk.cen, pk.fwhm, pk.eta);
-      s += model - ysSub[i] * Math.log(Math.max(model, 1e-10));
+      model = Math.max(model, 1e-10);
+      s += model - ys[i] * Math.log(model);
     }
     return s;
   };
 
-  const peakP = decode(nelderMead(loss, p0, { maxIter: 10000, tol: 1e-14 }));
+  const { bgCoeffs, peakP } = decode(nelderMead(loss, p0, { maxIter: 15000, tol: 1e-14 }));
 
   // ── Output ────────────────────────────────────────────────────────────────────
   const results = {};
@@ -1832,8 +1833,8 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow, snipIter = 40) {
   });
 
   const nFine   = 800;
-  const fittedX = Array.from({ length: nFine }, (_, k) => xs[0] + k * (xs[xs.length - 1] - xs[0]) / (nFine - 1));
-  const bgY     = fittedX.map(interpBg);
+  const fittedX = Array.from({ length: nFine }, (_, k) => xMin + k * (xMax - xMin) / (nFine - 1));
+  const bgY     = fittedX.map(x => Math.max(evalChebyshev(toCheb(x), bgCoeffs), 0));
   const fittedY = fittedX.map((x, i) => bgY[i] + peakP.reduce((s, pk) => s + pk.amp * pseudoVoigt(x, pk.cen, pk.fwhm, pk.eta), 0));
 
   const peakCurves = peaks.map((pk, i) => ({
