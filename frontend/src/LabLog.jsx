@@ -1723,11 +1723,12 @@ function pseudoVoigt(x, x0, fwhm, eta) {
   return Math.max(0, eta) * L + Math.max(0, 1 - eta) * G;
 }
 
-// Fit N pseudo-Voigt peaks simultaneously against a log-scale linear background.
+// Fit N pseudo-Voigt peaks simultaneously against a linear background.
 // peaks: [{ id, center, width }]  — center=reference 2θ, width=tolerance (hard bounds)
 // fitWindow: [x0, x1] | null      — if provided, only data in this range is used
-// Centers are bounded to [center-width, center+width] via tanh transform.
-// FWHM is unconstrained positive (log transform). Fit minimises log-scale residuals.
+// Loss: Poisson NLL = Σ(model - data·log(model)), statistically optimal for XRD counts.
+// At high counts this behaves like linear chi-squared (sensitive to bright peak shapes).
+// Centers hard-bounded via tanh, FWHM via log transform, eta via sigmoid.
 function fitPeaksVoigt(xrdData, peaks, fitWindow) {
   const LAMBDA = 0.15406; // nm Cu Kα
   const pts = (fitWindow
@@ -1737,18 +1738,35 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow) {
 
   if (pts.length < peaks.length * 3 + 3) return null;
 
-  const xs    = pts.map(p => p.x);
-  const logYs = pts.map(p => Math.log(Math.max(p.y, 1)));
-  const x0r   = xs[0];
+  const xs  = pts.map(p => p.x);
+  const ys  = pts.map(p => Math.max(p.y, 0));   // raw counts
+  const x0r = xs[0];
 
-  // Background: linear in log space, initialised from data minimum
-  const bgEst = Math.min(...logYs);
+  // Background: estimated as the minimum of a smoothed version of the data
+  const bgEst = Math.min(...ys.map((_, i) => {
+    const window = ys.slice(Math.max(0, i - 3), i + 4);
+    return window.reduce((a, b) => a + b, 0) / window.length;
+  }));
+  const bgFloor = Math.max(bgEst, 1);
 
-  // Per-peak log-amplitude init: log of (local max above bg) near reference
+  // Per-peak amplitude init: local max minus background, near reference 2θ
+  // Also estimate initial FWHM from local half-max width in the data
   const initLogAmps = peaks.map(pk => {
     const nearby = pts.filter(p => Math.abs(p.x - pk.center) <= pk.width);
-    const maxLogY = nearby.length ? Math.max(...nearby.map(p => Math.log(Math.max(p.y, 1)))) : bgEst + 2;
-    return Math.max(maxLogY - bgEst, 0.5);
+    const pkMax = nearby.length ? Math.max(...nearby.map(p => p.y)) : bgFloor + 100;
+    return Math.log(Math.max(pkMax - bgFloor, 10));
+  });
+
+  const initLogFwhms = peaks.map(pk => {
+    const nearby = pts.filter(p => Math.abs(p.x - pk.center) <= pk.width);
+    if (nearby.length < 4) return Math.log(0.1);
+    const pkMax = Math.max(...nearby.map(p => p.y));
+    const halfMax = bgFloor + (pkMax - bgFloor) * 0.5;
+    const above = nearby.filter(p => p.y >= halfMax);
+    const fwhmEst = above.length >= 2
+      ? (above[above.length - 1].x - above[0].x)
+      : 0.1;
+    return Math.log(Math.max(fwhmEst, 0.03));
   });
 
   // Transformed params: [bg_a, bg_b, logAmp0, rawCen0, logFwhm0, logitEta0, ...]
@@ -1756,7 +1774,7 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow) {
   //   fwhm = exp(logFwhm)                          → always > 0
   //   amp  = exp(logAmp)                           → always > 0
   //   eta  = sigmoid(logitEta)                     → always in (0,1)
-  const p0 = [bgEst, 0, ...peaks.flatMap((pk, i) => [initLogAmps[i], 0, Math.log(0.08), 0])];
+  const p0 = [bgFloor, 0, ...peaks.flatMap((pk, i) => [initLogAmps[i], 0, initLogFwhms[i], 0])];
 
   const decode = params => {
     const bg_a = params[0], bg_b = params[1];
@@ -1772,23 +1790,25 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow) {
     return { bg_a, bg_b, peakP };
   };
 
+  // Poisson NLL: Σ(model - data·log(model))
+  // Equivalent to linear chi-squared at high counts — properly weights bright peak shapes.
   const loss = params => {
     const { bg_a, bg_b, peakP } = decode(params);
     let s = 0;
     for (let i = 0; i < xs.length; i++) {
-      let lin = Math.exp(bg_a + bg_b * (xs[i] - x0r));
-      for (const pk of peakP) lin += pk.amp * pseudoVoigt(xs[i], pk.cen, pk.fwhm, pk.eta);
-      const diff = logYs[i] - Math.log(Math.max(lin, 1e-30));
-      s += diff * diff;
+      let model = Math.max(bg_a + bg_b * (xs[i] - x0r), 1e-10);
+      for (const pk of peakP) model += pk.amp * pseudoVoigt(xs[i], pk.cen, pk.fwhm, pk.eta);
+      model = Math.max(model, 1e-10);
+      s += model - ys[i] * Math.log(model);
     }
     return s;
   };
 
-  const fitted = nelderMead(loss, p0, { maxIter: 8000, tol: 1e-14 });
+  const fitted = nelderMead(loss, p0, { maxIter: 10000, tol: 1e-14 });
   const { bg_a, bg_b, peakP } = decode(fitted);
 
   const evalLinear = x => {
-    let y = Math.exp(bg_a + bg_b * (x - x0r));
+    let y = Math.max(bg_a + bg_b * (x - x0r), 0);
     for (const pk of peakP) y += pk.amp * pseudoVoigt(x, pk.cen, pk.fwhm, pk.eta);
     return y;
   };
@@ -1802,11 +1822,19 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow) {
     results[pk.id] = { amplitude: p.amp, center: p.cen, fwhm: p.fwhm, eta: p.eta, dSpacing, dRef, strain: (dSpacing - dRef) / dRef };
   });
 
-  // Fine curve across fit range
+  // Fine curves across fit range
   const nFine = 800;
   const fittedX = Array.from({ length: nFine }, (_, k) => xs[0] + k * (xs[xs.length - 1] - xs[0]) / (nFine - 1));
   const fittedY = fittedX.map(evalLinear);
-  return { results, fittedX, fittedY };
+
+  // Individual peak contribution curves (background-subtracted)
+  const peakCurves = peaks.map((pk, i) => ({
+    id: pk.id,
+    x: fittedX,
+    y: fittedX.map(x => peakP[i].amp * pseudoVoigt(x, peakP[i].cen, peakP[i].fwhm, peakP[i].eta)),
+  }));
+
+  return { results, fittedX, fittedY, peakCurves };
 }
 
 const PEAK_COLORS = ["#4a9eff", "#ff6b6b", "#51cf66", "#ffd43b", "#cc5de8", "#ff922b", "#20c997"];
@@ -1815,6 +1843,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
   const [lines,       setLines]       = useState(() => (sample.xrd_peaks || []).map(p => ({ ...p })));
   const [fitResults,  setFitResults]  = useState({});
   const [fittedCurve, setFittedCurve] = useState(null);
+  const [peakCurves,  setPeakCurves]  = useState([]);
   const [fitting,     setFitting]     = useState(false);
   const [fitError,        setFitError]        = useState(null);
   const [fitWindow,       setFitWindow]       = useState(null);  // [x0, x1] | null
@@ -1825,7 +1854,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
 
   const addLine = () => setLines(p => [...p, {
     id: String(Date.now()), material: structures[0]?.name || "__arbitrary__", hkl: "",
-    style: "solid", color: LINE_COLORS[p.length % LINE_COLORS.length] || "#888888",
+    style: "solid", color: PEAK_COLORS[p.length % PEAK_COLORS.length] || "#4a9eff",
     mode: "bulk", substrate: "", tolerance: 0.5, arbitrary_2theta: null,
   }]);
   const updateLine = (id, patch) => setLines(p => p.map(l => l.id === id ? { ...l, ...patch } : l));
@@ -1896,7 +1925,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
     setTimeout(() => {
       try {
         const res = fitPeaksVoigt(xrdData, fittable, fitWindow);
-        if (res) { setFitResults(res.results); setFittedCurve({ x: res.fittedX, y: res.fittedY }); }
+        if (res) { setFitResults(res.results); setFittedCurve({ x: res.fittedX, y: res.fittedY }); setPeakCurves(res.peakCurves || []); }
         else setFitError("Not enough data in window — try widening the tolerance or fit window.");
       } catch (e) { setFitError(String(e.message || e)); }
       setFitting(false);
@@ -1918,6 +1947,12 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
 
   const traces = [
     { x: xrdData.map(p => p.x), y: xrdData.map(p => Math.max(p.y, 1)), type: "scatter", mode: "lines", line: { color: T.textSecondary, width: 1 }, showlegend: false, hovertemplate: "2θ=%{x:.3f}°<br>I=%{y:.0f}<extra></extra>" },
+    // Individual peak shaded profiles (background-subtracted Voigt for each peak)
+    ...peakCurves.map(pc => {
+      const ln = lines.find(l => l.id === pc.id);
+      const col = ln?.color || "#888888";
+      return { x: pc.x, y: pc.y, type: "scatter", mode: "lines", fill: "tozeroy", fillcolor: col + "44", line: { color: col, width: 1 }, showlegend: false, hoverinfo: "skip" };
+    }),
     ...(fittedCurve ? [{ x: fittedCurve.x, y: fittedCurve.y, type: "scatter", mode: "lines", line: { color: T.accent, width: 1.5 }, showlegend: false, hoverinfo: "skip" }] : []),
   ];
 
@@ -2107,7 +2142,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, onSave, onClose }) {
                     {colorOpen && (
                       <div onClick={e => e.stopPropagation()}
                         style={{ position: "absolute", right: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, padding: 6, display: "flex", gap: 4, zIndex: 500, boxShadow: "0 4px 12px rgba(0,0,0,.5)" }}>
-                        {LINE_COLORS.map(c => (
+                        {PEAK_COLORS.map(c => (
                           <div key={c} onClick={() => { updateLine(ln.id, { color: c }); setOpenPicker(null); }}
                             style={{ width: 22, height: 22, borderRadius: 3, background: c, border: `2px solid ${ln.color === c ? T.amber : "transparent"}`, cursor: "pointer" }} />
                         ))}
