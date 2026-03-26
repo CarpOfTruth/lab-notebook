@@ -5371,41 +5371,57 @@ export default function App() {
       return s.includes(",") || s.includes('"') || s.includes("\n")
         ? `"${s.replace(/"/g, '""')}"` : s;
     };
-    const cols = [
-      "Sample ID", "Name", "Date", "Substrate", "Technique",
-      "Layer #", "Material(s)", "Temp (°C)", "Pressure (mTorr)",
-      "O2 (%)", "Power (W)", "Energy (mJ)", "Frequency (Hz)",
-      "Time (s)", "Pulses", "Thickness (nm)", "Notes",
+    const MAX_LAYERS = 5;
+    const layerInfo = (s, li) => {
+      const l = (s.layers || [])[li];
+      if (!l) return { technique:"", mats:"", temp:"", pressure:"", o2:"", power:"", energy:"", freq:"", time:"", pulses:"" };
+      const technique = l.technique || (l.targets?.[0]?.power_W != null ? "sputter" : l.targets?.[0]?.energy_mJ != null ? "pld" : "");
+      const t0 = l.targets?.[0] || {};
+      return {
+        technique,
+        mats:     (l.targets||[]).map(t=>t.material).filter(Boolean).join(" + "),
+        temp:     l.temp     ?? "",
+        pressure: l.pressure ?? "",
+        o2:       technique === "sputter" ? (t0.oxygen_pct ?? "") : "",
+        power:    technique === "sputter" ? (l.targets||[]).map(t=>t.power_W).filter(v=>v!=null).join(" + ") : "",
+        energy:   technique === "pld"     ? (t0.energy_mJ ?? "") : "",
+        freq:     technique === "pld"     ? (l.frequency_hz ?? "") : "",
+        time:     technique === "sputter" ? (t0.time_s ?? "") : "",
+        pulses:   technique === "pld"     ? (l.targets||[]).map(t=>t.pulses).filter(v=>v!=null).join(" + ") : "",
+      };
+    };
+    // Row definitions: [label, valueGetter(sample)]
+    const fieldRows = [
+      ["Sample ID",      s => s.id],
+      ["Name",           s => s.name || ""],
+      ["Date",           s => s.date || ""],
+      ["Substrate",      s => s.substrate || ""],
+      ["Thickness (nm)", s => s.thickness_nm ?? ""],
+      ["Notes",          s => s.notes || ""],
+      ["", () => ""],
     ];
-    const rows = [cols.map(esc).join(",")];
-    const sampleBase = s => [s.id, s.name || s.id, s.date || "", s.substrate || ""];
-    for (const s of samples) {
-      const layers = s.layers || [];
-      if (!layers.length) {
-        rows.push([...sampleBase(s), "", "", "", "", "", "", "", "", "", "", s.thickness_nm ?? "", s.notes || ""].map(esc).join(","));
-        continue;
-      }
-      layers.forEach((l, li) => {
-        const technique = l.technique || (l.targets?.[0]?.power_W != null ? "sputter" : l.targets?.[0]?.energy_mJ != null ? "pld" : "");
-        const mats = (l.targets || []).map(t => t.material).filter(Boolean).join(" + ");
-        const t0 = l.targets?.[0] || {};
-        const powerW   = technique === "sputter" ? (l.targets || []).map(t => t.power_W).filter(v => v != null).join(" + ") : "";
-        const energymJ = technique === "pld"     ? t0.energy_mJ ?? "" : "";
-        const freqHz   = technique === "pld"     ? l.frequency_hz ?? "" : "";
-        const timeS    = technique === "sputter" ? t0.time_s ?? "" : "";
-        const pulses   = technique === "pld"     ? (l.targets || []).map(t => t.pulses).filter(v => v != null).join(" + ") : "";
-        const o2       = technique === "sputter" ? t0.oxygen_pct ?? "" : "";
-        rows.push([
-          ...sampleBase(s),
-          technique, li + 1, mats,
-          l.temp ?? "", l.pressure ?? "",
-          o2, powerW, energymJ, freqHz, timeS, pulses,
-          li === 0 ? (s.thickness_nm ?? "") : "",
-          li === 0 ? (s.notes || "")        : "",
-        ].map(esc).join(","));
-      });
+    for (let li = 0; li < MAX_LAYERS; li++) {
+      const n = `Layer ${li + 1}`;
+      fieldRows.push(
+        [`${n} — Technique`,        s => layerInfo(s, li).technique],
+        [`${n} — Material(s)`,      s => layerInfo(s, li).mats],
+        [`${n} — Temp (°C)`,        s => layerInfo(s, li).temp],
+        [`${n} — Pressure (mTorr)`, s => layerInfo(s, li).pressure],
+        [`${n} — O2 (%)`,           s => layerInfo(s, li).o2],
+        [`${n} — Power (W)`,        s => layerInfo(s, li).power],
+        [`${n} — Energy (mJ)`,      s => layerInfo(s, li).energy],
+        [`${n} — Frequency (Hz)`,   s => layerInfo(s, li).freq],
+        [`${n} — Time (s)`,         s => layerInfo(s, li).time],
+        [`${n} — Pulses`,           s => layerInfo(s, li).pulses],
+        ["", () => ""],
+      );
     }
-    const blob = new Blob([rows.join("\n")], { type: "text/csv" });
+    // Header: blank + one column per sample (in current list order)
+    const csvRows = [["", ...samples.map(s => s.name || s.id)].map(esc).join(",")];
+    for (const [label, getter] of fieldRows) {
+      csvRows.push([label, ...samples.map(getter)].map(esc).join(","));
+    }
+    const blob = new Blob([csvRows.join("\n")], { type: "text/csv" });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement("a");
     a.href = url; a.download = "samples.csv"; a.click();
