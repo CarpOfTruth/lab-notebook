@@ -1742,8 +1742,10 @@ function evalChebyshev(x, coeffs) {
 // using Poisson NLL — the standard approach in Rietveld/profile-fitting XRD software.
 // peaks:     [{ id, center, width }]  center=reference 2θ, width=tolerance (hard bounds)
 // fitWindow: [x0, x1] | null          restrict to this 2θ range
-// nBgTerms:  number of Chebyshev coefficients (default 6 = degree-5 polynomial)
-function fitPeaksVoigt(xrdData, peaks, fitWindow, nBgTerms = 6) {
+// nBgTerms:  number of Chebyshev coefficients (default 4 = degree-3 / cubic)
+//            4 terms is enough for the slowly-varying XRD background in a narrow window;
+//            more terms risk oscillation and unphysical negative values between peaks.
+function fitPeaksVoigt(xrdData, peaks, fitWindow, nBgTerms = 4) {
   const LAMBDA = 0.15406; // nm Cu Kα
   const pts = (fitWindow
     ? xrdData.filter(p => p.x >= fitWindow[0] && p.x <= fitWindow[1])
@@ -1807,12 +1809,17 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow, nBgTerms = 6) {
     return { bgCoeffs, peakP };
   };
 
-  // Poisson NLL: Σ(model − data·log(model)) — optimal for counting data
+  // Poisson NLL: Σ(model − data·log(model)) — optimal for counting data.
+  // Non-negativity penalty: background physically cannot go below zero.
+  // Penalty is quadratic and scaled by bgFloor² so it dominates the NLL
+  // whenever the polynomial tries to dip unphysically below the baseline.
   const loss = params => {
     const { bgCoeffs, peakP } = decode(params);
     let s = 0;
     for (let i = 0; i < xs.length; i++) {
-      let model = Math.max(evalChebyshev(chebXs[i], bgCoeffs), 0);
+      const bg = evalChebyshev(chebXs[i], bgCoeffs);
+      if (bg < 0) s += 1e5 * (bg / (bgFloor + 1)) ** 2; // non-negativity barrier
+      let model = Math.max(bg, 0);
       for (const pk of peakP) model += pk.amp * pseudoVoigt(xs[i], pk.cen, pk.fwhm, pk.eta);
       model = Math.max(model, 1e-10);
       s += model - ys[i] * Math.log(model);
