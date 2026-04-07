@@ -4328,7 +4328,7 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
       showticklabels: false, showgrid: false,
       title: { text: "Intensity (arb.)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
     lineShapes,
-    { uirevision: "xrd", dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 } }
+    { uirevision: `xrd-${thetaMin ?? "a"}-${thetaMax ?? "a"}`, dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 } }
   );
 
   return (
