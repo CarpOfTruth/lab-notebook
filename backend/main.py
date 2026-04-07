@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 import sqlite3, json, os, shutil
 from pathlib import Path
@@ -89,6 +89,26 @@ def init_db():
             conn.execute("ALTER TABLE folders ADD COLUMN book_folder INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute("ALTER TABLE folders ADD COLUMN parent_id TEXT DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE folders ADD COLUMN sort_order INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE samples ADD COLUMN xrd_peaks TEXT DEFAULT '[]'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE samples ADD COLUMN lot TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE samples ADD COLUMN bin TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
@@ -109,6 +129,7 @@ def row_to_sample(row):
     d = dict(row)
     d["layers"]    = json.loads(d.get("layers")    or "[]")
     d["filenames"] = json.loads(d.get("filenames") or "{}")
+    d["xrd_peaks"] = json.loads(d.get("xrd_peaks") or "[]")
     return d
 
 def row_to_book(row):
@@ -123,15 +144,15 @@ def row_to_book(row):
 @app.get("/api/folders")
 def list_folders():
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM folders ORDER BY name").fetchall()
+        rows = conn.execute("SELECT * FROM folders ORDER BY COALESCE(sort_order, 0), name").fetchall()
     return [row_to_dict(r) for r in rows]
 
 @app.post("/api/folders")
 def create_folder(folder: dict):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO folders (id, name, color, book_folder) VALUES (:id, :name, :color, :book_folder)",
-            {"id": folder["id"], "name": folder["name"], "color": folder.get("color", "#4a5568"), "book_folder": 1 if folder.get("book_folder") else 0},
+            "INSERT INTO folders (id, name, color, book_folder, parent_id, sort_order) VALUES (:id, :name, :color, :book_folder, :parent_id, :sort_order)",
+            {"id": folder["id"], "name": folder["name"], "color": folder.get("color", "#4a5568"), "book_folder": 1 if folder.get("book_folder") else 0, "parent_id": folder.get("parent_id") or None, "sort_order": folder.get("sort_order", 0)},
         )
         conn.commit()
     return {"ok": True, "id": folder["id"]}
@@ -140,8 +161,8 @@ def create_folder(folder: dict):
 def update_folder(folder_id: str, folder: dict):
     with get_db() as conn:
         conn.execute(
-            "UPDATE folders SET name=:name, color=:color, book_folder=:book_folder WHERE id=:id",
-            {"id": folder_id, "name": folder["name"], "color": folder.get("color", "#4a5568"), "book_folder": 1 if folder.get("book_folder") else 0},
+            "UPDATE folders SET name=:name, color=:color, book_folder=:book_folder, parent_id=:parent_id, sort_order=:sort_order WHERE id=:id",
+            {"id": folder_id, "name": folder["name"], "color": folder.get("color", "#4a5568"), "book_folder": 1 if folder.get("book_folder") else 0, "parent_id": folder.get("parent_id") or None, "sort_order": folder.get("sort_order", 0)},
         )
         conn.commit()
     return {"ok": True}
@@ -149,9 +170,23 @@ def update_folder(folder_id: str, folder: dict):
 @app.delete("/api/folders/{folder_id}")
 def delete_folder(folder_id: str):
     with get_db() as conn:
-        # Unassign samples from this folder before deleting
+        # Promote children to the deleted folder's parent level
+        row = conn.execute("SELECT parent_id FROM folders WHERE id=?", (folder_id,)).fetchone()
+        new_parent = row["parent_id"] if row else None
+        conn.execute("UPDATE folders SET parent_id=? WHERE parent_id=?", (new_parent, folder_id))
         conn.execute("UPDATE samples SET folder_id=NULL WHERE folder_id=?", (folder_id,))
+        conn.execute("UPDATE analysis_books SET folder_id=NULL WHERE folder_id=?", (folder_id,))
         conn.execute("DELETE FROM folders WHERE id=?", (folder_id,))
+        conn.commit()
+    return {"ok": True}
+
+@app.post("/api/folders/reorder")
+async def reorder_folders(request: Request):
+    updates = await request.json()
+    with get_db() as conn:
+        for u in updates:
+            conn.execute("UPDATE folders SET sort_order=?, parent_id=? WHERE id=?",
+                         (u.get("sort_order", 0), u.get("parent_id") or None, u["id"]))
         conn.commit()
     return {"ok": True}
 
@@ -180,16 +215,19 @@ def create_sample(sample: dict):
         conn.execute("""
             INSERT INTO samples
               (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
-               technique, folder_id, layers, filenames)
+               technique, folder_id, layers, filenames, xrd_peaks, lot, bin)
             VALUES
               (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
-               :technique, :folder_id, :layers, :filenames)
+               :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin)
         """, {
             **sample,
             "technique":  sample.get("technique", "sputter"),
             "folder_id":  sample.get("folder_id"),
             "layers":     json.dumps(sample.get("layers", [])),
             "filenames":  json.dumps(sample.get("filenames", {})),
+            "xrd_peaks":  json.dumps(sample.get("xrd_peaks", [])),
+            "lot":        sample.get("lot"),
+            "bin":        sample.get("bin"),
         })
         conn.commit()
     return {"ok": True, "id": sample["id"]}
@@ -202,15 +240,24 @@ def update_sample(sample_id: str, sample: dict):
               date=:date, substrate=:substrate, notes=:notes,
               thickness_nm=:thickness_nm, area_m2=:area_m2, area_correction=:area_correction,
               technique=:technique, folder_id=:folder_id,
-              layers=:layers, filenames=:filenames
+              layers=:layers, filenames=:filenames, xrd_peaks=:xrd_peaks,
+              lot=:lot, bin=:bin
             WHERE id=:id
         """, {
-            **sample,
             "id":         sample_id,
+            "date":       sample.get("date"),
+            "substrate":  sample.get("substrate"),
+            "notes":      sample.get("notes"),
+            "thickness_nm": sample.get("thickness_nm"),
+            "area_m2":    sample.get("area_m2"),
+            "area_correction": sample.get("area_correction", 1.0),
             "technique":  sample.get("technique", "sputter"),
             "folder_id":  sample.get("folder_id"),
             "layers":     json.dumps(sample.get("layers", [])),
             "filenames":  json.dumps(sample.get("filenames", {})),
+            "xrd_peaks":  json.dumps(sample.get("xrd_peaks", [])),
+            "lot":        sample.get("lot"),
+            "bin":        sample.get("bin"),
         })
         conn.commit()
     return {"ok": True}
@@ -284,6 +331,120 @@ def get_file(sample_id: str, filename: str):
         raise HTTPException(404, "File not found")
     from fastapi.responses import FileResponse
     return FileResponse(path)
+
+
+@app.get("/api/samples/{sample_id}/afm_data")
+def get_afm_data(sample_id: str):
+    """Read the stored .ibw file, process each channel, and return display-ready JSON."""
+    try:
+        import numpy as np
+        import igor2.binarywave as bw
+    except ImportError:
+        raise HTTPException(500, "igor2 / numpy not installed — run: pip install igor2 numpy")
+
+    dest_dir = FILES_DIR / sample_id
+    afm_files = sorted(dest_dir.glob("afm_*.ibw"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not afm_files:
+        raise HTTPException(404, "No AFM file found for this sample")
+
+    path = afm_files[0]
+    wave = bw.load(str(path))
+    wdata = wave["wave"]["wData"]          # (H, W, C) float32, values already in SI units
+    note_raw = wave["wave"].get("note", b"")
+
+    # Parse note field (Key:Value\r pairs)
+    note: dict = {}
+    for line in note_raw.decode("latin-1", errors="replace").replace("\r\n", "\r").split("\r"):
+        if ":" in line:
+            k, _, v = line.partition(":")
+            note[k.strip()] = v.strip()
+
+    scan_size_m = float(note.get("ScanSize", 20e-6))
+
+    # Channel labels: dim2 of labels list; index 0 is always an empty placeholder in Igor
+    raw_labels = wave["wave"].get("labels", [])
+    dim2 = raw_labels[2] if len(raw_labels) > 2 else []
+    labels: list[str] = []
+    for lbl in dim2:
+        s = (lbl.decode("latin-1") if isinstance(lbl, bytes) else lbl).rstrip("\x00").strip()
+        labels.append(s)
+    # Drop the leading empty placeholder so index i matches channel i
+    while labels and not labels[0]:
+        labels.pop(0)
+
+    # Ensure 3-D shape
+    if wdata.ndim == 2:
+        wdata = wdata[:, :, np.newaxis]
+    H, W, C = wdata.shape
+
+    channels: dict = {}
+    channel_ranges: dict = {}
+    for i in range(C):
+        ch = np.rot90(wdata[:, :, i].astype(np.float64), k=1)  # 90° CCW before processing
+        Hr, Wr = ch.shape
+        ch_label = labels[i] if i < len(labels) else f"Ch{i}"
+
+        # Height channel: linewise (row-by-row) flatten to remove scan-line Z-drift,
+        # followed by a global plane tilt removal, then m → nm.
+        if "height" in ch_label.lower() or i == 0:
+            xs_row = np.arange(Wr, dtype=np.float64)
+
+            # Global IQR mask: exclude large features/outliers from all fits
+            flat_g = ch.ravel()
+            ok_g   = np.isfinite(flat_g)
+            q1g, q3g = np.percentile(flat_g[ok_g], [25, 75])
+            iqr_g    = q3g - q1g
+            global_mask = (np.isfinite(ch)
+                           & (ch >= q1g - 3.0 * iqr_g)
+                           & (ch <= q3g + 3.0 * iqr_g))
+
+            # Row-by-row 1st-order (linear) flatten — removes per-line Z drift
+            for r in range(Hr):
+                mask = global_mask[r]
+                if mask.sum() < 2:          # fallback if most of row is masked
+                    mask = np.isfinite(ch[r])
+                if mask.sum() < 2:
+                    continue
+                c = np.polyfit(xs_row[mask], ch[r, mask], 1)
+                ch[r] -= np.polyval(c, xs_row)
+
+            # Global 2nd-order polynomial flatten on post-linewise residuals
+            ys2, xs2 = np.mgrid[0:Hr, 0:Wr]
+            flat2 = ch.ravel()
+            ok2   = np.isfinite(flat2)
+            q1b, q3b = np.percentile(flat2[ok2], [25, 75])
+            iqr_b    = q3b - q1b
+            ok2 &= (flat2 >= q1b - 3.0 * iqr_b) & (flat2 <= q3b + 3.0 * iqr_b)
+            xf2, yf2 = xs2.ravel()[ok2], ys2.ravel()[ok2]
+            A2 = np.stack([np.ones(ok2.sum()), xf2, yf2, xf2**2, xf2*yf2, yf2**2], axis=1)
+            c2, *_ = np.linalg.lstsq(A2, flat2[ok2], rcond=None)
+            ch -= (c2[0] + c2[1]*xs2 + c2[2]*ys2
+                   + c2[3]*xs2**2 + c2[4]*xs2*ys2 + c2[5]*ys2**2)
+
+            ch *= 1e9  # m → nm
+
+        # Percentile-clipped display range (robust against outliers for all channels)
+        ch_flat = ch.ravel()
+        ch_ok = np.isfinite(ch_flat)
+        if ch_ok.any():
+            vmin, vmax = np.percentile(ch_flat[ch_ok], [0.5, 99.5])
+        else:
+            vmin, vmax = 0.0, 1.0
+        channel_ranges[ch_label] = [round(float(vmin), 4), round(float(vmax), 4)]
+
+        channels[ch_label] = ch.tolist()
+
+    first = next(iter(channels.values())) if channels else [[]]
+    out_h, out_w = len(first), len(first[0]) if first else 0
+
+    return {
+        "channels":       channels,
+        "channel_names":  list(channels.keys()),
+        "channel_ranges": channel_ranges,
+        "scan_size_um":   round(scan_size_m * 1e6, 3),
+        "pixels":         [out_h, out_w],
+        "filename":       path.name,
+    }
 
 
 # ── Analysis Books (stub) ─────────────────────────────────────────────────────
