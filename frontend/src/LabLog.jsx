@@ -1328,6 +1328,12 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
             <span style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", fontWeight: 600, color: T.teal, background: `${T.teal}22`, border: `1px solid ${T.teal}66`, borderRadius: 3, padding: "1px 5px", letterSpacing: 0.5 }}>BUF</span>
           )}
         </div>
+        {layer.thickness_nm != null && (
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", marginBottom: 1 }}>Thick</div>
+            <div style={{ fontSize: 12, color: T.textPrimary, fontFamily: "'DM Mono', monospace" }}>{layer.thickness_nm}<span style={{ fontSize: 10, color: T.textDim }}> nm</span></div>
+          </div>
+        )}
         {sharedField("temp", "Temp", "°C")}
         {sharedField("pressure", "Press", "mTorr")}
         {technique === "pld"
@@ -1346,6 +1352,13 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
     <div onKeyDown={handleEditKeyDown} style={{ background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 7, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 12 }}>
       {/* shared layer fields */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Thickness</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+            <input type="number" value={draft.thickness_nm ?? ""} onChange={e => setDraftField("thickness_nm", e.target.value === "" ? null : Number(e.target.value))} placeholder="—" style={{ ...inputSm, width: 60 }} />
+            <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>nm</span>
+          </div>
+        </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
           <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Temp</span>
           <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
@@ -2148,6 +2161,89 @@ function fitBackground(xrdData, peaks = [], nBgTerms = 6) {
   return { x: xs, y: xs.map(x => evalBg(x)), coeffs, xMin, xMax };
 }
 
+// Laue fringe (kinematical thin-film) fitting for a single peak.
+//
+// Model: I(θ) = A × sinc²(π t Δsinθ / λ) convolved with a narrow Gaussian (instrument broadening)
+// where sinc²(x) = sin²(x)/x² and Δsinθ = sin(θ) - sin(θ_B).
+//
+// Parameters optimised: amplitude, Bragg center (constrained ±tol), film thickness t, instrument sigma.
+// Seed thickness from layer.fringe_thickness_nm if provided, otherwise falls back to Voigt fit.
+//
+// Returns same shape as fitPeaksVoigt.results[id]: { center, dSpacing, dRef, strain, amplitude,
+//   fwhm, thickness_nm, fwhmG (instrument), fwhmL: 0, eta: 0 }
+function fitLaueFreeze(xrdData, peak, fitWindow, bgResult, thicknessNm) {
+  const LAMBDA = 0.15406; // nm  Cu Kα
+  const allPts = [...xrdData].sort((a, b) => a.x - b.x);
+  if (!allPts.length) return null;
+  const bg = bgResult || fitBackground(xrdData, [peak]);
+  if (!bg) return null;
+  const bgToCheb = x => 2 * (x - bg.xMin) / (bg.xMax - bg.xMin) - 1;
+  const evalBg   = x => Math.exp(evalChebyshev(bgToCheb(x), bg.coeffs));
+
+  const pts = fitWindow
+    ? allPts.filter(p => p.x >= fitWindow[0] && p.x <= fitWindow[1])
+    : allPts.filter(p => Math.abs(p.x - peak.center) <= peak.width);
+  if (pts.length < 4) return null;
+
+  const xs = pts.map(p => p.x);
+  const ys = pts.map(p => Math.max(p.y, 0));
+  const bgAtPts = xs.map(x => Math.max(evalBg(x), 0));
+
+  const thetaB = peak.center * Math.PI / 360; // 2theta → theta
+  const sinB   = Math.sin(thetaB);
+
+  // sinc² Laue model: evaluate at 2theta
+  const laueProfile = (twoTheta, t, sigInstr) => {
+    const theta    = twoTheta * Math.PI / 360;
+    const dSin     = Math.sin(theta) - sinB;
+    const arg      = Math.PI * t * dSin / LAMBDA;
+    const sinc2    = Math.abs(arg) < 1e-9 ? 1 : Math.pow(Math.sin(arg) / arg, 2);
+    // Instrument broadening: convolve analytically only shifts Gaussian width,
+    // but since we're per-point just apply Gaussian envelope centred at peak.center.
+    // For thin films, instrument broadening << Laue width, so treat multiplicatively.
+    const gEnv     = sigInstr > 0 ? Math.exp(-0.5 * Math.pow((twoTheta - peak.center) / sigInstr, 2)) : 1;
+    return sinc2 * gEnv;
+  };
+
+  // t seed: supplied, or estimate from fringe spacing if visible
+  const tSeed = (thicknessNm && thicknessNm > 0) ? thicknessNm : 20;
+  const tol   = peak.width;
+
+  // [logAmp, rawCen, logT, logSig]
+  const p0 = [
+    Math.log(Math.max(...ys) - Math.min(...bgAtPts) || 10),
+    0,
+    Math.log(tSeed),
+    Math.log(0.05),
+  ];
+  const loss = params => {
+    const amp = Math.exp(params[0]);
+    const cen = peak.center + tol * Math.tanh(params[1]);
+    const t   = Math.exp(params[2]);
+    const sig = Math.exp(params[3]);
+    let s = 0;
+    for (let i = 0; i < xs.length; i++) {
+      const model = Math.max(bgAtPts[i] + amp * laueProfile(xs[i] - cen + peak.center, t, sig), 1e-10);
+      s += model - ys[i] * Math.log(model);
+    }
+    return s;
+  };
+  const pFit = nelderMead(loss, p0, { maxIter: 8000, tol: 1e-10 });
+  const amp  = Math.exp(pFit[0]);
+  const cen  = peak.center + tol * Math.tanh(pFit[1]);
+  const t    = Math.exp(pFit[2]);
+  const sig  = Math.exp(pFit[3]);
+  const fwhmG = 2 * Math.sqrt(2 * Math.log(2)) * sig;
+
+  const theta   = cen * Math.PI / 360;
+  const dSpacing = LAMBDA / (2 * Math.sin(theta));
+  const dRef     = LAMBDA / (2 * Math.sin(peak.center * Math.PI / 360));
+  return {
+    amplitude: amp, center: cen, fwhmG, fwhmL: 0, fwhm: fwhmG, eta: 0,
+    dSpacing, dRef, strain: (dSpacing - dRef) / dRef, thickness_nm: t,
+  };
+}
+
 // Two-stage pseudo-Voigt peak fitting.
 //
 // Stage 1 — Background:
@@ -2457,15 +2553,30 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
     e.target.value = '';
   };
 
+  // For each XRD line that has fringe_model enabled, find the matching layer's thickness
+  const getLayerThickness = useCallback((ln) => {
+    if (ln.fringe_thickness_nm != null) return ln.fringe_thickness_nm;
+    if (!sample?.layers) return null;
+    const mat = ln.material === "__arbitrary__" ? null : ln.material;
+    if (!mat) return null;
+    const layer = sample.layers.find(l => l.targets?.some(t => t.material === mat));
+    return layer?.thickness_nm ?? null;
+  }, [sample?.layers]);
+
   const getFittablePeaks = useCallback(() =>
     lines.map((ln, i) => {
       const tt = ln.material === "__arbitrary__"
         ? (ln.arbitrary_2theta ?? null)
         : (lineEffStructs[i] ? calcTwoTheta(lineEffStructs[i], ln.hkl) : null);
-      return tt != null ? { id: ln.id, center: tt, width: ln.tolerance ?? 0.5 } : null;
+      if (tt == null) return null;
+      return {
+        id: ln.id, center: tt, width: ln.tolerance ?? 0.5,
+        fringeModel: ln.fringe_model ?? false,
+        fringeThicknessNm: ln.fringe_model ? getLayerThickness(ln) : null,
+      };
     }).filter(Boolean),
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  [lines, lineEffStructs]);
+  [lines, lineEffStructs, getLayerThickness]);
 
   const runFitBg = useCallback(() => {
     if (!xrdData.length) return;
@@ -2488,9 +2599,37 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
     setFitting(quick ? "quick" : "full"); setFitError(null);
     setTimeout(() => {
       try {
-        const res = fitPeaksVoigt(xrdData, fittable, fitWindow, bgCurve || undefined, quick);
-        if (res) { setFitResults(res.results); setFittedCurve({ x: res.fittedX, y: res.fittedY, bgY: res.bgY }); setPeakCurves(res.peakCurves || []); }
-        else setFitError("Not enough data in window — try widening the tolerance or fit window.");
+        const bg = bgCurve || undefined;
+        const voigtPeaks  = fittable.filter(p => !p.fringeModel);
+        const fringePeaks = fittable.filter(p => p.fringeModel);
+
+        // Fit non-fringe peaks together with Voigt
+        let mergedResults = {};
+        let fittedCurveOut = null;
+        let peakCurvesOut = [];
+
+        if (voigtPeaks.length) {
+          const res = fitPeaksVoigt(xrdData, voigtPeaks, fitWindow, bg, quick);
+          if (res) {
+            mergedResults = { ...res.results };
+            fittedCurveOut = { x: res.fittedX, y: res.fittedY, bgY: res.bgY };
+            peakCurvesOut = res.peakCurves || [];
+          }
+        }
+
+        // Fit each fringe peak independently
+        for (const fp of fringePeaks) {
+          const res = fitLaueFreeze(xrdData, fp, fitWindow, bg, fp.fringeThicknessNm);
+          if (res) mergedResults[fp.id] = res;
+        }
+
+        if (Object.keys(mergedResults).length) {
+          setFitResults(mergedResults);
+          if (fittedCurveOut) setFittedCurve(fittedCurveOut);
+          setPeakCurves(peakCurvesOut);
+        } else {
+          setFitError("Not enough data in window — try widening the tolerance or fit window.");
+        }
       } catch (e) { setFitError(String(e.message || e)); }
       setFitting(false);
     }, 20);
@@ -2503,7 +2642,8 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
       return r ? { ...ln, fitted_center: r.center,
                          fitted_fwhmG: r.fwhmG, fitted_fwhmL: r.fwhmL,
                          fitted_fwhm: r.fwhm, fitted_eta: r.eta,
-                         fitted_d: r.dSpacing, d_ref: r.dRef, strain: r.strain, amplitude: r.amplitude } : ln;
+                         fitted_d: r.dSpacing, d_ref: r.dRef, strain: r.strain, amplitude: r.amplitude,
+                         ...(r.thickness_nm != null ? { fitted_thickness_nm: r.thickness_nm } : {}) } : ln;
     });
     onSave({ lines: savedLines, fitWindow, fittedCurve, peakCurves, bgCurve, nBgTerms });
     onClose();
@@ -2709,15 +2849,38 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
                   <DeferredInput type="number" value={ln.tolerance ?? 0.5} step={0.1} min={0}
                     onChange={v => updateLine(ln.id, { tolerance: Math.max(0, Number(v)) })}
                     style={{ ...rc, width: 52, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text", padding: "4px 4px" }} />
+                  {/* Fringe model toggle + thickness seed */}
+                  <button
+                    title={ln.fringe_model ? "Laue fringe model active — click to disable" : "Enable Laue fringe model for this peak"}
+                    onClick={e => { e.stopPropagation(); updateLine(ln.id, { fringe_model: !ln.fringe_model }); }}
+                    style={{ ...rc, background: ln.fringe_model ? `${T.teal}22` : T.bg0, border: `1px solid ${ln.fringe_model ? T.teal : T.border}`, color: ln.fringe_model ? T.teal : T.textDim, fontSize: 10, padding: "3px 7px", flexShrink: 0 }}>
+                    ~fringe
+                  </button>
+                  {ln.fringe_model && (() => {
+                    const layerT = getLayerThickness(ln);
+                    return (
+                      <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                        <DeferredInput type="number" value={ln.fringe_thickness_nm ?? layerT ?? ""} placeholder={layerT != null ? String(layerT) : "nm"} min={0}
+                          onChange={v => updateLine(ln.id, { fringe_thickness_nm: v === "" ? null : Number(v) })}
+                          style={{ ...rc, width: 60, background: T.bg0, border: `1px solid ${T.teal}66`, color: T.teal, textAlign: "center", cursor: "text", padding: "4px 4px" }} />
+                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>nm</span>
+                      </div>
+                    );
+                  })()}
                   {/* Fit result — strain badge */}
-                  {res && (
+                  {res && !ln.fringe_model && (
                     <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: res.strain >= 0 ? "#51cf66" : "#ff6b6b", minWidth: 72 }}>
                       {res.strain >= 0 ? "+" : ""}{(res.strain * 100).toFixed(3)}%
                     </span>
                   )}
-                  {res && (
+                  {res && !ln.fringe_model && (
                     <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>
                       {res.center.toFixed(4)}° · {(res.dSpacing * 10).toFixed(4)} Å · f {res.fwhm.toFixed(4)}° (fG {res.fwhmG?.toFixed(4)}° fL {res.fwhmL?.toFixed(4)}°) · η {res.eta?.toFixed(3)}
+                    </span>
+                  )}
+                  {res && ln.fringe_model && (
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.teal }}>
+                      {res.center.toFixed(4)}° · {(res.dSpacing * 10).toFixed(4)} Å · t {res.thickness_nm != null ? `${res.thickness_nm.toFixed(1)} nm` : "—"}
                     </span>
                   )}
                   <div style={{ flex: 1 }} />
