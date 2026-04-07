@@ -101,6 +101,14 @@ def init_db():
             conn.execute("ALTER TABLE samples ADD COLUMN xrd_peaks TEXT DEFAULT '[]'")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute("ALTER TABLE samples ADD COLUMN lot TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE samples ADD COLUMN bin TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
@@ -207,10 +215,10 @@ def create_sample(sample: dict):
         conn.execute("""
             INSERT INTO samples
               (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
-               technique, folder_id, layers, filenames, xrd_peaks)
+               technique, folder_id, layers, filenames, xrd_peaks, lot, bin)
             VALUES
               (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
-               :technique, :folder_id, :layers, :filenames, :xrd_peaks)
+               :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin)
         """, {
             **sample,
             "technique":  sample.get("technique", "sputter"),
@@ -218,6 +226,8 @@ def create_sample(sample: dict):
             "layers":     json.dumps(sample.get("layers", [])),
             "filenames":  json.dumps(sample.get("filenames", {})),
             "xrd_peaks":  json.dumps(sample.get("xrd_peaks", [])),
+            "lot":        sample.get("lot"),
+            "bin":        sample.get("bin"),
         })
         conn.commit()
     return {"ok": True, "id": sample["id"]}
@@ -230,16 +240,24 @@ def update_sample(sample_id: str, sample: dict):
               date=:date, substrate=:substrate, notes=:notes,
               thickness_nm=:thickness_nm, area_m2=:area_m2, area_correction=:area_correction,
               technique=:technique, folder_id=:folder_id,
-              layers=:layers, filenames=:filenames, xrd_peaks=:xrd_peaks
+              layers=:layers, filenames=:filenames, xrd_peaks=:xrd_peaks,
+              lot=:lot, bin=:bin
             WHERE id=:id
         """, {
-            **sample,
             "id":         sample_id,
+            "date":       sample.get("date"),
+            "substrate":  sample.get("substrate"),
+            "notes":      sample.get("notes"),
+            "thickness_nm": sample.get("thickness_nm"),
+            "area_m2":    sample.get("area_m2"),
+            "area_correction": sample.get("area_correction", 1.0),
             "technique":  sample.get("technique", "sputter"),
             "folder_id":  sample.get("folder_id"),
             "layers":     json.dumps(sample.get("layers", [])),
             "filenames":  json.dumps(sample.get("filenames", {})),
             "xrd_peaks":  json.dumps(sample.get("xrd_peaks", [])),
+            "lot":        sample.get("lot"),
+            "bin":        sample.get("bin"),
         })
         conn.commit()
     return {"ok": True}

@@ -220,6 +220,14 @@ function csvToPlotData(text, type, thicknessNm) {
   if (!rows.length) return null;
   if (type === "rsm") return rows.map(r => ({ x: r[0], y: r[1], z: r[2] ?? 1 }));
   if (type === "diel_f") return rows.map(r => ({ x: r[0], y: r[1], y2: r[2] ?? null }));
+  // XRD / XRR: some instruments export ω (half-angle) instead of 2θ.
+  // Detect by scanning header lines for "ω" without "2θ" or "2T", then double x.
+  if (type === "xrd_ot" || type === "xrr") {
+    const isOmegaCol = text.split(/\r?\n/).slice(0, 8).some(l =>
+      /\u03c9/i.test(l) && !/2\s*[\u03b8tT\u00b0]/.test(l) && !/2theta/i.test(l)
+    );
+    return rows.map(r => ({ x: isOmegaCol ? r[0] * 2 : r[0], y: r[1] }));
+  }
   if (type === "pe") {
     const { vCol, pCol } = findPECols(text);
     let xs = rows.map(r => r[vCol] ?? r[0]);
@@ -1144,6 +1152,7 @@ function AfmCard({ afmData, filename, onFile }) {
 
 const DEFAULT_SETTINGS = {
   defaultSubstrate: "STO (001)",
+  defaultLot: "",
   defaultAreaCm2: "",
   sputter:    { temp: 600, pressure: 10, oxygen_pct: 20, time_s: 2000, power_W: 150 },
   pld:        { temp: 600, pressure: 2,  frequency_hz: 10, energy_mJ: 60, pulses: 10000 },
@@ -1315,6 +1324,9 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
               </span>
             );
           }) : <span style={{ color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 12 }}>no material</span>}
+          {layer.role === "buffer" && (
+            <span style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", fontWeight: 600, color: T.teal, background: `${T.teal}22`, border: `1px solid ${T.teal}66`, borderRadius: 3, padding: "1px 5px", letterSpacing: 0.5 }}>BUF</span>
+          )}
         </div>
         {sharedField("temp", "Temp", "°C")}
         {sharedField("pressure", "Press", "mTorr")}
@@ -1393,9 +1405,212 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
         ))}
         <button onClick={addTarget} style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>+ co-dep target</button>
       </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <input type="checkbox" id={`buf-${draft.id}`} checked={draft.role === "buffer"} onChange={e => setDraftField("role", e.target.checked ? "buffer" : "")} style={{ accentColor: T.teal, cursor: "pointer" }} />
+        <label htmlFor={`buf-${draft.id}`} style={{ fontSize: 11, color: T.textSecondary, fontFamily: "'DM Mono', monospace", cursor: "pointer", userSelect: "none" }}>Buffer layer</label>
+      </div>
       <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
         <Btn variant="ghost" small onClick={cancelEdit}>Cancel</Btn>
         <Btn small onClick={saveEdit}>Save Layer</Btn>
+      </div>
+    </div>
+  );
+}
+
+// ── Pulsed Measurement CSV parsers ────────────────────────────────────────────
+
+// Parses a single CSV line respecting double-quoted fields (which may contain commas).
+function splitCsvLine(line) {
+  const out = []; let cur = ''; let inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') { inQ = !inQ; }
+    else if (ch === ',' && !inQ) { out.push(cur); cur = ''; }
+    else { cur += ch; }
+  }
+  out.push(cur);
+  return out;
+}
+
+function parse3PPCsv(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) return null;
+  const hdrs = splitCsvLine(lines[0]).map(h => h.trim());
+  const gi = k => hdrs.indexOf(k);
+  const [iWPA, iPs, iVoff] = [gi('writePA'), gi('Ps'), gi('voff')];
+  if (iWPA < 0 || iPs < 0) return null;
+  const rows = lines.slice(1)
+    .map(l => { const c = splitCsvLine(l); return { wpa: parseFloat(c[iWPA]), ps: parseFloat(c[iPs]), voff: iVoff >= 0 ? parseFloat(c[iVoff]) : 0 }; })
+    .filter(r => isFinite(r.wpa) && isFinite(r.ps))
+    .sort((a, b) => a.wpa - b.wpa);
+  if (!rows.length) return null;
+  // Zero-correct: subtract Ps at the row closest to writePA = 0
+  const zeroRow = rows.reduce((best, r) => Math.abs(r.wpa) < Math.abs(best.wpa) ? r : best, rows[0]);
+  const psOffset = zeroRow.ps;
+  return { wpas: rows.map(r => r.wpa), ps: rows.map(r => r.ps - psOffset), voff: rows[0].voff ?? 0 };
+}
+
+function parsePrCsv(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) return null;
+  const hdrs = splitCsvLine(lines[0]).map(h => h.trim());
+  const gi = k => hdrs.indexOf(k);
+  const [iWPD, iMW, iWPA, iTwin] = [gi('writePD'), gi('MW_pos_dPoff'), gi('writePA'), gi('twin')];
+  if (iWPD < 0 || iMW < 0) return null;
+  const rows = lines.slice(1)
+    .map(l => { const c = splitCsvLine(l); return { wpd: parseFloat(c[iWPD]), mw: parseFloat(c[iMW]), wpa: iWPA >= 0 ? parseFloat(c[iWPA]) : null, twin: iTwin >= 0 ? c[iTwin]?.trim() : null }; })
+    .filter(r => isFinite(r.wpd) && isFinite(r.mw))
+    .sort((a, b) => a.wpd - b.wpd);
+  if (!rows.length) return null;
+  const wpa   = rows[0].wpa  != null && isFinite(rows[0].wpa)  ? Math.round(rows[0].wpa * 100) / 100 : null;
+  const twin  = rows[0].twin || null;
+  return { wpds: rows.map(r => r.wpd), mw: rows.map(r => r.mw), wpa, twin };
+}
+
+// ── PulsedAddModal ────────────────────────────────────────────────────────────
+
+function PulsedAddModal({ onAdd, onClose }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  const opts = [
+    { type: '3pp', label: '3PP Shmoo',    desc: 'ΔP vs write voltage — no offset + biased', color: T.teal },
+    { type: 'pr',  label: 'Pr Retention', desc: 'Switched polarization vs delay time',       color: T.blue },
+  ];
+  return (
+    <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, width: 340, overflow: 'hidden' }}>
+        <div style={{ padding: '11px 16px', borderBottom: `1px solid ${T.border}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>Add Data</span>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: T.textDim, cursor: 'pointer', fontSize: 16, lineHeight: 1 }}>✕</button>
+        </div>
+        <div style={{ borderBottom: `1px solid ${T.border}` }}>
+          <span style={{ display: 'inline-block', padding: '7px 16px', ...mono, fontSize: 11, color: T.teal, borderBottom: `2px solid ${T.teal}`, marginBottom: -1 }}>Pulsed Measurements</span>
+        </div>
+        <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {opts.map(o => (
+            <button key={o.type} onClick={() => { onAdd(o.type); onClose(); }}
+              style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: 3, transition: 'border-color .15s' }}
+              onMouseEnter={e => e.currentTarget.style.borderColor = o.color}
+              onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+              <span style={{ ...mono, fontSize: 12, color: o.color, fontWeight: 600 }}>{o.label}</span>
+              <span style={{ ...mono, fontSize: 10, color: T.textDim }}>{o.desc}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── ThreePPCard ───────────────────────────────────────────────────────────────
+
+function ThreePPCard({ data, onFileNo, onFileAt, onRemove }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  const hasNo  = !!(data?.no?.wpas?.length);
+  const hasAt  = !!(data?.at?.wpas?.length);
+  const hasAny = hasNo || hasAt;
+  const refNo  = useRef();
+  const refAt  = useRef();
+
+  const plotTraces = [
+    hasNo && { x: data.no.wpas, y: data.no.ps, name: 'No offset', line: { color: T.blue, width: 1.5 } },
+    hasAt && { x: data.at.wpas, y: data.at.ps, name: `@ ${data.at.voff?.toFixed(2)} V`, line: { color: T.amber, width: 1.5 } },
+  ].filter(Boolean).map(t => ({ ...t, type: 'scatter', mode: 'lines', showlegend: true, hovertemplate: '<extra></extra>' }));
+
+  const miniLayout = {
+    paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+    margin: { l: 42, r: 6, t: 6, b: 32 }, height: 150,
+    xaxis: { title: { text: 'V_write (V)', font: { size: 10, color: T.textDim }, standoff: 4 }, tickfont: { size: 9, color: T.textDim }, gridcolor: T.border, zerolinecolor: T.border },
+    yaxis: { title: { text: 'Ps (µC/cm²)', font: { size: 10, color: T.textDim }, standoff: 4 }, tickfont: { size: 9, color: T.textDim }, gridcolor: T.border, zerolinecolor: T.border },
+    legend: { font: { size: 9, color: T.textDim }, bgcolor: 'transparent', x: 0, y: 1 },
+  };
+
+  const zones = [
+    { label: 'No Offset', has: hasNo, ref: refNo, onFile: onFileNo },
+    { label: '@ Offset',  has: hasAt, ref: refAt,  onFile: onFileAt },
+  ];
+
+  return (
+    <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: 'hidden' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: `1px solid ${T.border}` }}>
+        <span style={{ ...mono, fontSize: 12, color: T.teal, fontWeight: 600 }}>3PP Shmoo</span>
+        <button onClick={onRemove} style={{ background: 'none', border: 'none', color: T.textDim, cursor: 'pointer', fontSize: 13, lineHeight: 1 }}>✕</button>
+      </div>
+      <div style={{ padding: '10px 12px' }}>
+        {hasAny && <Plot data={plotTraces} layout={miniLayout} config={{ displayModeBar: false }} style={{ width: '100%' }} useResizeHandler />}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: hasAny ? 8 : 0 }}>
+          {zones.map(({ label, has, ref, onFile }) => (
+            <div key={label}>
+              <div style={{ ...mono, fontSize: 10, color: T.textDim, marginBottom: 4 }}>{label}</div>
+              <input ref={ref} type="file" accept=".csv" style={{ display: 'none' }} onChange={e => { if (e.target.files[0]) onFile(e.target.files[0]); e.target.value = ''; }} />
+              <div
+                onClick={() => ref.current.click()}
+                onDragOver={e => e.preventDefault()}
+                onDrop={e => { e.preventDefault(); if (e.dataTransfer.files[0]) onFile(e.dataTransfer.files[0]); }}
+                style={{ border: `1px dashed ${T.borderBright}`, borderRadius: 6, padding: '7px 6px', cursor: 'pointer', textAlign: 'center', ...mono, fontSize: 10, color: T.textDim }}>
+                {has ? '↑ replace' : 'drop / click'}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── PrCard ────────────────────────────────────────────────────────────────────
+
+const PR_CURVE_COLORS = [T.blue, T.amber, T.teal, T.red, '#a78bfa', '#f472b6'];
+
+function PrCard({ data, onFile, onRemove }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  const curves = data?.curves || [];
+  const fileRef = useRef();
+
+  const curveLabel = (c, i) => c.wpa != null ? `${c.wpa} V` : `file ${i + 1}`;
+  const plotTraces = curves.map((c, i) => ({
+    x: c.wpds, y: c.mw,
+    name: curveLabel(c, i),
+    type: 'scatter', mode: 'lines+markers',
+    line: { color: PR_CURVE_COLORS[i % PR_CURVE_COLORS.length], width: 1.5 },
+    marker: { size: 3, color: PR_CURVE_COLORS[i % PR_CURVE_COLORS.length] },
+    showlegend: true, hovertemplate: '<extra></extra>',
+  }));
+
+  const miniLayout = {
+    paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+    margin: { l: 46, r: 6, t: 6, b: 32 }, height: 150,
+    xaxis: { type: 'log', title: { text: 'Delay (s)', font: { size: 10, color: T.textDim }, standoff: 4 }, tickfont: { size: 9, color: T.textDim }, gridcolor: T.border },
+    yaxis: { title: { text: '2Pr (µC/cm²)', font: { size: 10, color: T.textDim }, standoff: 4 }, tickfont: { size: 9, color: T.textDim }, gridcolor: T.border, zerolinecolor: T.border },
+    legend: { font: { size: 9, color: T.textDim }, bgcolor: 'transparent', x: 0, y: 1 },
+  };
+
+  return (
+    <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: 'hidden' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: `1px solid ${T.border}` }}>
+        <span style={{ ...mono, fontSize: 12, color: T.blue, fontWeight: 600 }}>Pr Retention</span>
+        <button onClick={onRemove} style={{ background: 'none', border: 'none', color: T.textDim, cursor: 'pointer', fontSize: 13, lineHeight: 1 }}>✕</button>
+      </div>
+      <div style={{ padding: '10px 12px' }}>
+        {curves.length > 0 && <Plot data={plotTraces} layout={miniLayout} config={{ displayModeBar: false }} style={{ width: '100%' }} useResizeHandler />}
+        <input ref={fileRef} type="file" accept=".csv" multiple style={{ display: 'none' }}
+          onChange={e => { [...e.target.files].forEach(onFile); e.target.value = ''; }} />
+        <div
+          onDragOver={e => e.preventDefault()}
+          onDrop={e => { e.preventDefault(); [...e.dataTransfer.files].forEach(onFile); }}
+          onClick={() => fileRef.current.click()}
+          style={{ border: `1px dashed ${T.borderBright}`, borderRadius: 6, padding: '8px 14px', cursor: 'pointer', textAlign: 'center', ...mono, fontSize: 10, color: T.textDim, marginTop: curves.length > 0 ? 8 : 0 }}>
+          {curves.length > 0 ? `↑ add more files  (${curves.length} loaded)` : 'drop one or more Pr .csv files'}
+        </div>
+        {curves.length > 0 && (
+          <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+            {curves.map((c, i) => (
+              <span key={i} style={{ ...mono, fontSize: 9, padding: '2px 6px', borderRadius: 4, background: PR_CURVE_COLORS[i % PR_CURVE_COLORS.length] + '22', color: PR_CURVE_COLORS[i % PR_CURVE_COLORS.length], border: `1px solid ${PR_CURVE_COLORS[i % PR_CURVE_COLORS.length]}44` }}>
+                {curveLabel(c, i)} · {c.wpds.length} pts
+              </span>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1410,6 +1625,8 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
   const [overIdx, setOverIdx]           = useState(null);
   const [knownMaterials, setKnownMaterials] = useState([]);
   const [xrdAnalysisOpen, setXrdAnalysisOpen] = useState(false);
+  const [addPulsedOpen, setAddPulsedOpen]     = useState(false);
+  const [pulsedData, setPulsedData]           = useState({});
 
   useEffect(() => {
     api("GET", "/materials").then(setKnownMaterials).catch(() => {});
@@ -1456,6 +1673,45 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
       if (!parsed || !hasPlotData(parsed)) return;
       const area = measType === "pe" ? findAreaFromFile(text) : null;
       onUploadFile(measType, file, parsed, area);
+    };
+    reader.readAsText(file);
+  };
+
+  const pulsedItems = sample.pulsed_items || [];
+
+  const addPulsedItem = type => {
+    const id = Math.random().toString(36).slice(2, 9);
+    onUpdate({ ...sample, pulsed_items: [...pulsedItems, { type, id }] });
+  };
+
+  const removePulsedItem = id => {
+    onUpdate({ ...sample, pulsed_items: pulsedItems.filter(i => i.id !== id) });
+    setPulsedData(p => { const c = { ...p }; delete c[id]; return c; });
+  };
+
+  const handlePulsedFile3PP = (itemId, slot, file) => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      const parsed = parse3PPCsv(e.target.result);
+      if (!parsed) return;
+      setPulsedData(p => ({ ...p, [itemId]: { ...(p[itemId] || { type: '3pp' }), [slot]: parsed } }));
+    };
+    reader.readAsText(file);
+  };
+
+  const handlePulsedFilePr = (itemId, file) => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      const parsed = parsePrCsv(e.target.result);
+      if (!parsed) return;
+      setPulsedData(p => {
+        const prev = p[itemId] || { type: 'pr', curves: [] };
+        const curves = [...(prev.curves || [])];
+        // Deduplicate by write voltage — replacing if same wpa dropped again
+        const existingIdx = parsed.wpa != null ? curves.findIndex(c => c.wpa === parsed.wpa) : -1;
+        if (existingIdx >= 0) curves[existingIdx] = parsed; else curves.push(parsed);
+        return { ...p, [itemId]: { ...prev, curves } };
+      });
     };
     reader.readAsText(file);
   };
@@ -1537,7 +1793,10 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
       </section>
 
       <section>
-        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Electrical Characterization</div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2 }}>Electrical Characterization</span>
+          <Btn variant="teal" small onClick={() => setAddPulsedOpen(true)}>+ Add Data</Btn>
+        </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
           {["pe", "diel_b", "diel_f"].map(t => (
             <MeasCard key={t} type={t}
@@ -1550,7 +1809,25 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               areaCorrFactor={sample.area_correction ?? 1.0}
               onAreaChange={handleAreaChange} />
           ))}
+          {pulsedItems.map(item => {
+            const d = pulsedData[item.id] || {};
+            if (item.type === '3pp') return (
+              <ThreePPCard key={item.id}
+                data={{ no: d.no, at: d.at }}
+                onFileNo={file => handlePulsedFile3PP(item.id, 'no', file)}
+                onFileAt={file => handlePulsedFile3PP(item.id, 'at', file)}
+                onRemove={() => removePulsedItem(item.id)} />
+            );
+            if (item.type === 'pr') return (
+              <PrCard key={item.id}
+                data={{ curves: d.curves || [] }}
+                onFile={file => handlePulsedFilePr(item.id, file)}
+                onRemove={() => removePulsedItem(item.id)} />
+            );
+            return null;
+          })}
         </div>
+        {addPulsedOpen && <PulsedAddModal onAdd={addPulsedItem} onClose={() => setAddPulsedOpen(false)} />}
       </section>
     </div>
   );
@@ -1627,11 +1904,15 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
     id: "", date: template.date ?? new Date().toISOString().slice(0, 10),
     substrate: template.substrate ?? "", notes: template.notes ?? "",
     thickness_nm: template.thickness_nm ?? "",
+    lot: template.lot ?? settings?.defaultLot ?? "",
+    bin: template.bin ?? "",
     technique: template.technique ?? "sputter",
     folder_id: template.folder_id ?? "",
   } : {
     id: "", date: new Date().toISOString().slice(0, 10),
     substrate: settings?.defaultSubstrate ?? "STO (001)", notes: "", thickness_nm: "",
+    lot: settings?.defaultLot ?? "",
+    bin: "",
     technique: "sputter", folder_id: "",
   });
   const set = k => v => setF(p => ({ ...p, [k]: v }));
@@ -1662,6 +1943,10 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
           <Input label="Thickness (nm)" value={f.thickness_nm} onChange={v => setF(p => ({ ...p, thickness_nm: v === "" ? "" : v }))} type="number" placeholder="e.g. 30" />
         </div>
         <Input label="Substrate"  value={f.substrate} onChange={set("substrate")} placeholder="e.g. STO (001)" />
+        <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 12 }}>
+          <Input label="Lot"  value={f.lot} onChange={set("lot")} placeholder="e.g. W2024-01" />
+          <Input label="Bin"  value={f.bin} onChange={set("bin")} placeholder="e.g. A3" />
+        </div>
         <Input label="Notes"      value={f.notes}     onChange={set("notes")}     placeholder="Brief description…" />
         {folders && folders.length > 0 && (
           <Sel label="Folder (optional)" value={f.folder_id} onChange={set("folder_id")}
@@ -1672,7 +1957,7 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
           <Btn onClick={() => {
             if (!f.id.trim()) return;
             const layers = template ? JSON.parse(JSON.stringify(template.layers || [])).map(l => ({ ...l, id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()) })) : [];
-            onAdd({ ...f, thickness_nm: f.thickness_nm === "" ? null : +f.thickness_nm, folder_id: f.folder_id || null, layers, filenames: {}, area_m2: null, area_correction: 1.0 });
+            onAdd({ ...f, thickness_nm: f.thickness_nm === "" ? null : +f.thickness_nm, folder_id: f.folder_id || null, lot: f.lot || null, bin: f.bin || null, layers, filenames: {}, area_m2: null, area_correction: 1.0 });
           }} disabled={!f.id.trim()}>Create</Btn>
         </div>
       </div>
@@ -2083,7 +2368,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lines, structures]);
 
-  // Shapes: fit window + tolerance window + reference line + fitted center per peak
+  // Shapes: fit window + tolerance window shading + fitted center (no reference line)
   const lineShapes = [
     ...(fitWindow ? [{ type: "rect", xref: "x", yref: "paper", x0: fitWindow[0], x1: fitWindow[1], y0: 0, y1: 1, fillcolor: T.teal + "18", line: { color: T.teal, width: 1, dash: "dot" }, layer: "below" }] : []),
     ...lines.flatMap((ln, i) => {
@@ -2093,10 +2378,14 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
       if (tt == null) return [];
       const tol  = ln.tolerance ?? 0.5;
       const dash = ln.style === "dashed" ? "dash" : ln.style === "dotted" ? "dot" : "solid";
+      const res  = fitResults[ln.id];
       return [
+        // Tolerance window shading — always shown
         { type: "rect", xref: "x", yref: "paper", x0: tt - tol, x1: tt + tol, y0: 0, y1: 1, fillcolor: ln.color + "22", line: { width: 0 }, layer: "below" },
-        { type: "line", xref: "x", yref: "paper", x0: tt, x1: tt, y0: 0, y1: 1, line: { color: ln.color, width: 1.5, dash }, layer: "above" },
-        ...(fitResults[ln.id] ? [{ type: "line", xref: "x", yref: "paper", x0: fitResults[ln.id].center, x1: fitResults[ln.id].center, y0: 0, y1: 1, line: { color: ln.color, width: 2, dash: "solid" }, layer: "above" }] : []),
+        // Reference line — only shown when there is no fit result yet
+        ...(!res ? [{ type: "line", xref: "x", yref: "paper", x0: tt, x1: tt, y0: 0, y1: 1, line: { color: ln.color, width: 1.5, dash }, layer: "above" }] : []),
+        // Fitted center — shown after fitting
+        ...(res ? [{ type: "line", xref: "x", yref: "paper", x0: res.center, x1: res.center, y0: 0, y1: 1, line: { color: ln.color, width: 2, dash }, layer: "above" }] : []),
       ];
     }),
   ];
@@ -2354,7 +2643,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
                     </button>
                     {cfgOpen && (
                       <div onClick={e => e.stopPropagation()}
-                        style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 500, boxShadow: "0 4px 16px rgba(0,0,0,.55)", minWidth: 280, display: "flex", flexDirection: "column", gap: 12 }}>
+                        style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 500, boxShadow: "0 4px 20px rgba(0,0,0,.3), 0 1px 4px rgba(0,0,0,.15)", minWidth: 280, display: "flex", flexDirection: "column", gap: 12 }}>
                         <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}`, alignSelf: "flex-start" }}>
                           {["bulk", "strained"].map(m => (
                             <button key={m} onClick={() => updateLine(ln.id, { mode: m })}
@@ -2500,7 +2789,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
                         placeholder="Config name…"
                         style={{ flex: 1, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 8px", borderRadius: 4, border: `1px solid ${T.border}`, background: T.bg0, color: T.textPrimary, outline: "none" }} />
                       <button onClick={saveConfigToLibrary} disabled={!configName.trim()}
-                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", borderRadius: 4, border: "none", background: configName.trim() ? T.accent : T.bg3, color: configName.trim() ? "#fff" : T.textDim, cursor: configName.trim() ? "pointer" : "default" }}>
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", borderRadius: 4, border: "none", background: configName.trim() ? T.amber : T.bg3, color: configName.trim() ? T.bg0 : T.textDim, cursor: configName.trim() ? "pointer" : "default" }}>
                         Save
                       </button>
                     </div>
@@ -2933,11 +3222,18 @@ function SettingsModal({ settings, onSave, onClose }) {
         {/* General */}
         {sectionHdr("General")}
         <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-          <div style={{ flex: 1, minWidth: 180 }}>
+          <div style={{ flex: 2, minWidth: 180 }}>
             <div style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", marginBottom: 4 }}>Default Substrate</div>
             <input value={draft.defaultSubstrate}
               onChange={e => set("defaultSubstrate", e.target.value)}
               placeholder="e.g. STO (001)"
+              style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "5px 8px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
+          </div>
+          <div style={{ flex: 1, minWidth: 120 }}>
+            <div style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", marginBottom: 4 }}>Default Lot</div>
+            <input value={draft.defaultLot ?? ""}
+              onChange={e => set("defaultLot", e.target.value)}
+              placeholder="e.g. W2024-01"
               style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "5px 8px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
           </div>
           <div>
@@ -3053,10 +3349,13 @@ function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, 
       </div>
       {sample.substrate && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textSecondary }}>{sample.substrate}</div>}
       {materials.length > 0 && (
-        <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
           {materials.map(m => { const s = getMaterialStyle(m); return (
             <span key={m} style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 7px" }}><ChemName name={m} /></span>
           );})}
+          {(sample.layers || []).some(l => l.role === "buffer") && (
+            <span style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", fontWeight: 600, color: T.teal, background: `${T.teal}22`, border: `1px solid ${T.teal}66`, borderRadius: 3, padding: "1px 5px", letterSpacing: 0.5 }}>BUF</span>
+          )}
         </div>
       )}
       {sample.notes && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, fontStyle: "italic" }}>{sample.notes}</div>}
@@ -3819,6 +4118,7 @@ function buildPlotLayout(ps, xaxisExtra = {}, yaxisExtra = {}, extraShapes = [],
     uirevision: "plot",
     margin: { t: 12, r: 20, b: 52, l: 72, pad: 0 },
     paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
+    modebar: { bgcolor: "transparent", color: T.textDim, activecolor: T.textPrimary },
     font: { family: ps.font, size: ps.fontSize, color: T.textPrimary },
     hovermode: "x", hoverdistance: 40,
     hoverlabel: { bgcolor: "rgba(0,0,0,0)", bordercolor: "rgba(0,0,0,0)", font: { color: "rgba(0,0,0,0)" } },
@@ -3885,7 +4185,7 @@ function buildPlotConfig(filename = "plot", ps = null) {
   };
 }
 
-function SciPlotWrap({ ps, cursorLabel, children }) {
+function SciPlotWrap({ ps, cursorLabel, children, noSpacer = false }) {
   const [cursor, setCursor] = useState(null);
   // Memoize the Plot element so cursor state updates don't re-render Plotly
   // (which would cause zoom/pan to snap back). Only rebuilds when parent data changes.
@@ -3893,7 +4193,7 @@ function SciPlotWrap({ ps, cursorLabel, children }) {
   const child = useMemo(() => typeof children === "function" ? children(setCursor) : children, [children]);
   return (
     <div className="sci-plot-wrap">
-      <div style={{ height: 30 }} />
+      {!noSpacer && <div style={{ height: 30 }} />}
       <div style={{ display: "flex", justifyContent: "center" }} onMouseLeave={() => setCursor(null)}>
         <div style={{ position: "relative", width: ps.plotWidth ? Math.round(ps.plotWidth * 96) : "100%", flexShrink: 0 }}>
           <Suspense fallback={<div style={{ height: 320, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>Loading chart…</div>}>
@@ -3914,11 +4214,12 @@ function SciPlotWrap({ ps, cursorLabel, children }) {
 
 function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, config, plotStyle, structures = [], onUpdate }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
-  const offsetDecades = config.offset_decades ?? 2;
-  const thetaMin  = config.theta_min  != null ? Number(config.theta_min)  : null;
-  const thetaMax  = config.theta_max  != null ? Number(config.theta_max)  : null;
-  const padAbove  = config.pad_above  ?? 2;
-  const padBelow  = config.pad_below  ?? 1;
+  const offsetDecades   = config.offset_decades ?? 2;
+  const thetaMin        = config.theta_min  != null ? Number(config.theta_min)  : null;
+  const thetaMax        = config.theta_max  != null ? Number(config.theta_max)  : null;
+  const padAbove        = config.pad_above  ?? 2;
+  const padBelow        = config.pad_below  ?? 1;
+  const normalizeBase   = config.normalize_baseline ?? true;
 
   const { traces, yDomMin, yDomMax, xTicks, xDomain } = useMemo(() => {
     const traces = sampleOrder.map((sid, i) => {
@@ -3929,20 +4230,29 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
       if (pos.length === 0) return null;
       const sorted = [...pos.map(p => p.y)].sort((a, b) => a - b);
       const floor  = sorted[Math.max(0, Math.floor(sorted.length * 0.05))];
+      // Median is a robust background estimator for XRD (most of the scan is background)
+      const median = sorted[Math.floor(sorted.length * 0.5)] || floor;
+      const norm   = normalizeBase && median > 0 ? median : 1;
       const scale  = Math.pow(10, i * offsetDecades);
-      const data   = pos.map(p => ({ x: p.x, y: Math.max(p.y, floor) * scale }));
+      const data   = pos.map(p => ({ x: p.x, y: Math.max(p.y, floor) / norm * scale }));
       return { sid, color: colors[i], data };
     }).filter(Boolean);
     const posY    = traces.flatMap(t => t.data.map(p => p.y));
     const yDomMin = posY.length ? Math.pow(10, Math.floor(Math.log10(Math.min(...posY))) - padBelow) : 1e-1;
     const yDomMax = posY.length ? Math.pow(10, Math.ceil(Math.log10(Math.max(...posY)))  + padAbove) : 1e8;
     const allX    = traces.flatMap(t => t.data.map(p => p.x));
-    const { ticks: xTicks, domain: xDomain } = allX.length
+    const { ticks: xTicksAuto, domain: xDomainAuto } = allX.length
       ? niceLinTicks(Math.min(...allX), Math.max(...allX))
       : { ticks: [], domain: ["auto", "auto"] };
+    const xDomLo = thetaMin != null ? thetaMin : xDomainAuto[0];
+    const xDomHi = thetaMax != null ? thetaMax : xDomainAuto[1];
+    const xDomain = (xDomLo === "auto" || xDomHi === "auto") ? xDomainAuto : [xDomLo, xDomHi];
+    const { ticks: xTicks } = (xDomain[0] !== "auto")
+      ? niceLinTicks(xDomain[0], xDomain[1])
+      : { ticks: xTicksAuto };
     return { traces, yDomMin, yDomMax, xTicks, xDomain };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sampleOrder.join(","), plotCache, thetaMin, thetaMax, offsetDecades, padAbove, padBelow, colors.join(",")]);
+  }, [sampleOrder.join(","), plotCache, thetaMin, thetaMax, offsetDecades, padAbove, padBelow, normalizeBase, colors.join(",")]);
 
   const lines = config.lines || [];
   const addLine    = () => onUpdate({ lines: [...lines, { id: String(Date.now()), material: structures[0]?.name || "", hkl: "", style: "solid", color: "#888888", mode: "bulk", substrate: "" }] });
@@ -4018,7 +4328,7 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
       showticklabels: false, showgrid: false,
       title: { text: "Intensity (arb.)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
     lineShapes,
-    { uirevision: "xrd", dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 } }
+    { uirevision: `xrd-${thetaMin ?? "a"}-${thetaMax ?? "a"}`, dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 } }
   );
 
   return (
@@ -4089,7 +4399,7 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
                 </button>
                 {cfgOpen && (
                   <div onClick={e => e.stopPropagation()}
-                    style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 200, boxShadow: "0 4px 16px rgba(0,0,0,.55)", minWidth: 280, display: "flex", flexDirection: "column", gap: 12 }}>
+                    style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 200, boxShadow: "0 4px 20px rgba(0,0,0,.3), 0 1px 4px rgba(0,0,0,.15)", minWidth: 280, display: "flex", flexDirection: "column", gap: 12 }}>
                     {/* Bulk / Strained toggle */}
                     <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}`, alignSelf: "flex-start" }}>
                       {["bulk", "strained"].map(m => (
@@ -4205,16 +4515,22 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
 
 // ── P–E Hysteresis comparison ─────────────────────────────────────────────────
 
-function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {}, plotStyle }) {
+function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {}, plotStyle, config: panelConfig = {}, onUpdate }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const [peLoop, setPeLoop] = useState("all");
+  const xAxisMode = ps.peXAxis || "field"; // "field" (kV/cm) | "voltage" (V)
 
   const traces = sampleOrder.map((sid, i) => {
     const sample = samples.find(s => s.id === sid);
     const corr   = sample?.area_correction ?? 1.0;
+    const thick  = sample?.thickness_nm || 0;
     const raw    = plotCache[sid]?.pe || [];
     const looped = peLoop === "second" ? splitPELoops(raw).second : raw;
-    const data   = (corr && corr !== 1.0) ? looped.map(p => ({ ...p, y: p.y / corr })) : looped;
+    const data0  = (corr && corr !== 1.0) ? looped.map(p => ({ ...p, y: p.y / corr })) : looped;
+    // Convert x from field (kV/cm) → voltage (V): V = E × d_nm × 1e-4
+    const data   = (xAxisMode === "voltage" && thick > 0)
+      ? data0.map(p => ({ ...p, x: p.x * thick * 1e-4 }))
+      : data0;
     return { sid, color: colors[i], data };
   }).filter(t => t.data.length > 0);
 
@@ -4224,14 +4540,17 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
   const allX    = traces.flatMap(t => t.data.map(p => p.x));
   const allY    = traces.flatMap(t => t.data.map(p => p.y));
-  const { ticks: autoXTicks, domain: xDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
+  const { ticks: autoXTicks, domain: autoXDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
+  const xDomain = [ps.xMin ?? autoXDomain[0], ps.xMax ?? autoXDomain[1]];
   const rawAbsY  = Math.max(...allY.map(Math.abs)) * 1.05;
   const absYMax0 = Math.max(rawAbsY, 30);
   const peStep   = absYMax0 >= 500 ? 200 : absYMax0 >= 250 ? 100 : absYMax0 >= 100 ? 50 : absYMax0 >= 40 ? 10 : 5;
   const absYMax  = Math.ceil(absYMax0 / peStep) * peStep;
+  const yMin = ps.yMin ?? -absYMax;
+  const yMax = ps.yMax ??  absYMax;
   const autoYTicks = Array.from({ length: 2 * (absYMax / peStep) + 1 }, (_, i) => -absYMax + i * peStep);
   const xTicks = makeTicks(xDomain[0], xDomain[1], ps.xTick) || autoXTicks;
-  const peTicks = makeTicks(-absYMax, absYMax, ps.yTick) || autoYTicks;
+  const peTicks = makeTicks(yMin, yMax, ps.yTick) || autoYTicks;
 
   const plotlyTraces = traces.map(t => ({
     x: t.data.map(p => p.x), y: t.data.map(p => p.y),
@@ -4239,10 +4558,11 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
     line: { color: t.color, width: ps.lineWidth },
     showlegend: false, hovertemplate: "<extra></extra>",
   }));
+  const xLabel = xAxisMode === "voltage" ? "V (V)" : "E (kV/cm)";
   const layout = buildPlotLayout(ps,
-    { tickvals: xTicks, tickformat: "d", range: xDomain,
-      title: { text: "E (kV/cm)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
-    { range: [-absYMax, absYMax], tickvals: peTicks, tickformat: "d",
+    { tickvals: xTicks, range: xDomain,
+      title: { text: xLabel, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+    { range: [yMin, yMax], tickvals: peTicks, tickformat: "d",
       title: { text: "P (µC/cm²)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } }
   );
 
@@ -4426,7 +4746,7 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
                 </button>
                 {cfgOpen && (
                   <div onClick={e => e.stopPropagation()}
-                    style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 200, boxShadow: "0 4px 16px rgba(0,0,0,.55)", minWidth: 280, display: "flex", flexDirection: "column", gap: 12 }}>
+                    style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 200, boxShadow: "0 4px 20px rgba(0,0,0,.3), 0 1px 4px rgba(0,0,0,.15)", minWidth: 280, display: "flex", flexDirection: "column", gap: 12 }}>
                     {/* Mode toggle: BULK / STRAINED */}
                     <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}`, alignSelf: "flex-start" }}>
                       {[["bulk", "BULK"], ["strained", "STRAINED"]].map(([m, label], idx, arr) => (
@@ -4740,21 +5060,28 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
 
 // ── εr vs E comparison ────────────────────────────────────────────────────────
 
-function DEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {}, plotStyle }) {
+function DEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {}, plotStyle, config: panelConfig = {}, onUpdate }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
+  const xAxisMode = ps.deXAxis || "field";
   const traces = sampleOrder.flatMap((sid, i) => {
-    const sample = samples.find(s => s.id === sid);
-    const thick  = (sample?.thickness_nm || 30) * 1e-9;
-    const area   = (sample?.area_m2 || DEFAULT_AREA_M2) * (sample?.area_correction || 1.0);
-    const convert = pts => {
+    const sample    = samples.find(s => s.id === sid);
+    const thickNm   = sample?.thickness_nm || 30;
+    const thick     = thickNm * 1e-9;
+    const area      = (sample?.area_m2 || DEFAULT_AREA_M2) * (sample?.area_correction || 1.0);
+    const convertXY = pts => {
       if (!pts?.length) return [];
       const maxY = pts.reduce((m, p) => Math.max(m, Math.abs(p.y)), 0);
-      return (maxY > 0 && maxY < 1)
-        ? pts.map(p => ({ x: p.x, y: p.y * thick / (area * EPS0) }))
-        : pts.map(p => ({ x: p.x, y: p.y }));
+      const ys = (maxY > 0 && maxY < 1)
+        ? pts.map(p => p.y * thick / (area * EPS0))
+        : pts.map(p => p.y);
+      // Convert x field→voltage if needed: V = E(kV/cm) × d_nm × 1e-4
+      const xs = xAxisMode === "voltage"
+        ? pts.map(p => p.x * thickNm * 1e-4)
+        : pts.map(p => p.x);
+      return xs.map((x, j) => ({ x, y: ys[j] }));
     };
-    const up   = convert(plotCache[sid]?.diel_b_up   || []);
-    const down = convert(plotCache[sid]?.diel_b_down || []);
+    const up   = convertXY(plotCache[sid]?.diel_b_up   || []);
+    const down = convertXY(plotCache[sid]?.diel_b_down || []);
     const color = colors[i];
     return [
       ...(up.length   ? [{ key: `${sid}_u`, sid, color, data: up   }] : []),
@@ -4768,13 +5095,17 @@ function DEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
   const allX    = traces.flatMap(t => t.data.map(p => p.x));
   const allY    = traces.flatMap(t => t.data.map(p => p.y)).filter(v => isFinite(v) && v > 0);
-  const { ticks: autoXTicks, domain: xDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
+  const { ticks: autoXTicks, domain: autoXDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
+  const xDomain = [ps.xMin ?? autoXDomain[0], ps.xMax ?? autoXDomain[1]];
   const rawYMax = allY.length ? Math.max(...allY) * 1.05 : 1000;
   const erStep  = rawYMax >= 8000 ? 2000 : rawYMax >= 4000 ? 1000 : rawYMax >= 2000 ? 500 : rawYMax >= 800 ? 200 : rawYMax >= 300 ? 100 : 50;
-  const erMax   = Math.ceil(rawYMax / erStep) * erStep;
-  const autoYTicks = Array.from({ length: erMax / erStep + 1 }, (_, i) => i * erStep);
+  const erMax   = ps.yMax ?? Math.ceil(rawYMax / erStep) * erStep;
+  const erMin   = ps.yMin ?? 0;
+  const autoYTicks = Array.from({ length: Math.ceil((erMax - erMin) / erStep) + 1 }, (_, i) => erMin + i * erStep);
   const xTicks = makeTicks(xDomain[0], xDomain[1], ps.xTick) || autoXTicks;
-  const erTicks = makeTicks(0, erMax, ps.yTick) || autoYTicks;
+  const erTicks = makeTicks(erMin, erMax, ps.yTick) || autoYTicks;
+  const xLabel = xAxisMode === "voltage" ? "V (V)" : "E (kV/cm)";
+  const cursorFmt = xAxisMode === "voltage" ? x => `V = ${x.toFixed(3)} V` : x => `E = ${x.toFixed(3)} kV/cm`;
 
   const plotlyTraces = traces.map(t => ({
     x: t.data.map(p => p.x), y: t.data.map(p => p.y),
@@ -4783,15 +5114,15 @@ function DEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
     showlegend: false, hovertemplate: "<extra></extra>",
   }));
   const layout = buildPlotLayout(ps,
-    { tickvals: xTicks, tickformat: "d", range: xDomain,
-      title: { text: "E (kV/cm)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
-    { range: [0, erMax], tickvals: erTicks, tickformat: "d",
+    { tickvals: xTicks, range: xDomain,
+      title: { text: xLabel, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+    { range: [erMin, erMax], tickvals: erTicks, tickformat: "d",
       title: { text: "εᵣ", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } }
   );
 
   return (
     <>
-      <SciPlotWrap ps={ps} cursorLabel={x => `E = ${x.toFixed(3)} kV/cm`}>
+      <SciPlotWrap ps={ps} cursorLabel={cursorFmt}>
         {setCursor => (
           <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("er-vs-E", ps)}
             style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
@@ -4921,7 +5252,7 @@ function AfmComparisonPanel({ sampleOrder, plotCache, labels = {}, plotStyle, co
 
 // ── Panel wrapper + add panel row ─────────────────────────────────────────────
 
-const PANEL_LABELS = { xrd: "XRD ω–2θ", pe: "P–E Hysteresis", rsm: "RSM", afm: "Scanning Probe", de: "εᵣ vs E", df: "εᵣ vs f", meta: "Meta-analysis" };
+const PANEL_LABELS = { xrd: "XRD ω–2θ", pe: "P–E Hysteresis", rsm: "RSM", afm: "Scanning Probe", de: "εᵣ vs E", df: "εᵣ vs f", meta: "Meta-analysis", stats: "Statistical Analysis", parcoords: "Parallel Coordinates" };
 
 // ── Meta-analysis parameter definitions ───────────────────────────────────────
 
@@ -5119,8 +5450,61 @@ function extractDielBiasProps(up, down) {
   return { crossEps, upMin, upMax, downMin, downMax };
 }
 
+// ── X-ray extraction helpers (used by META_PARAM_GROUPS X-ray group) ─────────
+
+function xrdPrimaryLine(sample, material) {
+  if (!material) return null;
+  const saved = sample.xrd_peaks;
+  const lines = saved && !Array.isArray(saved) ? (saved.lines || []) : (Array.isArray(saved) ? saved : []);
+  const matLines = lines.filter(l => l.material === material);
+  if (!matLines.length) return null;
+  return matLines.find(l => l.primary !== false) ?? matLines[0];
+}
+
+// d-spacing (Å) from 2θ (°) using Cu Kα1
+function dFromTwoTheta(twoTheta) {
+  const sinT = Math.sin(twoTheta * Math.PI / 360);
+  return sinT > 0 ? CU_KALPHA / (2 * sinT) : null;
+}
+
+// Lattice parameter (Å) from d-spacing and HKL {h,k,l} object (from existing parseHKL).
+// For c-axis (00l): c = d * l. For a-axis (h00)/(0k0): a = d * n.
+// For general pseudocubic (cubic): a = d * sqrt(h²+k²+l²).
+function latticeParamFromDAndHKL(d, hklStr) {
+  if (!d || !hklStr) return null;
+  const idx = parseHKL(hklStr);
+  if (!idx) return null;
+  const { h, k, l } = idx;
+  if (h === 0 && k === 0 && l !== 0) return d * l;
+  if (h === 0 && l === 0 && k !== 0) return d * k;
+  if (k === 0 && l === 0 && h !== 0) return d * h;
+  return d * Math.sqrt(h * h + k * k + l * l);
+}
+
+function extractXRDPeakPos(s, am) {
+  const line = xrdPrimaryLine(s, am);
+  return line?.fitted_center ?? null;
+}
+
+function extractXRDLatticeParam(s, am) {
+  const line = xrdPrimaryLine(s, am);
+  if (!line?.fitted_center || !line?.hkl) return null;
+  const d = dFromTwoTheta(line.fitted_center);
+  return latticeParamFromDAndHKL(d, line.hkl);
+}
+
+function extractXRDStrainPct(s, am) {
+  // The XRD modal saves `strain = (d_measured - d_ref) / d_ref` at fit time,
+  // where d_ref is derived from the theoretical reference 2θ (strained or bulk,
+  // depending on how the line was configured). This is identical to the % shown
+  // in the XRD fit row, so we read it directly rather than recomputing.
+  const line = xrdPrimaryLine(s, am);
+  if (line?.strain == null || !isFinite(line.strain)) return null;
+  return line.strain * 100;
+}
+
 const META_PARAM_GROUPS = [
-  { group: "Growth", params: [
+  { group: "Growth", isInput: true, params: [
     { id: "growth_temp",      label: "Temperature",    unit: "°C",    needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "temp") },
     { id: "growth_pressure",  label: "Pressure",       unit: "mTorr", needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "pressure") },
     { id: "growth_o2_pct",    label: "O₂ %",           unit: "%",     needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "oxygen_pct") },
@@ -5130,12 +5514,12 @@ const META_PARAM_GROUPS = [
     { id: "growth_energy_mj", label: "Laser energy",   unit: "mJ",    needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "energy_mJ") },
     { id: "growth_freq_hz",   label: "Rep. rate",      unit: "Hz",    needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "frequency_hz") },
   ]},
-  { group: "Sample", params: [
+  { group: "Sample", isInput: true, params: [
     { id: "thickness_nm",     label: "Thickness",      unit: "nm",    needsLayer: true, extract: (s, _pc, am) => metaLayerField(s, am, "thickness_nm") },
   ]},
   { group: "P–E Hysteresis", params: [
-    { id: "pe_ec",         label: "Coercive field E<sub>c</sub>", unit: "kV/cm",  extract: (s, pc) => extractPEProps(pc[s.id]?.pe)?.ec         ?? null },
-    { id: "pe_imprint",    label: "Imprint field",          unit: "kV/cm",  extract: (s, pc) => extractPEProps(pc[s.id]?.pe)?.imprint    ?? null },
+    { id: "pe_ec",         label: "Coercive field E<sub>c</sub>", corrLabel: "Ec",       unit: "kV/cm",  extract: (s, pc) => extractPEProps(pc[s.id]?.pe)?.ec         ?? null },
+    { id: "pe_imprint",    label: "Imprint field",                corrLabel: "Imprint",  unit: "kV/cm",  extract: (s, pc) => extractPEProps(pc[s.id]?.pe)?.imprint    ?? null },
     { id: "pe_pr",     label: "Pᵣ at E = 0",       unit: "µC/cm²", paired: true, extract: (s, pc) => { const r = extractPEProps(pc[s.id]?.pe); return r ? { pos: r.pr_pos,     neg: r.pr_neg     } : null; } },
     { id: "pe_pr_imp", label: "Pᵣ at imprint field", unit: "µC/cm²", paired: true, extract: (s, pc) => { const r = extractPEProps(pc[s.id]?.pe); return r ? { pos: r.pr_imp_pos, neg: r.pr_imp_neg } : null; } },
     { id: "pe_pmax",       label: "Max polarization",       unit: "µC/cm²", extract: (s, pc) => extractPEProps(pc[s.id]?.pe)?.pmax       ?? null },
@@ -5151,6 +5535,14 @@ const META_PARAM_GROUPS = [
       extract: (s, pc) => { const r = extractDielBiasProps(dielConvertPts(pc[s.id]?.diel_b_up, s), dielConvertPts(pc[s.id]?.diel_b_down, s)); return r ? { pos: r.upMin, neg: r.downMin } : null; } },
     { id: "diel_eps_max_b",   label: "Max ε (↑/↓ sweeps)",   unit: "", paired: true,
       extract: (s, pc) => { const r = extractDielBiasProps(dielConvertPts(pc[s.id]?.diel_b_up, s), dielConvertPts(pc[s.id]?.diel_b_down, s)); return r ? { pos: r.upMax, neg: r.downMax } : null; } },
+  ]},
+  { group: "X-ray", params: [
+    { id: "xrd_peak_pos",   label: "Peak position",    unit: "°", needsXRD: true,
+      extract: (s, _pc, am)         => extractXRDPeakPos(s, am) },
+    { id: "xrd_lattice",    label: "<i>c</i> Parameter", corrLabel: "<i>c</i> Parameter", unit: "Å", needsXRD: true,
+      extract: (s, _pc, am)         => extractXRDLatticeParam(s, am) },
+    { id: "xrd_strain_pct", label: "Δc/c",              unit: "%", needsXRD: true,
+      extract: (s, _pc, am) => extractXRDStrainPct(s, am) },
   ]},
 ];
 const META_PARAMS_FLAT = META_PARAM_GROUPS.flatMap(g => g.params.map(p => ({ ...p, group: g.group })));
@@ -5304,12 +5696,20 @@ function MetaScatterPlot({ points, y2Points = [], xLabel, yLabel, y2Label = "", 
 function CollapsibleParamSelect({ axis, value, onChange, groups, extra, rightSlot }) {
   const [open, setOpen] = useState(false);
   const [expanded, setExpanded] = useState({});
+  const [dropUp, setDropUp] = useState(false);
+  const btnRef = useRef(null);
 
   const handleOpen = () => {
-    if (!open && value) {
-      // Auto-expand whichever group holds the current selection
-      const g = groups.find(g => g.params.some(p => p.id === value));
-      if (g) setExpanded(prev => ({ ...prev, [g.group]: true }));
+    if (!open) {
+      if (value) {
+        // Auto-expand whichever group holds the current selection
+        const g = groups.find(g => g.params.some(p => p.id === value));
+        if (g) setExpanded(prev => ({ ...prev, [g.group]: true }));
+      }
+      if (btnRef.current) {
+        const rect = btnRef.current.getBoundingClientRect();
+        setDropUp(window.innerHeight - rect.bottom < 340);
+      }
     }
     setOpen(v => !v);
   };
@@ -5328,14 +5728,14 @@ function CollapsibleParamSelect({ axis, value, onChange, groups, extra, rightSlo
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <div style={{ position: "relative" }}>
           {open && <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />}
-          <button onClick={handleOpen}
+          <button ref={btnRef} onClick={handleOpen}
             style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: selectedParam ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 8px", outline: "none", cursor: "pointer", minWidth: 200, textAlign: "left", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
             <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} dangerouslySetInnerHTML={{ __html: triggerLabel }} />
             <span style={{ fontSize: 8, opacity: 0.5, flexShrink: 0 }}>▼</span>
           </button>
           {open && (
             <div onClick={e => e.stopPropagation()}
-              style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, zIndex: 200, minWidth: 240, maxHeight: 320, overflowY: "auto", boxShadow: "0 4px 16px rgba(0,0,0,.5)" }}>
+              style={{ position: "absolute", left: 0, ...(dropUp ? { bottom: "calc(100% + 4px)" } : { top: "calc(100% + 4px)" }), background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, zIndex: 200, minWidth: 240, maxHeight: 320, overflowY: "auto", boxShadow: "0 4px 16px rgba(0,0,0,.5)" }}>
               <div onClick={() => select("")}
                 style={{ padding: "6px 12px", fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, cursor: "pointer", borderBottom: `1px solid ${T.border}` }}>
                 — select —
@@ -5428,7 +5828,7 @@ function MetaMarkerPicker({ prefix, config, onUpdate, defaultSymbol = "circle" }
   );
 }
 
-function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {}, config = {}, plotStyle, activeMaterial, onUpdate }) {
+function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {}, config = {}, plotStyle, activeMaterial, structures = [], onUpdate }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const xParamId  = config.x_param  || "";
   const yParamId  = config.y_param  || "";
@@ -5439,14 +5839,34 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
   const [showY2, setShowY2] = useState(!!config.y2_param);
   const sampleMap = useMemo(() => Object.fromEntries(samples.map(s => [s.id, s])), [samples]);
 
+  // Per-panel X-ray material: used when any selected param is an X-ray param.
+  // Falls back to activeMaterial (sheet-level) if not set in config.
+  const anyXRD = yParam?.needsXRD || y2Param?.needsXRD || xParam?.needsXRD;
+  const xrdMaterial = config.xrd_material || activeMaterial || "";
+  // Collect all materials that appear in any sample's xrd_peaks
+  const xrdMaterials = useMemo(() => {
+    const seen = new Set();
+    for (const sid of sampleOrder) {
+      const s = sampleMap[sid];
+      if (!s) continue;
+      const saved = s.xrd_peaks;
+      const lines = saved && !Array.isArray(saved) ? (saved.lines || []) : (Array.isArray(saved) ? saved : []);
+      for (const ln of lines) { if (ln.material) seen.add(ln.material); }
+    }
+    return [...seen].sort();
+  }, [sampleOrder, sampleMap]);
+
   const extractPoints = (param) => {
     if (!param) return [];
     return sampleOrder.flatMap((sid, i) => {
       const s = sampleMap[sid];
       if (!s) return [];
       // When no X param, use the sample label as a categorical x value
-      const x = xParam ? xParam.extract(s, plotCache, activeMaterial) : (labels[sid] || sid);
-      const yRaw = param.extract(s, plotCache, activeMaterial);
+      // X-ray params use xrdMaterial (panel-level); others use activeMaterial (sheet-level)
+      const xMat = xParam?.needsXRD ? xrdMaterial : activeMaterial;
+      const yMat = param.needsXRD ? xrdMaterial : activeMaterial;
+      const x = xParam ? xParam.extract(s, plotCache, xMat, structures) : (labels[sid] || sid);
+      const yRaw = param.extract(s, plotCache, yMat, structures);
       if (x == null || yRaw == null) return [];
       if (xParam && !isFinite(x)) return [];
       const base = { sid, x, color: colors[i], label: labels[sid] || sid };
@@ -5462,11 +5882,12 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
   };
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const points  = useMemo(() => extractPoints(yParam),  [sampleOrder, xParamId, yParamId,  plotCache, activeMaterial, colors.join(","), sampleMap]);
+  const points  = useMemo(() => extractPoints(yParam),  [sampleOrder, xParamId, yParamId,  plotCache, activeMaterial, xrdMaterial, structures, colors.join(","), sampleMap]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const y2Points = useMemo(() => extractPoints(y2Param), [sampleOrder, xParamId, y2ParamId, plotCache, activeMaterial, colors.join(","), sampleMap]);
+  const y2Points = useMemo(() => extractPoints(y2Param), [sampleOrder, xParamId, y2ParamId, plotCache, activeMaterial, xrdMaterial, structures, colors.join(","), sampleMap]);
 
   const needsLayer = xParam?.needsLayer || yParam?.needsLayer || y2Param?.needsLayer;
+  const needsXRD   = xParam?.needsXRD   || yParam?.needsXRD   || y2Param?.needsXRD;
 
   // Build filtered groups: hide groups with no data, filter growth/sample params
   // to only those with a non-null value for at least one selected sample.
@@ -5487,13 +5908,24 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
         params = hasDielF ? g.params : [];
       } else if (g.group === "Dielectric — bias sweep") {
         params = hasDielB ? g.params : [];
+      } else if (g.group === "X-ray") {
+        // Show whenever any sample has any fitted XRD line
+        // (active material selects which one to use at extract time)
+        const hasXRD = sampleOrder.some(sid => {
+          const s = sampleMap[sid];
+          if (!s) return false;
+          const saved = s.xrd_peaks;
+          const lines = saved && !Array.isArray(saved) ? (saved.lines || []) : (Array.isArray(saved) ? saved : []);
+          return lines.some(l => l.fitted_center != null);
+        });
+        params = hasXRD ? g.params : [];
       } else {
         params = g.params;
       }
       return { ...g, params };
     }).filter(g => g.params.length > 0);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sampleOrder, sampleMap, plotCache, activeMaterial]);
+  }, [sampleOrder, sampleMap, plotCache, activeMaterial, structures]);
 
   const addY2BtnStyle = { background: "transparent", border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 8px", cursor: "pointer", letterSpacing: 0.5, textTransform: "uppercase" };
 
@@ -5515,6 +5947,22 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
             <MetaMarkerPicker prefix="y" config={config} onUpdate={onUpdate} defaultSymbol="circle" />
           </div>
         </div>
+        {/* Row 1b: X-ray material selector — shown when any param is an X-ray param */}
+        {anyXRD && (
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={axisLabelStyle}>MAT</span>
+            <select
+              value={xrdMaterial}
+              onChange={e => onUpdate({ xrd_material: e.target.value })}
+              style={{ background: T.bg0, border: `1px solid ${xrdMaterial ? T.amber : T.border}`, borderRadius: 4, color: xrdMaterial ? T.amber : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 8px", cursor: "pointer" }}>
+              <option value="">— material —</option>
+              {xrdMaterials.map(m => <option key={m} value={m}>{m}</option>)}
+            </select>
+            {!xrdMaterial && (
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.amber }}>⚠ Select a material to plot X-ray data</span>
+            )}
+          </div>
+        )}
         {/* Row 2: Y₂ */}
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <span style={axisLabelStyle}>Y₂</span>
@@ -5558,7 +6006,803 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
   );
 }
 
-function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, labels = {}, colorScale: bookColorScale = "viridis", structures = [], activeMaterial = null, onRemove, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver }) {
+// ── XRD Peak Position panel ────────────────────────────────────────────────────
+
+const XRD_POS_PARAMS = [
+  { value: "pressure",   label: "Pressure (mTorr)" },
+  { value: "temp",       label: "Temperature (°C)" },
+  { value: "oxygen_pct", label: "O₂ (%)"           },
+  { value: "time_s",     label: "Time (s)"          },
+  { value: "power_W",    label: "Power (W)"         },
+];
+
+const XRD_POS_Y_MODES = [
+  { value: "2theta",  label: "2θ (°)"    },
+  { value: "d",       label: "d (Å)"     },
+  { value: "strain",  label: "Strain (%)" },
+];
+
+function getXRDPosPoint(sample, material, param, yMode, hkl, structures) {
+  if (!material || !param) return null;
+  const saved = sample.xrd_peaks;
+  const lines = saved && !Array.isArray(saved) ? (saved.lines || []) : (Array.isArray(saved) ? saved : []);
+  const matLines = lines.filter(l => l.material === material);
+  if (!matLines.length) return null;
+  // Prefer primary line; fall back to first
+  const line = matLines.find(l => l.primary !== false) ?? matLines[0];
+  let twoTheta = line.fitted_center ?? null;
+  if (twoTheta == null && hkl) {
+    const struct = structures?.find(s => s.name === material);
+    if (struct) twoTheta = calcTwoTheta(struct, hkl);
+  }
+  if (twoTheta == null) return null;
+  // Growth parameter — look in whichever layer has this material as a target
+  let paramValue = null;
+  for (const layer of (sample.layers || [])) {
+    const target = layer.targets?.find(t => t.material === material);
+    if (target) {
+      paramValue = param === "power_W"
+        ? (target.power_W != null ? Number(target.power_W) : null)
+        : (layer[param]   != null ? Number(layer[param])   : null);
+      break;
+    }
+  }
+  if (paramValue == null || !isFinite(paramValue)) return null;
+  const LAMBDA = 1.5406;
+  let y;
+  if (yMode === "d") {
+    const sinT = Math.sin(twoTheta * Math.PI / 360);
+    y = sinT > 0 ? LAMBDA / (2 * sinT) : null;
+  } else if (yMode === "strain") {
+    const sinT = Math.sin(twoTheta * Math.PI / 360);
+    const d    = sinT > 0 ? LAMBDA / (2 * sinT) : null;
+    if (!d || !hkl) return null;
+    const struct = structures?.find(s => s.name === material);
+    if (!struct) return null;
+    const refTT = calcTwoTheta(struct, hkl);
+    if (!refTT) return null;
+    const dRef = LAMBDA / (2 * Math.sin(refTT * Math.PI / 360));
+    y = (d - dRef) / dRef * 100;
+  } else {
+    y = twoTheta;
+  }
+  if (y == null || !isFinite(y)) return null;
+  return { x: paramValue, y };
+}
+
+function XRDPeakPositionPanel({ sampleOrder, samples, colors, labels = {}, config = {}, plotStyle, structures = [], onUpdate }) {
+  const ps       = plotStyle || DEFAULT_PLOT_STYLE;
+  const material = config.material  || "";
+  const param    = config.param     || "";
+  const yMode    = config.y_mode    || "2theta";
+  const hkl      = config.hkl      || "";
+
+  const sampleMap  = useMemo(() => Object.fromEntries(samples.map(s => [s.id, s])), [samples]);
+  const paramInfo  = XRD_POS_PARAMS.find(p => p.value === param);
+  const yModeInfo  = XRD_POS_Y_MODES.find(m => m.value === yMode);
+
+  const points = useMemo(() => {
+    if (!material || !param) return [];
+    return sampleOrder.flatMap((sid, i) => {
+      const s = sampleMap[sid];
+      if (!s) return [];
+      const pt = getXRDPosPoint(s, material, param, yMode, hkl, structures);
+      if (!pt) return [];
+      return [{ ...pt, sid, color: colors[i], label: labels[sid] || sid }];
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sampleOrder, material, param, yMode, hkl, JSON.stringify(structures), sampleMap, colors.join(",")]);
+
+  const rc2 = { fontFamily: "'DM Mono', monospace", fontSize: 11, borderRadius: 4, padding: "4px 8px", outline: "none", cursor: "pointer", boxSizing: "border-box" };
+  const W  = ps.plotWidth  ? ps.plotWidth  * 96 : undefined;
+  const H  = ps.plotHeight ? ps.plotHeight * 96 : 320;
+
+  // Reference line (bulk position) for 2θ and d modes
+  const refShapes = [];
+  if (hkl && material && (yMode === "2theta" || yMode === "d")) {
+    const struct = structures.find(s => s.name === material);
+    if (struct) {
+      const refTT = calcTwoTheta(struct, hkl);
+      if (refTT != null) {
+        const LAMBDA = 1.5406;
+        const refY = yMode === "d" ? LAMBDA / (2 * Math.sin(refTT * Math.PI / 360)) : refTT;
+        refShapes.push({ type: "line", xref: "paper", yref: "y", x0: 0, x1: 1, y0: refY, y1: refY, line: { color: T.textDim, width: 1, dash: "dot" } });
+      }
+    }
+  }
+
+  const plotEl = (() => {
+    if (!material || !param) return (
+      <div style={{ height: 80, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>
+        Select material and growth parameter below.
+      </div>
+    );
+    if (!points.length) return (
+      <div style={{ height: 80, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>
+        No fitted XRD peaks found for <em style={{ marginLeft: 4 }}>{material}</em>.
+      </div>
+    );
+    const traces = [{
+      x: points.map(p => p.x),
+      y: points.map(p => p.y),
+      mode: ps.metaLabels ? "markers+text" : "markers",
+      type: "scatter",
+      text:         ps.metaLabels ? points.map(p => p.label) : undefined,
+      textposition: "top center",
+      textfont:     { family: ps.font, size: ps.fontSize - 1, color: T.textSecondary },
+      marker: {
+        color:  points.map(p => p.color),
+        size:   config.marker_size   ?? 9,
+        symbol: config.marker_symbol ?? "circle",
+        line:   { color: T.bg0, width: 1 },
+      },
+      customdata: points.map(p => p.label),
+      hovertemplate: `%{customdata}<br>${paramInfo?.label ?? param}: %{x}<br>${yModeInfo?.label ?? yMode}: %{y:.4f}<extra></extra>`,
+      showlegend: false,
+    }];
+    const layout = {
+      paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
+      font:   { family: ps.font, size: ps.fontSize, color: T.textPrimary },
+      margin: { t: 16, r: 20, b: 52, l: 64, pad: 0 },
+      xaxis:  {
+        title:     { text: paramInfo?.label ?? param, font: { size: 12, color: T.textSecondary }, standoff: 10 },
+        gridcolor: T.border, color: T.textSecondary, zeroline: false,
+        ...(ps.xMin != null || ps.xMax != null ? { range: [ps.xMin ?? null, ps.xMax ?? null] } : {}),
+        ...(ps.xTick ? { dtick: ps.xTick } : {}),
+      },
+      yaxis:  {
+        title:     { text: `${material}${hkl ? " " + hkl : ""} — ${yModeInfo?.label ?? yMode}`, font: { size: 12, color: T.textSecondary }, standoff: 8 },
+        gridcolor: T.border, color: T.textSecondary,
+        zeroline:  ps.zeroLines || yMode === "strain",
+        zerolinecolor: T.border,
+        ...(ps.yMin != null || ps.yMax != null ? { range: [ps.yMin ?? null, ps.yMax ?? null] } : {}),
+        ...(ps.yTick ? { dtick: ps.yTick } : {}),
+      },
+      shapes:    refShapes,
+      hovermode: "closest",
+      width: W, height: H,
+    };
+    return (
+      <Suspense fallback={<div style={{ height: H, background: T.bg1 }} />}>
+        <Plot data={traces} layout={layout} config={{ displayModeBar: false, responsive: !W }} style={{ width: "100%" }} />
+      </Suspense>
+    );
+  })();
+
+  return (
+    <div>
+      {plotEl}
+      {/* Inline config row */}
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end", marginTop: 10, paddingTop: 10, borderTop: `1px solid ${T.border}` }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Material</span>
+          <select value={material} onChange={e => onUpdate({ material: e.target.value })}
+            style={{ ...rc2, background: T.bg0, border: `1px solid ${material ? T.amber : T.border}`, color: material ? T.amber : T.textDim, minWidth: 110 }}>
+            <option value="">— select —</option>
+            {structures.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
+          </select>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>hkl</span>
+          <DeferredInput value={hkl} onChange={v => onUpdate({ hkl: v })} placeholder="e.g. 002"
+            style={{ ...rc2, width: 72, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center" }} />
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Y axis</span>
+          <select value={yMode} onChange={e => onUpdate({ y_mode: e.target.value })}
+            style={{ ...rc2, background: T.bg0, border: `1px solid ${T.border}`, color: T.textSecondary }}>
+            {XRD_POS_Y_MODES.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+          </select>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>X axis — growth param</span>
+          <select value={param} onChange={e => onUpdate({ param: e.target.value })}
+            style={{ ...rc2, background: T.bg0, border: `1px solid ${param ? T.border : T.border}`, color: T.textSecondary, minWidth: 150 }}>
+            <option value="">— select parameter —</option>
+            {XRD_POS_PARAMS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
+          </select>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Statistical Analysis panel ────────────────────────────────────────────────
+
+function pearsonR(xs, ys) {
+  const n = xs.length;
+  if (n < 2) return null;
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let num = 0, sx = 0, sy = 0;
+  for (let i = 0; i < n; i++) {
+    num += (xs[i] - mx) * (ys[i] - my);
+    sx  += (xs[i] - mx) ** 2;
+    sy  += (ys[i] - my) ** 2;
+  }
+  if (sx === 0 || sy === 0) return null;
+  return num / Math.sqrt(sx * sy);
+}
+
+function rankArray(arr) {
+  const sorted = arr.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v);
+  const ranks = new Array(arr.length);
+  // Handle ties by averaging ranks
+  let i = 0;
+  while (i < sorted.length) {
+    let j = i;
+    while (j < sorted.length - 1 && sorted[j + 1].v === sorted[j].v) j++;
+    const avgRank = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) ranks[sorted[k].i] = avgRank;
+    i = j + 1;
+  }
+  return ranks;
+}
+
+// Spearman ρ — Pearson applied to ranks (handles monotonic non-linear relationships)
+function spearmanRho(xs, ys) {
+  if (xs.length < 2) return null;
+  return pearsonR(rankArray(xs), rankArray(ys));
+}
+
+// OLS linear regression: returns { slope, intercept, r2 } or null
+function linearReg(xs, ys) {
+  const n = xs.length;
+  if (n < 2) return null;
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let sxy = 0, sxx = 0;
+  for (let i = 0; i < n; i++) { sxy += (xs[i] - mx) * (ys[i] - my); sxx += (xs[i] - mx) ** 2; }
+  if (sxx === 0) return null;
+  const slope = sxy / sxx;
+  const intercept = my - slope * mx;
+  const r = pearsonR(xs, ys);
+  return { slope, intercept, r2: r != null ? r * r : null };
+}
+
+// Coolwarm diverging colorscale matching matplotlib's coolwarm (gray center at r=0)
+const COOLWARM_SCALE = () => [
+  [0,    "#3b4cc0"],
+  [0.25, "#7aadfa"],
+  [0.5,  "#c8c8c8"],   // neutral gray at zero
+  [0.75, "#e87565"],
+  [1,    "#b40426"],
+];
+
+// Expand paired META params into two scalar entries (pos / neg)
+function buildStatParams(groups) {
+  return groups.map(g => ({
+    ...g,
+    params: g.params.flatMap(p => {
+      if (!p.paired) return [p];
+      return [
+        { ...p, id: p.id + "_pos", label: p.label + " (+)", paired: false,
+          extract: (s, pc, am, st) => { const r = p.extract(s, pc, am, st); return r?.pos ?? null; } },
+        { ...p, id: p.id + "_neg", label: p.label + " (−)", paired: false,
+          extract: (s, pc, am, st) => { const r = p.extract(s, pc, am, st); return r?.neg ?? null; } },
+      ];
+    }),
+  }));
+}
+
+// Multi-select param picker: dropdown with checkboxes, same visual style as CollapsibleParamSelect
+function StatParamPicker({ selectedIds, groups, onChange }) {
+  const [open, setOpen]         = useState(false);
+  const [expanded, setExpanded] = useState({});
+  const [dropUp, setDropUp]     = useState(false);
+  const btnRef                  = useRef(null);
+
+  const toggle = (id) => {
+    onChange(selectedIds.includes(id) ? selectedIds.filter(x => x !== id) : [...selectedIds, id]);
+  };
+  const count = selectedIds.length;
+
+  const handleOpen = () => {
+    if (!open && btnRef.current) {
+      const rect = btnRef.current.getBoundingClientRect();
+      setDropUp(window.innerHeight - rect.bottom < 360);
+    }
+    setOpen(v => !v);
+  };
+
+  return (
+    <div style={{ position: "relative" }}>
+      {open && <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />}
+      <button ref={btnRef} onClick={handleOpen}
+        style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: count ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 10px", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>
+        <span>{count ? `${count} parameter${count > 1 ? "s" : ""}` : "+ add parameters"}</span>
+        <span style={{ fontSize: 8, opacity: 0.5 }}>▼</span>
+      </button>
+      {open && (
+        <div onClick={e => e.stopPropagation()}
+          style={{ position: "absolute", left: 0, ...(dropUp ? { bottom: "calc(100% + 4px)" } : { top: "calc(100% + 4px)" }), background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, zIndex: 200, minWidth: 260, maxHeight: 340, overflowY: "auto", boxShadow: "0 4px 16px rgba(0,0,0,.5)" }}>
+          {groups.map(g => (
+            <div key={g.group}>
+              <div onClick={() => setExpanded(prev => ({ ...prev, [g.group]: !prev[g.group] }))}
+                style={{ padding: "5px 12px", fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 0.5, background: T.bg3, cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center", userSelect: "none", borderTop: `1px solid ${T.border}` }}>
+                <span>{g.group}</span>
+                <span style={{ fontSize: 9, opacity: 0.6 }}>{expanded[g.group] ? "▲" : "▼"}</span>
+              </div>
+              {expanded[g.group] && g.params.map(p => (
+                <label key={p.id} onClick={e => e.stopPropagation()}
+                  style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 12px 4px 20px", cursor: "pointer", userSelect: "none" }}>
+                  <input type="checkbox" checked={selectedIds.includes(p.id)} onChange={() => toggle(p.id)}
+                    style={{ accentColor: T.amber, cursor: "pointer" }} />
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: selectedIds.includes(p.id) ? T.textPrimary : T.textSecondary }}
+                    dangerouslySetInnerHTML={{ __html: `${p.label}${p.unit ? ` (${p.unit})` : ""}` }} />
+                </label>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatisticalAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {}, config = {}, plotStyle, activeMaterial, structures = [], onUpdate }) {
+  const ps          = plotStyle || DEFAULT_PLOT_STYLE;
+  const selectedIds  = config.stat_params  || [];
+  const corrMethod   = config.corr_method  || "pearson"; // "pearson" | "spearman"
+  const statsView    = config.stats_view   || "corr";    // "corr" | "effects"
+  const effectsY     = config.effects_y    || "";
+  const corrReduced  = config.corr_reduced ?? false;     // lower-triangle + gray input-input
+  // Single material selector covering both XRD and layer/growth params
+  const statMaterial = config.stat_material ?? config.xrd_material ?? config.growth_material ?? activeMaterial ?? "";
+  const [dragSrc, setDragSrc] = useState(null);
+  const sampleMap  = useMemo(() => Object.fromEntries(samples.map(s => [s.id, s])), [samples]);
+
+  // Dynamically build a "Stack" group:
+  //   "Has [material]" — 0/1 for each material that appears in any layer
+  //   "Buffer [mat1+mat2]" — 0/1 for each unique buffer-layer composition (co-sputter included)
+  const stackGroup = useMemo(() => {
+    const mats = new Set();
+    // Map from sorted-material-key → display label (e.g. "BTO+SRO")
+    const bufComboMap = new Map();
+    for (const sid of sampleOrder) {
+      const s = sampleMap[sid]; if (!s) continue;
+      for (const layer of (s.layers || [])) {
+        for (const t of (layer.targets || []))
+          if (t.material) mats.add(t.material);
+        if (layer.role === "buffer") {
+          const layerMats = (layer.targets || []).map(t => t.material).filter(Boolean).sort();
+          if (layerMats.length) {
+            const key = layerMats.join("\0");
+            if (!bufComboMap.has(key)) bufComboMap.set(key, layerMats.join("+"));
+          }
+        }
+      }
+    }
+    // Common material abbreviations for compact heatmap labels
+    const MAT_ABBREV = { LaSrMnO3: "LSMO", BaTiO3: "BTO", SrRuO3: "SRO", SrTiO3: "STO", BiFeO3: "BFO", PbZrTiO3: "PZT" };
+    const abbrevMat = m => MAT_ABBREV[m] || m;
+
+    const hasParams = [...mats].sort().map(mat => ({
+      id: `stack_has_${mat}`,
+      label: `Has ${mat}`,
+      corrLabel: `Has ${abbrevMat(mat)}`,
+      unit: "",
+      extract: (s) => (s.layers || []).some(l => (l.targets || []).some(t => t.material === mat)) ? 1 : 0,
+    }));
+    const bufParams = [...bufComboMap.entries()].map(([key, label]) => {
+      const comboMats = key.split("\0");
+      return {
+        id: `stack_buf_${key.replace(/\0/g, "_")}`,
+        label: `Buffer ${label}`,
+        corrLabel: "Buffer Layer",
+        unit: "",
+        extract: (s) => (s.layers || []).some(l =>
+          l.role === "buffer" &&
+          comboMats.every(m => (l.targets || []).some(t => t.material === m))
+        ) ? 1 : 0,
+      };
+    });
+    const params = [...hasParams, ...bufParams];
+    return params.length ? { group: "Stack", isInput: true, params } : null;
+  }, [sampleOrder, sampleMap]);
+
+  // Filtered groups (same data-availability logic as MetaAnalysisPanel)
+  const statGroups = useMemo(() => {
+    const baseGroups = buildStatParams(META_PARAM_GROUPS);
+    const hasPE    = sampleOrder.some(sid => plotCache[sid]?.pe?.length > 0);
+    const hasDielF = sampleOrder.some(sid => plotCache[sid]?.diel_f?.length > 0);
+    const hasDielB = sampleOrder.some(sid => (plotCache[sid]?.diel_b_up?.length || 0) + (plotCache[sid]?.diel_b_down?.length || 0) > 0);
+    const hasXRD   = sampleOrder.some(sid => {
+      const s = sampleMap[sid]; if (!s) return false;
+      const saved = s.xrd_peaks;
+      const lines = saved && !Array.isArray(saved) ? (saved.lines || []) : (Array.isArray(saved) ? saved : []);
+      return lines.some(l => l.fitted_center != null);
+    });
+    const filtered = baseGroups.map(g => {
+      let params;
+      if (g.group === "Growth" || g.group === "Sample") {
+        // Try activeMaterial first; fall back to any material present in the sample's layers
+        params = g.params.filter(p => sampleOrder.some(sid => {
+          const s = sampleMap[sid]; if (!s) return false;
+          if (activeMaterial && p.extract(s, {}, activeMaterial) != null) return true;
+          const mats = [...new Set((s.layers || []).flatMap(l => (l.targets || []).map(t => t.material).filter(Boolean)))];
+          return mats.some(m => p.extract(s, {}, m) != null);
+        }));
+      } else if (g.group === "P–E Hysteresis")        { params = hasPE    ? g.params : []; }
+      else if (g.group === "Dielectric — freq sweep") { params = hasDielF ? g.params : []; }
+      else if (g.group === "Dielectric — bias sweep") { params = hasDielB ? g.params : []; }
+      else if (g.group === "X-ray")                   { params = hasXRD   ? g.params : []; }
+      else                                             { params = g.params; }
+      return { ...g, params };
+    }).filter(g => g.params.length > 0);
+    return stackGroup ? [...filtered, stackGroup] : filtered;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sampleOrder, sampleMap, plotCache, activeMaterial, structures, stackGroup]);
+
+  const statParamsFlat = useMemo(() => statGroups.flatMap(g => g.params), [statGroups]);
+
+  // Set of param IDs that are "input" (growth conditions / stack flags) vs measured outputs
+  const inputParamIds = useMemo(() => {
+    const ids = new Set();
+    for (const g of statGroups) {
+      if (g.isInput) g.params.forEach(p => ids.add(p.id));
+    }
+    return ids;
+  }, [statGroups]);
+
+  const anyXRD   = selectedIds.some(id => statParamsFlat.find(p => p.id === id)?.needsXRD);
+  const anyLayer = selectedIds.some(id => statParamsFlat.find(p => p.id === id)?.needsLayer);
+
+  const growthMaterial = statMaterial;
+
+  // Extract a value map {sid → number} for each selected param
+  const paramData = useMemo(() => {
+    return selectedIds.map(id => {
+      const param = statParamsFlat.find(p => p.id === id);
+      if (!param) return null;
+      const mat = (param.needsXRD || param.needsLayer) ? statMaterial : activeMaterial;
+      const data = {};
+      for (const sid of sampleOrder) {
+        const s = sampleMap[sid]; if (!s) continue;
+        const raw = param.extract(s, plotCache, mat, structures);
+        if (raw == null || !isFinite(raw)) continue;
+        data[sid] = raw;
+      }
+      return { id, param, data };
+    }).filter(Boolean);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedIds, sampleOrder, sampleMap, plotCache, activeMaterial, statMaterial, structures, statParamsFlat]);
+
+  // Correlation matrix
+  const { matrix, nMatrix } = useMemo(() => {
+    const n = paramData.length;
+    const matrix  = Array.from({ length: n }, () => Array(n).fill(null));
+    const nMatrix = Array.from({ length: n }, () => Array(n).fill(0));
+    for (let i = 0; i < n; i++) {
+      matrix[i][i]  = 1;
+      nMatrix[i][i] = Object.keys(paramData[i].data).length;
+      for (let j = i + 1; j < n; j++) {
+        const common = sampleOrder.filter(sid => paramData[i].data[sid] != null && paramData[j].data[sid] != null);
+        nMatrix[i][j] = nMatrix[j][i] = common.length;
+        if (common.length < 2) { matrix[i][j] = matrix[j][i] = null; continue; }
+        const xs = common.map(sid => paramData[i].data[sid]);
+        const ys = common.map(sid => paramData[j].data[sid]);
+        const r = corrMethod === "spearman" ? spearmanRho(xs, ys) : pearsonR(xs, ys);
+        matrix[i][j] = matrix[j][i] = r;
+      }
+    }
+    return { matrix, nMatrix };
+  }, [paramData, sampleOrder, corrMethod]);
+
+  const stripHtml = s => s.replace(/<[^>]+>/g, "").replace(/&[a-z]+;/g, c => ({ "&lt;": "<", "&gt;": ">", "&amp;": "&" }[c] || c));
+
+  // Heatmap axis labels: use corrLabel (short form, no units) if defined, else label without units
+  const axLabels = paramData.map(pd =>
+    pd.param.corrLabel ? pd.param.corrLabel : stripHtml(pd.param.label)
+  );
+
+  const n = paramData.length;
+
+  // In reduced mode: rows = params[1..n-1] (skip first, it has no lower-tri cells)
+  //                  cols = params[0..n-2] (skip last, it has no lower-tri cells)
+  // In full mode:    rows = cols = all params
+  let rowParams = corrReduced ? paramData.slice(1)      : paramData;
+  let colParams = corrReduced ? paramData.slice(0, -1)  : paramData;
+  let yLabels   = corrReduced ? axLabels.slice(1)       : axLabels;
+  let xLabels   = corrReduced ? axLabels.slice(0, -1)   : axLabels;
+
+  // Maps from display row/col index → original paramData index
+  let rowOrigIdx = rowParams.map((_, r) => corrReduced ? r + 1 : r);
+  let colOrigIdx = colParams.map((_, c) => c);
+
+  // In reduced mode, prune rows whose every visible cell is input-input (all "—").
+  // Users can order input params to the top and they collapse out automatically.
+  // Then prune columns that become entirely empty after row pruning.
+  if (corrReduced) {
+    const rowMask = rowParams.map((rpd, r) => {
+      const i = rowOrigIdx[r];
+      // Keep if any visible cell (j < i) is not input-input
+      return colParams.some((cpd, c) => colOrigIdx[c] < i && !(inputParamIds.has(rpd.id) && inputParamIds.has(cpd.id)));
+    });
+    const keptRowParams  = rowParams.filter((_, r) => rowMask[r]);
+    const keptYLabels    = yLabels.filter((_, r) => rowMask[r]);
+    const keptRowOrigIdx = rowOrigIdx.filter((_, r) => rowMask[r]);
+
+    const colMask = colParams.map((cpd, c) => {
+      const j = colOrigIdx[c];
+      return keptRowParams.some((rpd, dr) => {
+        const i = keptRowOrigIdx[dr];
+        return j < i && !(inputParamIds.has(rpd.id) && inputParamIds.has(cpd.id));
+      });
+    });
+    rowParams  = keptRowParams;
+    yLabels    = keptYLabels;
+    rowOrigIdx = keptRowOrigIdx;
+    colParams  = colParams.filter((_, c) => colMask[c]);
+    xLabels    = xLabels.filter((_, c) => colMask[c]);
+    colOrigIdx = colOrigIdx.filter((_, c) => colMask[c]);
+  }
+
+  const nr = rowParams.length;
+  const nc = colParams.length;
+  const fSz = Math.max(nr, nc) > 6 ? 9 : 11;
+
+  const zData = rowParams.map((rpd, r) => {
+    const i = rowOrigIdx[r];
+    return colParams.map((cpd, c) => {
+      const j = colOrigIdx[c];
+      if (corrReduced && j >= i) return null;  // upper triangle + diagonal hidden
+      if (i === j) return 0;                   // diagonal → gray midpoint (full mode)
+      const bothInput = inputParamIds.has(rpd.id) && inputParamIds.has(cpd.id);
+      if (bothInput) return 0;                 // input-input → gray midpoint
+      return matrix[i]?.[j] ?? null;
+    });
+  });
+
+  const annotations = [];
+  for (let r = 0; r < nr; r++) {
+    const rpd = rowParams[r];
+    const i   = rowOrigIdx[r];
+    for (let c = 0; c < nc; c++) {
+      const cpd = colParams[c];
+      const j   = colOrigIdx[c];
+      if (corrReduced && j >= i) continue;     // skip upper triangle + diagonal
+      const bothInput = inputParamIds.has(rpd.id) && inputParamIds.has(cpd.id);
+      if (i === j || bothInput) {
+        annotations.push({
+          x: xLabels[c], y: yLabels[r], text: "—",
+          font: { size: fSz, family: ps.font || "'DM Mono', monospace", color: T.textDim },
+          showarrow: false, xref: "x", yref: "y",
+        });
+        continue;
+      }
+      const rv = matrix[i]?.[j];
+      const ns = nMatrix[i]?.[j];
+      const text    = rv == null ? "—" : rv.toFixed(2);
+      const subtext = (rv != null && ns < sampleOrder.length) ? `n=${ns}` : "";
+      annotations.push({
+        x: xLabels[c], y: yLabels[r], text: subtext ? `${text}<br><sub>${subtext}</sub>` : text,
+        font: { size: fSz, family: ps.font || "'DM Mono', monospace", color: rv != null && Math.abs(rv) > 0.6 ? "#ffffff" : T.textPrimary },
+        showarrow: false, xref: "x", yref: "y",
+      });
+    }
+  }
+
+  const corrColorscale = COOLWARM_SCALE();
+  const cellPx  = Math.max(48, Math.min(100, Math.floor(360 / Math.max(nr, nc, 1))));
+  const autoH   = nr > 0 ? Math.max(200, nr * cellPx + 80) : 200;
+  const displayW = ps.plotWidth  ? Math.round(ps.plotWidth  * 96) : null;
+  const displayH = ps.plotHeight ? Math.round(ps.plotHeight * 96) : autoH;
+
+  const trace = {
+    type: "heatmap",
+    z: zData, x: xLabels, y: yLabels,
+    zmin: -1, zmax: 1,
+    colorscale: corrColorscale,
+    showscale: false,
+    hovertemplate: `<b>%{y}</b> vs <b>%{x}</b><br>${corrMethod === "spearman" ? "ρ" : "r"} = %{z:.2f}<extra></extra>`,
+    xgap: 2, ygap: 2,
+  };
+
+  const layout = {
+    paper_bgcolor: T.bg1,
+    plot_bgcolor:  T.bg1,
+    modebar: { bgcolor: "transparent", color: T.textDim, activecolor: T.textPrimary },
+    margin: { t: 16, r: 16, b: 120, l: 120, pad: 0 },
+    font: { family: ps.font || "'DM Mono', monospace", size: ps.fontSize || 11, color: T.textDim },
+    xaxis: { tickangle: xLabels.length * Math.max(...xLabels.map(l => l.length), 0) > 60 ? -40 : 0, automargin: true, tickfont: { size: Math.max(8, (ps.fontSize || 11) - 1), family: ps.font }, side: "bottom", showgrid: false, zeroline: false },
+    yaxis: { automargin: true, tickfont: { size: Math.max(8, (ps.fontSize || 11) - 1), family: ps.font }, showgrid: false, zeroline: false, autorange: "reversed" },
+    annotations,
+    ...(displayW ? { width: displayW } : {}),
+    height: displayH,
+    uirevision: `stats-${selectedIds.join("-")}-${corrMethod}-${corrReduced}`,
+  };
+
+  // Main effects data: per-factor regression
+  const effectsYParam  = statParamsFlat.find(p => p.id === effectsY) || null;
+  const effectsYData   = effectsYParam ? paramData.find(pd => pd.id === effectsY) : null;
+  const effectsFactors = statsView === "effects"
+    ? paramData.filter(pd => pd.id !== effectsY)
+    : [];
+
+  const monoSm = { fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim };
+  const segBtn = (active) => ({ background: active ? T.bg3 : T.bg0, border: "none", borderRight: `1px solid ${T.border}`, color: active ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 10px", cursor: "pointer" });
+
+  const xrdMats = useMemo(() => [...new Set(sampleOrder.flatMap(sid => {
+    const s = sampleMap[sid]; if (!s) return [];
+    const saved = s.xrd_peaks;
+    const lines = saved && !Array.isArray(saved) ? (saved.lines || []) : (Array.isArray(saved) ? saved : []);
+    return lines.map(l => l.material).filter(Boolean);
+  }))].sort(), [sampleOrder, sampleMap]);
+
+  const layerMats = useMemo(() => [...new Set(sampleOrder.flatMap(sid => {
+    const s = sampleMap[sid]; if (!s) return [];
+    return (s.layers || []).flatMap(l => (l.targets || []).map(t => t.material).filter(Boolean));
+  }))].sort(), [sampleOrder, sampleMap]);
+
+  const effectsCols = config.effects_cols ? Number(config.effects_cols) : 3;
+
+  return (
+    <div>
+      {/* Parameter selector row — chips are draggable for reordering */}
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginBottom: 8 }}>
+        <StatParamPicker selectedIds={selectedIds} groups={statGroups} onChange={ids => onUpdate({ stat_params: ids })} />
+        {selectedIds.map((id, i) => {
+          const p = statParamsFlat.find(x => x.id === id);
+          if (!p) return null;
+          const lbl = stripHtml(`${p.label}${p.unit ? ` (${p.unit})` : ""}`);
+          const isOver = dragSrc != null && dragSrc !== i;
+          return (
+            <div key={id}
+              draggable
+              onDragStart={() => setDragSrc(i)}
+              onDragOver={e => { e.preventDefault(); }}
+              onDrop={() => {
+                if (dragSrc == null || dragSrc === i) return;
+                const next = [...selectedIds];
+                const [item] = next.splice(dragSrc, 1);
+                next.splice(i, 0, item);
+                onUpdate({ stat_params: next });
+                setDragSrc(null);
+              }}
+              onDragEnd={() => setDragSrc(null)}
+              style={{ display: "flex", alignItems: "center", gap: 4, background: T.bg3, border: `1px solid ${isOver ? T.amber : T.border}`, borderRadius: 4, padding: "2px 6px", cursor: "grab", opacity: dragSrc === i ? 0.4 : 1 }}>
+              <span style={{ ...monoSm, color: statsView === "effects" && id === effectsY ? T.amber : T.textSecondary }}>{lbl}</span>
+              <button onClick={() => onUpdate({ stat_params: selectedIds.filter(x => x !== id) })}
+                style={{ background: "none", border: "none", color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 13, lineHeight: 1, padding: 0, cursor: "pointer" }}>×</button>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Options row */}
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 16, marginBottom: 8 }}>
+        {/* View toggle */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ ...monoSm, textTransform: "uppercase", letterSpacing: 1 }}>VIEW</span>
+          <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+            <button onClick={() => onUpdate({ stats_view: "corr" })}    style={segBtn(statsView === "corr")}>Correlation</button>
+            <button onClick={() => onUpdate({ stats_view: "effects" })} style={{ ...segBtn(statsView === "effects"), borderRight: "none" }}>Main effects</button>
+          </div>
+        </div>
+        {/* Correlation method + reduce (only relevant for corr view) */}
+        {statsView === "corr" && (<>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ ...monoSm, textTransform: "uppercase", letterSpacing: 1 }}>METHOD</span>
+            <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+              <button onClick={() => onUpdate({ corr_method: "pearson" })}  style={segBtn(corrMethod === "pearson")}>Pearson r</button>
+              <button onClick={() => onUpdate({ corr_method: "spearman" })} style={{ ...segBtn(corrMethod === "spearman"), borderRight: "none" }}>Spearman ρ</button>
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ ...monoSm, textTransform: "uppercase", letterSpacing: 1 }}>REDUCE</span>
+            <button onClick={() => onUpdate({ corr_reduced: !corrReduced })}
+              style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", borderRadius: 4, border: `1px solid ${corrReduced ? T.accent : T.border}`, background: corrReduced ? T.accent + "22" : "none", color: corrReduced ? T.accent : T.textDim, cursor: "pointer" }}>
+              {corrReduced ? "on" : "off"}
+            </button>
+          </div>
+        </>)}
+        {/* Response selector (main effects only) */}
+        {statsView === "effects" && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ ...monoSm, textTransform: "uppercase", letterSpacing: 1 }}>RESPONSE</span>
+            <select value={effectsY} onChange={e => onUpdate({ effects_y: e.target.value })}
+              style={{ background: T.bg0, border: `1px solid ${effectsY ? T.amber : T.border}`, borderRadius: 4, color: effectsY ? T.amber : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 8px" }}>
+              <option value="">— pick Y —</option>
+              {selectedIds.map(id => { const p = statParamsFlat.find(x => x.id === id); return p ? <option key={id} value={id}>{stripHtml(`${p.label}${p.unit ? ` (${p.unit})` : ""}`)}</option> : null; })}
+            </select>
+          </div>
+        )}
+        {/* Unified material selector — shown when any XRD or layer/growth param is active */}
+        {(anyXRD || anyLayer) && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ ...monoSm, textTransform: "uppercase", letterSpacing: 1 }}>MAT</span>
+            <select value={statMaterial} onChange={e => onUpdate({ stat_material: e.target.value })}
+              style={{ background: T.bg0, border: `1px solid ${statMaterial ? T.amber : T.border}`, borderRadius: 4, color: statMaterial ? T.amber : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 8px" }}>
+              <option value="">— material —</option>
+              {[...new Set([...xrdMats, ...layerMats])].sort().map(m => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </div>
+        )}
+      </div>
+
+      {/* ── Correlation heatmap ── */}
+      {statsView === "corr" && (n < 2 ? (
+        <div style={{ ...monoSm, padding: "32px 0" }}>Select at least 2 parameters above to compute correlations.</div>
+      ) : (
+        <SciPlotWrap ps={ps}>
+          {() => (
+            <Plot data={[trace]} layout={layout} config={buildPlotConfig("stats-corr", ps)}
+              style={{ width: displayW ? `${displayW}px` : "100%", height: `${displayH}px` }}
+              useResizeHandler />
+          )}
+        </SciPlotWrap>
+      ))}
+
+      {/* ── Main effects plots ── */}
+      {statsView === "effects" && (!effectsY || !effectsYData ? (
+        <div style={{ ...monoSm, padding: "32px 0" }}>Pick a response variable above, then add factor parameters.</div>
+      ) : effectsFactors.length === 0 ? (
+        <div style={{ ...monoSm, padding: "32px 0" }}>Add at least one factor parameter (other than the response).</div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(effectsFactors.length, effectsCols)}, 1fr)`, gap: "16px 12px", marginTop: 8 }}>
+          {effectsFactors.map(factorPd => {
+            const common = sampleOrder.filter(sid => factorPd.data[sid] != null && effectsYData.data[sid] != null);
+            const xs = common.map(sid => factorPd.data[sid]);
+            const ys = common.map(sid => effectsYData.data[sid]);
+            const reg = linearReg(xs, ys);
+            const xLabel = stripHtml(`${factorPd.param.label}${factorPd.param.unit ? ` (${factorPd.param.unit})` : ""}`);
+            const yLabel = stripHtml(`${effectsYParam.label}${effectsYParam.unit ? ` (${effectsYParam.unit})` : ""}`);
+            // Regression line span
+            const xMin = Math.min(...xs), xMax = Math.max(...xs);
+            const pad = (xMax - xMin) * 0.15 || Math.abs(xMin) * 0.1 || 1;
+            const rx0 = xMin - pad, rx1 = xMax + pad;
+            const traces = [
+              // Regression line
+              ...(reg ? [{ x: [rx0, rx1], y: [reg.intercept + reg.slope * rx0, reg.intercept + reg.slope * rx1],
+                type: "scatter", mode: "lines", line: { color: T.textDim, width: 1.5, dash: "dash" },
+                hoverinfo: "skip", showlegend: false }] : []),
+              // Sample points
+              ...common.map((sid, ci) => {
+                const idx = sampleOrder.indexOf(sid);
+                return {
+                  x: [xs[ci]], y: [ys[ci]],
+                  type: "scatter", mode: ps.metaLabels ? "markers+text" : "markers",
+                  marker: { color: colors[idx] ?? T.teal, size: 9, line: { color: T.bg0, width: 1.5 } },
+                  text: ps.metaLabels ? [labels[sid] || sid] : undefined,
+                  textposition: "top center",
+                  textfont: { size: (ps.fontSize || 11) - 1, family: ps.font, color: colors[idx] },
+                  hovertemplate: `<b>${labels[sid] || sid}</b><br>${xLabel}: %{x}<br>${yLabel}: %{y}<extra></extra>`,
+                  showlegend: false,
+                };
+              }),
+            ];
+            const r2Str = reg?.r2 != null ? `R² = ${reg.r2.toFixed(2)}` : "";
+            const r2Corner = reg && reg.slope >= 0
+              ? { x: 0.03, xanchor: "left" }
+              : { x: 0.97, xanchor: "right" };
+            const effLayout = buildPlotLayout(
+              ps,
+              { title: { text: xLabel, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 6 } },
+              { title: { text: yLabel, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 6 } },
+              [],
+              {
+                margin: { t: 28, r: 12, b: 52, l: 60, pad: 0 },
+                annotations: r2Str ? [{ xref: "paper", yref: "paper", ...r2Corner, y: 0.97, yanchor: "top", text: r2Str, showarrow: false, font: { size: (ps.fontSize || 11) - 1, family: ps.font, color: T.textDim }, bgcolor: T.bg1 + "dd", borderpad: 3 }] : [],
+                uirevision: `effects-${factorPd.id}-${effectsY}`,
+              }
+            );
+            return (
+              <SciPlotWrap key={factorPd.id} ps={ps} noSpacer>
+                {() => (
+                  <Plot data={traces} layout={effLayout} config={{ ...buildPlotConfig(`effects-${factorPd.id}`, ps), displayModeBar: "hover" }}
+                    style={{ width: "100%", height: "240px" }} useResizeHandler />
+                )}
+              </SciPlotWrap>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, labels = {}, colorScale: bookColorScale = "viridis", structures = [], activeMaterial = null, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver }) {
   const { type, config } = panel;
   const [cogOpen, setCogOpen] = useState(false);
   const [savedFlash, setSavedFlash] = useState(false);
@@ -5595,6 +6839,8 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
     xMax:           config.x_max  != null ? Number(config.x_max)  : null,
     yMin:           config.y_min  != null ? Number(config.y_min)  : null,
     yMax:           config.y_max  != null ? Number(config.y_max)  : null,
+    peXAxis:        config.pe_x_axis      || "field",
+    deXAxis:        config.de_x_axis      || "field",
     metaLabels:     config.meta_labels    ?? false,
     y2Tick:         config.plot_y2_tick   || null,
     y2Min:          config.y2_min  != null ? Number(config.y2_min)  : null,
@@ -5614,6 +6860,9 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
           style={{ cursor: "grab", color: T.textDim, fontSize: 13, lineHeight: 1, padding: "0 1px", userSelect: "none", opacity: 0.5, flexShrink: 0 }}>⠿</div>
         <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>{PANEL_LABELS[type] || type}</span>
         <div style={{ flex: 1 }} />
+        {/* Duplicate */}
+        <button onClick={onDuplicate} title="Duplicate panel"
+          style={{ ...btnStyle, fontSize: 14 }}>⧉</button>
         {/* Cog */}
         <div style={{ position: "relative" }}>
           {cogOpen && <div onClick={() => setCogOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />}
@@ -5732,8 +6981,8 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>in</span>
                 </div>
               </div>
-              {/* Point labels — meta only */}
-              {type === "meta" && (
+              {/* Point labels — meta / xrd_pos */}
+              {(type === "meta" || type === "xrd_pos") && (
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>LABELS</span>
                   <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
@@ -5788,6 +7037,20 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                   </div>
                 ) : null;
               })()}
+              {/* PE / DE x-axis unit toggle */}
+              {(type === "pe" || type === "de") && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>X AXIS</span>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    {[{ v: "field", label: "kV/cm" }, { v: "voltage", label: "V" }].map(({ v, label }) => (
+                      <button key={v} onClick={() => onUpdate({ [type === "pe" ? "pe_x_axis" : "de_x_axis"]: v, x_min: null, x_max: null, x_tick: null })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 8px", borderRadius: 4, border: `1px solid ${(type === "pe" ? ps.peXAxis : ps.deXAxis) === v ? T.accent : T.border}`, background: (type === "pe" ? ps.peXAxis : ps.deXAxis) === v ? T.accent + "22" : T.bg0, color: (type === "pe" ? ps.peXAxis : ps.deXAxis) === v ? T.accent : T.textDim, cursor: "pointer" }}>
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
               {/* X/Y Range — for panels other than xrd/rsm/afm which have their own range controls */}
               {type !== "xrd" && type !== "rsm" && type !== "afm" && <>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -5836,6 +7099,16 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                   </div>
                 </>}
               </>}
+              {/* Stats-specific */}
+              {type === "stats" && <>
+                <div style={{ borderTop: `1px solid ${T.border}`, margin: "2px 0" }} />
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>COLS</span>
+                  <DeferredInput type="number" value={config.effects_cols ?? 3} onChange={v => onUpdate({ effects_cols: Math.max(1, Math.min(6, Number(v) || 3)) })}
+                    className="no-spin" min="1" max="6" step="1" placeholder="3"
+                    style={{ width: 52, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                </div>
+              </>}
               {/* XRD-specific */}
               {type === "xrd" && <>
                 <div style={{ borderTop: `1px solid ${T.border}`, margin: "2px 0" }} />
@@ -5871,6 +7144,15 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                       style={{ width: 48, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
                     <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>dec.</span>
                   </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>NORMALIZE</span>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                    <input type="checkbox" checked={config.normalize_baseline ?? true}
+                      onChange={e => onUpdate({ normalize_baseline: e.target.checked })}
+                      style={{ accentColor: T.amber }} />
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>baseline</span>
+                  </label>
                 </div>
               </>}
               {/* RSM-specific */}
@@ -6012,12 +7294,190 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
           style={btnStyle}>×</button>
       </div>
       {type === "xrd"  && <XRDComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} structures={structures} config={config} plotStyle={ps} onUpdate={onUpdate} />}
-      {type === "pe"   && <PEComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
+      {type === "pe"   && <PEComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
       {type === "rsm"  && <RSMComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} structures={structures} />}
       {type === "afm"  && <AfmComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
-      {type === "de"   && <DEComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
+      {type === "de"   && <DEComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
       {type === "df"   && <DfComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
-      {type === "meta" && <MetaAnalysisPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} onUpdate={onUpdate} />}
+      {type === "meta" && <MetaAnalysisPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
+      {type === "xrd_pos" && <XRDPeakPositionPanel sampleOrder={sampleOrder} samples={samples} colors={colors} labels={labels} config={config} plotStyle={ps} structures={structures} onUpdate={onUpdate} />}
+      {type === "stats"      && <StatisticalAnalysisPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
+      {type === "parcoords"  && <ParallelCoordsPanel       sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
+    </div>
+  );
+}
+
+// ── Parallel Coordinates Panel ────────────────────────────────────────────────
+
+function ParallelCoordsPanel({ sampleOrder, samples, plotCache, colors, labels = {}, config = {}, plotStyle, activeMaterial, structures = [], onUpdate }) {
+  const ps           = plotStyle || DEFAULT_PLOT_STYLE;
+  const selectedIds  = config.stat_params  || [];
+  const statMaterial = config.stat_material ?? activeMaterial ?? "";
+  const sampleMap    = useMemo(() => Object.fromEntries(samples.map(s => [s.id, s])), [samples]);
+  const monoSm       = { fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim };
+  const stripHtml    = s => s.replace(/<[^>]+>/g, "").replace(/&[a-z]+;/g, c => ({ "&lt;": "<", "&gt;": ">", "&amp;": "&" }[c] || c));
+
+  // ── reuse same group/param infrastructure as stats panel ──────────────────
+  const stackGroup = useMemo(() => {
+    const mats = new Set();
+    const bufComboMap = new Map();
+    for (const sid of sampleOrder) {
+      const s = sampleMap[sid]; if (!s) continue;
+      for (const layer of (s.layers || [])) {
+        for (const t of (layer.targets || [])) if (t.material) mats.add(t.material);
+        if (layer.role === "buffer") {
+          const lm = (layer.targets || []).map(t => t.material).filter(Boolean).sort();
+          if (lm.length) { const key = lm.join("\0"); if (!bufComboMap.has(key)) bufComboMap.set(key, lm.join("+")); }
+        }
+      }
+    }
+    const sorted = [...mats].sort();
+    const hasP = sorted.map(mat => ({ id: `stack_has_${mat}`, label: `Has ${mat}`, unit: "", extract: s => (s.layers||[]).some(l=>(l.targets||[]).some(t=>t.material===mat))?1:0 }));
+    const bufP = [...bufComboMap.entries()].map(([key, label]) => {
+      const cm = key.split("\0");
+      return { id: `stack_buf_${key.replace(/\0/g,"_")}`, label: `Buffer ${label}`, unit: "", extract: s => (s.layers||[]).some(l=>l.role==="buffer"&&cm.every(m=>(l.targets||[]).some(t=>t.material===m)))?1:0 };
+    });
+    const params = [...hasP, ...bufP];
+    return params.length ? { group: "Stack", params } : null;
+  }, [sampleOrder, sampleMap]);
+
+  const statGroups = useMemo(() => {
+    const baseGroups = buildStatParams(META_PARAM_GROUPS);
+    const hasPE    = sampleOrder.some(sid => plotCache[sid]?.pe?.length > 0);
+    const hasDielF = sampleOrder.some(sid => plotCache[sid]?.diel_f?.length > 0);
+    const hasDielB = sampleOrder.some(sid => (plotCache[sid]?.diel_b_up?.length||0)+(plotCache[sid]?.diel_b_down?.length||0) > 0);
+    const hasXRD   = sampleOrder.some(sid => { const s=sampleMap[sid]; if(!s) return false; const saved=s.xrd_peaks; const lines=saved&&!Array.isArray(saved)?(saved.lines||[]):(Array.isArray(saved)?saved:[]); return lines.some(l=>l.fitted_center!=null); });
+    const filtered = baseGroups.map(g => {
+      let params;
+      if (g.group === "Growth" || g.group === "Sample") {
+        params = g.params.filter(p => sampleOrder.some(sid => {
+          const s = sampleMap[sid]; if (!s) return false;
+          if (activeMaterial && p.extract(s, {}, activeMaterial) != null) return true;
+          return [...new Set((s.layers||[]).flatMap(l=>(l.targets||[]).map(t=>t.material).filter(Boolean)))].some(m => p.extract(s,{},m)!=null);
+        }));
+      } else if (g.group==="P–E Hysteresis")        { params = hasPE    ? g.params : []; }
+        else if (g.group==="Dielectric — freq sweep") { params = hasDielF ? g.params : []; }
+        else if (g.group==="Dielectric — bias sweep") { params = hasDielB ? g.params : []; }
+        else if (g.group==="X-ray")                   { params = hasXRD   ? g.params : []; }
+        else                                           { params = g.params; }
+      return { ...g, params };
+    }).filter(g => g.params.length > 0);
+    return stackGroup ? [...filtered, stackGroup] : filtered;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sampleOrder, sampleMap, plotCache, activeMaterial, structures, stackGroup]);
+
+  const statParamsFlat = useMemo(() => statGroups.flatMap(g => g.params), [statGroups]);
+  const anyXRD   = selectedIds.some(id => statParamsFlat.find(p => p.id === id)?.needsXRD);
+  const anyLayer = selectedIds.some(id => statParamsFlat.find(p => p.id === id)?.needsLayer);
+
+  const xrdMats   = useMemo(() => [...new Set(sampleOrder.flatMap(sid => { const s=sampleMap[sid]; if(!s) return []; const saved=s.xrd_peaks; const lines=saved&&!Array.isArray(saved)?(saved.lines||[]):(Array.isArray(saved)?saved:[]); return lines.map(l=>l.material).filter(Boolean); }))].sort(), [sampleOrder, sampleMap]);
+  const layerMats = useMemo(() => [...new Set(sampleOrder.flatMap(sid => { const s=sampleMap[sid]; if(!s) return []; return (s.layers||[]).flatMap(l=>(l.targets||[]).map(t=>t.material).filter(Boolean)); }))].sort(), [sampleOrder, sampleMap]);
+  const allMats   = useMemo(() => [...new Set([...xrdMats, ...layerMats])].sort(), [xrdMats, layerMats]);
+
+  const paramData = useMemo(() => {
+    return selectedIds.map(id => {
+      const param = statParamsFlat.find(p => p.id === id); if (!param) return null;
+      const mat = (param.needsXRD || param.needsLayer) ? statMaterial : activeMaterial;
+      const data = {};
+      for (const sid of sampleOrder) {
+        const s = sampleMap[sid]; if (!s) continue;
+        const raw = param.extract(s, plotCache, mat, structures);
+        if (raw == null || !isFinite(raw)) continue;
+        data[sid] = raw;
+      }
+      return { id, param, data };
+    }).filter(Boolean);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedIds, sampleOrder, sampleMap, plotCache, activeMaterial, statMaterial, structures, statParamsFlat]);
+
+  // ── Plotly parcoords trace ─────────────────────────────────────────────────
+  const n = sampleOrder.length;
+  const colorscale = n <= 1
+    ? [[0, colors[0] ?? T.teal], [1, colors[0] ?? T.teal]]
+    : colors.slice(0, n).map((c, i) => [i / (n - 1), c]);
+
+  const dimensions = paramData.map(pd => {
+    const vals = sampleOrder.map(sid => pd.data[sid] ?? NaN);
+    const isBinary = sampleOrder.every(sid => pd.data[sid] == null || pd.data[sid] === 0 || pd.data[sid] === 1);
+    const dim = { label: stripHtml(`${pd.param.label}${pd.param.unit ? ` (${pd.param.unit})` : ""}`), values: vals };
+    if (isBinary) { dim.tickvals = [0, 1]; dim.ticktext = ["No", "Yes"]; dim.range = [-0.3, 1.3]; }
+    return dim;
+  });
+
+  const trace = {
+    type: "parcoords",
+    line: { color: sampleOrder.map((_, i) => i), colorscale, showscale: false },
+    dimensions,
+    unselected: { line: { opacity: 0.08 } },
+    labelfont:  { family: ps.font, size: ps.fontSize,         color: T.textSecondary },
+    tickfont:   { family: ps.font, size: (ps.fontSize||11)-1, color: T.textDim       },
+    rangefont:  { family: ps.font, size: (ps.fontSize||11)-2, color: T.textDim       },
+  };
+
+  const layout = {
+    paper_bgcolor: "transparent",
+    plot_bgcolor:  "transparent",
+    font: { family: ps.font, size: ps.fontSize, color: T.textSecondary },
+    margin: { t: 48, r: 60, b: 16, l: 80 },
+    modebar: { bgcolor: "transparent", color: T.textDim, activecolor: T.textPrimary },
+    uirevision: `parcoords-${selectedIds.join("-")}`,
+  };
+
+  return (
+    <div>
+      {/* Param picker + chips */}
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginBottom: 8 }}>
+        <StatParamPicker selectedIds={selectedIds} groups={statGroups} onChange={ids => onUpdate({ stat_params: ids })} />
+        {selectedIds.map(id => {
+          const p = statParamsFlat.find(x => x.id === id);
+          const lbl = p ? stripHtml(`${p.label}${p.unit ? ` (${p.unit})` : ""}`) : id;
+          return (
+            <div key={id} style={{ display: "flex", alignItems: "center", gap: 4, background: T.bg3, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 6px" }}>
+              <span style={{ ...monoSm, color: T.textSecondary }}>{lbl}</span>
+              <button onClick={() => onUpdate({ stat_params: selectedIds.filter(x => x !== id) })}
+                style={{ background: "none", border: "none", color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 13, lineHeight: 1, padding: 0, cursor: "pointer" }}>×</button>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* MAT selector */}
+      {(anyXRD || anyLayer) && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <span style={{ ...monoSm, textTransform: "uppercase", letterSpacing: 1 }}>MAT</span>
+          <select value={statMaterial} onChange={e => onUpdate({ stat_material: e.target.value })}
+            style={{ background: T.bg0, border: `1px solid ${statMaterial ? T.amber : T.border}`, borderRadius: 4, color: statMaterial ? T.amber : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 8px" }}>
+            <option value="">— material —</option>
+            {allMats.map(m => <option key={m} value={m}>{m}</option>)}
+          </select>
+        </div>
+      )}
+
+      {/* Plot */}
+      {dimensions.length < 2 ? (
+        <div style={{ ...monoSm, padding: "32px 0" }}>Select at least 2 parameters above.</div>
+      ) : (
+        <SciPlotWrap ps={ps} noSpacer>
+          {() => (
+            <Plot data={[trace]} layout={layout}
+              config={{ ...buildPlotConfig("parcoords", ps), displayModeBar: false }}
+              style={{ width: "100%", height: "300px" }}
+              useResizeHandler />
+          )}
+        </SciPlotWrap>
+      )}
+
+      {/* Sample legend */}
+      {n > 0 && dimensions.length >= 2 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 14px", marginTop: 8 }}>
+          {sampleOrder.map((sid, i) => (
+            <div key={sid} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <div style={{ width: 20, height: 2, background: colors[i] ?? T.teal, borderRadius: 1 }} />
+              <span style={{ ...monoSm, fontSize: 10, color: T.textSecondary }}>{labels[sid] || sid}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -6027,13 +7487,15 @@ function AddPanelRow({ onAdd }) {
   const [openUp, setOpenUp] = useState(false);
   const btnRef = useRef(null);
   const PANEL_TYPES = [
-    { type: "xrd",  label: "XRD ω–2θ"      },
-    { type: "rsm",  label: "RSM"            },
-    { type: "afm",  label: "Scanning Probe" },
-    { type: "pe",   label: "P–E Hysteresis" },
-    { type: "de",   label: "εᵣ vs E"        },
-    { type: "df",   label: "εᵣ vs f"        },
-    { type: "meta", label: "Meta-analysis"  },
+    { type: "xrd",       label: "XRD ω–2θ"              },
+    { type: "rsm",       label: "RSM"                   },
+    { type: "afm",       label: "Scanning Probe"        },
+    { type: "pe",        label: "P–E Hysteresis"        },
+    { type: "de",        label: "εᵣ vs E"               },
+    { type: "df",        label: "εᵣ vs f"               },
+    { type: "meta",      label: "Meta-analysis"         },
+    { type: "stats",     label: "Statistical Analysis"  },
+    { type: "parcoords", label: "Parallel Coordinates"  },
   ];
   const toggle = () => {
     if (!open && btnRef.current) {
@@ -6137,6 +7599,13 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings }
           onDrop={() => { if (panelDragIdx !== null && panelDragIdx !== i) reorderPanels(panelDragIdx, i); setPanelDragIdx(null); setPanelDragOverIdx(null); }}
           onDragEnd={() => { setPanelDragIdx(null); setPanelDragOverIdx(null); }}
           onRemove={() => updateCfg({ panels: panels.filter(p => p.id !== panel.id) })}
+          onDuplicate={() => {
+            const clone = { ...panel, id: String(Date.now()), config: { ...panel.config } };
+            const idx = panels.indexOf(panel);
+            const next = [...panels];
+            next.splice(idx + 1, 0, clone);
+            updateCfg({ panels: next });
+          }}
           onUpdate={patch => updateCfg({ panels: panels.map(p => p.id === panel.id ? { ...p, config: { ...p.config, ...patch } } : p) })}
         />
       ))}
@@ -6386,8 +7855,11 @@ export default function App() {
   const [exportOpen,   setExportOpen]   = useState(false);
 
   const handleSaveSettings = (s) => {
-    saveSettings(s);
-    setSettings(s);
+    // Always deep-merge with current settings so partial updates (e.g. xrd_configs)
+    // never silently wipe other fields (structures, materials, etc.)
+    const merged = mergeSettings({ ...settings, ...s });
+    saveSettings(merged);
+    setSettings(merged);
   };
 
   // Persist theme choice + sync body background
