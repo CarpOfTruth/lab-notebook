@@ -4241,9 +4241,15 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
     const yDomMin = posY.length ? Math.pow(10, Math.floor(Math.log10(Math.min(...posY))) - padBelow) : 1e-1;
     const yDomMax = posY.length ? Math.pow(10, Math.ceil(Math.log10(Math.max(...posY)))  + padAbove) : 1e8;
     const allX    = traces.flatMap(t => t.data.map(p => p.x));
-    const { ticks: xTicks, domain: xDomain } = allX.length
+    const { ticks: xTicksAuto, domain: xDomainAuto } = allX.length
       ? niceLinTicks(Math.min(...allX), Math.max(...allX))
       : { ticks: [], domain: ["auto", "auto"] };
+    const xDomLo = thetaMin != null ? thetaMin : xDomainAuto[0];
+    const xDomHi = thetaMax != null ? thetaMax : xDomainAuto[1];
+    const xDomain = (xDomLo === "auto" || xDomHi === "auto") ? xDomainAuto : [xDomLo, xDomHi];
+    const { ticks: xTicks } = (xDomain[0] !== "auto")
+      ? niceLinTicks(xDomain[0], xDomain[1])
+      : { ticks: xTicksAuto };
     return { traces, yDomMin, yDomMax, xTicks, xDomain };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sampleOrder.join(","), plotCache, thetaMin, thetaMax, offsetDecades, padAbove, padBelow, normalizeBase, colors.join(",")]);
