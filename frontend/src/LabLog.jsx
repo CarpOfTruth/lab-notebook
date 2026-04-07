@@ -2192,20 +2192,19 @@ function fitLaueFreeze(xrdData, peak, fitWindow, bgResult, thicknessNm) {
   const thetaB = peak.center * Math.PI / 360; // 2theta → theta
   const sinB   = Math.sin(thetaB);
 
-  // sinc² Laue model: evaluate at 2theta
-  const laueProfile = (twoTheta, t, sigInstr) => {
+  // sinc² Laue model: evaluate at actual 2θ value given fitted center cen
+  const laueProfile = (twoTheta, cen, t, sigInstr) => {
     const theta    = twoTheta * Math.PI / 360;
-    const dSin     = Math.sin(theta) - sinB;
+    const thetaCen = cen      * Math.PI / 360;
+    const dSin     = Math.sin(theta) - Math.sin(thetaCen);
     const arg      = Math.PI * t * dSin / LAMBDA;
     const sinc2    = Math.abs(arg) < 1e-9 ? 1 : Math.pow(Math.sin(arg) / arg, 2);
-    // Instrument broadening: convolve analytically only shifts Gaussian width,
-    // but since we're per-point just apply Gaussian envelope centred at peak.center.
-    // For thin films, instrument broadening << Laue width, so treat multiplicatively.
-    const gEnv     = sigInstr > 0 ? Math.exp(-0.5 * Math.pow((twoTheta - peak.center) / sigInstr, 2)) : 1;
+    // Instrument broadening as multiplicative Gaussian envelope
+    const gEnv     = sigInstr > 0 ? Math.exp(-0.5 * Math.pow((twoTheta - cen) / sigInstr, 2)) : 1;
     return sinc2 * gEnv;
   };
 
-  // t seed: supplied, or estimate from fringe spacing if visible
+  // t seed: supplied, or fallback to 20 nm
   const tSeed = (thicknessNm && thicknessNm > 0) ? thicknessNm : 20;
   const tol   = peak.width;
 
@@ -2223,7 +2222,7 @@ function fitLaueFreeze(xrdData, peak, fitWindow, bgResult, thicknessNm) {
     const sig = Math.exp(params[3]);
     let s = 0;
     for (let i = 0; i < xs.length; i++) {
-      const model = Math.max(bgAtPts[i] + amp * laueProfile(xs[i] - cen + peak.center, t, sig), 1e-10);
+      const model = Math.max(bgAtPts[i] + amp * laueProfile(xs[i], cen, t, sig), 1e-10);
       s += model - ys[i] * Math.log(model);
     }
     return s;
@@ -2617,10 +2616,31 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
           }
         }
 
-        // Fit each fringe peak independently
+        // Fit each fringe peak independently and build display curves
+        const allPtsSorted = [...xrdData].sort((a, b) => a.x - b.x);
         for (const fp of fringePeaks) {
           const res = fitLaueFreeze(xrdData, fp, fitWindow, bg, fp.fringeThicknessNm);
-          if (res) mergedResults[fp.id] = res;
+          if (!res) continue;
+          mergedResults[fp.id] = res;
+          // Build peak curve for display — same x-grid as fitting window
+          const pts = fitWindow
+            ? allPtsSorted.filter(p => p.x >= fitWindow[0] && p.x <= fitWindow[1])
+            : allPtsSorted.filter(p => Math.abs(p.x - fp.center) <= fp.width);
+          if (pts.length >= 2) {
+            const xMin = pts[0].x, xMax = pts[pts.length - 1].x;
+            const nFine = 400;
+            const fxs = Array.from({ length: nFine }, (_, k) => xMin + k * (xMax - xMin) / (nFine - 1));
+            const thetaCen = res.center * Math.PI / 360;
+            const fys = fxs.map(x => {
+              const theta = x * Math.PI / 360;
+              const dSin = Math.sin(theta) - Math.sin(thetaCen);
+              const arg = Math.PI * res.thickness_nm * dSin / 0.15406;
+              const sinc2 = Math.abs(arg) < 1e-9 ? 1 : Math.pow(Math.sin(arg) / arg, 2);
+              const gEnv = res.fwhmG > 0 ? Math.exp(-0.5 * Math.pow((x - res.center) / (res.fwhmG / 2.355), 2)) : 1;
+              return res.amplitude * sinc2 * gEnv;
+            });
+            peakCurvesOut.push({ id: fp.id, x: fxs, y: fys });
+          }
         }
 
         if (Object.keys(mergedResults).length) {
