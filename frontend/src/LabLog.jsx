@@ -3152,7 +3152,6 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
 // ── ViewDataModal ──────────────────────────────────────────────────────────────
 
 function ViewDataModal({ sampleId, files, loading, onClose }) {
-  const T = useTheme();
 
   const fmt = (bytes) => {
     if (bytes < 1024) return `${bytes} B`;
