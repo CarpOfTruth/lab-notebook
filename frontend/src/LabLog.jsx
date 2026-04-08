@@ -8372,19 +8372,41 @@ export default function App() {
     setImporting(true);
     setImportError(null);
     try {
-      const form = new FormData();
-      form.append("file", file);
-      const res = await fetch(`${API_BASE}/samples/import`, { method: "POST", body: form });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.detail || "Import failed");
-      // Refresh samples list
-      const updated = await api("GET", "/samples");
-      setSamples(updated);
-      setActive(json.id);
+      await doImport(file, false);
     } catch (err) {
       setImportError(err.message);
     }
     setImporting(false);
+  };
+
+  const doImport = async (file, merge) => {
+    const form = new FormData();
+    form.append("file", file);
+    const url = `${API_BASE}/samples/import${merge ? "?merge=true" : ""}`;
+    const res = await fetch(url, { method: "POST", body: form });
+    const json = await res.json();
+    if (res.status === 409) {
+      const sampleId = json.detail?.match(/'([^']+)'/)?.[1] ?? "this sample";
+      const ok = window.confirm(
+        `'${sampleId}' already exists.\n\n` +
+        `Merge? Metadata will be overwritten. Existing data files will be kept; missing ones restored.`
+      );
+      if (!ok) return;
+      // re-read the file bytes since FormData body was already consumed
+      const mergeForm = new FormData();
+      mergeForm.append("file", file);
+      const mergeRes = await fetch(`${API_BASE}/samples/import?merge=true`, { method: "POST", body: mergeForm });
+      const mergeJson = await mergeRes.json();
+      if (!mergeRes.ok) throw new Error(mergeJson.detail || "Merge failed");
+      const updated = await api("GET", "/samples");
+      setSamples(updated);
+      setActive(mergeJson.id);
+      return;
+    }
+    if (!res.ok) throw new Error(json.detail || "Import failed");
+    const updated = await api("GET", "/samples");
+    setSamples(updated);
+    setActive(json.id);
   };
 
   const handleReparseFiles = async () => {

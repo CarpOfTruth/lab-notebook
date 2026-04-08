@@ -334,10 +334,13 @@ def get_file(sample_id: str, filename: str):
 
 
 @app.post("/api/samples/import")
-async def import_sample(file: UploadFile = File(...)):
+async def import_sample(file: UploadFile = File(...), merge: bool = False):
     """
-    Accept a .zip produced by /export, recreate the sample record and all
-    uploaded data files.  Returns 409 if the sample ID already exists.
+    Accept a .zip produced by /export.
+
+    merge=false (default): fail with 409 if the sample ID already exists.
+    merge=true: overwrite all metadata fields (except folder_id) and restore
+                any data files that don't already exist on disk.
     """
     import zipfile, io as _io
 
@@ -361,44 +364,65 @@ async def import_sample(file: UploadFile = File(...)):
     if not sample_id:
         raise HTTPException(400, "sample.json has no 'id' field")
 
+    params = {
+        "id":            sample_id,
+        "date":          sample_data.get("date"),
+        "substrate":     sample_data.get("substrate"),
+        "notes":         sample_data.get("notes"),
+        "thickness_nm":  sample_data.get("thickness_nm"),
+        "area_m2":       sample_data.get("area_m2"),
+        "area_correction": sample_data.get("area_correction", 1.0),
+        "technique":     sample_data.get("technique", "sputter"),
+        "layers":        json.dumps(sample_data.get("layers", [])),
+        "filenames":     json.dumps(sample_data.get("filenames", {})),
+        "xrd_peaks":     json.dumps(sample_data.get("xrd_peaks", [])),
+        "lot":           sample_data.get("lot"),
+        "bin":           sample_data.get("bin"),
+    }
+
     with get_db() as conn:
-        if conn.execute("SELECT id FROM samples WHERE id=?", (sample_id,)).fetchone():
-            raise HTTPException(409, f"Sample '{sample_id}' already exists — rename it in the zip or delete the existing record first")
-        conn.execute("""
-            INSERT INTO samples
-              (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
-               technique, folder_id, layers, filenames, xrd_peaks, lot, bin)
-            VALUES
-              (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
-               :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin)
-        """, {
-            "id":            sample_id,
-            "date":          sample_data.get("date"),
-            "substrate":     sample_data.get("substrate"),
-            "notes":         sample_data.get("notes"),
-            "thickness_nm":  sample_data.get("thickness_nm"),
-            "area_m2":       sample_data.get("area_m2"),
-            "area_correction": sample_data.get("area_correction", 1.0),
-            "technique":     sample_data.get("technique", "sputter"),
-            "folder_id":     None,   # don't transplant folder membership
-            "layers":        json.dumps(sample_data.get("layers", [])),
-            "filenames":     json.dumps(sample_data.get("filenames", {})),
-            "xrd_peaks":     json.dumps(sample_data.get("xrd_peaks", [])),
-            "lot":           sample_data.get("lot"),
-            "bin":           sample_data.get("bin"),
-        })
+        exists = conn.execute("SELECT id FROM samples WHERE id=?", (sample_id,)).fetchone()
+        if exists and not merge:
+            raise HTTPException(409, f"Sample '{sample_id}' already exists")
+        if exists:
+            # Merge: overwrite metadata, preserve folder_id
+            conn.execute("""
+                UPDATE samples SET
+                  date=:date, substrate=:substrate, notes=:notes,
+                  thickness_nm=:thickness_nm, area_m2=:area_m2, area_correction=:area_correction,
+                  technique=:technique, layers=:layers, filenames=:filenames,
+                  xrd_peaks=:xrd_peaks, lot=:lot, bin=:bin
+                WHERE id=:id
+            """, params)
+        else:
+            params["folder_id"] = None  # don't transplant folder membership
+            conn.execute("""
+                INSERT INTO samples
+                  (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
+                   technique, folder_id, layers, filenames, xrd_peaks, lot, bin)
+                VALUES
+                  (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
+                   :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin)
+            """, params)
         conn.commit()
 
-    # Restore data files
+    # Restore data files — on merge, skip files that already exist on disk
     file_entries = [n for n in names if "/files/" in n and not n.endswith("/")]
     dest_dir = FILES_DIR / sample_id
+    files_written = 0
+    files_skipped = 0
     if file_entries:
         dest_dir.mkdir(exist_ok=True)
         for entry in file_entries:
-            (dest_dir / Path(entry).name).write_bytes(zf.read(entry))
+            dest = dest_dir / Path(entry).name
+            if merge and dest.exists():
+                files_skipped += 1
+                continue
+            dest.write_bytes(zf.read(entry))
+            files_written += 1
 
     zf.close()
-    return {"ok": True, "id": sample_id, "files_restored": len(file_entries)}
+    return {"ok": True, "id": sample_id, "files_written": files_written, "files_skipped": files_skipped}
 
 
 @app.get("/api/samples/{sample_id}/files")
