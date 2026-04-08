@@ -3149,6 +3149,104 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
   );
 }
 
+// ── ViewDataModal ──────────────────────────────────────────────────────────────
+
+function ViewDataModal({ sampleId, files, loading, onClose }) {
+  const T = useTheme();
+
+  const fmt = (bytes) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  };
+
+  const fmtDate = (ts) => {
+    const d = new Date(ts * 1000);
+    return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
+      + "  " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  };
+
+  // Strip the leading "{meas_type}_" prefix for a cleaner display label
+  const label = (filename) => {
+    const m = filename.match(/^[^_]+_(.*)/);
+    return m ? m[1] : filename;
+  };
+
+  const measType = (filename) => filename.split("_")[0] ?? "";
+
+  const MEAS_LABELS = {
+    pe: "PE Loop", diel_b: "Dielectric", diel_b_up: "Dielectric ↑", diel_b_down: "Dielectric ↓",
+    iv: "IV", pulsed: "Pulsed", xrd_ot: "XRD θ/2θ", xrr: "XRR", rsm: "RSM", afm: "AFM",
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, width: 580, maxWidth: "92vw", maxHeight: "80vh", display: "flex", flexDirection: "column", boxShadow: "0 8px 40px rgba(0,0,0,0.45)" }}>
+        {/* Header */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: `1px solid ${T.border}` }}>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textPrimary, flex: 1 }}>
+            Data files — <span style={{ color: T.amber }}>{sampleId}</span>
+          </span>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>
+            {loading ? "…" : `${files.length} file${files.length !== 1 ? "s" : ""}`}
+          </span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }}>✕</button>
+        </div>
+
+        {/* File list */}
+        <div style={{ overflowY: "auto", flex: 1, padding: "10px 0" }}>
+          {loading ? (
+            <div style={{ padding: "24px 20px", textAlign: "center", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>Loading…</div>
+          ) : files.length === 0 ? (
+            <div style={{ padding: "24px 20px", textAlign: "center", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>No files found on disk for this sample.</div>
+          ) : files.map((f, i) => {
+            const mt = measType(f.filename);
+            const mtLabel = MEAS_LABELS[mt] ?? mt;
+            return (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 18px", borderBottom: `1px solid ${T.border}33`, background: i % 2 === 0 ? "transparent" : T.bg2 + "55" }}>
+                {/* Type badge */}
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.teal, background: T.teal + "18", border: `1px solid ${T.teal}44`, borderRadius: 4, padding: "2px 6px", minWidth: 64, textAlign: "center", flexShrink: 0 }}>
+                  {mtLabel}
+                </span>
+                {/* Filename */}
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textPrimary, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={f.filename}>
+                  {label(f.filename)}
+                </span>
+                {/* Size */}
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, flexShrink: 0 }}>
+                  {fmt(f.size_bytes)}
+                </span>
+                {/* Date */}
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, flexShrink: 0, minWidth: 150, textAlign: "right" }}>
+                  {fmtDate(f.modified)}
+                </span>
+                {/* Download link */}
+                <a href={`${API_BASE}/samples/${sampleId}/files/${encodeURIComponent(f.filename)}`}
+                  download={f.filename}
+                  title="Download"
+                  style={{ color: T.textDim, textDecoration: "none", fontSize: 14, flexShrink: 0, opacity: 0.7 }}
+                  onMouseEnter={e => e.currentTarget.style.opacity = 1}
+                  onMouseLeave={e => e.currentTarget.style.opacity = 0.7}>
+                  ↓
+                </a>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Footer */}
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, padding: "12px 18px", borderTop: `1px solid ${T.border}` }}>
+          <button onClick={onClose}
+            style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 16px", borderRadius: 5, border: `1px solid ${T.border}`, background: T.bg2, color: T.textSecondary, cursor: "pointer" }}>
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── ExportModal ────────────────────────────────────────────────────────────────
 
 function ExportModal({ samples, onClose }) {
@@ -8134,8 +8232,11 @@ export default function App() {
   const [loading,  setLoading]  = useState(true);
   const [error,    setError]    = useState(null);
   const [settings, setSettings] = useState(() => JSON.parse(JSON.stringify(DEFAULT_SETTINGS)));
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [exportOpen,   setExportOpen]   = useState(false);
+  const [settingsOpen,  setSettingsOpen]  = useState(false);
+  const [exportOpen,    setExportOpen]    = useState(false);
+  const [viewDataOpen,  setViewDataOpen]  = useState(false);  // View Data modal
+  const [viewDataFiles, setViewDataFiles] = useState([]);
+  const [viewDataLoading, setViewDataLoading] = useState(false);
 
   const handleSaveSettings = (s) => {
     // Always deep-merge with current settings so partial updates (e.g. xrd_configs)
@@ -8227,6 +8328,28 @@ export default function App() {
       };
       await updateSample(updatedSample);
     } catch (e) { console.error("Upload failed", e); }
+  };
+
+  const handleViewData = async () => {
+    if (!active) return;
+    setViewDataLoading(true);
+    setViewDataOpen(true);
+    try {
+      const files = await api("GET", `/samples/${active}/files`);
+      setViewDataFiles(files || []);
+    } catch (e) {
+      setViewDataFiles([]);
+      console.error("Failed to list files:", e);
+    }
+    setViewDataLoading(false);
+  };
+
+  const handleExportSample = () => {
+    if (!active) return;
+    const a = document.createElement("a");
+    a.href = `${API_BASE}/samples/${active}/export`;
+    a.download = `${active}_export.zip`;
+    a.click();
   };
 
   const handleReparseFiles = async () => {
@@ -8466,6 +8589,8 @@ export default function App() {
                 <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>{activeSample.technique || "sputter"}</span>
                 <div style={{ flex: 1 }} />
                 {hasFilesForActive && <Btn variant="teal" small onClick={handleReparseFiles}>↻ Reparse</Btn>}
+                {hasFilesForActive && <Btn variant="ghost" small onClick={handleViewData}>View Data</Btn>}
+                <Btn variant="ghost" small onClick={handleExportSample}>Export Sample</Btn>
                 <Btn variant="ghost" small onClick={() => setEditingMeta(v => !v)}>{editingMeta ? "Cancel" : "Edit"}</Btn>
                 <Btn variant="danger" small onClick={() => { if (window.confirm(`Delete ${activeSample.id}?`)) deleteSample(activeSample.id); }}>Delete</Btn>
               </>
@@ -8649,6 +8774,7 @@ export default function App() {
       {adding && <AddSampleModal onAdd={addSample} onClose={() => setAdding(false)} folders={folders} settings={settings} />}
       {templateSample && <AddSampleModal onAdd={s => { addSample(s); setTemplateSample(null); }} onClose={() => setTemplateSample(null)} folders={folders} template={templateSample} settings={settings} />}
       {exportOpen   && <ExportModal samples={samples} onClose={() => setExportOpen(false)} />}
+      {viewDataOpen && <ViewDataModal sampleId={active} files={viewDataFiles} loading={viewDataLoading} onClose={() => setViewDataOpen(false)} />}
       {settingsOpen && <SettingsModal settings={settings} onSave={handleSaveSettings} onClose={() => setSettingsOpen(false)} />}
       {(addingFolder || editingFolder) && (
         <AddFolderModal onSave={saveFolder} onClose={() => { setAddingFolder(false); setEditingFolder(null); }} existing={editingFolder} allFolders={folders} />

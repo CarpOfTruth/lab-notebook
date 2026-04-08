@@ -333,6 +333,68 @@ def get_file(sample_id: str, filename: str):
     return FileResponse(path)
 
 
+@app.get("/api/samples/{sample_id}/files")
+def list_files(sample_id: str):
+    """Return metadata for every file stored under this sample."""
+    dest_dir = FILES_DIR / sample_id
+    if not dest_dir.exists():
+        return []
+    files = []
+    for p in sorted(dest_dir.iterdir()):
+        if not p.is_file():
+            continue
+        stat = p.stat()
+        files.append({
+            "filename": p.name,
+            "size_bytes": stat.st_size,
+            "modified": stat.st_mtime,
+        })
+    return files
+
+
+@app.get("/api/samples/{sample_id}/export")
+def export_sample(sample_id: str):
+    """
+    Package the sample's DB record (sample.json) plus all uploaded files
+    into a .zip archive and stream it back for download.
+    """
+    import zipfile, io, time
+    from fastapi.responses import StreamingResponse
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Sample not found")
+
+    sample_data = row_to_sample(row)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # 1. sample metadata as JSON
+        zf.writestr(
+            f"{sample_id}/sample.json",
+            json.dumps(sample_data, indent=2, default=str),
+        )
+        # 2. all uploaded data files
+        dest_dir = FILES_DIR / sample_id
+        if dest_dir.exists():
+            for p in sorted(dest_dir.iterdir()):
+                if p.is_file():
+                    zf.write(p, arcname=f"{sample_id}/files/{p.name}")
+
+    buf.seek(0)
+
+    def iter_zip():
+        yield from iter(lambda: buf.read(65536), b"")
+
+    safe_id = sample_id.replace("/", "_")
+    return StreamingResponse(
+        iter_zip(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{safe_id}_export.zip"'},
+    )
+
+
 @app.get("/api/samples/{sample_id}/afm_data")
 def get_afm_data(sample_id: str):
     """Read the stored .ibw file, process each channel, and return display-ready JSON."""
