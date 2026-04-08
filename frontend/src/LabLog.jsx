@@ -2180,50 +2180,56 @@ function fitLaueFreeze(xrdData, peak, fitWindow, bgResult, thicknessNm, locked =
   const bgToCheb = x => 2 * (x - bg.xMin) / (bg.xMax - bg.xMin) - 1;
   const evalBg   = x => Math.exp(evalChebyshev(bgToCheb(x), bg.coeffs));
 
+  const tSeed  = (thicknessNm && thicknessNm > 0) ? thicknessNm : 20;
+  // Estimate fringe period from seed thickness so the fit window covers ≥8 oscillations
+  const cenRad     = peak.center * Math.PI / 360;
+  const seedPeriod = LAMBDA / (tSeed * Math.cos(cenRad)) * (180 / Math.PI);
+  const autoHalf   = Math.max(peak.width, seedPeriod * 8);
+
   const pts = fitWindow
     ? allPts.filter(p => p.x >= fitWindow[0] && p.x <= fitWindow[1])
-    : allPts.filter(p => Math.abs(p.x - peak.center) <= peak.width);
+    : allPts.filter(p => Math.abs(p.x - peak.center) <= autoHalf);
   if (pts.length < 4) return null;
 
   const xs = pts.map(p => p.x);
   const ys = pts.map(p => Math.max(p.y, 0));
   const bgAtPts = xs.map(x => Math.max(evalBg(x), 0));
 
-  const thetaB = peak.center * Math.PI / 360; // 2theta → theta
-  const sinB   = Math.sin(thetaB);
-
-  // sinc² Laue model: evaluate at actual 2θ value given fitted center cen
+  // sinc² Laue model × Gaussian envelope for finite-crystal / instrument damping.
+  // sigInstr ≫ fringe_period → pure sinc² (undamped fringes).
   const laueProfile = (twoTheta, cen, t, sigInstr) => {
     const theta    = twoTheta * Math.PI / 360;
     const thetaCen = cen      * Math.PI / 360;
     const dSin     = Math.sin(theta) - Math.sin(thetaCen);
     const arg      = Math.PI * t * dSin / LAMBDA;
     const sinc2    = Math.abs(arg) < 1e-9 ? 1 : Math.pow(Math.sin(arg) / arg, 2);
-    // Instrument broadening as multiplicative Gaussian envelope
     const gEnv     = sigInstr > 0 ? Math.exp(-0.5 * Math.pow((twoTheta - cen) / sigInstr, 2)) : 1;
     return sinc2 * gEnv;
   };
 
-  const tSeed = (thicknessNm && thicknessNm > 0) ? thicknessNm : 20;
-  const tol   = peak.width;
+  const tol        = peak.width;   // center constrained ±tol via tanh
   const initLogAmp = Math.log(Math.max(...ys) - Math.min(...bgAtPts) || 10);
 
   let amp, cen, t, sig;
   if (locked && thicknessNm > 0) {
-    // Locked: only fit [logAmp, rawCen], thickness fixed
-    t = thicknessNm; sig = 0.05;
+    // Locked: fit [logAmp, rawCen, logSig] — thickness fixed, envelope free
+    // Start sigInstr = 3° (broad → nearly no damping); optimizer can narrow it
+    t = thicknessNm;
     const pFit = nelderMead(params => {
       const a = Math.exp(params[0]), c = peak.center + tol * Math.tanh(params[1]);
+      const _s = Math.exp(params[2]);
       let s = 0;
       for (let i = 0; i < xs.length; i++) {
-        const m = Math.max(bgAtPts[i] + a * laueProfile(xs[i], c, t, sig), 1e-10);
+        const m = Math.max(bgAtPts[i] + a * laueProfile(xs[i], c, t, _s), 1e-10);
         s += m - ys[i] * Math.log(m);
       }
       return s;
-    }, [initLogAmp, 0], { maxIter: 4000, tol: 1e-8 });
+    }, [initLogAmp, 0, Math.log(3.0)], { maxIter: 6000, tol: 1e-9 });
     amp = Math.exp(pFit[0]); cen = peak.center + tol * Math.tanh(pFit[1]);
+    sig = Math.exp(pFit[2]);
   } else {
     // Free fit: [logAmp, rawCen, logT, logSig]
+    // Start sigInstr = 3° so the initial model shows real fringes, not a Gaussian blob
     const pFit = nelderMead(params => {
       const a = Math.exp(params[0]), c = peak.center + tol * Math.tanh(params[1]);
       const _t = Math.exp(params[2]), _s = Math.exp(params[3]);
@@ -2233,7 +2239,7 @@ function fitLaueFreeze(xrdData, peak, fitWindow, bgResult, thicknessNm, locked =
         s += m - ys[i] * Math.log(m);
       }
       return s;
-    }, [initLogAmp, 0, Math.log(tSeed), Math.log(0.05)], { maxIter: 8000, tol: 1e-10 });
+    }, [initLogAmp, 0, Math.log(tSeed), Math.log(3.0)], { maxIter: 8000, tol: 1e-10 });
     amp = Math.exp(pFit[0]); cen = peak.center + tol * Math.tanh(pFit[1]);
     t   = Math.exp(pFit[2]); sig = Math.exp(pFit[3]);
   }
@@ -2622,33 +2628,64 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
           }
         }
 
+        // Background evaluator (needed for total fit curve + peakCurve fills)
+        const bgEvalFn = bg
+          ? (x => Math.exp(evalChebyshev(2*(x - bg.xMin)/(bg.xMax - bg.xMin) - 1, bg.coeffs)))
+          : null;
+
         // Fit each fringe peak independently and build display curves
         const allPtsSorted = [...xrdData].sort((a, b) => a.x - b.x);
+        const fringeResultsList = []; // collected for total-fit-curve computation
         for (const fp of fringePeaks) {
           const res = fitLaueFreeze(xrdData, fp, fitWindow, bg, fp.fringeThicknessNm, fp.fringeLock);
           if (!res) continue;
           mergedResults[fp.id] = res;
-          // Build peak curve for display — extend to ±6 fringe periods for visibility
+          fringeResultsList.push(res);
+          // Build peak curve for display — extend to ±8 fringe periods
           if (allPtsSorted.length >= 2) {
             const LAMBDA_D = 0.15406;
-            const thetaCenD = res.center * Math.PI / 360;
-            const period = LAMBDA_D / (res.thickness_nm * Math.cos(thetaCenD)) * (180 / Math.PI);
-            const halfRange = Math.max(period * 6, 3);
+            const thetaCen = res.center * Math.PI / 360;
+            const period = LAMBDA_D / (res.thickness_nm * Math.cos(thetaCen)) * (180 / Math.PI);
+            const halfRange = Math.max(period * 8, 3);
             const xMin = Math.max(allPtsSorted[0].x, res.center - halfRange);
             const xMax = Math.min(allPtsSorted[allPtsSorted.length - 1].x, res.center + halfRange);
-            const nFine = 600;
+            const nFine = 800;
             const fxs = Array.from({ length: nFine }, (_, k) => xMin + k * (xMax - xMin) / (nFine - 1));
-            const thetaCen = res.center * Math.PI / 360;
+            const sigInstr = res.fwhmG / 2.355;
             const fys = fxs.map(x => {
               const theta = x * Math.PI / 360;
-              const dSin = Math.sin(theta) - Math.sin(thetaCen);
-              const arg = Math.PI * res.thickness_nm * dSin / 0.15406;
+              const dSin  = Math.sin(theta) - Math.sin(thetaCen);
+              const arg   = Math.PI * res.thickness_nm * dSin / LAMBDA_D;
               const sinc2 = Math.abs(arg) < 1e-9 ? 1 : Math.pow(Math.sin(arg) / arg, 2);
-              const gEnv = res.fwhmG > 0 ? Math.exp(-0.5 * Math.pow((x - res.center) / (res.fwhmG / 2.355), 2)) : 1;
+              const gEnv  = sigInstr > 0 ? Math.exp(-0.5 * Math.pow((x - res.center) / sigInstr, 2)) : 1;
               return res.amplitude * sinc2 * gEnv;
             });
-            peakCurvesOut.push({ id: fp.id, x: fxs, y: fys });
+            // Store bg at each x so the fill renders correctly (avoids index mismatch)
+            const fBgAtX = bgEvalFn ? fxs.map(x => Math.max(bgEvalFn(x), 1)) : fxs.map(() => 1);
+            peakCurvesOut.push({ id: fp.id, x: fxs, y: fys, bgAtX: fBgAtX });
           }
+        }
+
+        // Build a total fit curve (bg + sum of fringe contributions) when no Voigt fit ran
+        if (fringeResultsList.length && !fittedCurveOut) {
+          const LAMBDA_D = 0.15406;
+          const totalX   = allPtsSorted.map(p => p.x);
+          const totalBgY = bgEvalFn ? totalX.map(x => Math.max(bgEvalFn(x), 1)) : totalX.map(() => 1);
+          const totalY   = totalX.map((x, xi) => {
+            let y = totalBgY[xi];
+            for (const res of fringeResultsList) {
+              const theta    = x * Math.PI / 360;
+              const thetaCen = res.center * Math.PI / 360;
+              const dSin     = Math.sin(theta) - Math.sin(thetaCen);
+              const arg      = Math.PI * res.thickness_nm * dSin / LAMBDA_D;
+              const sinc2    = Math.abs(arg) < 1e-9 ? 1 : Math.pow(Math.sin(arg) / arg, 2);
+              const sigInstr = res.fwhmG / 2.355;
+              const gEnv     = sigInstr > 0 ? Math.exp(-0.5 * Math.pow((x - res.center) / sigInstr, 2)) : 1;
+              y += res.amplitude * sinc2 * gEnv;
+            }
+            return y;
+          });
+          fittedCurveOut = { x: totalX, y: totalY, bgY: totalBgY };
         }
 
         if (Object.keys(mergedResults).length) {
@@ -2730,7 +2767,9 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
     ...peakCurves.map(pc => {
       const ln  = lines.find(l => l.id === pc.id);
       const col = ln?.color || "#888888";
-      const bgY = fittedCurve?.bgY || pc.x.map(() => 1);
+      // bgAtX (fringe peaks) is pre-computed at the same x-grid as the curve;
+      // fittedCurve.bgY is index-matched only for Voigt peaks (same fittedX).
+      const bgY = pc.bgAtX || fittedCurve?.bgY || pc.x.map(() => 1);
       const topY = pc.y.map((v, i) => Math.max((bgY[i] ?? 1) + v, 1));
       const bgFloor = bgY.map(v => Math.max(v, 1));
       // Closed polygon: top L→R then bottom R→L
