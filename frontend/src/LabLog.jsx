@@ -3259,6 +3259,82 @@ function ViewDataModal({ sampleId, files, loading, onClose, onDeleteFile }) {
   );
 }
 
+// ── ModuleSourceModal ─────────────────────────────────────────────────────────
+
+function ModuleSourceModal({ mod, onClose, onSave }) {
+  const [source, setSource] = useState(mod.source);
+  const [saving, setSaving] = useState(false);
+  const [error,  setError]  = useState(null);
+  const [saved,  setSaved]  = useState(false);
+  const isEditable = !mod.builtin;
+
+  const handleSave = async () => {
+    setSaving(true); setError(null);
+    try {
+      await api("PUT", `/modules/${mod.id}/source`, { source });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+      onSave?.();
+    } catch (e) { setError(e.message || "Save failed"); }
+    setSaving(false);
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, width: "min(860px, 94vw)", maxHeight: "88vh", display: "flex", flexDirection: "column", boxShadow: "0 8px 40px rgba(0,0,0,0.5)" }}>
+
+        {/* Header */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 18px", borderBottom: `1px solid ${T.border}` }}>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: mod.builtin ? T.amber : T.teal, background: (mod.builtin ? T.amber : T.teal) + "18", border: `1px solid ${(mod.builtin ? T.amber : T.teal)}44`, borderRadius: 4, padding: "2px 7px", flexShrink: 0 }}>
+            {mod.builtin ? "built-in" : "user"}
+          </span>
+          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: T.textPrimary, flex: 1 }}>{mod.name}</span>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{mod.id} · v{mod.version}</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0, marginLeft: 8 }}>✕</button>
+        </div>
+
+        {/* Source editor */}
+        <textarea
+          value={source}
+          onChange={e => { if (isEditable) setSource(e.target.value); }}
+          readOnly={!isEditable}
+          spellCheck={false}
+          style={{
+            flex: 1, resize: "none", border: "none", outline: "none",
+            background: T.bg0, color: T.textPrimary,
+            fontFamily: "'DM Mono', monospace", fontSize: 12, lineHeight: 1.6,
+            padding: "16px 20px", overflowY: "auto",
+            opacity: isEditable ? 1 : 0.8,
+            minHeight: 400,
+          }}
+        />
+
+        {/* Footer */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 18px", borderTop: `1px solid ${T.border}` }}>
+          {mod.builtin && (
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, flex: 1 }}>
+              Read-only — duplicate to create an editable copy
+            </span>
+          )}
+          {error && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, flex: 1 }}>{error}</span>}
+          {!mod.builtin && !error && <div style={{ flex: 1 }} />}
+          <button onClick={onClose}
+            style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 14px", borderRadius: 5, border: `1px solid ${T.border}`, background: T.bg2, color: T.textSecondary, cursor: "pointer" }}>
+            Close
+          </button>
+          {isEditable && (
+            <button onClick={handleSave} disabled={saving}
+              style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 14px", borderRadius: 5, border: `1px solid ${saved ? T.teal : T.amber}`, background: saved ? T.teal + "22" : T.amber + "22", color: saved ? T.teal : T.amber, cursor: saving ? "wait" : "pointer", opacity: saving ? 0.6 : 1 }}>
+              {saved ? "Saved ✓" : saving ? "Saving…" : "Save"}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── ExportModal ────────────────────────────────────────────────────────────────
 
 function ExportModal({ samples, onClose }) {
@@ -8246,6 +8322,8 @@ export default function App() {
   const [settings, setSettings] = useState(() => JSON.parse(JSON.stringify(DEFAULT_SETTINGS)));
   const [settingsOpen,  setSettingsOpen]  = useState(false);
   const [exportOpen,    setExportOpen]    = useState(false);
+  const [modules,       setModules]       = useState([]);
+  const [moduleSource,  setModuleSource]  = useState(null); // { id, name, builtin, source }
   const [importError,   setImportError]   = useState(null);
   const [importing,     setImporting]     = useState(false);
   const [viewDataOpen,  setViewDataOpen]  = useState(false);  // View Data modal
@@ -8274,9 +8352,11 @@ export default function App() {
       api("GET", "/folders"),
       api("GET", "/analysis-books"),
       api("GET", "/settings"),
-    ]).then(([s, f, b, cfg]) => {
+      api("GET", "/modules").catch(() => []),
+    ]).then(([s, f, b, cfg, mods]) => {
       setSamples(s); setFolders(f); setBooks(b);
       setSettings(mergeSettings(cfg || {}));
+      setModules(mods || []);
       setLoading(false);
     }).catch(e => { setError(e.message); setLoading(false); });
   }, []);
@@ -8855,6 +8935,43 @@ export default function App() {
                   );
                 })()}
               </div>
+
+              {/* Modules section */}
+              <div style={{ marginTop: 8 }}>
+                <div style={{ marginBottom: 14, display: "flex", alignItems: "baseline", gap: 12 }}>
+                  <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.textPrimary }}>Modules</h2>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{modules.length}</span>
+                  <div style={{ flex: 1 }} />
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
+                  {modules.map(m => (
+                    <div key={m.id}
+                      onClick={async () => {
+                        const res = await api("GET", `/modules/${m.id}/source`);
+                        setModuleSource({ ...m, source: res.source, builtin: res.builtin });
+                      }}
+                      style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "12px 14px", cursor: "pointer", transition: "border-color .12s", display: "flex", flexDirection: "column", gap: 6 }}
+                      onMouseEnter={e => e.currentTarget.style.borderColor = T.borderBright}
+                      onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 15, color: T.textPrimary, flex: 1 }}>{m.name}</span>
+                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: m.builtin ? T.amber : T.teal, background: (m.builtin ? T.amber : T.teal) + "18", border: `1px solid ${(m.builtin ? T.amber : T.teal)}33`, borderRadius: 3, padding: "1px 5px" }}>
+                          {m.builtin ? "built-in" : "user"}
+                        </span>
+                      </div>
+                      <p style={{ margin: 0, fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textSecondary, lineHeight: 1.5 }}>{m.description}</p>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
+                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>v{m.version}</span>
+                        <span style={{ color: T.border }}>·</span>
+                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{m.accepts?.join(", ")}</span>
+                      </div>
+                    </div>
+                  ))}
+                  {modules.length === 0 && (
+                    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>No modules loaded.</div>
+                  )}
+                </div>
+              </div>
             </>
           )}
         </div>
@@ -8863,6 +8980,8 @@ export default function App() {
       {adding && <AddSampleModal onAdd={addSample} onClose={() => setAdding(false)} folders={folders} settings={settings} />}
       {templateSample && <AddSampleModal onAdd={s => { addSample(s); setTemplateSample(null); }} onClose={() => setTemplateSample(null)} folders={folders} template={templateSample} settings={settings} />}
       {exportOpen   && <ExportModal samples={samples} onClose={() => setExportOpen(false)} />}
+      {moduleSource && <ModuleSourceModal mod={moduleSource} onClose={() => setModuleSource(null)}
+        onSave={async () => { const mods = await api("GET", "/modules"); setModules(mods); }} />}
       {viewDataOpen && <ViewDataModal sampleId={active} files={viewDataFiles} loading={viewDataLoading} onClose={() => setViewDataOpen(false)}
         onDeleteFile={async (filename) => {
           await api("DELETE", `/samples/${active}/files/${encodeURIComponent(filename)}`);
