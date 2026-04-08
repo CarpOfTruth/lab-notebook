@@ -776,6 +776,35 @@ def delete_module(module_id: str):
     return {"ok": True}
 
 
+@app.get("/api/modules/{module_id}/schema")
+def get_module_schema(module_id: str):
+    """Return the schema JSON for a module (from data/module_schemas/{id}.json)."""
+    schema_path = DATA_DIR / "module_schemas" / f"{module_id}.json"
+    if not schema_path.exists():
+        return {"schema": None}
+    try:
+        return {"schema": json.loads(schema_path.read_text())}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/modules/{module_id}/example")
+def get_module_example(module_id: str, lines: int = 60):
+    """Return the first N lines of the example file for a module."""
+    example_dir = DATA_DIR / "module_examples"
+    # Try exact name, then glob for {module_id}_example.*
+    candidates = list(example_dir.glob(f"{module_id}_example.*")) + list(example_dir.glob(f"{module_id}.*"))
+    if not candidates:
+        return {"preview": None}
+    path = candidates[0]
+    try:
+        text = path.read_text(errors="replace")
+        preview_lines = text.splitlines()[:lines]
+        return {"preview": "\n".join(preview_lines), "filename": path.name}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 # ── Screenshot helper (dev only) ───────────────────────────────────────────────
 import base64
 

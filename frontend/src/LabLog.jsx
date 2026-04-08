@@ -3259,6 +3259,296 @@ function ViewDataModal({ sampleId, files, loading, onClose, onDeleteFile }) {
   );
 }
 
+// ── ModuleDetailPage ───────────────────────────────────────────────────────────
+
+const ROLE_COLORS = { x: "#63b3ed", y: "#68d391", ignore: "#718096", available: "#f6ad55" };
+const ROLE_LABELS = { x: "X axis", y: "Y axis", ignore: "Ignored", available: "Available" };
+
+function ModuleDetailPage({ moduleId, moduleInfo, onBack, onModulesChange }) {
+  const [schema,   setSchema]   = useState(null);
+  const [preview,  setPreview]  = useState(null);
+  const [source,   setSource]   = useState(null);
+  const [editSrc,  setEditSrc]  = useState(null);   // null = viewing; string = editing
+  const [saving,   setSaving]   = useState(false);
+  const [saveErr,  setSaveErr]  = useState(null);
+  const [saved,    setSaved]    = useState(false);
+  const [showSrc,  setShowSrc]  = useState(false);
+  const [tab,      setTab]      = useState("overview"); // "overview" | "source"
+
+  const isNew     = moduleId === "__new__";
+  const isBuiltin = moduleInfo?.builtin ?? true;
+
+  useEffect(() => {
+    if (isNew) { setSource(""); setEditSrc(""); return; }
+    // Load schema, example preview, and source in parallel
+    Promise.all([
+      api("GET", `/modules/${moduleId}/schema`).catch(() => ({ schema: null })),
+      api("GET", `/modules/${moduleId}/example`).catch(() => ({ preview: null })),
+      api("GET", `/modules/${moduleId}/source`).catch(() => ({ source: "" })),
+    ]).then(([s, ex, src]) => {
+      setSchema(s.schema);
+      setPreview(ex.preview);
+      setSource(src.source);
+    });
+  }, [moduleId]);
+
+  const handleSave = async () => {
+    setSaving(true); setSaveErr(null);
+    try {
+      const src = editSrc ?? "";
+      // Extract module id from `id = "..."` in source
+      const mid = isNew
+        ? (src.match(/\bid\s*=\s*["']([^"']+)["']/)?.[1] ?? "new_module")
+        : moduleId;
+      await api("PUT", `/modules/${mid}/source`, { source: src });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+      await onModulesChange?.();
+      if (isNew) onBack?.();  // Return to modules list after creating
+    } catch (e) { setSaveErr(e.message || "Save failed"); }
+    setSaving(false);
+  };
+
+  const monoStyle = { fontFamily: "'DM Mono', monospace" };
+
+  // ── New module scaffold ──
+  if (isNew) {
+    return (
+      <div style={{ maxWidth: 860, margin: "0 auto" }}>
+        <div style={{ marginBottom: 20, display: "flex", alignItems: "center", gap: 12 }}>
+          <h2 style={{ margin: 0, ...monoStyle, fontSize: 18, color: T.teal }}>New Module</h2>
+          <div style={{ flex: 1 }} />
+          {saveErr && <span style={{ ...monoStyle, fontSize: 11, color: T.red }}>{saveErr}</span>}
+          <Btn variant="teal" small onClick={handleSave} disabled={saving}>{saving ? "Saving…" : saved ? "Saved ✓" : "Save"}</Btn>
+          <Btn variant="ghost" small onClick={onBack}>Cancel</Btn>
+        </div>
+        <p style={{ ...monoStyle, fontSize: 11, color: T.textDim, marginBottom: 12 }}>
+          Write a Python class that subclasses <code>LabModule</code> and implements <code>parse()</code> and <code>plot()</code>.
+        </p>
+        <textarea
+          value={editSrc ?? ""}
+          onChange={e => setEditSrc(e.target.value)}
+          spellCheck={false}
+          placeholder={NEW_MODULE_SCAFFOLD}
+          style={{ width: "100%", boxSizing: "border-box", minHeight: 480, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 6, padding: "14px 16px", ...monoStyle, fontSize: 12, lineHeight: 1.6, resize: "vertical", outline: "none" }}
+        />
+      </div>
+    );
+  }
+
+  if (!moduleInfo) return <div style={{ ...monoStyle, fontSize: 13, color: T.textDim }}>Loading…</div>;
+
+  const accentColor = isBuiltin ? T.amber : T.teal;
+
+  return (
+    <div style={{ maxWidth: 960, margin: "0 auto" }}>
+
+      {/* Identity header */}
+      <div style={{ marginBottom: 28 }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 14, marginBottom: 10 }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+              <h1 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 26, color: T.textPrimary }}>{moduleInfo.name}</h1>
+              <span style={{ ...monoStyle, fontSize: 10, color: accentColor, background: accentColor + "18", border: `1px solid ${accentColor}44`, borderRadius: 4, padding: "2px 7px" }}>
+                {isBuiltin ? "built-in" : "user"}
+              </span>
+            </div>
+            <p style={{ margin: 0, ...monoStyle, fontSize: 12, color: T.textSecondary, lineHeight: 1.6 }}>{moduleInfo.description}</p>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4, flexShrink: 0 }}>
+            <span style={{ ...monoStyle, fontSize: 11, color: T.textDim }}>v{moduleInfo.version} · {moduleInfo.id}</span>
+            <span style={{ ...monoStyle, fontSize: 11, color: T.textDim }}>{moduleInfo.accepts?.join(" · ")}</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Tab bar */}
+      <div style={{ display: "flex", borderBottom: `1px solid ${T.border}`, marginBottom: 24, gap: 0 }}>
+        {[["overview", "Overview"], ["source", "Source Code"]].map(([id, label]) => (
+          <button key={id} onClick={() => setTab(id)}
+            style={{ background: "none", border: "none", borderBottom: tab === id ? `2px solid ${accentColor}` : "2px solid transparent", padding: "6px 18px", marginBottom: -1, ...monoStyle, fontSize: 12, color: tab === id ? accentColor : T.textDim, cursor: "pointer", transition: "color .12s" }}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "overview" && (
+        <>
+          {/* Schema columns table */}
+          {schema?.columns && (
+            <div style={{ marginBottom: 28 }}>
+              <h3 style={{ margin: "0 0 12px 0", ...monoStyle, fontSize: 13, color: T.textPrimary, fontWeight: 500 }}>File Columns</h3>
+              {schema.file_preview && (
+                <div style={{ ...monoStyle, fontSize: 11, color: T.textDim, marginBottom: 10 }}>
+                  Delimiter: <span style={{ color: T.textSecondary }}>{schema.file_preview.delimiter}</span>
+                  {" · "}Header rows: <span style={{ color: T.textSecondary }}>{schema.file_preview.header_rows}</span>
+                </div>
+              )}
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", ...monoStyle, fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ borderBottom: `1px solid ${T.border}` }}>
+                      {["#", "Column Name", "Role", "Unit", "Display Unit", "Notes"].map(h => (
+                        <th key={h} style={{ padding: "6px 12px", textAlign: "left", color: T.textDim, fontWeight: 400, fontSize: 11, whiteSpace: "nowrap" }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {schema.columns.map((col, i) => {
+                      const rc = ROLE_COLORS[col.role] ?? T.textSecondary;
+                      return (
+                        <tr key={i} style={{ borderBottom: `1px solid ${T.border}20` }}>
+                          <td style={{ padding: "5px 12px", color: T.textDim }}>{col.index}</td>
+                          <td style={{ padding: "5px 12px", color: T.textPrimary }}>{col.name}</td>
+                          <td style={{ padding: "5px 12px" }}>
+                            <span style={{ color: rc, background: rc + "18", border: `1px solid ${rc}44`, borderRadius: 3, padding: "1px 6px", fontSize: 10 }}>
+                              {ROLE_LABELS[col.role] ?? col.role}
+                            </span>
+                          </td>
+                          <td style={{ padding: "5px 12px", color: T.textSecondary }}>{col.unit || "—"}</td>
+                          <td style={{ padding: "5px 12px", color: T.textSecondary }}>{col.display_unit || "—"}</td>
+                          <td style={{ padding: "5px 12px", color: T.textDim, fontSize: 11 }}>{col.convert ? "conversion applied" : ""}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Metadata fields */}
+          {schema?.metadata_fields?.length > 0 && (
+            <div style={{ marginBottom: 28 }}>
+              <h3 style={{ margin: "0 0 12px 0", ...monoStyle, fontSize: 13, color: T.textPrimary, fontWeight: 500 }}>Metadata Extraction</h3>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {schema.metadata_fields.map((mf, i) => (
+                  <div key={i} style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, padding: "10px 14px", display: "flex", gap: 16, alignItems: "flex-start" }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ ...monoStyle, fontSize: 12, color: T.textPrimary, marginBottom: 4 }}>{mf.label}</div>
+                      <code style={{ ...monoStyle, fontSize: 10, color: T.textDim, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 3, padding: "2px 6px", display: "inline-block" }}>{mf.pattern}</code>
+                    </div>
+                    <div style={{ ...monoStyle, fontSize: 11, color: T.textDim, flexShrink: 0, textAlign: "right" }}>
+                      <div style={{ color: T.textSecondary }}>{mf.key}</div>
+                      <div>{mf.unit}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Transforms */}
+          {schema?.transforms && (
+            <div style={{ marginBottom: 28 }}>
+              <h3 style={{ margin: "0 0 12px 0", ...monoStyle, fontSize: 13, color: T.textPrimary, fontWeight: 500 }}>Transforms</h3>
+              <pre style={{ margin: 0, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, padding: "14px 16px", ...monoStyle, fontSize: 11, color: T.textSecondary, lineHeight: 1.6, overflowX: "auto", whiteSpace: "pre-wrap" }}>{schema.transforms}</pre>
+            </div>
+          )}
+
+          {/* Exposed variables */}
+          {schema?.exposed_vars?.length > 0 && (
+            <div style={{ marginBottom: 28 }}>
+              <h3 style={{ margin: "0 0 12px 0", ...monoStyle, fontSize: 13, color: T.textPrimary, fontWeight: 500 }}>Exposed Variables</h3>
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", ...monoStyle, fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ borderBottom: `1px solid ${T.border}` }}>
+                      {["ID", "Label", "Unit", "Description"].map(h => (
+                        <th key={h} style={{ padding: "6px 12px", textAlign: "left", color: T.textDim, fontWeight: 400, fontSize: 11 }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {schema.exposed_vars.map((v, i) => (
+                      <tr key={i} style={{ borderBottom: `1px solid ${T.border}20` }}>
+                        <td style={{ padding: "5px 12px" }}><code style={{ color: T.teal, fontSize: 11 }}>{v.id}</code></td>
+                        <td style={{ padding: "5px 12px", color: T.textPrimary }}>{v.label}</td>
+                        <td style={{ padding: "5px 12px", color: T.textDim }}>{v.unit}</td>
+                        <td style={{ padding: "5px 12px", color: T.textSecondary, fontSize: 11 }}>{v.description}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Example file preview */}
+          {preview && (
+            <div style={{ marginBottom: 28 }}>
+              <h3 style={{ margin: "0 0 12px 0", ...monoStyle, fontSize: 13, color: T.textPrimary, fontWeight: 500 }}>Example File Preview</h3>
+              <pre style={{ margin: 0, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, padding: "14px 16px", ...monoStyle, fontSize: 10, color: T.textDim, lineHeight: 1.5, overflowX: "auto", maxHeight: 300, overflowY: "auto", whiteSpace: "pre" }}>{preview}</pre>
+            </div>
+          )}
+        </>
+      )}
+
+      {tab === "source" && (
+        <div>
+          {isBuiltin ? (
+            <div style={{ ...monoStyle, fontSize: 11, color: T.textDim, marginBottom: 10, padding: "8px 12px", background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 5 }}>
+              Read-only — duplicate to create an editable user module
+            </div>
+          ) : (
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginBottom: 10 }}>
+              {editSrc !== null ? (
+                <>
+                  {saveErr && <span style={{ ...monoStyle, fontSize: 11, color: T.red, alignSelf: "center" }}>{saveErr}</span>}
+                  <Btn variant="ghost" small onClick={() => setEditSrc(null)}>Cancel</Btn>
+                  <Btn variant="teal" small onClick={handleSave} disabled={saving}>{saving ? "Saving…" : saved ? "Saved ✓" : "Save"}</Btn>
+                </>
+              ) : (
+                <Btn variant="ghost" small onClick={() => setEditSrc(source ?? "")}>Edit</Btn>
+              )}
+            </div>
+          )}
+          <textarea
+            value={editSrc !== null ? editSrc : (source ?? "")}
+            onChange={e => { if (!isBuiltin && editSrc !== null) setEditSrc(e.target.value); }}
+            readOnly={isBuiltin || editSrc === null}
+            spellCheck={false}
+            style={{ width: "100%", boxSizing: "border-box", minHeight: 520, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 6, padding: "14px 16px", ...monoStyle, fontSize: 12, lineHeight: 1.6, resize: "vertical", outline: "none", opacity: (isBuiltin || editSrc === null) ? 0.8 : 1 }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+const NEW_MODULE_SCAFFOLD = `from modules.base import LabModule
+
+class MyModule(LabModule):
+    id          = "my_module"
+    name        = "My Module"
+    description = "One-line description"
+    accepts     = [".csv", ".txt"]
+    version     = "1.0"
+    author      = "your name"
+
+    def parse(self, file_bytes, filename, meta):
+        # Parse file_bytes and return a JSON-serialisable dict
+        text = file_bytes.decode("utf-8", errors="replace")
+        # ... process text ...
+        return {"x": [], "y": []}
+
+    def plot(self, data, meta, options):
+        # Return a Plotly figure dict
+        return {
+            "data": [{
+                "x": data.get("x", []),
+                "y": data.get("y", []),
+                "type": "scatter",
+                "mode": "lines",
+            }],
+            "layout": {
+                "xaxis": {"title": "X"},
+                "yaxis": {"title": "Y"},
+                "margin": {"t": 20, "r": 20, "b": 50, "l": 60},
+            },
+        }
+`;
+
 // ── ModuleSourceModal ─────────────────────────────────────────────────────────
 
 function ModuleSourceModal({ mod, onClose, onSave }) {
@@ -8324,6 +8614,7 @@ export default function App() {
   const [exportOpen,    setExportOpen]    = useState(false);
   const [modules,       setModules]       = useState([]);
   const [moduleSource,  setModuleSource]  = useState(null); // { id, name, builtin, source }
+  const [activeModule,  setActiveModule]  = useState(null); // module id
   const [importError,   setImportError]   = useState(null);
   const [importing,     setImporting]     = useState(false);
   const [viewDataOpen,  setViewDataOpen]  = useState(false);  // View Data modal
@@ -8765,6 +9056,15 @@ export default function App() {
                 <Btn variant="ghost" small onClick={() => setEditingBook(activeBookObj)}>Edit</Btn>
                 <Btn variant="danger" small onClick={() => { if (window.confirm(`Delete book "${activeBookObj.name}"?`)) { deleteBook(activeBookObj.id); } }}>Delete</Btn>
               </>
+            ) : activeModule ? (
+              <>
+                <button onClick={() => setActiveModule(null)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 20, lineHeight: 1, padding: 0 }}>←</button>
+                <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.teal }}>
+                  {activeModule === "__new__" ? "New Module" : (modules.find(m => m.id === activeModule)?.name ?? activeModule)}
+                </span>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>Module</span>
+                <div style={{ flex: 1 }} />
+              </>
             ) : (
               <>
                 <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.amber, letterSpacing: 1 }}>LabLog</span>
@@ -8823,6 +9123,12 @@ export default function App() {
               plotCache={plotCache}
               settings={settings}
               onUpdateBook={(updates) => updateBookInPlace(activeBook, updates)} />
+          ) : activeModule ? (
+            <ModuleDetailPage
+              moduleId={activeModule}
+              moduleInfo={modules.find(m => m.id === activeModule)}
+              onBack={() => setActiveModule(null)}
+              onModulesChange={async () => { const mods = await api("GET", "/modules"); setModules(mods); }} />
           ) : (
             <>
               {/* Samples section */}
@@ -8942,14 +9248,12 @@ export default function App() {
                   <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.textPrimary }}>Modules</h2>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{modules.length}</span>
                   <div style={{ flex: 1 }} />
+                  <Btn variant="ghost" small onClick={() => setActiveModule("__new__")}>+ New Module</Btn>
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
                   {modules.map(m => (
                     <div key={m.id}
-                      onClick={async () => {
-                        const res = await api("GET", `/modules/${m.id}/source`);
-                        setModuleSource({ ...m, source: res.source, builtin: res.builtin });
-                      }}
+                      onClick={() => setActiveModule(m.id)}
                       style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "12px 14px", cursor: "pointer", transition: "border-color .12s", display: "flex", flexDirection: "column", gap: 6 }}
                       onMouseEnter={e => e.currentTarget.style.borderColor = T.borderBright}
                       onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
