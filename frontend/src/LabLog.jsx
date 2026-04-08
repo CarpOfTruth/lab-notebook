@@ -3151,7 +3151,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
 
 // ── ViewDataModal ──────────────────────────────────────────────────────────────
 
-function ViewDataModal({ sampleId, files, loading, onClose }) {
+function ViewDataModal({ sampleId, files, loading, onClose, onDeleteFile }) {
 
   const fmt = (bytes) => {
     if (bytes < 1024) return `${bytes} B`;
@@ -3229,6 +3229,18 @@ function ViewDataModal({ sampleId, files, loading, onClose }) {
                   onMouseLeave={e => e.currentTarget.style.opacity = 0.7}>
                   ↓
                 </a>
+                {/* Delete file */}
+                <button
+                  title="Delete file"
+                  onClick={() => {
+                    if (window.confirm(`Delete "${label(f.filename)}" from ${sampleId}?\n\nThis cannot be undone.`))
+                      onDeleteFile(f.filename);
+                  }}
+                  style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 13, flexShrink: 0, opacity: 0.6, padding: 0, lineHeight: 1 }}
+                  onMouseEnter={e => e.currentTarget.style.opacity = 1}
+                  onMouseLeave={e => e.currentTarget.style.opacity = 0.6}>
+                  ✕
+                </button>
               </div>
             );
           })}
@@ -8233,6 +8245,8 @@ export default function App() {
   const [settings, setSettings] = useState(() => JSON.parse(JSON.stringify(DEFAULT_SETTINGS)));
   const [settingsOpen,  setSettingsOpen]  = useState(false);
   const [exportOpen,    setExportOpen]    = useState(false);
+  const [importError,   setImportError]   = useState(null);
+  const [importing,     setImporting]     = useState(false);
   const [viewDataOpen,  setViewDataOpen]  = useState(false);  // View Data modal
   const [viewDataFiles, setViewDataFiles] = useState([]);
   const [viewDataLoading, setViewDataLoading] = useState(false);
@@ -8349,6 +8363,28 @@ export default function App() {
     a.href = `${API_BASE}/samples/${active}/export`;
     a.download = `${active}_export.zip`;
     a.click();
+  };
+
+  const handleImportSample = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";          // reset so same file can be re-selected
+    if (!file) return;
+    setImporting(true);
+    setImportError(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch(`${API_BASE}/samples/import`, { method: "POST", body: form });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.detail || "Import failed");
+      // Refresh samples list
+      const updated = await api("GET", "/samples");
+      setSamples(updated);
+      setActive(json.id);
+    } catch (err) {
+      setImportError(err.message);
+    }
+    setImporting(false);
   };
 
   const handleReparseFiles = async () => {
@@ -8608,6 +8644,13 @@ export default function App() {
                 <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>ferroelectric oxide films</span>
                 <div style={{ flex: 1 }} />
                 <Btn variant="ghost" small onClick={() => setExportOpen(true)}>Export</Btn>
+                <label style={{ cursor: importing ? "wait" : "pointer" }}>
+                  <input type="file" accept=".zip" style={{ display: "none" }} onChange={handleImportSample} disabled={importing} />
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", borderRadius: 4, border: `1px solid ${T.border}`, background: T.bg2, color: importing ? T.textDim : T.textSecondary, cursor: "inherit", userSelect: "none" }}>
+                    {importing ? "Importing…" : "Import"}
+                  </span>
+                </label>
+                {importError && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={importError}>{importError}</span>}
                 <Btn variant="ghost" small onClick={() => setAddingFolder(true)}>+ Folder</Btn>
                 <button onClick={() => setSettingsOpen(true)}
                   title="Settings"
@@ -8773,7 +8816,14 @@ export default function App() {
       {adding && <AddSampleModal onAdd={addSample} onClose={() => setAdding(false)} folders={folders} settings={settings} />}
       {templateSample && <AddSampleModal onAdd={s => { addSample(s); setTemplateSample(null); }} onClose={() => setTemplateSample(null)} folders={folders} template={templateSample} settings={settings} />}
       {exportOpen   && <ExportModal samples={samples} onClose={() => setExportOpen(false)} />}
-      {viewDataOpen && <ViewDataModal sampleId={active} files={viewDataFiles} loading={viewDataLoading} onClose={() => setViewDataOpen(false)} />}
+      {viewDataOpen && <ViewDataModal sampleId={active} files={viewDataFiles} loading={viewDataLoading} onClose={() => setViewDataOpen(false)}
+        onDeleteFile={async (filename) => {
+          await api("DELETE", `/samples/${active}/files/${encodeURIComponent(filename)}`);
+          setViewDataFiles(f => f.filter(x => x.filename !== filename));
+          // refresh sample so filenames dict stays in sync
+          const updated = await api("GET", `/samples/${active}`);
+          setSamples(p => p.map(s => s.id === active ? updated : s));
+        }} />}
       {settingsOpen && <SettingsModal settings={settings} onSave={handleSaveSettings} onClose={() => setSettingsOpen(false)} />}
       {(addingFolder || editingFolder) && (
         <AddFolderModal onSave={saveFolder} onClose={() => { setAddingFolder(false); setEditingFolder(null); }} existing={editingFolder} allFolders={folders} />

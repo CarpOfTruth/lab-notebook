@@ -333,6 +333,74 @@ def get_file(sample_id: str, filename: str):
     return FileResponse(path)
 
 
+@app.post("/api/samples/import")
+async def import_sample(file: UploadFile = File(...)):
+    """
+    Accept a .zip produced by /export, recreate the sample record and all
+    uploaded data files.  Returns 409 if the sample ID already exists.
+    """
+    import zipfile, io as _io
+
+    data = await file.read()
+    try:
+        zf = zipfile.ZipFile(_io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "Not a valid zip file")
+
+    names = zf.namelist()
+    json_names = [n for n in names if n.endswith("/sample.json")]
+    if not json_names:
+        raise HTTPException(400, "zip does not contain sample.json")
+
+    try:
+        sample_data = json.loads(zf.read(json_names[0]))
+    except Exception:
+        raise HTTPException(400, "Could not parse sample.json")
+
+    sample_id = sample_data.get("id")
+    if not sample_id:
+        raise HTTPException(400, "sample.json has no 'id' field")
+
+    with get_db() as conn:
+        if conn.execute("SELECT id FROM samples WHERE id=?", (sample_id,)).fetchone():
+            raise HTTPException(409, f"Sample '{sample_id}' already exists — rename it in the zip or delete the existing record first")
+        conn.execute("""
+            INSERT INTO samples
+              (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
+               technique, folder_id, layers, filenames, xrd_peaks, lot, bin)
+            VALUES
+              (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
+               :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin)
+        """, {
+            "id":            sample_id,
+            "date":          sample_data.get("date"),
+            "substrate":     sample_data.get("substrate"),
+            "notes":         sample_data.get("notes"),
+            "thickness_nm":  sample_data.get("thickness_nm"),
+            "area_m2":       sample_data.get("area_m2"),
+            "area_correction": sample_data.get("area_correction", 1.0),
+            "technique":     sample_data.get("technique", "sputter"),
+            "folder_id":     None,   # don't transplant folder membership
+            "layers":        json.dumps(sample_data.get("layers", [])),
+            "filenames":     json.dumps(sample_data.get("filenames", {})),
+            "xrd_peaks":     json.dumps(sample_data.get("xrd_peaks", [])),
+            "lot":           sample_data.get("lot"),
+            "bin":           sample_data.get("bin"),
+        })
+        conn.commit()
+
+    # Restore data files
+    file_entries = [n for n in names if "/files/" in n and not n.endswith("/")]
+    dest_dir = FILES_DIR / sample_id
+    if file_entries:
+        dest_dir.mkdir(exist_ok=True)
+        for entry in file_entries:
+            (dest_dir / Path(entry).name).write_bytes(zf.read(entry))
+
+    zf.close()
+    return {"ok": True, "id": sample_id, "files_restored": len(file_entries)}
+
+
 @app.get("/api/samples/{sample_id}/files")
 def list_files(sample_id: str):
     """Return metadata for every file stored under this sample."""
@@ -393,6 +461,23 @@ def export_sample(sample_id: str):
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{safe_id}_export.zip"'},
     )
+
+
+@app.delete("/api/samples/{sample_id}/files/{filename}")
+def delete_file(sample_id: str, filename: str):
+    path = FILES_DIR / sample_id / filename
+    if not path.exists():
+        raise HTTPException(404, "File not found")
+    path.unlink()
+    # Remove from the sample's filenames dict if present
+    with get_db() as conn:
+        row = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
+        if row:
+            filenames = json.loads(row["filenames"] or "{}")
+            updated = {k: v for k, v in filenames.items() if v != filename}
+            conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(updated), sample_id))
+            conn.commit()
+    return {"ok": True}
 
 
 @app.get("/api/samples/{sample_id}/afm_data")
