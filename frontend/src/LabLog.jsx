@@ -44,6 +44,7 @@ const DARK_T = {
   amber: "#f6ad55", amberDim: "#c47f2a", amberGlow: "rgba(246,173,85,0.15)",
   teal: "#4fd1c5", red: "#fc8181", green: "#68d391", blue: "#63b3ed", violet: "#a78bfa",
   textPrimary: "#e2e8f0", textSecondary: "#a0aec0", textDim: "#718096",
+  accent: "#e2e8f0",
 };
 const LIGHT_T = {
   bg0: "#f0f2f5", bg1: "#ffffff", bg2: "#f8f9fa", bg3: "#e4e8ef",
@@ -51,6 +52,7 @@ const LIGHT_T = {
   amber: "#d97706", amberDim: "#b45309", amberGlow: "rgba(217,119,6,0.08)",
   teal: "#0d9488", red: "#dc2626", green: "#16a34a", blue: "#2563eb", violet: "#7c3aed",
   textPrimary: "#1a202c", textSecondary: "#4a5568", textDim: "#6b7280",
+  accent: "#2d3748",
 };
 let T = DARK_T;
 
@@ -2691,11 +2693,13 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
         if (Object.keys(mergedResults).length) {
           setFitResults(mergedResults);
           if (fittedCurveOut) setFittedCurve(fittedCurveOut);
+          else if (fringePeaks.length && !fringeResultsList.length)
+            setFitError("Fringe fit returned no result — check thickness seed and tolerance.");
           setPeakCurves(peakCurvesOut);
         } else {
           setFitError("Not enough data in window — try widening the tolerance or fit window.");
         }
-      } catch (e) { setFitError(String(e.message || e)); }
+      } catch (e) { setFitError(String(e.message || e)); console.error("runFit error:", e); }
       setFitting(false);
     }, 20);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2779,7 +2783,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
     }),
     // Live fringe preview (dotted) — shown whenever fringe_model is on + thickness set
     ...fringePreviewTraces,
-    ...(fittedCurve ? [{ x: fittedCurve.x, y: fittedCurve.y, type: "scatter", mode: "lines", line: { color: T.accent, width: 1.5 }, showlegend: false, hoverinfo: "skip" }] : []),
+    ...(fittedCurve ? [{ x: fittedCurve.x, y: fittedCurve.y, type: "scatter", mode: "lines", line: { color: T.accent, width: 2 }, showlegend: false, hoverinfo: "skip", opacity: 0.9 }] : []),
   ];
 
   const layout = {
