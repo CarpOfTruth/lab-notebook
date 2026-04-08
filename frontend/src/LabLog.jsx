@@ -2171,7 +2171,7 @@ function fitBackground(xrdData, peaks = [], nBgTerms = 6) {
 //
 // Returns same shape as fitPeaksVoigt.results[id]: { center, dSpacing, dRef, strain, amplitude,
 //   fwhm, thickness_nm, fwhmG (instrument), fwhmL: 0, eta: 0 }
-function fitLaueFreeze(xrdData, peak, fitWindow, bgResult, thicknessNm) {
+function fitLaueFreeze(xrdData, peak, fitWindow, bgResult, thicknessNm, locked = false) {
   const LAMBDA = 0.15406; // nm  Cu Kα
   const allPts = [...xrdData].sort((a, b) => a.x - b.x);
   if (!allPts.length) return null;
@@ -2204,34 +2204,39 @@ function fitLaueFreeze(xrdData, peak, fitWindow, bgResult, thicknessNm) {
     return sinc2 * gEnv;
   };
 
-  // t seed: supplied, or fallback to 20 nm
   const tSeed = (thicknessNm && thicknessNm > 0) ? thicknessNm : 20;
   const tol   = peak.width;
+  const initLogAmp = Math.log(Math.max(...ys) - Math.min(...bgAtPts) || 10);
 
-  // [logAmp, rawCen, logT, logSig]
-  const p0 = [
-    Math.log(Math.max(...ys) - Math.min(...bgAtPts) || 10),
-    0,
-    Math.log(tSeed),
-    Math.log(0.05),
-  ];
-  const loss = params => {
-    const amp = Math.exp(params[0]);
-    const cen = peak.center + tol * Math.tanh(params[1]);
-    const t   = Math.exp(params[2]);
-    const sig = Math.exp(params[3]);
-    let s = 0;
-    for (let i = 0; i < xs.length; i++) {
-      const model = Math.max(bgAtPts[i] + amp * laueProfile(xs[i], cen, t, sig), 1e-10);
-      s += model - ys[i] * Math.log(model);
-    }
-    return s;
-  };
-  const pFit = nelderMead(loss, p0, { maxIter: 8000, tol: 1e-10 });
-  const amp  = Math.exp(pFit[0]);
-  const cen  = peak.center + tol * Math.tanh(pFit[1]);
-  const t    = Math.exp(pFit[2]);
-  const sig  = Math.exp(pFit[3]);
+  let amp, cen, t, sig;
+  if (locked && thicknessNm > 0) {
+    // Locked: only fit [logAmp, rawCen], thickness fixed
+    t = thicknessNm; sig = 0.05;
+    const pFit = nelderMead(params => {
+      const a = Math.exp(params[0]), c = peak.center + tol * Math.tanh(params[1]);
+      let s = 0;
+      for (let i = 0; i < xs.length; i++) {
+        const m = Math.max(bgAtPts[i] + a * laueProfile(xs[i], c, t, sig), 1e-10);
+        s += m - ys[i] * Math.log(m);
+      }
+      return s;
+    }, [initLogAmp, 0], { maxIter: 4000, tol: 1e-8 });
+    amp = Math.exp(pFit[0]); cen = peak.center + tol * Math.tanh(pFit[1]);
+  } else {
+    // Free fit: [logAmp, rawCen, logT, logSig]
+    const pFit = nelderMead(params => {
+      const a = Math.exp(params[0]), c = peak.center + tol * Math.tanh(params[1]);
+      const _t = Math.exp(params[2]), _s = Math.exp(params[3]);
+      let s = 0;
+      for (let i = 0; i < xs.length; i++) {
+        const m = Math.max(bgAtPts[i] + a * laueProfile(xs[i], c, _t, _s), 1e-10);
+        s += m - ys[i] * Math.log(m);
+      }
+      return s;
+    }, [initLogAmp, 0, Math.log(tSeed), Math.log(0.05)], { maxIter: 8000, tol: 1e-10 });
+    amp = Math.exp(pFit[0]); cen = peak.center + tol * Math.tanh(pFit[1]);
+    t   = Math.exp(pFit[2]); sig = Math.exp(pFit[3]);
+  }
   const fwhmG = 2 * Math.sqrt(2 * Math.log(2)) * sig;
 
   const theta   = cen * Math.PI / 360;
@@ -2571,7 +2576,8 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
       return {
         id: ln.id, center: tt, width: ln.tolerance ?? 0.5,
         fringeModel: ln.fringe_model ?? false,
-        fringeThicknessNm: ln.fringe_model ? getLayerThickness(ln) : null,
+        fringeThicknessNm: ln.fringe_model ? (ln.fringe_thickness_nm ?? getLayerThickness(ln)) : null,
+        fringeLock: ln.fringe_lock ?? false,
       };
     }).filter(Boolean),
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2619,16 +2625,18 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
         // Fit each fringe peak independently and build display curves
         const allPtsSorted = [...xrdData].sort((a, b) => a.x - b.x);
         for (const fp of fringePeaks) {
-          const res = fitLaueFreeze(xrdData, fp, fitWindow, bg, fp.fringeThicknessNm);
+          const res = fitLaueFreeze(xrdData, fp, fitWindow, bg, fp.fringeThicknessNm, fp.fringeLock);
           if (!res) continue;
           mergedResults[fp.id] = res;
-          // Build peak curve for display — same x-grid as fitting window
-          const pts = fitWindow
-            ? allPtsSorted.filter(p => p.x >= fitWindow[0] && p.x <= fitWindow[1])
-            : allPtsSorted.filter(p => Math.abs(p.x - fp.center) <= fp.width);
-          if (pts.length >= 2) {
-            const xMin = pts[0].x, xMax = pts[pts.length - 1].x;
-            const nFine = 400;
+          // Build peak curve for display — extend to ±6 fringe periods for visibility
+          if (allPtsSorted.length >= 2) {
+            const LAMBDA_D = 0.15406;
+            const thetaCenD = res.center * Math.PI / 360;
+            const period = LAMBDA_D / (res.thickness_nm * Math.cos(thetaCenD)) * (180 / Math.PI);
+            const halfRange = Math.max(period * 6, 3);
+            const xMin = Math.max(allPtsSorted[0].x, res.center - halfRange);
+            const xMax = Math.min(allPtsSorted[allPtsSorted.length - 1].x, res.center + halfRange);
+            const nFine = 600;
             const fxs = Array.from({ length: nFine }, (_, k) => xMin + k * (xMax - xMin) / (nFine - 1));
             const thetaCen = res.center * Math.PI / 360;
             const fys = fxs.map(x => {
@@ -2673,6 +2681,45 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
   const yMin = yRaw.length ? Math.min(...yRaw) : 1;
   const yMax = yRaw.length ? Math.max(...yRaw) : 1e6;
 
+  // Live sinc² preview — recomputes immediately when thickness input changes
+  const fringePreviewTraces = useMemo(() => {
+    const LAMBDA = 0.15406;
+    const allXSorted = [...xrdData].sort((a, b) => a.x - b.x);
+    const dataXMin = allXSorted[0]?.x ?? 0;
+    const dataXMax = allXSorted[allXSorted.length - 1]?.x ?? 90;
+    return lines.flatMap((ln, i) => {
+      if (!ln.fringe_model) return [];
+      const cen = ln.material === "__arbitrary__"
+        ? (ln.arbitrary_2theta ?? null)
+        : (lineEffStructs[i] ? calcTwoTheta(lineEffStructs[i], ln.hkl) : null);
+      if (cen == null) return [];
+      const t = ln.fringe_thickness_nm ?? getLayerThickness(ln);
+      if (!t || t <= 0) return [];
+      const cenRad = cen * Math.PI / 360;
+      // Estimate amplitude from data within ±1° of center
+      const nearby = xrdData.filter(p => Math.abs(p.x - cen) <= 1.0);
+      const amp = nearby.length ? Math.max(...nearby.map(p => p.y)) : (yMax || 1000);
+      // Cover ±6 fringe periods, clamped to data range
+      const period = LAMBDA / (t * Math.cos(cenRad)) * (180 / Math.PI);
+      const halfRange = Math.max(period * 6, 3);
+      const xMin = Math.max(dataXMin, cen - halfRange);
+      const xMax = Math.min(dataXMax, cen + halfRange);
+      const nFine = 600;
+      const fxs = Array.from({ length: nFine }, (_, k) => xMin + k * (xMax - xMin) / (nFine - 1));
+      const fys = fxs.map(x => {
+        const theta = x * Math.PI / 360;
+        const dSin = Math.sin(theta) - Math.sin(cenRad);
+        const arg = Math.PI * t * dSin / LAMBDA;
+        const sinc2 = Math.abs(arg) < 1e-9 ? 1 : Math.pow(Math.sin(arg) / arg, 2);
+        return Math.max(amp * sinc2, 1);
+      });
+      return [{ x: fxs, y: fys, type: "scatter", mode: "lines",
+        line: { color: ln.color, width: 1.5, dash: "dot" },
+        showlegend: false, hoverinfo: "skip", opacity: 0.55 }];
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lines, lineEffStructs, xrdData, yMax, getLayerThickness]);
+
   const traces = [
     { x: xrdData.map(p => p.x), y: xrdData.map(p => Math.max(p.y, 1)), type: "scatter", mode: "lines", line: { color: T.textSecondary, width: 1 }, showlegend: false, hovertemplate: "2θ=%{x:.3f}°<br>I=%{y:.0f}<extra></extra>" },
     // Background curve — bgCurve (standalone) takes priority over peak-fit bgY
@@ -2691,6 +2738,8 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
       const yPath = [...topY, ...bgFloor.slice().reverse()];
       return { x: xPath, y: yPath, type: "scatter", mode: "lines", fill: "toself", fillcolor: col + "40", line: { color: col, width: 1 }, showlegend: false, hoverinfo: "skip" };
     }),
+    // Live fringe preview (dotted) — shown whenever fringe_model is on + thickness set
+    ...fringePreviewTraces,
     ...(fittedCurve ? [{ x: fittedCurve.x, y: fittedCurve.y, type: "scatter", mode: "lines", line: { color: T.accent, width: 1.5 }, showlegend: false, hoverinfo: "skip" }] : []),
   ];
 
@@ -2869,7 +2918,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
                   <DeferredInput type="number" value={ln.tolerance ?? 0.5} step={0.1} min={0}
                     onChange={v => updateLine(ln.id, { tolerance: Math.max(0, Number(v)) })}
                     style={{ ...rc, width: 52, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text", padding: "4px 4px" }} />
-                  {/* Fringe model toggle + thickness seed */}
+                  {/* Fringe model toggle + thickness seed + lock */}
                   <button
                     title={ln.fringe_model ? "Laue fringe model active — click to disable" : "Enable Laue fringe model for this peak"}
                     onClick={e => { e.stopPropagation(); updateLine(ln.id, { fringe_model: !ln.fringe_model }); }}
@@ -2878,12 +2927,20 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
                   </button>
                   {ln.fringe_model && (() => {
                     const layerT = getLayerThickness(ln);
+                    const tVal = ln.fringe_thickness_nm ?? layerT ?? "";
                     return (
                       <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-                        <DeferredInput type="number" value={ln.fringe_thickness_nm ?? layerT ?? ""} placeholder={layerT != null ? String(layerT) : "nm"} min={0}
-                          onChange={v => updateLine(ln.id, { fringe_thickness_nm: v === "" ? null : Number(v) })}
+                        <input type="number" value={tVal} placeholder={layerT != null ? String(layerT) : "nm"} min={0}
+                          onChange={e => updateLine(ln.id, { fringe_thickness_nm: e.target.value === "" ? null : Number(e.target.value) })}
+                          onClick={e => e.stopPropagation()}
                           style={{ ...rc, width: 60, background: T.bg0, border: `1px solid ${T.teal}66`, color: T.teal, textAlign: "center", cursor: "text", padding: "4px 4px" }} />
                         <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>nm</span>
+                        <button
+                          title={ln.fringe_lock ? "Thickness locked — click to allow fitting" : "Click to lock thickness (won't be fitted)"}
+                          onClick={e => { e.stopPropagation(); updateLine(ln.id, { fringe_lock: !ln.fringe_lock }); }}
+                          style={{ ...rc, background: ln.fringe_lock ? `${T.amber}22` : T.bg0, border: `1px solid ${ln.fringe_lock ? T.amber : T.border}`, color: ln.fringe_lock ? T.amber : T.textDim, fontSize: 11, padding: "3px 5px" }}>
+                          {ln.fringe_lock ? "🔒" : "🔓"}
+                        </button>
                       </div>
                     );
                   })()}
