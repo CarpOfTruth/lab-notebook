@@ -1680,14 +1680,15 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 
   const handleFile = (measType, file) => {
     if (measType === "afm") { onUploadFile("afm", file, null, null); return; }
+    // Route PE through the server-side module
+    if (measType === "pe") { onUploadFile("pe", file, null, null, true); return; }
     const reader = new FileReader();
     reader.onload = e => {
       const text = e.target.result;
       const thick = sample.thickness_nm || 0;
       const parsed = csvToPlotData(text, measType, thick);
       if (!parsed || !hasPlotData(parsed)) return;
-      const area = measType === "pe" ? findAreaFromFile(text) : null;
-      onUploadFile(measType, file, parsed, area);
+      onUploadFile(measType, file, parsed, null);
     };
     reader.readAsText(file);
   };
@@ -8313,11 +8314,35 @@ export default function App() {
 
   // ── File upload + plotCache ──────────────────────────────────────────────
 
-  const handleUploadFile = async (measType, file, parsed, peArea) => {
+  const handleUploadFile = async (measType, file, parsed, peArea, useModule = false) => {
     if (!active) return;
     const sample = samples.find(s => s.id === active);
     if (!sample) return;
     try {
+      if (useModule) {
+        // Route through the module parse endpoint — file saved + parsed server-side
+        const form = new FormData();
+        form.append("file", file);
+        const res  = await fetch(`${API_BASE}/modules/${measType}/parse?sample_id=${encodeURIComponent(active)}`, { method: "POST", body: form });
+        const json = await res.json();
+        if (!res.ok) throw new Error(json.detail || "Module parse failed");
+        const moduleData = json.data;
+        // Store as flat points array for backwards-compat with existing rendering.
+        // The module also provides pre-split first/second loops in moduleData.
+        const cacheValue = moduleData.points || moduleData;
+        setPlotCache(p => ({ ...p, [active]: { ...(p[active] || {}), [measType]: cacheValue } }));
+        // Update sample record (filenames updated server-side; re-fetch to sync)
+        const updatedSample = await api("GET", `/samples/${active}`);
+        const withArea = moduleData.area_m2
+          ? { ...updatedSample, area_m2: updatedSample.area_m2 || moduleData.area_m2 }
+          : updatedSample;
+        setSamples(p => p.map(s => s.id === active ? withArea : s));
+        if (moduleData.area_m2 && !updatedSample.area_m2) {
+          await updateSample(withArea);
+        }
+        return;
+      }
+
       const { filename } = await uploadFile(active, measType, file);
       if (measType === "afm") {
         // Binary file — fetch processed data from the backend

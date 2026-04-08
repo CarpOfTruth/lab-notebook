@@ -1,7 +1,8 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 import sqlite3, json, os, shutil
 from pathlib import Path
+import modules as mod_registry
 
 app = FastAPI(title="LabLog API")
 
@@ -663,6 +664,115 @@ def delete_book(book_id: str):
     with get_db() as conn:
         conn.execute("DELETE FROM analysis_books WHERE id=?", (book_id,))
         conn.commit()
+    return {"ok": True}
+
+
+# ── Module system ─────────────────────────────────────────────────────────────
+
+@app.get("/api/modules")
+def list_modules():
+    """Return metadata for all registered modules."""
+    return [m.to_info() for m in mod_registry.all_modules()]
+
+
+@app.get("/api/modules/{module_id}/source")
+def get_module_source(module_id: str):
+    """Return the raw Python source of a module."""
+    src = mod_registry.source(module_id)
+    if src is None:
+        raise HTTPException(404, f"Module '{module_id}' not found")
+    m = mod_registry.get(module_id)
+    return {
+        "id":      module_id,
+        "builtin": m.author == "built-in" if m else True,
+        "source":  src,
+    }
+
+
+@app.post("/api/modules/{module_id}/parse")
+async def parse_with_module(
+    module_id: str,
+    sample_id: str = Query(...),
+    file: UploadFile = File(...),
+):
+    """
+    Parse an uploaded file using the named module and return structured data.
+    Also saves the file to disk under FILES_DIR/{sample_id}/.
+    """
+    m = mod_registry.get(module_id)
+    if not m:
+        raise HTTPException(404, f"Module '{module_id}' not found")
+
+    file_bytes = await file.read()
+
+    # Fetch sample meta for unit conversion
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
+    meta = row_to_sample(row) if row else {}
+
+    result = m.parse(file_bytes, file.filename, meta)
+    if result is None:
+        raise HTTPException(422, "Module could not parse this file")
+
+    # Save file to disk (same convention as the generic upload endpoint)
+    dest_dir = FILES_DIR / sample_id
+    dest_dir.mkdir(exist_ok=True)
+    dest = dest_dir / f"{module_id}_{file.filename}"
+    dest.write_bytes(file_bytes)
+
+    # Update sample filenames dict
+    if row:
+        sample = row_to_sample(row)
+        filenames = sample.get("filenames", {})
+        filenames[module_id] = dest.name
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE samples SET filenames=? WHERE id=?",
+                (json.dumps(filenames), sample_id),
+            )
+            conn.commit()
+
+    return {"ok": True, "filename": dest.name, "data": result}
+
+
+@app.post("/api/modules/{module_id}/plot")
+def plot_with_module(module_id: str, body: dict):
+    """
+    Generate a Plotly figure dict from already-parsed data.
+    body: { data: {...}, meta: {...}, options: {...} }
+    """
+    m = mod_registry.get(module_id)
+    if not m:
+        raise HTTPException(404, f"Module '{module_id}' not found")
+    try:
+        fig = m.plot(body.get("data", {}), body.get("meta", {}), body.get("options", {}))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    return fig
+
+
+@app.put("/api/modules/{module_id}/source")
+def save_module_source(module_id: str, body: dict):
+    """Save / update a user module. Built-ins must be duplicated first."""
+    code = body.get("source", "")
+    if not code.strip():
+        raise HTTPException(400, "Source cannot be empty")
+    try:
+        inst = mod_registry.save_user_module(module_id, code)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return {"ok": True, "id": inst.id, "name": inst.name}
+
+
+@app.delete("/api/modules/{module_id}")
+def delete_module(module_id: str):
+    """Delete a user module. Built-ins cannot be deleted."""
+    try:
+        mod_registry.delete_user_module(module_id)
+    except ValueError as e:
+        raise HTTPException(403, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
     return {"ok": True}
 
 
