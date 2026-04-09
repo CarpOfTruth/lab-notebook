@@ -3,14 +3,14 @@
   "configurations": [
     {
       "name": "frontend",
-      "runtimeExecutable": "node",
-      "runtimeArgs": ["scripts/start-frontend.js"],
+      "runtimeExecutable": "/Users/admin/Projects/Lab Notebook/frontend/node_modules/.bin/vite",
+      "runtimeArgs": ["/Users/admin/Projects/Lab Notebook/.claude/worktrees/cranky-wu/frontend", "--config", "/Users/admin/Projects/Lab Notebook/frontend/vite.config.js"],
       "port": 5173
     },
     {
       "name": "backend",
-      "runtimeExecutable": "node",
-      "runtimeArgs": ["scripts/start-backend.js"],
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "cd '/Users/admin/Projects/Lab Notebook/.claude/worktrees/cranky-wu/backend' && '/Users/admin/Projects/Lab Notebook/backend/.venv/bin/uvicorn' main:app --reload --port 8000"],
       "port": 8000
     }
   ]
