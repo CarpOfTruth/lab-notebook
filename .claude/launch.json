@@ -3,14 +3,14 @@
   "configurations": [
     {
       "name": "frontend",
-      "runtimeExecutable": "/Users/admin/Projects/Lab Notebook/frontend/node_modules/.bin/vite",
-      "runtimeArgs": ["--config", "/Users/admin/Projects/Lab Notebook/frontend/vite.config.js"],
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["scripts/start-frontend.js"],
       "port": 5173
     },
     {
       "name": "backend",
-      "runtimeExecutable": "sh",
-      "runtimeArgs": ["-c", "cd backend && .venv/bin/uvicorn main:app --reload --port 8000"],
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["scripts/start-backend.js"],
       "port": 8000
     }
   ]
