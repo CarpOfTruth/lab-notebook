@@ -1,18 +1,23 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 import sqlite3, json, os, shutil
 from pathlib import Path
 import modules as mod_registry
 
 app = FastAPI(title="LabLog API")
 
-BASE_DIR = Path(__file__).parent
-DATA_DIR = BASE_DIR / "data"
-FILES_DIR = DATA_DIR / "files"
-DB_PATH   = DATA_DIR / "lablog.db"
+BASE_DIR    = Path(__file__).parent
+DATA_DIR    = BASE_DIR / "data"
+FILES_DIR   = DATA_DIR / "files"
+DB_PATH     = DATA_DIR / "lablog.db"
+EXAMPLES_DIR = DATA_DIR / "module_examples"
+SCHEMAS_DIR  = DATA_DIR / "module_schemas"
 
 DATA_DIR.mkdir(exist_ok=True)
 FILES_DIR.mkdir(exist_ok=True)
+EXAMPLES_DIR.mkdir(exist_ok=True)
+SCHEMAS_DIR.mkdir(exist_ok=True)
 
 config_path = BASE_DIR / "config.json"
 config = json.loads(config_path.read_text()) if config_path.exists() else {}
@@ -260,6 +265,14 @@ def update_sample(sample_id: str, sample: dict):
             "lot":        sample.get("lot"),
             "bin":        sample.get("bin"),
         })
+        conn.commit()
+    return {"ok": True}
+
+@app.patch("/api/samples/{sample_id}/area-correction")
+def patch_area_correction(sample_id: str, body: dict):
+    factor = float(body.get("area_correction", 1.0) or 1.0)
+    with get_db() as conn:
+        conn.execute("UPDATE samples SET area_correction=? WHERE id=?", (factor, sample_id))
         conn.commit()
     return {"ok": True}
 
@@ -671,8 +684,24 @@ def delete_book(book_id: str):
 
 @app.get("/api/modules")
 def list_modules():
-    """Return metadata for all registered modules."""
-    return [m.to_info() for m in mod_registry.all_modules()]
+    """Return metadata for all registered modules, merged with visual editor config."""
+    result = []
+    for m in mod_registry.all_modules():
+        info = m.to_info()
+        cfg_path = SCHEMAS_DIR / f"{m.id}.json"
+        if cfg_path.exists():
+            cfg = json.loads(cfg_path.read_text())
+            info["section"]          = cfg.get("section", "")
+            info["card_controls"]    = cfg.get("card_controls", [])
+            info["analysis_metrics"] = cfg.get("analysis_metrics", [])
+            info["analysis_code"]    = cfg.get("analysis_code", "")
+        else:
+            info["section"]          = ""
+            info["card_controls"]    = []
+            info["analysis_metrics"] = []
+            info["analysis_code"]    = ""
+        result.append(info)
+    return result
 
 
 @app.get("/api/modules/{module_id}/source")
@@ -687,6 +716,45 @@ def get_module_source(module_id: str):
         "builtin": m.author == "built-in" if m else True,
         "source":  src,
     }
+
+
+@app.delete("/api/samples/{sample_id}/module-files/{module_id}")
+def delete_module_file(sample_id: str, module_id: str):
+    """Remove a module's file from a sample — deletes the file and clears the filenames entry."""
+    with get_db() as conn:
+        row = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Sample not found")
+    filenames = json.loads(row["filenames"] or "{}")
+    filename = filenames.pop(module_id, None)
+    if filename:
+        fp = FILES_DIR / sample_id / filename
+        if fp.exists():
+            fp.unlink(missing_ok=True)
+    with get_db() as conn:
+        conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(filenames), sample_id))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/samples/{sample_id}/upload-module-file")
+async def upload_module_file(sample_id: str, module_id: str = Query(...), file: UploadFile = File(...)):
+    """Save a data file for a module on a sample, update filenames dict. No parsing."""
+    with get_db() as conn:
+        row = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, f"Sample '{sample_id}' not found")
+    dest_dir = FILES_DIR / sample_id
+    dest_dir.mkdir(exist_ok=True)
+    file_bytes = await file.read()
+    dest = dest_dir / f"{module_id}_{file.filename}"
+    dest.write_bytes(file_bytes)
+    filenames = json.loads(row["filenames"] or "{}")
+    filenames[module_id] = dest.name
+    with get_db() as conn:
+        conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(filenames), sample_id))
+        conn.commit()
+    return {"ok": True, "filename": dest.name}
 
 
 @app.post("/api/modules/{module_id}/parse")
@@ -774,6 +842,444 @@ def delete_module(module_id: str):
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     return {"ok": True}
+
+
+# ── Module example-file & config endpoints ────────────────────────────────────
+
+COMMENT_CHARS = ('#', ';', '!')
+
+
+def _sniff_file(file_bytes: bytes, delimiter: str = "auto",
+                skip_rows: Optional[int] = None) -> dict:
+    """Parse raw bytes and return a preview structure for the visual editor."""
+    text = file_bytes.decode("utf-8", errors="replace")
+    raw_lines = text.splitlines()
+
+    # Detect delimiter by majority vote over first 20 non-comment, non-blank lines
+    det_delim = delimiter
+    if det_delim == "auto":
+        counts: dict = {"\t": 0, ",": 0, ";": 0, None: 0}
+        checked = 0
+        for line in raw_lines:
+            s = line.strip()
+            if not s or s[0] in COMMENT_CHARS:
+                continue
+            # Skip lines that are mostly non-ASCII (binary preamble)
+            ascii_ratio = sum(1 for c in s if ord(c) < 128) / len(s)
+            if ascii_ratio < 0.5:
+                continue
+            if "\t" in s:
+                counts["\t"] += 1
+            elif "," in s:
+                counts[","] += 1
+            elif ";" in s:
+                counts[";"] += 1
+            else:
+                counts[None] += 1
+            checked += 1
+            if checked >= 20:
+                break
+        if checked == 0:
+            det_delim = ","
+        else:
+            det_delim = max(counts, key=lambda k: counts[k])
+
+    def split_line(line):
+        s = line.strip()
+        if det_delim:
+            return [c.strip().strip("\"'") for c in s.split(det_delim)]
+        return s.split()
+
+    # Classify lines
+    data_rows = []
+    for line in raw_lines:
+        s = line.strip()
+        if not s or s[0] in COMMENT_CHARS:
+            continue
+        data_rows.append(split_line(line))
+
+    def is_numeric_row(cells):
+        if not cells:
+            return False
+        ok = sum(1 for c in cells if c not in ("", "nan", "inf")
+                 and _try_float(c) is not None)
+        return ok / len(cells) > 0.5
+
+    def _try_float(v):
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
+
+    # Auto-detect skip_rows: first row index where majority of cells are numeric
+    auto_skip = 0
+    headers: list = []
+    if skip_rows is None:
+        for i, row in enumerate(data_rows[:200]):
+            if is_numeric_row(row):
+                auto_skip = i
+                if i > 0:
+                    headers = data_rows[i - 1]
+                break
+    else:
+        auto_skip = skip_rows
+        if skip_rows > 0 and data_rows:
+            headers = data_rows[min(skip_rows - 1, len(data_rows) - 1)]
+
+    preview_rows = [r for r in data_rows[auto_skip: auto_skip + 20]]
+    num_cols = max((len(r) for r in preview_rows), default=0)
+
+    # Normalise headers to num_cols length
+    headers = list(headers)
+    while len(headers) < num_cols:
+        headers.append(f"col_{len(headers)}")
+    headers = headers[:num_cols]
+
+    # Extract key-value metadata from header rows (before the data section)
+    header_meta = []
+    for row in data_rows[:auto_skip]:
+        if len(row) != 2:
+            continue
+        key, val = row[0], row[1]
+        if not key or not val:
+            continue
+        # Strip leading replacement characters from binary preamble artifacts
+        clean_key = key.lstrip("\ufffd").lstrip()
+        # Require key starts with an ASCII letter
+        if not clean_key or not (clean_key[0].isascii() and clean_key[0].isalpha()):
+            continue
+        header_meta.append({"key": clean_key.rstrip(":").strip(), "value": val.strip()})
+
+    return {
+        "delimiter": det_delim if det_delim else "whitespace",
+        "skip_rows": auto_skip,
+        "headers": headers,
+        "preview_rows": preview_rows,
+        "num_cols": num_cols,
+        "total_lines": len(raw_lines),
+        "header_meta": header_meta,
+    }
+
+
+@app.post("/api/modules/{module_id}/example")
+async def upload_module_example(module_id: str, file: UploadFile,
+                                delimiter: str = "auto"):
+    """Upload and store an example data file for a module, return sniff preview."""
+    file_bytes = await file.read()
+    ext = Path(file.filename).suffix or ".csv"
+
+    # Remove any existing example for this module
+    for old in EXAMPLES_DIR.glob(f"{module_id}.*"):
+        old.unlink()
+
+    dest = EXAMPLES_DIR / f"{module_id}{ext}"
+    dest.write_bytes(file_bytes)
+
+    sniff = _sniff_file(file_bytes, delimiter)
+    return {"ok": True, "filename": file.filename, "stored": dest.name, **sniff}
+
+
+@app.get("/api/modules/{module_id}/example")
+def get_module_example(module_id: str, delimiter: str = "auto",
+                       skip_rows: Optional[int] = None):
+    """Return sniff preview of the stored example file."""
+    files = list(EXAMPLES_DIR.glob(f"{module_id}.*"))
+    if not files:
+        raise HTTPException(404, f"No example file for module '{module_id}'")
+    f = files[0]
+    sniff = _sniff_file(f.read_bytes(), delimiter, skip_rows)
+    return {"filename": f.name, **sniff}
+
+
+@app.delete("/api/modules/{module_id}/example")
+def delete_module_example(module_id: str):
+    """Delete the stored example file for a module."""
+    files = list(EXAMPLES_DIR.glob(f"{module_id}.*"))
+    if not files:
+        raise HTTPException(404, "No example file found")
+    for f in files:
+        f.unlink()
+    return {"ok": True}
+
+
+@app.get("/api/modules/{module_id}/config")
+def get_module_config(module_id: str):
+    """Return the visual editor config JSON for a module."""
+    path = SCHEMAS_DIR / f"{module_id}.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+@app.put("/api/modules/{module_id}/config")
+def save_module_config(module_id: str, body: dict):
+    """Save the visual editor config JSON for a module."""
+    path = SCHEMAS_DIR / f"{module_id}.json"
+    path.write_text(json.dumps(body, indent=2))
+    return {"ok": True}
+
+
+def _json_safe(obj):
+    """Recursively convert obj to a JSON-serialisable form."""
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    # numpy support (optional)
+    try:
+        import numpy as np
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.integer, np.floating)):
+            return obj.item()
+    except ImportError:
+        pass
+    return str(obj)
+
+
+@app.post("/api/modules/{module_id}/run-processing")
+def run_module_processing(module_id: str, body: dict):
+    """Execute processing code against the stored example file and return the result."""
+    import traceback as tb
+    code = body.get("code", "")
+    files = list(EXAMPLES_DIR.glob(f"{module_id}.*"))
+    if not files:
+        raise HTTPException(404, "No example file for this module")
+    file_bytes = files[0].read_bytes()
+    filename   = files[0].name
+    # Wrap user code (which uses `return`) in a function
+    indented = "\n".join(f"    {line}" for line in code.splitlines())
+    wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
+    namespace: dict = {"file_bytes": file_bytes, "filename": filename, "meta": {}}
+    try:
+        exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
+        result = namespace["_proc"](file_bytes, filename, {})
+        return {"ok": True, "result": _json_safe(result)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "traceback": tb.format_exc()}
+
+
+@app.post("/api/modules/{module_id}/preview-plot")
+def preview_module_plot(module_id: str, body: dict):
+    """Run processing code, then build a Plotly figure from visual plot config."""
+    import traceback as tb
+    code = body.get("code", "")
+    plot_cfg = body.get("plot_config", {})
+    x_var   = plot_cfg.get("x_var") or "x"
+    y_var   = plot_cfg.get("y_var") or "y"
+    color   = plot_cfg.get("color") or "#94a3b8"
+    x_scale = plot_cfg.get("x_scale") or "linear"
+    y_scale = plot_cfg.get("y_scale") or "linear"
+
+    files = list(EXAMPLES_DIR.glob(f"{module_id}.*"))
+    if not files:
+        raise HTTPException(404, "No example file for this module")
+    file_bytes = files[0].read_bytes()
+    filename   = files[0].name
+    # Run processing code
+    indented = "\n".join(f"    {line}" for line in code.splitlines())
+    wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
+    namespace: dict = {"file_bytes": file_bytes, "filename": filename, "meta": {}}
+    try:
+        exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
+        data = namespace["_proc"](file_bytes, filename, {})
+    except Exception as exc:
+        return {"ok": False, "stage": "processing", "error": str(exc), "traceback": tb.format_exc()}
+    if not isinstance(data, dict):
+        return {"ok": False, "stage": "plot", "error": "Processing result must be a dict"}
+    # Extract x/y arrays from result
+    x_data = data.get(x_var)
+    y_data = data.get(y_var)
+    if not x_data or not y_data:
+        available = [k for k, v in data.items() if isinstance(v, list) and v and isinstance(v[0], (int, float))]
+        return {"ok": False, "stage": "plot",
+                "error": f"Variable '{x_var}' or '{y_var}' not found or empty. "
+                         f"Available array keys: {available}"}
+    # Derive axis labels: prefer explicit config, fall back to result metadata
+    x_label = plot_cfg.get("x_label") or data.get("x_label") or x_var
+    y_label = plot_cfg.get("y_label") or data.get("y_label") or y_var
+    figure = {
+        "data": [{
+            "x": x_data, "y": y_data,
+            "type": "scatter", "mode": "lines",
+            "line": {"color": color, "width": 1.5},
+            "hovertemplate": f"%{{x:.3g}} {x_label}<br>%{{y:.3g}} {y_label}<extra></extra>",
+        }],
+        "layout": {
+            "xaxis": {"title": x_label, "type": x_scale, "zeroline": True, "zerolinewidth": 1},
+            "yaxis": {"title": y_label, "type": y_scale, "zeroline": True, "zerolinewidth": 1},
+            "margin": {"t": 20, "r": 20, "b": 56, "l": 72},
+            "showlegend": False, "hovermode": "closest",
+        },
+        # Pass available array keys back so frontend can populate dropdowns
+        "available_vars": [k for k, v in data.items()
+                           if isinstance(v, list) and v and isinstance(v[0], (int, float))],
+    }
+    return {"ok": True, "figure": figure}
+
+
+@app.post("/api/modules/{module_id}/render-for-sample")
+def render_for_sample(module_id: str, body: dict):
+    """
+    Run processing code against a sample's actual data file, build a Plotly figure.
+    Body: { sample_id, proc_code, plot_config, options }
+    options are merged into plot_config (overrides x_var/y_var etc. for card controls).
+    """
+    import traceback as tb
+    sample_id  = body.get("sample_id", "")
+    proc_code  = body.get("proc_code", "")
+    plot_cfg   = {**(body.get("plot_config") or {}), **(body.get("options") or {})}
+    x_var   = plot_cfg.get("x_var") or "x"
+    y_var   = plot_cfg.get("y_var") or "y"
+    color   = plot_cfg.get("color") or "#94a3b8"
+    x_scale = plot_cfg.get("x_scale") or "linear"
+    y_scale = plot_cfg.get("y_scale") or "linear"
+
+    # Find the sample's file for this module
+    sample_dir = FILES_DIR / sample_id
+    if not sample_dir.is_dir():
+        raise HTTPException(404, f"No data directory for sample '{sample_id}'")
+
+    # Look for a file matching the module_id key in filenames
+    with get_db() as conn:
+        row = conn.execute("SELECT filenames, thickness_nm, area_m2 FROM samples WHERE id=?", (sample_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, f"Sample '{sample_id}' not found")
+    filenames   = json.loads(row["filenames"] or "{}")
+    thickness   = row["thickness_nm"] or 0.0
+    area        = row["area_m2"]
+    filename    = filenames.get(module_id)
+    if not filename:
+        return {"ok": False, "error": f"No file for module '{module_id}' on sample '{sample_id}'"}
+    file_path = sample_dir / filename
+    if not file_path.exists():
+        return {"ok": False, "error": f"File not found: {filename}"}
+    file_bytes = file_path.read_bytes()
+    area_correction = float((body.get("options") or {}).get("area_correction", 1.0) or 1.0)
+    meta = {"thickness_nm": thickness, "area_m2": area, "area_correction": area_correction}
+
+    # Run processing code
+    indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
+    wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
+    namespace: dict = {}
+    try:
+        exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
+        data = namespace["_proc"](file_bytes, filename, meta)
+    except Exception as exc:
+        return {"ok": False, "stage": "processing", "error": str(exc), "traceback": tb.format_exc()}
+    if not isinstance(data, dict):
+        return {"ok": False, "stage": "plot", "error": "Processing result must be a dict"}
+
+    x_data = data.get(x_var)
+    y_data = data.get(y_var)
+    if not x_data or not y_data:
+        available = [k for k, v in data.items() if isinstance(v, list) and v and isinstance(v[0], (int, float))]
+        return {"ok": False, "stage": "plot",
+                "error": f"Variable '{x_var}' or '{y_var}' not found. Available: {available}"}
+    x_label = plot_cfg.get("x_label") or data.get("x_label") or x_var
+    y_label = plot_cfg.get("y_label") or data.get("y_label") or y_var
+    result_area = data.get("area_m2")
+    return {
+        "ok": True,
+        "x": _json_safe(x_data),
+        "y": _json_safe(y_data),
+        "x_label": x_label,
+        "y_label": y_label,
+        "color": color,
+        "area_m2": result_area,
+    }
+
+
+@app.post("/api/modules/{module_id}/compute-analysis-for-sample")
+def compute_module_analysis_for_sample(module_id: str, body: dict):
+    """Run proc_code + analysis_code against a sample's actual data file."""
+    import traceback as tb
+    sample_id     = body.get("sample_id", "")
+    proc_code     = body.get("proc_code", "")
+    analysis_code = body.get("analysis_code", "")
+
+    with get_db() as conn:
+        row = conn.execute("SELECT filenames, thickness_nm, area_m2, area_correction FROM samples WHERE id=?", (sample_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, f"Sample '{sample_id}' not found")
+    filenames    = json.loads(row["filenames"] or "{}")
+    thickness    = row["thickness_nm"] or 0.0
+    area         = row["area_m2"]
+    area_corr    = float(row["area_correction"] or 1.0)
+    filename     = filenames.get(module_id)
+    if not filename:
+        return {"ok": False, "error": f"No file for module '{module_id}' on sample '{sample_id}'"}
+    file_path = FILES_DIR / sample_id / filename
+    if not file_path.exists():
+        return {"ok": False, "error": f"File not found: {filename}"}
+    file_bytes = file_path.read_bytes()
+    meta = {"thickness_nm": thickness, "area_m2": area, "area_correction": area_corr}
+
+    indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
+    wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
+    namespace: dict = {}
+    try:
+        exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
+        result = namespace["_proc"](file_bytes, filename, meta)
+    except Exception as exc:
+        return {"ok": False, "stage": "processing", "error": str(exc), "traceback": tb.format_exc()}
+    if not isinstance(result, dict):
+        return {"ok": False, "stage": "processing", "error": "Processing result must be a dict"}
+
+    indented2 = "\n".join(f"    {line}" for line in analysis_code.splitlines())
+    wrapped2  = f"def _analysis(result):\n{indented2}\n"
+    namespace2: dict = {}
+    try:
+        exec(compile(wrapped2, "<analysis>", "exec"), namespace2)   # noqa: S102
+        metrics = namespace2["_analysis"](result)
+    except Exception as exc:
+        return {"ok": False, "stage": "analysis", "error": str(exc), "traceback": tb.format_exc()}
+    if not isinstance(metrics, dict):
+        return {"ok": False, "stage": "analysis", "error": "Analysis code must return a dict"}
+
+    return {"ok": True, "values": _json_safe(metrics)}
+
+
+@app.post("/api/modules/{module_id}/compute-analysis")
+def compute_module_analysis(module_id: str, body: dict):
+    """Run processing code then analysis code; return computed metric values."""
+    import traceback as tb
+    proc_code     = body.get("proc_code", "")
+    analysis_code = body.get("analysis_code", "")
+
+    files = list(EXAMPLES_DIR.glob(f"{module_id}.*"))
+    if not files:
+        raise HTTPException(404, "No example file for this module")
+    file_bytes = files[0].read_bytes()
+    filename   = files[0].name
+
+    # Run processing code
+    indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
+    wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
+    namespace: dict = {}
+    try:
+        exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
+        result = namespace["_proc"](file_bytes, filename, {})
+    except Exception as exc:
+        return {"ok": False, "stage": "processing", "error": str(exc), "traceback": tb.format_exc()}
+    if not isinstance(result, dict):
+        return {"ok": False, "stage": "processing", "error": "Processing result must be a dict"}
+
+    # Run analysis code — wrap in a function that receives `result` and must return a dict
+    indented2 = "\n".join(f"    {line}" for line in analysis_code.splitlines())
+    wrapped2  = f"def _analysis(result):\n{indented2}\n"
+    namespace2: dict = {}
+    try:
+        exec(compile(wrapped2, "<analysis>", "exec"), namespace2)   # noqa: S102
+        metrics = namespace2["_analysis"](result)
+    except Exception as exc:
+        return {"ok": False, "stage": "analysis", "error": str(exc), "traceback": tb.format_exc()}
+    if not isinstance(metrics, dict):
+        return {"ok": False, "stage": "analysis", "error": "Analysis code must return a dict"}
+
+    return {"ok": True, "values": _json_safe(metrics)}
 
 
 # ── Screenshot helper (dev only) ───────────────────────────────────────────────

@@ -67,6 +67,61 @@ const MEAS_TYPES = {
   diel_b: { label: "Rel. Permittivity vs E",       xLabel: "E (kV/cm)",      yLabel: "εᵣ",              logY: false, color: T.green, clampYZero: true, twoSweep: true, symXTicks: true },
 };
 
+// ── New module boilerplate template ──────────────────────────────────────────
+
+const NEW_MODULE_TEMPLATE = `"""
+New Module
+==========
+Describe what this module parses.
+"""
+
+from .base import LabModule
+
+
+class NewModule(LabModule):
+    id          = "new_module"   # ← must match the ID field in the header
+    name        = "New Module"
+    description = "Describe this module"
+    accepts     = [".csv", ".txt"]
+    version     = "1.0"
+    author      = "your name"
+
+    def parse(self, file_bytes: bytes, filename: str, meta: dict) -> dict:
+        """Parse raw file bytes into structured data.
+
+        meta contains sample metadata: thickness_nm, area_m2, technique, etc.
+        Return a JSON-serialisable dict, or None if the file is unrecognised.
+        """
+        try:
+            text = file_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
+        xs, ys = [], []
+        # TODO: parse text into xs and ys
+
+        return {"xs": xs, "ys": ys}
+
+    def plot(self, data: dict, meta: dict, options: dict) -> dict:
+        """Return a Plotly figure dict for rendering in the app."""
+        color = options.get("color", "#e2e8f0")
+        return {
+            "data": [{
+                "x": data.get("xs", []),
+                "y": data.get("ys", []),
+                "type": "scatter",
+                "mode": "lines",
+                "line": {"color": color, "width": 1.5},
+            }],
+            "layout": {
+                "xaxis": {"title": "X"},
+                "yaxis": {"title": "Y"},
+                "margin": {"t": 20, "r": 20, "b": 50, "l": 60},
+                "showlegend": False,
+            },
+        }
+`;
+
 // ── Material colour palette (hash-based for any string) ───────────────────────
 
 const MAT_PALETTE_DARK = [
@@ -168,8 +223,10 @@ const DEFAULT_AREA_M2 = Math.PI * 1e-10;
 
 function evalMathExpr(str) {
   if (!str || !str.trim()) return null;
-  const sanitized = str.trim().replace(/\^/g, "**");
-  if (!/^[\d\s+\-*/().]+$/.test(sanitized)) return null;
+  const sanitized = str.trim()
+    .replace(/\bpi\b/gi, String(Math.PI))
+    .replace(/\^/g, "**");
+  if (!/^[\d\s+\-*/().eE]+$/.test(sanitized)) return null;
   try {
     // eslint-disable-next-line no-new-func
     const result = new Function("return " + sanitized)();
@@ -550,7 +607,12 @@ function LinePlot({ data, cfg }) {
             scale={logX ? "log" : "auto"} domain={xDomain} />
           <YAxis yAxisId="left" tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
             tickFormatter={yTickFmt} ticks={yTicks} tickLine={false}
-            axisLine={{ stroke: T.borderBright }} label={{ value: yLabel, angle: -90, position: "insideLeft", offset: 14, fill: T.textSecondary, fontSize: 10 }}
+            axisLine={{ stroke: T.borderBright }}
+            label={{ content: ({ viewBox }) => {
+              const { x, y, height } = viewBox;
+              const cx = (x || 0) + 14, cy = (y || 0) + (height || 166) / 2;
+              return <text transform={`rotate(-90, ${cx}, ${cy})`} x={cx} y={cy} textAnchor="middle" dominantBaseline="middle" fill={T.textSecondary} fontSize={10} fontFamily="'DM Mono', monospace">{yLabel}</text>;
+            }}}
             domain={yDomain} />
           {hasD && <YAxis yAxisId="right" orientation="right"
             tick={{ fill: T.amber, fontSize: 9, fontFamily: "'DM Mono', monospace" }} tickLine={false}
@@ -860,6 +922,150 @@ function fmtAreaMicron(m2) {
   if (!m2) return null;
   const um2 = m2 * 1e12;
   return um2 >= 1000 ? `${(um2 / 1000).toFixed(2)}×10³ µm²` : `${um2.toFixed(2)} µm²`;
+}
+
+// ── ModuleCard ────────────────────────────────────────────────────────────────
+// Generic card for user/built-in modules on the sample detail page.
+
+function ModuleCard({ mod, sample, onRemoved }) {
+  const mono = "'DM Mono', monospace";
+
+  const filename = sample.filenames?.[mod.id];
+  if (!filename) return null; // only render when a file has been added
+
+  const initControls = () => {
+    const s = {};
+    for (const ctrl of (mod.card_controls || [])) s[ctrl.name] = ctrl.default ?? (ctrl.choices?.[0] ?? "");
+    return s;
+  };
+  const areaCtrl = (mod.card_controls || []).find(c => c.type === "area");
+  const [controlState, setControlState] = useState(initControls);
+  const [plotData,     setPlotData]     = useState(null); // {points, xLabel, yLabel, color}
+  const [loading,      setLoading]      = useState(false);
+  const [fetchError,   setFetchError]   = useState(null);
+  const [areaM2,       setAreaM2]       = useState(sample.area_m2 ?? null);
+  const [corrExpr,     setCorrExpr]     = useState(String(sample.area_correction ?? areaCtrl?.default ?? 1.0));
+
+  const fetchPlot = async (overrides = {}) => {
+    setLoading(true); setFetchError(null);
+    try {
+      const options = {};
+      for (const ctrl of (mod.card_controls || [])) {
+        if (ctrl.type === "area") {
+          options.area_correction = evalMathExpr(corrExpr) || 1.0;
+        } else {
+          const val = overrides[ctrl.name] ?? controlState[ctrl.name];
+          const po  = ctrl.plot_overrides?.[val];
+          if (po) Object.assign(options, po);
+        }
+      }
+      const cfg = await api("GET", `/modules/${mod.id}/config`);
+      const res = await api("POST", `/modules/${mod.id}/render-for-sample`, {
+        sample_id:   sample.id,
+        proc_code:   cfg.proc_code || "",
+        plot_config: cfg.plot_config || {},
+        options,
+      });
+      if (res.ok) {
+        setPlotData({
+          points: res.x.map((xi, i) => ({ x: xi, y: res.y[i] })),
+          xLabel: res.x_label,
+          yLabel: res.y_label,
+          color:  res.color || "#fc8181",
+        });
+        if (res.area_m2 != null) setAreaM2(res.area_m2);
+      } else setFetchError(res.error || "Render failed");
+    } catch (e) { setFetchError(e.message || "Request failed"); }
+    setLoading(false);
+  };
+
+  useEffect(() => { fetchPlot(); }, [mod.id, sample.id]);
+
+  const handleControlChange = (name, val) => {
+    const next = { ...controlState, [name]: val };
+    setControlState(next);
+    fetchPlot(next);
+  };
+
+  const handleDelete = async () => {
+    if (!window.confirm(`Remove ${mod.name} data from this sample?`)) return;
+    try {
+      await api("DELETE", `/samples/${sample.id}/module-files/${mod.id}`);
+      onRemoved?.();
+    } catch (e) { setFetchError(e.message); }
+  };
+
+  const effArea = (areaM2 || null) && (areaM2 * (evalMathExpr(corrExpr) || 1.0));
+
+  return (
+    <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden" }}>
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "space-between", padding: "8px 12px", borderBottom: `1px solid ${T.border}` }}>
+        <span style={{ fontFamily: mono, fontSize: 12, color: T.red, fontWeight: 600 }}>{mod.name}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {(mod.card_controls || []).filter(c => c.type === "toggle").map(ctrl => (
+            <div key={ctrl.name} style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 10, overflow: "hidden" }}>
+              {(ctrl.choices || []).map(ch => (
+                <button key={ch} onClick={() => handleControlChange(ctrl.name, ch)}
+                  style={{ padding: "2px 8px", fontSize: 10, fontFamily: mono, border: "none", cursor: "pointer",
+                    background: controlState[ctrl.name] === ch ? T.amber : "transparent",
+                    color:      controlState[ctrl.name] === ch ? "#000"   : T.textDim,
+                    transition: "background 0.15s" }}>
+                  {ch}
+                </button>
+              ))}
+            </div>
+          ))}
+          <span style={{ fontSize: 10, color: T.textDim, fontFamily: mono, maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filename}</span>
+          <button onClick={handleDelete} title="Remove data" style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 14, lineHeight: 1, padding: 0 }}>✕</button>
+        </div>
+      </div>
+      {/* Body */}
+      <div style={{ padding: "10px 12px" }}>
+        {plotData ? (
+          <>
+            <LinePlot data={plotData.points} cfg={{
+              xLabel:    plotData.xLabel,
+              yLabel:    plotData.yLabel,
+              color:     plotData.color,
+              symXTicks: true,
+              zeroRefY:  true,
+              ySymRange: 30,
+            }} />
+            <div style={{ marginTop: 8 }}>
+              <label style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, border: `1px dashed ${T.border}`, borderRadius: 6, padding: "6px 0", cursor: "pointer", fontFamily: mono, fontSize: 11, color: T.textDim }}>
+                ↑ replace file
+                <input type="file" accept={mod.accepts?.join(",")} style={{ display: "none" }} onChange={e => { if (e.target.files[0]) { onRemoved?.(); } }} />
+              </label>
+            </div>
+          </>
+        ) : loading ? (
+          <div style={{ height: 200, display: "flex", alignItems: "center", justifyContent: "center", color: T.textDim, fontFamily: mono, fontSize: 11 }}>Loading…</div>
+        ) : fetchError ? (
+          <div style={{ padding: "8px 0", fontFamily: mono, fontSize: 11, color: T.red }}>{fetchError}</div>
+        ) : null}
+        {/* Area block — only shown when module declares an "area" card control */}
+        {areaCtrl && areaM2 != null && (
+          <div style={{ marginTop: 8, borderTop: `1px solid ${T.border}`, paddingTop: 8, display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 10, color: T.teal, fontFamily: mono }}>⌀ {fmtAreaMicron(areaM2)} (file)</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: mono }}>× corr</span>
+              <input type="text" value={corrExpr} onChange={e => setCorrExpr(e.target.value)}
+                onBlur={async () => {
+                  const val = evalMathExpr(corrExpr);
+                  if (val !== null) {
+                    try { await api("PATCH", `/samples/${sample.id}/area-correction`, { area_correction: val }); onRemoved?.(); } catch (_) {}
+                  }
+                  fetchPlot();
+                }}
+                style={{ width: 72, background: T.bg0, border: `1px solid ${evalMathExpr(corrExpr) !== null ? T.teal : T.red}`, borderRadius: 4, color: T.textPrimary, padding: "3px 6px", fontFamily: mono, fontSize: 11, outline: "none" }} />
+            </div>
+            {effArea != null && <span style={{ fontSize: 10, color: T.textSecondary, fontFamily: mono }}>eff: {fmtAreaMicron(effArea)}</span>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 // ── MeasCard ──────────────────────────────────────────────────────────────────
@@ -1484,12 +1690,27 @@ function parsePrCsv(text) {
 
 // ── PulsedAddModal ────────────────────────────────────────────────────────────
 
-function PulsedAddModal({ onAdd, onClose }) {
+function PulsedAddModal({ onAdd, onClose, moduleOptions = [], sampleId, onModuleFileAdded }) {
   const mono = { fontFamily: "'DM Mono', monospace" };
-  const opts = [
+  const pulsedOpts = [
     { type: '3pp', label: '3PP Shmoo',    desc: 'ΔP vs write voltage — no offset + biased', color: T.teal },
     { type: 'pr',  label: 'Pr Retention', desc: 'Switched polarization vs delay time',       color: T.blue },
   ];
+  const [uploadingFor, setUploadingFor] = useState(null); // module id being uploaded
+  const [uploading,    setUploading]    = useState(false);
+
+  const handleModuleFile = async (mod, file) => {
+    setUploading(true);
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("module_id", mod.id);
+    try {
+      const res = await fetch(`/api/samples/${sampleId}/upload-module-file?module_id=${mod.id}`, { method: "POST", body: fd });
+      if (res.ok) { onModuleFileAdded?.(); onClose(); }
+    } catch (_) {}
+    setUploading(false);
+  };
+
   return (
     <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
       style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
@@ -1498,11 +1719,39 @@ function PulsedAddModal({ onAdd, onClose }) {
           <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>Add Data</span>
           <button onClick={onClose} style={{ background: 'none', border: 'none', color: T.textDim, cursor: 'pointer', fontSize: 16, lineHeight: 1 }}>✕</button>
         </div>
-        <div style={{ borderBottom: `1px solid ${T.border}` }}>
-          <span style={{ display: 'inline-block', padding: '7px 16px', ...mono, fontSize: 11, color: T.teal, borderBottom: `2px solid ${T.teal}`, marginBottom: -1 }}>Pulsed Measurements</span>
+        {moduleOptions.length > 0 && (
+          <>
+            <div style={{ padding: '7px 16px', borderBottom: `1px solid ${T.border}` }}>
+              <span style={{ ...mono, fontSize: 11, color: T.red }}>Module Data</span>
+            </div>
+            <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8, borderBottom: `1px solid ${T.border}` }}>
+              {moduleOptions.map(mod => (
+                <div key={mod.id}>
+                  {uploadingFor === mod.id ? (
+                    <label style={{ background: T.bg2, border: `1px solid ${T.teal}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ ...mono, fontSize: 12, color: T.teal }}>{uploading ? 'Uploading…' : `↑ Choose file for ${mod.name}`}</span>
+                      <input type="file" accept={mod.accepts?.join(",")} style={{ display: 'none' }}
+                        onChange={e => { if (e.target.files[0]) handleModuleFile(mod, e.target.files[0]); }} />
+                    </label>
+                  ) : (
+                    <button onClick={() => setUploadingFor(mod.id)}
+                      style={{ width: '100%', background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: 3, transition: 'border-color .15s' }}
+                      onMouseEnter={e => e.currentTarget.style.borderColor = T.red}
+                      onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+                      <span style={{ ...mono, fontSize: 12, color: T.red, fontWeight: 600 }}>{mod.name}</span>
+                      <span style={{ ...mono, fontSize: 10, color: T.textDim }}>{mod.description}</span>
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+        <div style={{ padding: '7px 16px', borderBottom: `1px solid ${T.border}` }}>
+          <span style={{ ...mono, fontSize: 11, color: T.teal }}>Pulsed Measurements</span>
         </div>
         <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {opts.map(o => (
+          {pulsedOpts.map(o => (
             <button key={o.type} onClick={() => { onAdd(o.type); onClose(); }}
               style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: 3, transition: 'border-color .15s' }}
               onMouseEnter={e => e.currentTarget.style.borderColor = o.color}
@@ -1633,7 +1882,7 @@ function PrCard({ data, onFile, onRemove }) {
 
 // ── SampleDetail ──────────────────────────────────────────────────────────────
 
-function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings }) {
+function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [] }) {
   const [addingLayer, setAddingLayer]   = useState(false);
   const [meta, setMeta]                 = useState({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
   const [dragIdx, setDragIdx]           = useState(null);
@@ -1668,6 +1917,14 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
   };
   const handleAreaChange = (area_m2, area_correction) => onUpdate({ ...sample, area_m2, area_correction });
   const saveMeta = () => { onUpdate({ ...sample, ...meta, thickness_nm: meta.thickness_nm === "" ? null : +meta.thickness_nm }); setEditingMeta(false); };
+
+  // Re-fetch sample after a module file is added or removed so cards update.
+  const refreshSample = async () => {
+    try {
+      const updated = await api("GET", `/samples/${sample.id}`);
+      if (updated) onUpdate(updated);
+    } catch (_) {}
+  };
 
   const handleDrop = (toIdx) => {
     if (dragIdx === null || dragIdx === toIdx) return;
@@ -1734,6 +1991,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 
   const pd = plotData || {};
   const hasFiles = Object.keys(sample.filenames || {}).length > 0;
+  const modulesForSection = (sec) => modules.filter(m => m.section === sec);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
@@ -1788,6 +2046,9 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               onFile={(measType, file) => handleFile(measType, file)}
               onAnalyze={t === "xrd_ot" ? () => setXrdAnalysisOpen(true) : undefined} />
           ))}
+          {modulesForSection("structural").map(m => (
+            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} />
+          ))}
           {xrdAnalysisOpen && (
             <XRDAnalysisModal
               sample={sample}
@@ -1805,6 +2066,9 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Scanning Probe</div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
           <AfmCard afmData={pd.afm} filename={sample.filenames?.afm} onFile={file => handleFile("afm", file)} />
+          {modulesForSection("scanning_probe").map(m => (
+            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} />
+          ))}
         </div>
       </section>
 
@@ -1825,6 +2089,9 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               areaCorrFactor={sample.area_correction ?? 1.0}
               onAreaChange={handleAreaChange} />
           ))}
+          {modulesForSection("electrical").map(m => (
+            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} />
+          ))}
           {pulsedItems.map(item => {
             const d = pulsedData[item.id] || {};
             if (item.type === '3pp') return (
@@ -1843,8 +2110,34 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
             return null;
           })}
         </div>
-        {addPulsedOpen && <PulsedAddModal onAdd={addPulsedItem} onClose={() => setAddPulsedOpen(false)} />}
+        {addPulsedOpen && <PulsedAddModal
+          onAdd={addPulsedItem}
+          onClose={() => setAddPulsedOpen(false)}
+          sampleId={sample.id}
+          moduleOptions={modulesForSection("electrical").filter(m => !sample.filenames?.[m.id])}
+          onModuleFileAdded={refreshSample}
+        />}
       </section>
+
+      {/* Optical section — only rendered if modules exist for it */}
+      {modulesForSection("optical").length > 0 && (
+        <section>
+          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Optical</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
+            {modulesForSection("optical").map(m => <ModuleCard key={m.id} mod={m} sample={sample} />)}
+          </div>
+        </section>
+      )}
+
+      {/* Other section */}
+      {modulesForSection("other").length > 0 && (
+        <section>
+          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Other</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
+            {modulesForSection("other").map(m => <ModuleCard key={m.id} mod={m} sample={sample} />)}
+          </div>
+        </section>
+      )}
     </div>
   );
 }
@@ -3260,13 +3553,28 @@ function ViewDataModal({ sampleId, files, loading, onClose, onDeleteFile }) {
 }
 
 // ── ModuleSourceModal ─────────────────────────────────────────────────────────
+// mod.mode: "view" (built-in, read-only) | "edit" (user, editable) | "create" (new module)
 
-function ModuleSourceModal({ mod, onClose, onSave }) {
-  const [source, setSource] = useState(mod.source);
-  const [saving, setSaving] = useState(false);
-  const [error,  setError]  = useState(null);
-  const [saved,  setSaved]  = useState(false);
-  const isEditable = !mod.builtin;
+function ModuleSourceModal({ mod, onClose, onSave, existingIds = [] }) {
+  const isView   = mod.mode === "view";
+  const isEdit   = mod.mode === "edit";
+  const isCreate = mod.mode === "create";
+
+  const [source,    setSource]    = useState(mod.source);
+  const [saving,    setSaving]    = useState(false);
+  const [error,     setError]     = useState(null);
+  const [saved,     setSaved]     = useState(false);
+
+  // Create mode: editable module ID
+  const [newId,     setNewId]     = useState(mod.id || "");
+  const newIdValid  = /^[a-z][a-z0-9_]*$/.test(newId);
+  const newIdExists = existingIds.includes(newId);
+
+  // View mode: inline duplicate expansion
+  const [dupOpen,   setDupOpen]   = useState(false);
+  const [dupId,     setDupId]     = useState(`copy_of_${mod.id}`);
+  const [dupSaving, setDupSaving] = useState(false);
+  const dupIdValid  = /^[a-z][a-z0-9_]*$/.test(dupId);
 
   const handleSave = async () => {
     setSaving(true); setError(null);
@@ -3274,10 +3582,33 @@ function ModuleSourceModal({ mod, onClose, onSave }) {
       await api("PUT", `/modules/${mod.id}/source`, { source });
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
-      onSave?.();
+      await onSave?.();
     } catch (e) { setError(e.message || "Save failed"); }
     setSaving(false);
   };
+
+  const handleCreate = async () => {
+    if (!newIdValid) { setError("ID must be lowercase letters, digits, or underscores, starting with a letter"); return; }
+    setSaving(true); setError(null);
+    try {
+      await api("PUT", `/modules/${newId}/source`, { source });
+      await onSave?.();
+      onClose();
+    } catch (e) { setError(e.message || "Create failed"); setSaving(false); }
+  };
+
+  const handleDuplicate = async () => {
+    if (!dupIdValid) return;
+    setDupSaving(true); setError(null);
+    try {
+      await api("PUT", `/modules/${dupId}/source`, { source });
+      await onSave?.();
+      onClose();
+    } catch (e) { setError(e.message || "Duplicate failed"); setDupSaving(false); }
+  };
+
+  const badgeColor = isView ? T.amber : T.teal;
+  const badgeLabel = isView ? "built-in" : isEdit ? "user" : "new";
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}
@@ -3286,51 +3617,1240 @@ function ModuleSourceModal({ mod, onClose, onSave }) {
 
         {/* Header */}
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 18px", borderBottom: `1px solid ${T.border}` }}>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: mod.builtin ? T.amber : T.teal, background: (mod.builtin ? T.amber : T.teal) + "18", border: `1px solid ${(mod.builtin ? T.amber : T.teal)}44`, borderRadius: 4, padding: "2px 7px", flexShrink: 0 }}>
-            {mod.builtin ? "built-in" : "user"}
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: badgeColor, background: badgeColor + "18", border: `1px solid ${badgeColor}44`, borderRadius: 4, padding: "2px 7px", flexShrink: 0 }}>
+            {badgeLabel}
           </span>
           <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: T.textPrimary, flex: 1 }}>{mod.name}</span>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{mod.id} · v{mod.version}</span>
+          {isCreate ? (
+            <input
+              value={newId}
+              onChange={e => { setNewId(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, "")); setError(null); }}
+              placeholder="module_id"
+              spellCheck={false}
+              style={{
+                fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textPrimary,
+                background: T.bg0, outline: "none", borderRadius: 4, padding: "3px 8px", width: 160,
+                border: `1px solid ${!newId ? T.border : newIdValid ? (newIdExists ? T.amber : T.teal + "88") : T.red}`,
+              }}
+            />
+          ) : (
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{mod.id} · v{mod.version}</span>
+          )}
           <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0, marginLeft: 8 }}>✕</button>
         </div>
+
+        {/* ID conflict warning (create mode) */}
+        {isCreate && newIdExists && (
+          <div style={{ padding: "5px 18px", background: T.amber + "11", borderBottom: `1px solid ${T.amber}33`, fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.amber }}>
+            ⚠ A module with this ID already exists and will be overwritten.
+          </div>
+        )}
 
         {/* Source editor */}
         <textarea
           value={source}
-          onChange={e => { if (isEditable) setSource(e.target.value); }}
-          readOnly={!isEditable}
+          onChange={e => { if (!isView) setSource(e.target.value); }}
+          readOnly={isView}
           spellCheck={false}
           style={{
             flex: 1, resize: "none", border: "none", outline: "none",
             background: T.bg0, color: T.textPrimary,
             fontFamily: "'DM Mono', monospace", fontSize: 12, lineHeight: 1.6,
             padding: "16px 20px", overflowY: "auto",
-            opacity: isEditable ? 1 : 0.8,
+            opacity: isView ? 0.8 : 1,
             minHeight: 400,
           }}
         />
 
         {/* Footer */}
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 18px", borderTop: `1px solid ${T.border}` }}>
-          {mod.builtin && (
-            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, flex: 1 }}>
-              Read-only — duplicate to create an editable copy
-            </span>
-          )}
-          {error && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, flex: 1 }}>{error}</span>}
-          {!mod.builtin && !error && <div style={{ flex: 1 }} />}
-          <button onClick={onClose}
-            style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 14px", borderRadius: 5, border: `1px solid ${T.border}`, background: T.bg2, color: T.textSecondary, cursor: "pointer" }}>
-            Close
-          </button>
-          {isEditable && (
-            <button onClick={handleSave} disabled={saving}
-              style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 14px", borderRadius: 5, border: `1px solid ${saved ? T.teal : T.amber}`, background: saved ? T.teal + "22" : T.amber + "22", color: saved ? T.teal : T.amber, cursor: saving ? "wait" : "pointer", opacity: saving ? 0.6 : 1 }}>
-              {saved ? "Saved ✓" : saving ? "Saving…" : "Save"}
-            </button>
+          {dupOpen ? (
+            /* Inline duplicate ID row */
+            <>
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>New ID:</span>
+              <input
+                value={dupId}
+                onChange={e => setDupId(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))}
+                spellCheck={false}
+                autoFocus
+                style={{
+                  fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textPrimary,
+                  background: T.bg0, outline: "none", borderRadius: 4, padding: "3px 8px", width: 200,
+                  border: `1px solid ${dupIdValid ? T.border : T.red}`,
+                }}
+              />
+              <div style={{ flex: 1 }} />
+              <button onClick={() => setDupOpen(false)}
+                style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 12px", borderRadius: 5, border: `1px solid ${T.border}`, background: T.bg2, color: T.textSecondary, cursor: "pointer" }}>
+                Cancel
+              </button>
+              <button onClick={handleDuplicate} disabled={!dupIdValid || dupSaving}
+                style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 14px", borderRadius: 5, border: `1px solid ${T.teal}`, background: T.teal + "22", color: T.teal, cursor: (!dupIdValid || dupSaving) ? "not-allowed" : "pointer", opacity: (!dupIdValid || dupSaving) ? 0.5 : 1 }}>
+                {dupSaving ? "Saving…" : "Save as copy"}
+              </button>
+            </>
+          ) : (
+            /* Normal footer */
+            <>
+              {isView && (
+                <button onClick={() => setDupOpen(true)}
+                  style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 14px", borderRadius: 5, border: `1px solid ${T.teal}44`, background: "none", color: T.teal, cursor: "pointer" }}>
+                  Duplicate
+                </button>
+              )}
+              {error && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, flex: 1 }}>{error}</span>}
+              {!error && <div style={{ flex: 1 }} />}
+              <button onClick={onClose}
+                style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 14px", borderRadius: 5, border: `1px solid ${T.border}`, background: T.bg2, color: T.textSecondary, cursor: "pointer" }}>
+                {isCreate ? "Cancel" : "Close"}
+              </button>
+              {isEdit && (
+                <button onClick={handleSave} disabled={saving}
+                  style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 14px", borderRadius: 5, border: `1px solid ${saved ? T.teal : T.amber}`, background: saved ? T.teal + "22" : T.amber + "22", color: saved ? T.teal : T.amber, cursor: saving ? "wait" : "pointer", opacity: saving ? 0.6 : 1 }}>
+                  {saved ? "Saved ✓" : saving ? "Saving…" : "Save"}
+                </button>
+              )}
+              {isCreate && (
+                <button onClick={handleCreate} disabled={saving || !newIdValid}
+                  style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 14px", borderRadius: 5, border: `1px solid ${T.teal}`, background: T.teal + "22", color: T.teal, cursor: (saving || !newIdValid) ? "not-allowed" : "pointer", opacity: (saving || !newIdValid) ? 0.5 : 1 }}>
+                  {saving ? "Creating…" : "Create Module"}
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── ModuleEditorPage ──────────────────────────────────────────────────────────
+// Full-page module editor — navigated to like SampleDetail / AnalysisBookDetail.
+// mod: { id, name, builtin, source, mode: "view"|"edit"|"create", version, accepts, description }
+
+function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModules = [] }) {
+  const [tab,        setTab]        = useState("visual");
+  const [source,     setSource]     = useState(mod.source || "");
+  const [saving,     setSaving]     = useState(false);
+  const [error,      setError]      = useState(null);
+  const [saved,      setSaved]      = useState(false);
+
+  const isBuiltin = mod.builtin && mod.mode !== "create";
+  const isCreate  = mod.mode === "create";
+
+  // ── Identity fields ──────────────────────────────────────────────────────
+  const [mName,   setMName]   = useState(mod.name        || "");
+  const [mId,     setMId]     = useState(mod.id          || "");
+  const [mDesc,   setMDesc]   = useState(mod.description || "");
+  const [mVer,    setMVer]    = useState(mod.version     || "1.0");
+  const [mAuthor, setMAuthor] = useState(mod.author      || "");
+  const [mAccepts, setMAccepts] = useState(mod.accepts   || []);
+  const [mNotes,  setMNotes]  = useState(() => {
+    const m = (mod.source || "").match(/"""([\s\S]*?)"""/);
+    return m ? m[1].trim() : "";
+  });
+  const [newExt,  setNewExt]  = useState("");
+
+  // ── Data section state ────────────────────────────────────────────────────
+  const [exInfo,    setExInfo]    = useState(null);   // sniff result from backend
+  const [exDelim,   setExDelim]   = useState("auto");
+  const [exSkip,    setExSkip]    = useState("");     // "" = auto
+  const [exLoading, setExLoading] = useState(false);
+  const [assignments,     setAssignments]     = useState({}); // { colIdx: varName }
+  const [metaAssignments, setMetaAssignments] = useState({}); // { key: varName }
+
+  // ── Processing section state ──────────────────────────────────────────────
+  const [procBlock2,  setProcBlock2]  = useState("");  // user transform (editable)
+  const [procBlock3,  setProcBlock3]  = useState("");  // return dict (editable, resettable)
+  const [procRunning, setProcRunning] = useState(false);
+  const [procResult,  setProcResult]  = useState(null);
+  const [procError,   setProcError]   = useState(null);
+
+  // ── Plot section state ────────────────────────────────────────────────────
+  const [plotConfig,  setPlotConfig]  = useState({ x_var: "", y_var: "", x_label: "", y_label: "", x_scale: "linear", y_scale: "linear", color: "" });
+  const [plotVars,    setPlotVars]    = useState([]); // available array keys from last proc run
+  const [plotFigure,  setPlotFigure]  = useState(null);
+  const [plotLoading, setPlotLoading] = useState(false);
+  const [plotError,   setPlotError]   = useState(null);
+
+  // ── Analysis section state ────────────────────────────────────────────────
+  const [analysisMetrics,  setAnalysisMetrics]  = useState([]); // [{name, label, unit}]
+  const [analysisBlock2,   setAnalysisBlock2]   = useState("");  // user analysis logic
+  const [analysisBlock3,   setAnalysisBlock3]   = useState("");  // return dict
+  const [analysisRunning,  setAnalysisRunning]  = useState(false);
+  const [analysisResult,   setAnalysisResult]   = useState(null); // {metric_name: value}
+  const [analysisError,    setAnalysisError]    = useState(null);
+
+  // ── Card section state ────────────────────────────────────────────────────
+  const [cardSection,   setCardSection]   = useState("");          // "electrical"|"structural"|...
+  const [cardControls,  setCardControls]  = useState([]);          // [{name,type,choices,default,plot_overrides}]
+
+  const defaultProcBlock3 = () =>
+    `return {\n    "x": ,        # required\n    "y": ,        # required\n    # "x_label": "",\n    # "y_label": "",\n    # "x_fit":   [],\n    # "y_fit":   [],\n    # "area_m2": None,\n}`;
+
+  const defaultAnalysisBlock3 = () =>
+    `return {\n    # "metric_name": value,\n}`;
+
+  useEffect(() => {
+    if (isCreate) return;
+    api("GET", `/modules/${mod.id}/config`).then(cfg => {
+      if (!cfg) return;
+      if (cfg.columns)          setAssignments(cfg.columns);
+      if (cfg.meta_assignments) setMetaAssignments(cfg.meta_assignments);
+      // Three-block proc: prefer explicit block fields; fall back to splitting proc_code
+      if (cfg.proc_block2 != null) {
+        setProcBlock2(cfg.proc_block2);
+        setProcBlock3(cfg.proc_block3 ?? defaultProcBlock3());
+      } else if (cfg.proc_code) {
+        // Backward compat: split on last `return` line
+        const idx = cfg.proc_code.lastIndexOf("\nreturn ");
+        if (idx !== -1) {
+          setProcBlock2(cfg.proc_code.slice(0, idx).trim());
+          setProcBlock3(cfg.proc_code.slice(idx + 1).trim());
+        } else {
+          setProcBlock2(cfg.proc_code);
+          setProcBlock3(defaultProcBlock3());
+        }
+      }
+      if (cfg.plot_config)       setPlotConfig(cfg.plot_config);
+      if (cfg.analysis_metrics) setAnalysisMetrics(cfg.analysis_metrics);
+      // Three-block analysis: prefer explicit block fields; fall back to splitting analysis_code
+      if (cfg.analysis_block2 != null) {
+        setAnalysisBlock2(cfg.analysis_block2);
+        setAnalysisBlock3(cfg.analysis_block3 ?? defaultAnalysisBlock3());
+      } else if (cfg.analysis_code) {
+        const idx = cfg.analysis_code.lastIndexOf("\nreturn ");
+        if (idx !== -1) {
+          setAnalysisBlock2(cfg.analysis_code.slice(0, idx).trim());
+          setAnalysisBlock3(cfg.analysis_code.slice(idx + 1).trim());
+        } else {
+          setAnalysisBlock2(cfg.analysis_code);
+          setAnalysisBlock3(defaultAnalysisBlock3());
+        }
+      }
+      if (cfg.section)          setCardSection(cfg.section);
+      if (cfg.card_controls)    setCardControls(cfg.card_controls);
+      if (cfg.delimiter)  setExDelim(cfg.delimiter);
+      if (cfg.skip_rows != null) setExSkip(String(cfg.skip_rows));
+    }).catch(() => {});
+    api("GET", `/modules/${mod.id}/example`).then(info => {
+      setExInfo(info);
+      if (info.delimiter && info.delimiter !== "auto") setExDelim(info.delimiter);
+      if (info.skip_rows != null) setExSkip(String(info.skip_rows));
+    }).catch(() => {});
+  }, [mod.id, isCreate]);
+
+  const handleExampleUpload = async (file) => {
+    setExLoading(true);
+    const fd = new FormData();
+    fd.append("file", file);
+    try {
+      const res = await fetch(`/api/modules/${targetId}/example`, { method: "POST", body: fd });
+      const info = await res.json();
+      setExInfo(info);
+      if (info.delimiter && info.delimiter !== "auto") setExDelim(info.delimiter);
+      if (info.skip_rows != null) setExSkip(String(info.skip_rows));
+      setAssignments({});
+      setMetaAssignments({});
+    } catch (e) { setError("Upload failed: " + (e.message || "")); }
+    setExLoading(false);
+  };
+
+  const handleResniff = async () => {
+    if (!exInfo) return;
+    setExLoading(true);
+    try {
+      const params = new URLSearchParams({ delimiter: exDelim });
+      if (exSkip !== "") params.set("skip_rows", exSkip);
+      const info = await api("GET", `/modules/${mod.id}/example?${params}`);
+      setExInfo(info);
+    } catch (e) { setError("Re-parse failed"); }
+    setExLoading(false);
+  };
+
+  const handleRemoveExample = async () => {
+    if (!window.confirm("Remove example file?")) return;
+    try {
+      await api("DELETE", `/modules/${mod.id}/example`);
+      setExInfo(null);
+      setAssignments({});
+      setMetaAssignments({});
+    } catch (e) { setError("Remove failed"); }
+  };
+
+  const fullProcCode = () =>
+    [generateBlock1(), procBlock2.trim(), procBlock3.trim()].filter(Boolean).join("\n\n");
+
+  const fullAnalysisCode = () =>
+    [analysisBlock2.trim(), analysisBlock3.trim()].filter(Boolean).join("\n\n");
+
+  const saveDataConfig = async (id) => {
+    const cfg = {
+      delimiter: exDelim,
+      skip_rows: exSkip !== "" ? parseInt(exSkip, 10) : null,
+      columns: assignments,
+      meta_assignments: metaAssignments,
+      proc_block2: procBlock2,
+      proc_block3: procBlock3,
+      proc_code: fullProcCode(),       // backward compat
+      plot_config: plotConfig,
+      analysis_metrics: analysisMetrics,
+      analysis_block2: analysisBlock2,
+      analysis_block3: analysisBlock3,
+      analysis_code: fullAnalysisCode(), // backward compat
+      section: cardSection,
+      card_controls: cardControls,
+    };
+    await api("PUT", `/modules/${id}/config`, cfg);
+  };
+
+  const generateBlock1 = () => {
+    if (!exInfo) return "";
+    const delim = exInfo.delimiter === "whitespace" ? null : (exInfo.delimiter || "\t");
+    const skipRows = exInfo.skip_rows ?? 0;
+    const headers  = exInfo.headers || [];
+    const delimRepr = delim === "\t" ? '"\\t"' : delim === "," ? '","' : delim === ";" ? '";"' : "None";
+    const splitExpr = delim ? `.split(${delimRepr})` : `.split()`;
+
+    const namedCols = Object.entries(assignments)
+      .filter(([, v]) => v.trim())
+      .sort(([a], [b]) => Number(a) - Number(b));
+    const namedMeta = Object.entries(metaAssignments).filter(([, v]) => v.trim());
+
+    const lines = [];
+    lines.push(`# ── Block 1: Auto-generated imports — do not edit ────────────────────`);
+    if (delim) lines.push(`DELIMITER = ${delimRepr}`);
+    lines.push(`SKIP_ROWS = ${skipRows}`);
+    lines.push(``);
+    lines.push(`_text = file_bytes.decode("utf-8", errors="replace")`);
+
+    if (namedCols.length > 0) {
+      lines.push(`_rows = []`);
+      lines.push(`for _line in _text.splitlines()[SKIP_ROWS:]:`);
+      lines.push(`    _cells = _line.strip()${splitExpr}`);
+      lines.push(`    try:`);
+      lines.push(`        _rows.append([float(c) for c in _cells])`);
+      lines.push(`    except ValueError:`);
+      lines.push(`        continue`);
+      lines.push(``);
+      lines.push(`# Columns`);
+      const maxV = Math.max(...namedCols.map(([, v]) => v.length));
+      for (const [idx, varName] of namedCols) {
+        const hdr = headers[Number(idx)] || `col_${idx}`;
+        lines.push(`${varName.padEnd(maxV)} = [r[${idx}] for r in _rows]  # ${hdr}`);
+      }
+      lines.push(``);
+    }
+
+    if (namedMeta.length > 0) {
+      lines.push(`# Header metadata`);
+      lines.push(`def _hdr(key):`);
+      lines.push(`    for _ln in _text.splitlines():`);
+      lines.push(`        _p = _ln.strip().split("\\t", 1)`);
+      lines.push(`        if len(_p) == 2 and _p[0].strip().rstrip(":") == key:`);
+      lines.push(`            try: return float(_p[1].strip().split()[0])`);
+      lines.push(`            except: return _p[1].strip()`);
+      lines.push(`    return None`);
+      lines.push(``);
+      const maxV = Math.max(...namedMeta.map(([, v]) => v.length));
+      for (const [key, varName] of namedMeta) {
+        const hint = (exInfo.header_meta || []).find(m => m.key === key)?.value || "";
+        lines.push(`${varName.padEnd(maxV)} = _hdr("${key}")${hint ? `  # ${hint}` : ""}`);
+      }
+      lines.push(``);
+    }
+
+    // Footer comment listing available names
+    const available = ["file_bytes", "filename", "meta",
+      ...namedCols.map(([, v]) => v),
+      ...namedMeta.map(([, v]) => v),
+    ].join(", ");
+    lines.push(`# Available: ${available}`);
+    lines.push(`# ─────────────────────────────────────────────────────────────────────`);
+    return lines.join("\n");
+  };
+
+  const handleRunProc = async () => {
+    const code = fullProcCode();
+    if (!code.trim()) return;
+    setProcRunning(true); setProcResult(null); setProcError(null);
+    try {
+      const res = await api("POST", `/modules/${mod.id}/run-processing`, { code });
+      if (res.ok) setProcResult(res.result);
+      else setProcError(res.traceback || res.error || "Unknown error");
+    } catch (e) { setProcError(e.message || "Request failed"); }
+    setProcRunning(false);
+  };
+
+  const handlePreviewPlot = async () => {
+    const code = fullProcCode();
+    if (!code.trim()) return;
+    setPlotLoading(true); setPlotFigure(null); setPlotError(null);
+    try {
+      const res = await api("POST", `/modules/${mod.id}/preview-plot`, { code, plot_config: plotConfig });
+      if (res.ok) {
+        setPlotFigure(res.figure);
+        if (res.figure.available_vars?.length) setPlotVars(res.figure.available_vars);
+      } else setPlotError(res.traceback || res.error || "Unknown error");
+    } catch (e) { setPlotError(e.message || "Request failed"); }
+    setPlotLoading(false);
+  };
+
+  const handleComputeAnalysis = async () => {
+    const proc_code = fullProcCode();
+    const analysis_code = fullAnalysisCode();
+    if (!proc_code.trim() || !analysis_code.trim()) return;
+    setAnalysisRunning(true); setAnalysisResult(null); setAnalysisError(null);
+    try {
+      const res = await api("POST", `/modules/${mod.id}/compute-analysis`, { proc_code, analysis_code });
+      if (res.ok) setAnalysisResult(res.values);
+      else setAnalysisError(res.traceback || res.error || "Unknown error");
+    } catch (e) { setAnalysisError(e.message || "Request failed"); }
+    setAnalysisRunning(false);
+  };
+
+  const targetId  = isCreate ? mId : mod.id;
+  const idValid   = /^[a-z][a-z0-9_]*$/.test(targetId);
+  const idExists  = isCreate && allModules.some(m => m.id === targetId);
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  const applyVisualToSource = (src) => {
+    const setAttr = (s, key, value) => {
+      const re = new RegExp(`(^[ \\t]+${key}[ \\t]+=[ \\t]+)("[^"]*"|\\[[^\\]]*\\])`, "m");
+      if (key === "accepts") {
+        const fmt = "[" + value.map(v => `"${v}"`).join(", ") + "]";
+        return s.replace(re, `$1${fmt}`);
+      }
+      return s.replace(re, `$1"${value.replace(/"/g, '\\"')}"`);
+    };
+    let s = src;
+    s = setAttr(s, "name",        mName);
+    s = setAttr(s, "description", mDesc);
+    s = setAttr(s, "version",     mVer);
+    s = setAttr(s, "author",      mAuthor);
+    s = setAttr(s, "accepts",     mAccepts);
+    if (isCreate) s = setAttr(s, "id", targetId);
+    // Replace first docstring
+    const newDoc = `"""\n${mName}\n${"=".repeat(Math.max(mName.length, 4))}\n${mNotes || mDesc}\n"""`;
+    s = s.replace(/"""[\s\S]*?"""/, newDoc);
+    return s;
+  };
+
+  const handleSave = async () => {
+    if (!idValid) { setError("ID must be lowercase letters, digits, or underscores — start with a letter"); return; }
+    setSaving(true); setError(null);
+    const finalSource = tab === "source" ? source : applyVisualToSource(source);
+    try {
+      await api("PUT", `/modules/${targetId}/source`, { source: finalSource });
+      setSource(finalSource);
+      await saveDataConfig(targetId);
+      setSaved(true); setTimeout(() => setSaved(false), 2000);
+      await onSave?.();
+      if (isCreate) onBack?.();
+    } catch (e) { setError(e.message || "Save failed"); }
+    setSaving(false);
+  };
+
+  const handleDelete = async () => {
+    if (!window.confirm(`Delete module "${mod.name}"? This cannot be undone.`)) return;
+    try {
+      await api("DELETE", `/modules/${mod.id}`);
+      await onSave?.();
+      onBack?.();
+    } catch (e) { setError(e.message || "Delete failed"); }
+  };
+
+  // ── Styles ───────────────────────────────────────────────────────────────
+  const mono = "'DM Mono', monospace";
+  const serif = "'Playfair Display', serif";
+  const field = (editable = true) => ({
+    fontFamily: mono, fontSize: 12, background: T.bg0, color: T.textPrimary,
+    border: `1px solid ${T.border}`, borderRadius: 5, padding: "6px 10px",
+    width: "100%", outline: "none", opacity: (!editable || isBuiltin) ? 0.65 : 1,
+  });
+  const label = { fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 4, display: "block" };
+  const section = {
+    background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, padding: "20px 24px",
+  };
+  const sh = { fontFamily: serif, fontSize: 15, color: T.textPrimary, margin: "0 0 16px 0" };
+
+  // ── Tab bar ──────────────────────────────────────────────────────────────
+  const tabBar = (
+    <div style={{ display: "flex", alignItems: "center", gap: 2, marginBottom: 24, borderBottom: `1px solid ${T.border}`, paddingBottom: 0 }}>
+      {[["visual", "Visual Editor"], ["source", "Source"]].map(([t, label]) => (
+        <button key={t} onClick={() => setTab(t)} style={{
+          fontFamily: mono, fontSize: 11, padding: "8px 18px", cursor: "pointer",
+          background: "none", border: "none",
+          color: tab === t ? T.teal : T.textDim,
+          borderBottom: `2px solid ${tab === t ? T.teal : "transparent"}`,
+          marginBottom: -1,
+        }}>{label}</button>
+      ))}
+      <div style={{ flex: 1 }} />
+      {error && <span style={{ fontFamily: mono, fontSize: 10, color: T.red, marginRight: 8 }}>{error}</span>}
+      {isBuiltin ? (
+        <button onClick={() => onDuplicate?.(source, `copy_of_${mod.id}`)}
+          style={{ fontFamily: mono, fontSize: 11, padding: "5px 14px", borderRadius: 5, border: `1px solid ${T.teal}44`, background: "none", color: T.teal, cursor: "pointer", marginBottom: 8 }}>
+          Duplicate
+        </button>
+      ) : (
+        <button onClick={handleSave} disabled={saving || (isCreate && !idValid)}
+          style={{ fontFamily: mono, fontSize: 11, padding: "5px 16px", borderRadius: 5, marginBottom: 8,
+            border: `1px solid ${saved ? T.teal : T.amber}`,
+            background: saved ? T.teal + "22" : T.amber + "22",
+            color: saved ? T.teal : T.amber,
+            cursor: (saving || (isCreate && !idValid)) ? "not-allowed" : "pointer",
+            opacity: (saving || (isCreate && !idValid)) ? 0.5 : 1 }}>
+          {saved ? "Saved ✓" : saving ? "Saving…" : isCreate ? "Create Module" : "Save"}
+        </button>
+      )}
+    </div>
+  );
+
+  // ── Visual tab ───────────────────────────────────────────────────────────
+  const visualTab = (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+      {/* Identity */}
+      <div style={section}>
+        <h3 style={sh}>Identity</h3>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+          <div>
+            <span style={label}>Name</span>
+            <input value={mName} onChange={e => !isBuiltin && setMName(e.target.value)} readOnly={isBuiltin} style={field()} />
+          </div>
+          <div>
+            <span style={label}>ID</span>
+            <input
+              value={targetId}
+              onChange={e => isCreate && setMId(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))}
+              readOnly={!isCreate}
+              style={{ ...field(!isCreate), border: `1px solid ${isCreate && mId && !idValid ? T.red : isCreate && idExists ? T.amber : T.border}` }}
+            />
+            {isCreate && idExists && <span style={{ fontFamily: mono, fontSize: 9, color: T.amber }}>⚠ will overwrite existing module</span>}
+          </div>
+          <div>
+            <span style={label}>Version</span>
+            <input value={mVer} onChange={e => !isBuiltin && setMVer(e.target.value)} readOnly={isBuiltin} style={field()} />
+          </div>
+          <div>
+            <span style={label}>Author</span>
+            <input value={mAuthor} onChange={e => !isBuiltin && setMAuthor(e.target.value)} readOnly={isBuiltin} style={field()} />
+          </div>
+        </div>
+        <div style={{ marginBottom: 14 }}>
+          <span style={label}>Description</span>
+          <input value={mDesc} onChange={e => !isBuiltin && setMDesc(e.target.value)} readOnly={isBuiltin} style={field()} />
+        </div>
+        <div style={{ marginBottom: 14 }}>
+          <span style={label}>Accepts</span>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+            {mAccepts.map(ext => (
+              <span key={ext} style={{ fontFamily: mono, fontSize: 11, color: T.teal, background: T.teal + "18", border: `1px solid ${T.teal}33`, borderRadius: 4, padding: "2px 8px", display: "flex", alignItems: "center", gap: 4 }}>
+                {ext}
+                {!isBuiltin && <button onClick={() => setMAccepts(a => a.filter(x => x !== ext))} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", padding: 0, fontSize: 12, lineHeight: 1 }}>×</button>}
+              </span>
+            ))}
+            {!isBuiltin && (
+              <input value={newExt} onChange={e => setNewExt(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === "Enter" && newExt.trim()) {
+                    const ext = newExt.trim().startsWith(".") ? newExt.trim() : "." + newExt.trim();
+                    setMAccepts(a => [...a, ext]); setNewExt("");
+                  }
+                }}
+                placeholder="+ .ext"
+                style={{ fontFamily: mono, fontSize: 11, width: 70, background: "none", border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px", color: T.textPrimary, outline: "none" }}
+              />
+            )}
+          </div>
+        </div>
+        <div>
+          <span style={label}>Usage notes</span>
+          <textarea value={mNotes} onChange={e => !isBuiltin && setMNotes(e.target.value)} readOnly={isBuiltin}
+            rows={4} spellCheck={false}
+            placeholder="Describe what this module parses, expected file format, options, etc."
+            style={{ ...field(), resize: "vertical", lineHeight: 1.6 }} />
+        </div>
+      </div>
+
+      {/* ── Card section ── */}
+      <div style={section}>
+        <h3 style={sh}>Card</h3>
+        <p style={{ fontFamily: mono, fontSize: 11, color: T.textDim, margin: "0 0 16px" }}>
+          Controls where this module appears on the sample page and what interactive options the card exposes.
+        </p>
+
+        {/* Section picker */}
+        <div style={{ marginBottom: 20 }}>
+          <label style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase", display: "block", marginBottom: 6 }}>Sample Page Section</label>
+          <select value={cardSection} onChange={e => setCardSection(e.target.value)}
+            style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "6px 10px", outline: "none", cursor: "pointer" }}>
+            <option value="">— Not shown —</option>
+            <option value="electrical">Electrical Characterization</option>
+            <option value="structural">X-Ray Characterization</option>
+            <option value="scanning_probe">Scanning Probe</option>
+            <option value="optical">Optical</option>
+            <option value="other">Other</option>
+          </select>
+        </div>
+
+        {/* Card controls */}
+        <div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Card Controls</span>
+            <button onClick={() => setCardControls(prev => [...prev, { name: "", type: "toggle", choices: ["a", "b"], default: "a", plot_overrides: {} }])}
+              style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: T.textSecondary, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+              + Add control
+            </button>
+          </div>
+          {cardControls.length === 0 && (
+            <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>No controls — the card will render the plot with default plot config settings.</div>
+          )}
+          {cardControls.map((ctrl, i) => (
+            <div key={i} style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "12px 14px", marginBottom: 8 }}>
+              <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Name (key)</div>
+                  <input value={ctrl.name}
+                    onChange={e => setCardControls(prev => prev.map((c, j) => j === i ? { ...c, name: e.target.value } : c))}
+                    style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.teal, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none" }} />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Displayed Name</div>
+                  <input value={ctrl.label || ""}
+                    onChange={e => setCardControls(prev => prev.map((c, j) => j === i ? { ...c, label: e.target.value } : c))}
+                    style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none" }} />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Default</div>
+                  <input value={ctrl.default || ""}
+                    onChange={e => setCardControls(prev => prev.map((c, j) => j === i ? { ...c, default: e.target.value } : c))}
+                    style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none" }} />
+                </div>
+                <div style={{ display: "flex", alignItems: "flex-end", gap: 4 }}>
+                  <select value={ctrl.type}
+                    onChange={e => setCardControls(prev => prev.map((c, j) => j === i ? { ...c, type: e.target.value } : c))}
+                    style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 11, padding: "4px 6px", outline: "none" }}>
+                    <option value="toggle">toggle</option>
+                    <option value="number">number</option>
+                    <option value="area">area</option>
+                  </select>
+                  <button onClick={() => setCardControls(prev => prev.filter((_, j) => j !== i))}
+                    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, padding: "0 4px", marginBottom: 1 }}>×</button>
+                </div>
+              </div>
+              {ctrl.type === "area" && (
+                <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>
+                  Displays the electrode area detected in the file and a correction-factor input on the card. Default sets the initial correction factor.
+                </div>
+              )}
+              {ctrl.type === "toggle" && (
+                <div>
+                  <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 6 }}>Choices → plot_config overrides (JSON)</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {(ctrl.choices || []).map((ch, ci) => (
+                      <div key={ci} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <input value={ch}
+                          onChange={e => setCardControls(prev => prev.map((c, j) => {
+                            if (j !== i) return c;
+                            const newChoices = [...c.choices]; newChoices[ci] = e.target.value;
+                            return { ...c, choices: newChoices };
+                          }))}
+                          style={{ width: 80, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.teal, fontFamily: mono, fontSize: 12, padding: "3px 6px", outline: "none" }} />
+                        <span style={{ color: T.textDim, fontFamily: mono, fontSize: 11 }}>→</span>
+                        <input value={JSON.stringify(ctrl.plot_overrides?.[ch] || {})}
+                          onChange={e => {
+                            try {
+                              const parsed = JSON.parse(e.target.value);
+                              setCardControls(prev => prev.map((c, j) => j !== i ? c : { ...c, plot_overrides: { ...c.plot_overrides, [ch]: parsed } }));
+                            } catch (_) {}
+                          }}
+                          style={{ flex: 1, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "3px 6px", outline: "none" }} />
+                        <button onClick={() => setCardControls(prev => prev.map((c, j) => {
+                          if (j !== i) return c;
+                          const newChoices = c.choices.filter((_, k) => k !== ci);
+                          const newOverrides = { ...c.plot_overrides }; delete newOverrides[ch];
+                          return { ...c, choices: newChoices, plot_overrides: newOverrides };
+                        }))}
+                          style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>×</button>
+                      </div>
+                    ))}
+                    <button onClick={() => setCardControls(prev => prev.map((c, j) => j !== i ? c : { ...c, choices: [...(c.choices || []), ""] }))}
+                      style={{ alignSelf: "flex-start", background: "none", border: `1px dashed ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 10, padding: "2px 8px", cursor: "pointer" }}>
+                      + choice
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Data section ── */}
+      <div style={section}>
+        <div style={{ display: "flex", alignItems: "center", marginBottom: 16 }}>
+          <h3 style={{ ...sh, margin: 0, flex: 1 }}>Data</h3>
+          {isBuiltin && exInfo && (
+            <button onClick={() => saveDataConfig(mod.id).then(() => { setSaved(true); setTimeout(() => setSaved(false), 1500); }).catch(e => setError(e.message))}
+              style={{ fontFamily: mono, fontSize: 10, padding: "4px 10px", borderRadius: 4, border: `1px solid ${T.teal}44`, background: "none", color: T.teal, cursor: "pointer" }}>
+              Save column map
+            </button>
+          )}
+        </div>
+
+        {/* Create-mode notice */}
+        {isCreate && (
+          <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, padding: "16px 0" }}>
+            Create the module first, then return here to add an example file.
+          </div>
+        )}
+
+        {/* Upload dropzone — shown when no example loaded */}
+        {!isCreate && !exInfo && !exLoading && (
+          <label style={{
+            display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+            border: `2px dashed ${T.border}`, borderRadius: 8, padding: "32px 20px",
+            cursor: "pointer", gap: 8, transition: "border-color .15s",
+          }}
+          onDragOver={e => e.preventDefault()}
+          onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) handleExampleUpload(f); }}>
+            <input type="file" style={{ display: "none" }} onChange={e => { const f = e.target.files[0]; if (f) handleExampleUpload(f); }} />
+            <span style={{ fontFamily: mono, fontSize: 13, color: T.textDim }}>Drop an example file or click to upload</span>
+            {mAccepts.length > 0 && (
+              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Accepts: {mAccepts.join(", ")}</span>
+            )}
+          </label>
+        )}
+
+        {/* Loading */}
+        {exLoading && (
+          <div style={{ fontFamily: mono, fontSize: 12, color: T.textDim, padding: "16px 0" }}>Analyzing file…</div>
+        )}
+
+        {/* File loaded */}
+        {!isCreate && exInfo && !exLoading && (() => {
+          const delimLabel = exInfo.delimiter === "\t" ? "tab"
+            : exInfo.delimiter === "," ? "comma"
+            : exInfo.delimiter === ";" ? "semicolon"
+            : exInfo.delimiter === " " ? "space"
+            : exInfo.delimiter || "?";
+          return (
+            <>
+              {/* Info bar */}
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, padding: "8px 12px", background: T.bg0, borderRadius: 6, border: `1px solid ${T.border}` }}>
+                <span style={{ fontFamily: mono, fontSize: 11, color: T.textPrimary, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {exInfo.filename}
+                </span>
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, whiteSpace: "nowrap" }}>{exInfo.total_lines} rows</span>
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, whiteSpace: "nowrap" }}>{exInfo.num_cols} cols</span>
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.teal, background: T.teal + "18", border: `1px solid ${T.teal}33`, borderRadius: 3, padding: "1px 7px" }}>
+                  {delimLabel}
+                </span>
+                <button onClick={handleRemoveExample}
+                  style={{ fontFamily: mono, fontSize: 10, color: T.red, background: "none", border: "none", cursor: "pointer", padding: "2px 4px" }}>
+                  Remove
+                </button>
+              </div>
+
+              {/* Parse options */}
+              <div style={{ display: "flex", gap: 10, alignItems: "flex-end", marginBottom: 16, flexWrap: "wrap" }}>
+                <div>
+                  <span style={label}>Delimiter</span>
+                  <select value={exDelim} onChange={e => setExDelim(e.target.value)}
+                    style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", outline: "none" }}>
+                    <option value="auto">Auto-detect</option>
+                    <option value={"\t"}>Tab</option>
+                    <option value=",">Comma</option>
+                    <option value=";">Semicolon</option>
+                    <option value=" ">Space</option>
+                  </select>
+                </div>
+                <div>
+                  <span style={label}>Skip rows</span>
+                  <input type="number" min={0} value={exSkip} onChange={e => setExSkip(e.target.value)}
+                    placeholder="auto"
+                    style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", width: 70, outline: "none" }} />
+                </div>
+                <button onClick={handleResniff}
+                  style={{ fontFamily: mono, fontSize: 11, padding: "5px 12px", borderRadius: 4, border: `1px solid ${T.border}`, background: "none", color: T.textSecondary, cursor: "pointer" }}>
+                  Re-parse
+                </button>
+              </div>
+
+              {/* Column preview + assignments */}
+              {exInfo.headers && exInfo.headers.length > 0 && (
+                <div style={{ overflowX: "auto", maxHeight: 420, overflowY: "auto" }}>
+                  <table style={{ borderCollapse: "collapse", minWidth: "100%", fontFamily: mono, fontSize: 11 }}>
+                    <thead>
+                      {/* Header row */}
+                      <tr>
+                        {exInfo.headers.map((h, i) => (
+                          <th key={i} style={{ padding: "6px 12px", background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "left", fontWeight: 600, whiteSpace: "nowrap", position: "sticky", top: 0, zIndex: 1 }}>
+                            {h || `Col ${i + 1}`}
+                          </th>
+                        ))}
+                      </tr>
+                      {/* Variable name row */}
+                      <tr>
+                        {exInfo.headers.map((_, i) => (
+                          <th key={i} style={{ padding: "3px 8px", background: T.bg1, border: `1px solid ${T.border}`, fontWeight: "normal", position: "sticky", top: 33, zIndex: 1 }}>
+                            <input
+                              value={assignments[i] || ""}
+                              onChange={e => setAssignments(a => ({ ...a, [i]: e.target.value }))}
+                              placeholder="→ var"
+                              style={{ fontFamily: mono, fontSize: 10, width: "100%", minWidth: 60, background: "none", border: "none", outline: "none", color: T.teal, textAlign: "center" }}
+                            />
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(exInfo.preview_rows || []).map((row, ri) => (
+                        <tr key={ri} style={{ background: ri % 2 === 0 ? "transparent" : T.bg0 + "80" }}>
+                          {(Array.isArray(row) ? row : []).map((cell, ci) => (
+                            <td key={ci} style={{ padding: "4px 12px", border: `1px solid ${T.border}`, color: T.textDim, textAlign: "right", whiteSpace: "nowrap" }}>
+                              {cell}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <div style={{ fontFamily: mono, fontSize: 9, color: T.textDim, marginTop: 6 }}>
+                    Showing first {(exInfo.preview_rows || []).length} data rows of {exInfo.total_lines} total
+                  </div>
+                </div>
+              )}
+
+              {/* Header metadata */}
+              {(exInfo.header_meta || []).length > 0 && (
+                <div style={{ marginTop: 20 }}>
+                  <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 8, letterSpacing: "0.05em", textTransform: "uppercase" }}>
+                    Header metadata ({exInfo.header_meta.length} entries)
+                  </div>
+                  <div style={{ overflowX: "auto", maxHeight: 280, overflowY: "auto" }}>
+                    <table style={{ borderCollapse: "collapse", width: "100%", fontFamily: mono, fontSize: 11 }}>
+                      <thead>
+                        <tr>
+                          <th style={{ padding: "5px 12px", background: T.bg0, border: `1px solid ${T.border}`, color: T.textDim, textAlign: "left", fontWeight: 500, position: "sticky", top: 0, zIndex: 1 }}>Key</th>
+                          <th style={{ padding: "5px 12px", background: T.bg0, border: `1px solid ${T.border}`, color: T.textDim, textAlign: "left", fontWeight: 500, position: "sticky", top: 0, zIndex: 1 }}>Value</th>
+                          <th style={{ padding: "5px 12px", background: T.bg0, border: `1px solid ${T.border}`, color: T.textDim, textAlign: "left", fontWeight: 500, position: "sticky", top: 0, zIndex: 1, width: 110 }}>→ var name</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {exInfo.header_meta.map(({ key, value }, i) => (
+                          <tr key={i} style={{ background: i % 2 === 0 ? "transparent" : T.bg0 + "80" }}>
+                            <td style={{ padding: "4px 12px", border: `1px solid ${T.border}`, color: T.textSecondary, whiteSpace: "nowrap" }}>{key}</td>
+                            <td style={{ padding: "4px 12px", border: `1px solid ${T.border}`, color: T.textDim }}>{value}</td>
+                            <td style={{ padding: "2px 8px", border: `1px solid ${T.border}` }}>
+                              <input
+                                value={metaAssignments[key] || ""}
+                                onChange={e => setMetaAssignments(a => ({ ...a, [key]: e.target.value }))}
+                                placeholder="var name"
+                                style={{ fontFamily: mono, fontSize: 10, width: "100%", background: "none", border: "none", outline: "none", color: T.teal }}
+                              />
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </>
+          );
+        })()}
+      </div>
+
+      {/* ── Processing section ── */}
+      <div style={section}>
+        <div style={{ display: "flex", alignItems: "center", marginBottom: 16 }}>
+          <h3 style={{ ...sh, margin: 0, flex: 1 }}>Processing</h3>
+          <button onClick={handleRunProc} disabled={procRunning || !exInfo}
+            style={{ fontFamily: mono, fontSize: 10, padding: "4px 14px", borderRadius: 4,
+              border: `1px solid ${exInfo ? T.teal + "66" : T.border}`,
+              background: "none",
+              color: exInfo ? T.teal : T.textDim,
+              cursor: (exInfo && !procRunning) ? "pointer" : "not-allowed" }}>
+            {procRunning ? "Running…" : "▶ Run"}
+          </button>
+        </div>
+
+        <p style={{ fontFamily: mono, fontSize: 11, color: T.textDim, margin: "0 0 16px" }}>
+          Three blocks concatenated at run time. Block 1 is auto-generated and read-only.
+          Block 2 is your transform logic. Block 3 is the return dict — must include <code style={{ color: T.teal }}>x</code> and <code style={{ color: T.teal }}>y</code>.
+        </p>
+
+        {/* Block 1 — Auto-generated, locked */}
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+            background: T.bg2, border: `1px solid ${T.border}`, borderBottom: "none",
+            borderRadius: "8px 8px 0 0", padding: "6px 14px" }}>
+            <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, letterSpacing: "0.05em", textTransform: "uppercase" }}>
+              Block 1 — Column Imports <span style={{ color: T.textDim, fontWeight: 400 }}>(auto-generated · read-only)</span>
+            </span>
+            {exInfo && (
+              <button onClick={() => {/* Block 1 is always regenerated — no state to update */}}
+                title="Block 1 regenerates automatically from Data assignments"
+                style={{ fontFamily: mono, fontSize: 10, padding: "2px 8px", borderRadius: 3, border: `1px solid ${T.border}`, background: "none", color: T.textDim, cursor: "default", opacity: 0.5 }}>
+                auto
+              </button>
+            )}
+          </div>
+          <textarea
+            value={exInfo ? generateBlock1() : "# Upload an example file in the Data section first."}
+            readOnly
+            spellCheck={false}
+            rows={Math.min(Math.max((exInfo ? generateBlock1() : "").split("\n").length, 4), 18)}
+            style={{
+              width: "100%", resize: "none",
+              fontFamily: mono, fontSize: 11, lineHeight: 1.65,
+              background: T.bg2, color: T.textDim,
+              border: `1px solid ${T.border}`, borderTop: "none", borderBottom: "none",
+              padding: "12px 18px", outline: "none", boxSizing: "border-box", opacity: 0.8,
+            }}
+          />
+          <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderTop: "none", borderRadius: "0 0 8px 8px", height: 6 }} />
+        </div>
+
+        {/* Block 2 — User transform */}
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderBottom: "none",
+            borderRadius: "8px 8px 0 0", padding: "6px 14px" }}>
+            <span style={{ fontFamily: mono, fontSize: 10, color: T.amber, letterSpacing: "0.05em", textTransform: "uppercase" }}>
+              Block 2 — Processing
+            </span>
+          </div>
+          <textarea
+            value={procBlock2}
+            onChange={e => setProcBlock2(e.target.value)}
+            spellCheck={false}
+            placeholder={"# Transform the imported variables into your desired output.\n# Variables from Block 1 are in scope.\n# Example:\n# xs = [v * 1000 for v in voltage]\n# ys = [c / area_m2 for c in charge]"}
+            style={{
+              width: "100%", minHeight: 160, resize: "vertical",
+              fontFamily: mono, fontSize: 12, lineHeight: 1.7,
+              background: T.bg0, color: T.textPrimary,
+              border: `1px solid ${T.border}`, borderTop: "none", borderBottom: "none",
+              padding: "14px 18px", outline: "none", boxSizing: "border-box",
+            }}
+          />
+          <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderTop: "none", borderRadius: "0 0 8px 8px", height: 6 }} />
+        </div>
+
+        {/* Block 3 — Return dict */}
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+            background: T.bg1, border: `1px solid ${T.border}`, borderBottom: "none",
+            borderRadius: "8px 8px 0 0", padding: "6px 14px" }}>
+            <span style={{ fontFamily: mono, fontSize: 10, color: T.teal, letterSpacing: "0.05em", textTransform: "uppercase" }}>
+              Block 3 — Return Dict
+            </span>
+            <button onClick={() => setProcBlock3(defaultProcBlock3())}
+              style={{ fontFamily: mono, fontSize: 10, padding: "2px 8px", borderRadius: 3,
+                border: `1px solid ${T.border}`, background: "none", color: T.textDim, cursor: "pointer" }}>
+              Reset to scaffold
+            </button>
+          </div>
+          <textarea
+            value={procBlock3}
+            onChange={e => setProcBlock3(e.target.value)}
+            spellCheck={false}
+            placeholder={defaultProcBlock3()}
+            style={{
+              width: "100%", minHeight: 120, resize: "vertical",
+              fontFamily: mono, fontSize: 12, lineHeight: 1.7,
+              background: T.bg0, color: T.textPrimary,
+              border: `1px solid ${T.border}`, borderTop: "none", borderBottom: "none",
+              padding: "14px 18px", outline: "none", boxSizing: "border-box",
+            }}
+          />
+          <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderTop: "none", borderRadius: "0 0 8px 8px", height: 6 }} />
+        </div>
+
+        {/* Run result / error */}
+        {(procResult !== null || procError) && (
+          <div style={{ marginTop: 4, background: T.bg0, border: `1px solid ${procError ? T.red : T.teal}44`, borderRadius: 6, padding: "12px 16px" }}>
+            <div style={{ fontFamily: mono, fontSize: 10, color: procError ? T.red : T.teal, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+              {procError ? "Error" : "Result"}
+            </div>
+            <pre style={{ fontFamily: mono, fontSize: 11, color: procError ? T.red : T.textSecondary, margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 320, overflow: "auto" }}>
+              {procError || JSON.stringify(procResult, null, 2)}
+            </pre>
+          </div>
+        )}
+      </div>
+
+      {/* ── Plot section ── */}
+      <div style={section}>
+        <div style={{ display: "flex", alignItems: "center", marginBottom: 20 }}>
+          <h3 style={{ ...sh, margin: 0, flex: 1 }}>Plot</h3>
+          <button onClick={handlePreviewPlot} disabled={plotLoading || !exInfo}
+            style={{ fontFamily: mono, fontSize: 10, padding: "4px 14px", borderRadius: 4,
+              border: `1px solid ${exInfo ? T.teal + "66" : T.border}`,
+              background: "none", color: exInfo ? T.teal : T.textDim,
+              cursor: (exInfo && !plotLoading) ? "pointer" : "not-allowed" }}>
+            {plotLoading ? "Rendering…" : "▶ Preview Plot"}
+          </button>
+        </div>
+
+        {/* Visual config grid */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+          {/* X variable */}
+          <div>
+            <span style={label}>X variable</span>
+            {plotVars.length > 0 ? (
+              <select value={plotConfig.x_var} onChange={e => setPlotConfig(c => ({ ...c, x_var: e.target.value }))}
+                style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", width: "100%", outline: "none" }}>
+                {plotVars.map(v => <option key={v} value={v}>{v}</option>)}
+              </select>
+            ) : (
+              <input value={plotConfig.x_var} onChange={e => setPlotConfig(c => ({ ...c, x_var: e.target.value }))}
+                placeholder="e.g. x" style={field()} />
+            )}
+          </div>
+          {/* Y variable */}
+          <div>
+            <span style={label}>Y variable</span>
+            {plotVars.length > 0 ? (
+              <select value={plotConfig.y_var} onChange={e => setPlotConfig(c => ({ ...c, y_var: e.target.value }))}
+                style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", width: "100%", outline: "none" }}>
+                {plotVars.map(v => <option key={v} value={v}>{v}</option>)}
+              </select>
+            ) : (
+              <input value={plotConfig.y_var} onChange={e => setPlotConfig(c => ({ ...c, y_var: e.target.value }))}
+                placeholder="e.g. y" style={field()} />
+            )}
+          </div>
+          {/* X label */}
+          <div>
+            <span style={label}>X axis label <span style={{ color: T.textDim }}>(blank = auto from data)</span></span>
+            <input value={plotConfig.x_label} onChange={e => setPlotConfig(c => ({ ...c, x_label: e.target.value }))}
+              placeholder="auto" style={field()} />
+          </div>
+          {/* Y label */}
+          <div>
+            <span style={label}>Y axis label <span style={{ color: T.textDim }}>(blank = auto from data)</span></span>
+            <input value={plotConfig.y_label} onChange={e => setPlotConfig(c => ({ ...c, y_label: e.target.value }))}
+              placeholder="auto" style={field()} />
+          </div>
+          {/* X scale */}
+          <div>
+            <span style={label}>X scale</span>
+            <select value={plotConfig.x_scale} onChange={e => setPlotConfig(c => ({ ...c, x_scale: e.target.value }))}
+              style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", width: "100%", outline: "none" }}>
+              <option value="linear">Linear</option>
+              <option value="log">Log</option>
+            </select>
+          </div>
+          {/* Y scale */}
+          <div>
+            <span style={label}>Y scale</span>
+            <select value={plotConfig.y_scale} onChange={e => setPlotConfig(c => ({ ...c, y_scale: e.target.value }))}
+              style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", width: "100%", outline: "none" }}>
+              <option value="linear">Linear</option>
+              <option value="log">Log</option>
+            </select>
+          </div>
+        </div>
+
+        {/* Error */}
+        {plotError && (
+          <div style={{ background: T.bg0, border: `1px solid ${T.red}44`, borderRadius: 6, padding: "12px 16px", marginBottom: 12 }}>
+            <div style={{ fontFamily: mono, fontSize: 10, color: T.red, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.05em" }}>Error</div>
+            <pre style={{ fontFamily: mono, fontSize: 11, color: T.red, margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 200, overflow: "auto" }}>{plotError}</pre>
+          </div>
+        )}
+
+        {/* Plot */}
+        {plotFigure && (
+          <Suspense fallback={<div style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>Loading chart…</div>}>
+            <Plot
+              data={plotFigure.data || []}
+              layout={{
+                ...(plotFigure.layout || {}),
+                paper_bgcolor: "transparent",
+                plot_bgcolor: "transparent",
+                font: { color: T.textPrimary, family: "'DM Mono', monospace", size: 11 },
+                xaxis: { ...(plotFigure.layout?.xaxis || {}), gridcolor: T.border, zerolinecolor: T.border,
+                  title: { text: plotFigure.layout?.xaxis?.title || "", font: { color: T.textSecondary, size: 11 } } },
+                yaxis: { ...(plotFigure.layout?.yaxis || {}), gridcolor: T.border, zerolinecolor: T.border,
+                  title: { text: plotFigure.layout?.yaxis?.title || "", font: { color: T.textSecondary, size: 11 } } },
+              }}
+              config={{ displayModeBar: false, responsive: true }}
+              style={{ width: "100%" }}
+              useResizeHandler
+            />
+          </Suspense>
+        )}
+
+        {!exInfo && !plotFigure && (
+          <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, paddingTop: 8 }}>
+            Fill in the Processing section first, then preview the plot here.
+          </div>
+        )}
+      </div>
+
+      {/* ── Analysis section ── */}
+      <div style={section}>
+        <h3 style={sh}>Analysis</h3>
+        <p style={{ fontFamily: mono, fontSize: 11, color: T.textDim, margin: "0 0 16px" }}>
+          Compute derived quantities from the processing result. Values are stored per-sample and exposed to analysis notebooks.
+        </p>
+
+        {/* Metrics table */}
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Metrics</span>
+            <button onClick={() => setAnalysisMetrics(prev => [...prev, { name: "", label: "", unit: "" }])}
+              style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: T.textSecondary, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+              + Add metric
+            </button>
+          </div>
+          <div style={{ border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden" }}>
+            {/* Header row */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1.5fr 80px 100px 28px", gap: 0, background: T.bg2, borderBottom: `1px solid ${T.border}`, padding: "6px 12px", fontFamily: mono, fontSize: 10, color: T.textDim, letterSpacing: 0.5, textTransform: "uppercase" }}>
+              <span>Key</span><span>Label</span><span>Unit</span><span>Value</span><span/>
+            </div>
+            {analysisMetrics.length === 0 && (
+              <div style={{ padding: "12px 16px", fontFamily: mono, fontSize: 11, color: T.textDim, textAlign: "center" }}>No metrics defined</div>
+            )}
+            {analysisMetrics.map((m, i) => {
+              const val = analysisResult?.[m.name];
+              const valStr = val == null ? "—" : typeof val === "number" ? val.toPrecision(4) : String(val);
+              return (
+                <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1.5fr 80px 100px 28px", gap: 0, alignItems: "center", borderBottom: i < analysisMetrics.length - 1 ? `1px solid ${T.border}` : "none", padding: "4px 12px", background: i % 2 === 0 ? "transparent" : T.bg2 + "66" }}>
+                  <input value={m.name} placeholder="ec"
+                    onChange={e => setAnalysisMetrics(prev => prev.map((x, j) => j === i ? { ...x, name: e.target.value } : x))}
+                    style={{ background: "none", border: "none", outline: "none", fontFamily: mono, fontSize: 12, color: T.teal, padding: "2px 0", width: "100%" }} />
+                  <input value={m.label} placeholder="Coercive Field"
+                    onChange={e => setAnalysisMetrics(prev => prev.map((x, j) => j === i ? { ...x, label: e.target.value } : x))}
+                    style={{ background: "none", border: "none", outline: "none", fontFamily: mono, fontSize: 12, color: T.textPrimary, padding: "2px 0", width: "100%" }} />
+                  <input value={m.unit} placeholder="kV/cm"
+                    onChange={e => setAnalysisMetrics(prev => prev.map((x, j) => j === i ? { ...x, unit: e.target.value } : x))}
+                    style={{ background: "none", border: "none", outline: "none", fontFamily: mono, fontSize: 12, color: T.textSecondary, padding: "2px 0", width: "100%" }} />
+                  <span style={{ fontFamily: mono, fontSize: 12, color: analysisResult ? (val == null ? T.textDim : T.amber) : T.textDim, paddingLeft: 4 }}>
+                    {valStr}{val != null && m.unit ? ` ${m.unit}` : ""}
+                  </span>
+                  <button onClick={() => setAnalysisMetrics(prev => prev.filter((_, j) => j !== i))}
+                    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 14, padding: 0, lineHeight: 1 }} title="Remove">×</button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Analysis code — three blocks */}
+
+        {/* Block A — locked reference (result keys from last proc run) */}
+        {(() => {
+          const resultKeys = procResult ? Object.keys(procResult) : [];
+          const blockA = resultKeys.length > 0
+            ? `# Block A: Available keys from Processing result\n# result = {\n${resultKeys.map(k => `#   "${k}": ${JSON.stringify(procResult[k])?.slice(0, 60) ?? "..."},`).join("\n")}\n# }`
+            : `# Block A: Run Processing first to see available result keys.\n# result = { "x": [...], "y": [...], "x_label": "...", ... }`;
+          return (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderBottom: "none",
+                borderRadius: "8px 8px 0 0", padding: "6px 14px" }}>
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, letterSpacing: "0.05em", textTransform: "uppercase" }}>
+                  Block A — Result Reference <span style={{ fontWeight: 400 }}>(read-only)</span>
+                </span>
+              </div>
+              <textarea value={blockA} readOnly spellCheck={false}
+                rows={Math.min(resultKeys.length + 4, 12)}
+                style={{ width: "100%", resize: "none", fontFamily: mono, fontSize: 11, lineHeight: 1.65,
+                  background: T.bg2, color: T.textDim,
+                  border: `1px solid ${T.border}`, borderTop: "none", borderBottom: "none",
+                  padding: "10px 16px", outline: "none", boxSizing: "border-box", opacity: 0.8 }} />
+              <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderTop: "none", borderRadius: "0 0 8px 8px", height: 6 }} />
+            </div>
+          );
+        })()}
+
+        {/* Block B — user analysis logic */}
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderBottom: "none",
+            borderRadius: "8px 8px 0 0", padding: "6px 14px" }}>
+            <span style={{ fontFamily: mono, fontSize: 10, color: T.amber, letterSpacing: "0.05em", textTransform: "uppercase" }}>
+              Block B — Analysis
+            </span>
+          </div>
+          <textarea value={analysisBlock2} onChange={e => setAnalysisBlock2(e.target.value)}
+            spellCheck={false}
+            placeholder={"# Extract metrics from the processing result.\n# result dict is in scope — use result[\"x\"], result[\"y\"], etc.\n# Example:\n# ec = (result[\"x_pos\"] + abs(result[\"x_neg\"])) / 2"}
+            style={{ width: "100%", minHeight: 140, resize: "vertical", fontFamily: mono, fontSize: 12, lineHeight: 1.7,
+              background: T.bg0, color: T.textPrimary,
+              border: `1px solid ${T.border}`, borderTop: "none", borderBottom: "none",
+              padding: "14px 18px", outline: "none", boxSizing: "border-box" }} />
+          <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderTop: "none", borderRadius: "0 0 8px 8px", height: 6 }} />
+        </div>
+
+        {/* Block C — return dict */}
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+            background: T.bg1, border: `1px solid ${T.border}`, borderBottom: "none",
+            borderRadius: "8px 8px 0 0", padding: "6px 14px" }}>
+            <span style={{ fontFamily: mono, fontSize: 10, color: T.teal, letterSpacing: "0.05em", textTransform: "uppercase" }}>
+              Block C — Return Dict
+            </span>
+            <button onClick={() => setAnalysisBlock3(defaultAnalysisBlock3())}
+              style={{ fontFamily: mono, fontSize: 10, padding: "2px 8px", borderRadius: 3,
+                border: `1px solid ${T.border}`, background: "none", color: T.textDim, cursor: "pointer" }}>
+              Reset to scaffold
+            </button>
+          </div>
+          <textarea value={analysisBlock3} onChange={e => setAnalysisBlock3(e.target.value)}
+            spellCheck={false}
+            placeholder={defaultAnalysisBlock3()}
+            style={{ width: "100%", minHeight: 80, resize: "vertical", fontFamily: mono, fontSize: 12, lineHeight: 1.7,
+              background: T.bg0, color: T.textPrimary,
+              border: `1px solid ${T.border}`, borderTop: "none", borderBottom: "none",
+              padding: "14px 18px", outline: "none", boxSizing: "border-box" }} />
+          <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderTop: "none", borderRadius: "0 0 8px 8px", height: 6 }} />
+        </div>
+
+        {/* Compute button */}
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <button onClick={handleComputeAnalysis}
+            disabled={analysisRunning || !exInfo}
+            style={{ background: T.teal + "22", border: `1px solid ${T.teal}55`, borderRadius: 8, color: T.teal, fontFamily: mono, fontSize: 12, padding: "7px 18px", cursor: "pointer", opacity: (analysisRunning || !exInfo) ? 0.4 : 1 }}>
+            {analysisRunning ? "Computing…" : "▶ Compute"}
+          </button>
+          {analysisResult && !analysisError && (
+            <span style={{ fontFamily: mono, fontSize: 11, color: T.teal }}>✓ {Object.keys(analysisResult).length} values computed</span>
+          )}
+        </div>
+
+        {analysisError && (
+          <pre style={{ marginTop: 12, fontFamily: mono, fontSize: 11, color: T.red, background: T.red + "11", border: `1px solid ${T.red}33`, borderRadius: 8, padding: "10px 14px", whiteSpace: "pre-wrap", wordBreak: "break-all", maxHeight: 200, overflow: "auto" }}>
+            {analysisError}
+          </pre>
+        )}
+      </div>
+
+    </div>
+  );
+
+  // ── Source tab ───────────────────────────────────────────────────────────
+  const sourceTab = (
+    <div>
+      {isBuiltin && (
+        <div style={{ fontFamily: mono, fontSize: 10, color: T.amber, background: T.amber + "11", border: `1px solid ${T.amber}33`, borderRadius: 6, padding: "8px 12px", marginBottom: 12 }}>
+          Read-only — built-in module. Use Duplicate to create an editable copy.
+        </div>
+      )}
+      <textarea value={source} onChange={e => { if (!isBuiltin) setSource(e.target.value); }}
+        readOnly={isBuiltin} spellCheck={false}
+        style={{ width: "100%", minHeight: 560, resize: "vertical", fontFamily: mono, fontSize: 12, lineHeight: 1.6, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 8, padding: "16px 20px", outline: "none", opacity: isBuiltin ? 0.8 : 1 }}
+      />
+    </div>
+  );
+
+  return (
+    <div>
+      {tabBar}
+      {tab === "visual" ? visualTab : sourceTab}
     </div>
   );
 }
@@ -4041,6 +5561,145 @@ function defaultPanelConfig(type) {
     type === "meta" ? { x_param: "", y_param: "" } :
     {};
   return saved ? { ...base, ...saved } : base;
+}
+
+// ── Module comparison panel ────────────────────────────────────────────────────
+// Generic comparison panel for any installed module.
+// Fetches render-for-sample for each sample, overlays with Plotly (same stack as other panels).
+
+function ModuleComparisonPanel({ moduleId, sampleOrder, samples, colors, labels = {}, plotStyle, config: panelConfig = {}, onUpdate, modules = [] }) {
+  const ps      = plotStyle || DEFAULT_PLOT_STYLE;
+  const mod     = modules.find(m => m.id === moduleId);
+  const mono    = "'DM Mono', monospace";
+
+  // Control state (toggles from card_controls)
+  const cardControls = mod?.card_controls || [];
+  const initControls = () => {
+    const s = {};
+    for (const c of cardControls) if (c.type === "toggle") s[c.name] = panelConfig[`ctrl_${c.name}`] ?? c.default ?? (c.choices?.[0] ?? "");
+    return s;
+  };
+  const [ctrlState, setCtrlState] = useState(initControls);
+
+  // Per-sample fetched data: { [sid]: {x, y, x_label, y_label} | null }
+  const [fetchedData, setFetchedData] = useState({});
+  const [loading, setLoading]         = useState(false);
+  const [fetchError, setFetchError]   = useState(null);
+
+  const buildOptions = (ctrl = ctrlState) => {
+    const options = {};
+    for (const c of cardControls) {
+      if (c.type === "toggle") {
+        const val = ctrl[c.name];
+        const po  = c.plot_overrides?.[val];
+        if (po) Object.assign(options, po);
+      }
+    }
+    return options;
+  };
+
+  const fetchAll = async (ctrl = ctrlState) => {
+    if (!moduleId) return;
+    setLoading(true); setFetchError(null);
+    try {
+      const cfg = await api("GET", `/modules/${moduleId}/config`);
+      const options = buildOptions(ctrl);
+      const results = {};
+      await Promise.all(sampleOrder.map(async sid => {
+        const sample = samples.find(s => s.id === sid);
+        if (!sample) return;
+        const area_correction = sample.area_correction ?? 1.0;
+        try {
+          const res = await api("POST", `/modules/${moduleId}/render-for-sample`, {
+            sample_id:   sid,
+            proc_code:   cfg.proc_code || "",
+            plot_config: cfg.plot_config || {},
+            options:     { ...options, area_correction },
+          });
+          if (res.ok) results[sid] = { x: res.x, y: res.y, x_label: res.x_label, y_label: res.y_label };
+          else results[sid] = null;
+        } catch { results[sid] = null; }
+      }));
+      setFetchedData(results);
+    } catch (e) { setFetchError(e.message); }
+    setLoading(false);
+  };
+
+  useEffect(() => { fetchAll(); }, [moduleId, sampleOrder.join(",")]);
+
+  const handleCtrlChange = (name, val) => {
+    const next = { ...ctrlState, [name]: val };
+    setCtrlState(next);
+    onUpdate?.({ [`ctrl_${name}`]: val });
+    fetchAll(next);
+  };
+
+  if (loading) return <div style={{ fontFamily: mono, fontSize: 12, color: T.textDim, padding: "20px 0" }}>Loading…</div>;
+  if (fetchError) return <div style={{ fontFamily: mono, fontSize: 12, color: T.red, padding: "20px 0" }}>{fetchError}</div>;
+
+  const traces = sampleOrder.map((sid, i) => {
+    const d = fetchedData[sid];
+    if (!d || !d.x?.length) return null;
+    return { sid, color: colors[i], data: d.x.map((xi, j) => ({ x: xi, y: d.y[j] })), x_label: d.x_label, y_label: d.y_label };
+  }).filter(Boolean);
+
+  if (!traces.length) return <div style={{ fontFamily: mono, fontSize: 12, color: T.textDim, padding: "20px 0" }}>No data for this module on selected samples.</div>;
+
+  const allX = traces.flatMap(t => t.data.map(p => p.x));
+  const allY = traces.flatMap(t => t.data.map(p => p.y));
+  const { ticks: autoXTicks, domain: autoXDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
+  const xDomain = [ps.xMin ?? autoXDomain[0], ps.xMax ?? autoXDomain[1]];
+  const xTicks  = makeTicks(xDomain[0], xDomain[1], ps.xTick) || autoXTicks;
+  const absYMax = Math.max(...allY.map(Math.abs)) * 1.1 || 1;
+  const yMin = ps.yMin ?? -absYMax;
+  const yMax = ps.yMax ??  absYMax;
+  const { ticks: autoYTicks } = niceLinTicks(yMin, yMax);
+  const yTicks = makeTicks(yMin, yMax, ps.yTick) || autoYTicks;
+  const x_label = traces[0]?.x_label || "x";
+  const y_label = traces[0]?.y_label || "y";
+
+  const plotlyTraces = traces.map(t => ({
+    x: t.data.map(p => p.x), y: t.data.map(p => p.y),
+    type: "scatter", mode: "lines",
+    line: { color: t.color, width: ps.lineWidth },
+    showlegend: false, hovertemplate: "<extra></extra>",
+  }));
+  const layout = buildPlotLayout(ps,
+    { tickvals: xTicks, range: xDomain, title: { text: x_label, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+    { range: [yMin, yMax], tickvals: yTicks, title: { text: y_label, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } }
+  );
+
+  return (
+    <>
+      {cardControls.filter(c => c.type === "toggle").length > 0 && (
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginBottom: 6 }}>
+          {cardControls.filter(c => c.type === "toggle").map(ctrl => (
+            <div key={ctrl.name} style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3 }}>
+              {ctrl.label && <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>{ctrl.label}</span>}
+              <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 10, overflow: "hidden" }}>
+                {(ctrl.choices || []).map(ch => (
+                  <button key={ch} onClick={() => handleCtrlChange(ctrl.name, ch)}
+                    style={{ padding: "2px 8px", fontSize: 10, fontFamily: mono, border: "none", cursor: "pointer",
+                      background: ctrlState[ctrl.name] === ch ? T.amber : "transparent",
+                      color:      ctrlState[ctrl.name] === ch ? "#000"   : T.textDim }}>
+                    {ch}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      <SciPlotWrap ps={ps} cursorLabel={x => `${x_label}: ${x.toFixed(3)}`}>
+        {setCursor => (
+          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig(`mod-${moduleId}`, ps)}
+            style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
+            onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+        )}
+      </SciPlotWrap>
+      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
+    </>
+  );
 }
 
 // Inline sample picker shown inside SampleRoster
@@ -5722,6 +7381,14 @@ function AfmComparisonPanel({ sampleOrder, plotCache, labels = {}, plotStyle, co
 // ── Panel wrapper + add panel row ─────────────────────────────────────────────
 
 const PANEL_LABELS = { xrd: "XRD ω–2θ", pe: "P–E Hysteresis", rsm: "RSM", afm: "Scanning Probe", de: "εᵣ vs E", df: "εᵣ vs f", meta: "Meta-analysis", stats: "Statistical Analysis", parcoords: "Parallel Coordinates" };
+function panelLabel(type, modules = []) {
+  if (PANEL_LABELS[type]) return PANEL_LABELS[type];
+  if (type.startsWith("mod:")) {
+    const mod = modules.find(m => m.id === type.slice(4));
+    return mod ? mod.name : type.slice(4);
+  }
+  return type;
+}
 
 // ── Meta-analysis parameter definitions ───────────────────────────────────────
 
@@ -6297,16 +7964,74 @@ function MetaMarkerPicker({ prefix, config, onUpdate, defaultSymbol = "circle" }
   );
 }
 
-function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {}, config = {}, plotStyle, activeMaterial, structures = [], onUpdate }) {
+function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {}, config = {}, plotStyle, activeMaterial, structures = [], modules = [], onUpdate }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const xParamId  = config.x_param  || "";
   const yParamId  = config.y_param  || "";
   const y2ParamId = config.y2_param || "";
-  const xParam  = META_PARAMS_FLAT.find(p => p.id === xParamId)  || null;
-  const yParam  = META_PARAMS_FLAT.find(p => p.id === yParamId)  || null;
-  const y2Param = META_PARAMS_FLAT.find(p => p.id === y2ParamId) || null;
   const [showY2, setShowY2] = useState(!!config.y2_param);
   const sampleMap = useMemo(() => Object.fromEntries(samples.map(s => [s.id, s])), [samples]);
+
+  // ── Module analysis results: { [sid]: { [modId]: { [metricName]: value } } }
+  const [modResults, setModResults] = useState({});
+  const fetchingRef = useRef(new Set());
+  useEffect(() => {
+    const modsWithAnalysis = modules.filter(m => m.analysis_metrics?.length && m.analysis_code);
+    if (!modsWithAnalysis.length) return;
+    (async () => {
+      const cfgCache = {};
+      for (const mod of modsWithAnalysis) {
+        try { cfgCache[mod.id] = await api("GET", `/modules/${mod.id}/config`); } catch { cfgCache[mod.id] = null; }
+      }
+      for (const sid of sampleOrder) {
+        const sample = sampleMap[sid];
+        if (!sample) continue;
+        for (const mod of modsWithAnalysis) {
+          const key = `${sid}::${mod.id}`;
+          if (fetchingRef.current.has(key)) continue;
+          if (!sample.filenames?.[mod.id]) continue;
+          const cfg = cfgCache[mod.id];
+          if (!cfg?.proc_code || !cfg?.analysis_code) continue;
+          fetchingRef.current.add(key);
+          try {
+            const res = await api("POST", `/modules/${mod.id}/compute-analysis-for-sample`, {
+              sample_id: sid, proc_code: cfg.proc_code, analysis_code: cfg.analysis_code,
+            });
+            if (res.ok) {
+              setModResults(prev => ({ ...prev, [sid]: { ...(prev[sid] || {}), [mod.id]: res.values } }));
+            }
+          } catch { /* skip */ }
+        }
+      }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sampleOrder.join(","), modules.map(m => m.id).join(",")]);
+
+  // Build dynamic groups from modules that have analysis_metrics and results for at least one sample
+  const moduleGroups = useMemo(() => {
+    return modules
+      .filter(m => m.analysis_metrics?.length)
+      .map(mod => {
+        const params = mod.analysis_metrics.map(metric => ({
+          id: `mod:${mod.id}:${metric.name}`,
+          label: metric.label,
+          unit: metric.unit || "",
+          extract: (s) => {
+            const v = modResults[s.id]?.[mod.id]?.[metric.name];
+            return (v != null && isFinite(v)) ? v : null;
+          },
+        })).filter(p => sampleOrder.some(sid => { const s = sampleMap[sid]; return s && p.extract(s) != null; }));
+        return params.length ? { group: mod.name, params } : null;
+      })
+      .filter(Boolean);
+  }, [modules, modResults, sampleOrder, sampleMap]);
+
+  const allParamGroups = useMemo(() => [...META_PARAM_GROUPS, ...moduleGroups], [moduleGroups]);
+  const allParamsFlat  = useMemo(() => allParamGroups.flatMap(g => g.params.map(p => ({ ...p, group: g.group }))), [allParamGroups]);
+
+  const xParam  = allParamsFlat.find(p => p.id === xParamId)  || null;
+  const yParam  = allParamsFlat.find(p => p.id === yParamId)  || null;
+  const y2Param = allParamsFlat.find(p => p.id === y2ParamId) || null;
 
   // Per-panel X-ray material: used when any selected param is an X-ray param.
   // Falls back to activeMaterial (sheet-level) if not set in config.
@@ -6364,10 +8089,9 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
     const hasPE    = sampleOrder.some(sid => plotCache[sid]?.pe?.length > 0);
     const hasDielF = sampleOrder.some(sid => plotCache[sid]?.diel_f?.length > 0);
     const hasDielB = sampleOrder.some(sid => (plotCache[sid]?.diel_b_up?.length || 0) + (plotCache[sid]?.diel_b_down?.length || 0) > 0);
-    return META_PARAM_GROUPS.map(g => {
+    const builtinFiltered = META_PARAM_GROUPS.map(g => {
       let params;
       if (g.group === "Growth" || g.group === "Sample") {
-        // Include only params where at least one sample has a non-null value
         params = g.params.filter(p =>
           sampleOrder.some(sid => { const s = sampleMap[sid]; return s && p.extract(s, {}, activeMaterial) != null; })
         );
@@ -6378,8 +8102,6 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
       } else if (g.group === "Dielectric — bias sweep") {
         params = hasDielB ? g.params : [];
       } else if (g.group === "X-ray") {
-        // Show whenever any sample has any fitted XRD line
-        // (active material selects which one to use at extract time)
         const hasXRD = sampleOrder.some(sid => {
           const s = sampleMap[sid];
           if (!s) return false;
@@ -6393,8 +8115,10 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
       }
       return { ...g, params };
     }).filter(g => g.params.length > 0);
+    // Module groups are already pre-filtered to params with ≥1 non-null value
+    return [...builtinFiltered, ...moduleGroups];
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sampleOrder, sampleMap, plotCache, activeMaterial, structures]);
+  }, [sampleOrder, sampleMap, plotCache, activeMaterial, structures, moduleGroups]);
 
   const addY2BtnStyle = { background: "transparent", border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 8px", cursor: "pointer", letterSpacing: 0.5, textTransform: "uppercase" };
 
@@ -7271,7 +8995,7 @@ function StatisticalAnalysisPanel({ sampleOrder, samples, plotCache, colors, lab
   );
 }
 
-function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, labels = {}, colorScale: bookColorScale = "viridis", structures = [], activeMaterial = null, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver }) {
+function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, labels = {}, colorScale: bookColorScale = "viridis", structures = [], activeMaterial = null, modules = [], onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver }) {
   const { type, config } = panel;
   const [cogOpen, setCogOpen] = useState(false);
   const [savedFlash, setSavedFlash] = useState(false);
@@ -7327,7 +9051,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
         <div draggable onDragStart={onDragStart} onDragEnd={onDragEnd}
           title="Drag to reorder"
           style={{ cursor: "grab", color: T.textDim, fontSize: 13, lineHeight: 1, padding: "0 1px", userSelect: "none", opacity: 0.5, flexShrink: 0 }}>⠿</div>
-        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>{PANEL_LABELS[type] || type}</span>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>{panelLabel(type, modules)}</span>
         <div style={{ flex: 1 }} />
         {/* Duplicate */}
         <button onClick={onDuplicate} title="Duplicate panel"
@@ -7768,10 +9492,11 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
       {type === "afm"  && <AfmComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
       {type === "de"   && <DEComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
       {type === "df"   && <DfComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
-      {type === "meta" && <MetaAnalysisPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
+      {type === "meta" && <MetaAnalysisPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} modules={modules} onUpdate={onUpdate} />}
       {type === "xrd_pos" && <XRDPeakPositionPanel sampleOrder={sampleOrder} samples={samples} colors={colors} labels={labels} config={config} plotStyle={ps} structures={structures} onUpdate={onUpdate} />}
       {type === "stats"      && <StatisticalAnalysisPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
       {type === "parcoords"  && <ParallelCoordsPanel       sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
+      {type.startsWith("mod:") && <ModuleComparisonPanel moduleId={type.slice(4)} sampleOrder={sampleOrder} samples={samples} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} modules={modules} />}
     </div>
   );
 }
@@ -7951,10 +9676,11 @@ function ParallelCoordsPanel({ sampleOrder, samples, plotCache, colors, labels =
   );
 }
 
-function AddPanelRow({ onAdd }) {
+function AddPanelRow({ onAdd, modules = [] }) {
   const [open, setOpen] = useState(false);
   const [openUp, setOpenUp] = useState(false);
   const btnRef = useRef(null);
+  const mono = "'DM Mono', monospace";
   const PANEL_TYPES = [
     { type: "xrd",       label: "XRD ω–2θ"              },
     { type: "rsm",       label: "RSM"                   },
@@ -7970,32 +9696,43 @@ function AddPanelRow({ onAdd }) {
     if (!open && btnRef.current) {
       const rect = btnRef.current.getBoundingClientRect();
       const spaceBelow = window.innerHeight - rect.bottom;
-      setOpenUp(spaceBelow < 240); // dropdown is ~220px tall
+      setOpenUp(spaceBelow < 300);
     }
     setOpen(v => !v);
   };
   const dropStyle = openUp
     ? { bottom: "100%", marginBottom: 4 }
     : { top: "100%",    marginTop: 4 };
+  const btnItem = { background: "none", border: "none", color: T.textSecondary, cursor: "pointer", fontFamily: mono, fontSize: 12, padding: "7px 12px", textAlign: "left", borderRadius: 5 };
   return (
     <div ref={btnRef} style={{ position: "relative", alignSelf: "center" }}>
       {open && <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 190 }} />}
       <Btn variant="ghost" onClick={toggle}>+ Add Panel</Btn>
       {open && (
-        <div style={{ position: "absolute", left: "50%", transform: "translateX(-50%)", ...dropStyle, background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: 6, zIndex: 200, display: "flex", flexDirection: "column", gap: 2, minWidth: 170, boxShadow: "0 4px 16px rgba(0,0,0,.55)" }}>
+        <div style={{ position: "absolute", left: "50%", transform: "translateX(-50%)", ...dropStyle, background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: 6, zIndex: 200, display: "flex", flexDirection: "column", gap: 2, minWidth: 180, boxShadow: "0 4px 16px rgba(0,0,0,.55)" }}>
           {PANEL_TYPES.map(p => (
-            <button key={p.type} onMouseDown={() => { onAdd(p.type); setOpen(false); }}
-              style={{ background: "none", border: "none", color: T.textSecondary, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "7px 12px", textAlign: "left", borderRadius: 5 }}>
+            <button key={p.type} onMouseDown={() => { onAdd(p.type); setOpen(false); }} style={btnItem}>
               {p.label}
             </button>
           ))}
+          {modules.length > 0 && (
+            <>
+              <div style={{ borderTop: `1px solid ${T.border}`, margin: "4px 0" }} />
+              <div style={{ fontFamily: mono, fontSize: 9, color: T.textDim, padding: "2px 12px", textTransform: "uppercase", letterSpacing: 1 }}>Modules</div>
+              {modules.map(m => (
+                <button key={m.id} onMouseDown={() => { onAdd(`mod:${m.id}`); setOpen(false); }} style={btnItem}>
+                  {m.name}
+                </button>
+              ))}
+            </>
+          )}
         </div>
       )}
     </div>
   );
 }
 
-function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings }) {
+function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, modules = [] }) {
   const cfg            = book.config || {};
   const sampleOrder    = cfg.sample_order?.length ? cfg.sample_order : (book.sample_ids || []);
   const colorScale     = cfg.color_scale    || "viridis";
@@ -8062,6 +9799,7 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings }
           colorScale={colorScale}
           structures={settings?.structures || []}
           activeMaterial={activeMaterial}
+          modules={modules}
           isDragOver={panelDragOverIdx === i && panelDragIdx !== i}
           onDragStart={() => setPanelDragIdx(i)}
           onDragOver={() => setPanelDragOverIdx(i)}
@@ -8078,7 +9816,7 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings }
           onUpdate={patch => updateCfg({ panels: panels.map(p => p.id === panel.id ? { ...p, config: { ...p.config, ...patch } } : p) })}
         />
       ))}
-      <AddPanelRow onAdd={type => updateCfg({ panels: [...panels, { id: String(Date.now()), type, config: defaultPanelConfig(type) }] })} />
+      <AddPanelRow onAdd={type => updateCfg({ panels: [...panels, { id: String(Date.now()), type, config: defaultPanelConfig(type) }] })} modules={modules} />
     </div>
   );
 }
@@ -8323,7 +10061,7 @@ export default function App() {
   const [settingsOpen,  setSettingsOpen]  = useState(false);
   const [exportOpen,    setExportOpen]    = useState(false);
   const [modules,       setModules]       = useState([]);
-  const [moduleSource,  setModuleSource]  = useState(null); // { id, name, builtin, source }
+  const [activeModule,  setActiveModule]  = useState(null); // full module editor state: { id, name, builtin, source, mode, ... }
   const [importError,   setImportError]   = useState(null);
   const [importing,     setImporting]     = useState(false);
   const [viewDataOpen,  setViewDataOpen]  = useState(false);  // View Data modal
@@ -8633,6 +10371,17 @@ export default function App() {
     await Promise.all(sampleIds.map(sid => loadSampleData(sid)));
   };
 
+  const openModule = async (id, overrides = {}) => {
+    if (!id) {
+      // Create mode — blank template
+      setActiveModule({ id: "", name: "New Module", builtin: false, source: NEW_MODULE_TEMPLATE, mode: "create", version: "1.0", accepts: [], description: "", author: "", ...overrides });
+      return;
+    }
+    const res = await api("GET", `/modules/${id}/source`);
+    const m   = modules.find(m => m.id === id) || {};
+    setActiveModule({ ...m, source: res.source, builtin: res.builtin, mode: res.builtin ? "view" : "edit", ...overrides });
+  };
+
   const bookSaveTimers = useRef({});
   const updateBookInPlace = (bookId, updates) => {
     setBooks(p => {
@@ -8765,6 +10514,26 @@ export default function App() {
                 <Btn variant="ghost" small onClick={() => setEditingBook(activeBookObj)}>Edit</Btn>
                 <Btn variant="danger" small onClick={() => { if (window.confirm(`Delete book "${activeBookObj.name}"?`)) { deleteBook(activeBookObj.id); } }}>Delete</Btn>
               </>
+            ) : activeModule ? (
+              <>
+                <button onClick={() => setActiveModule(null)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 20, lineHeight: 1, padding: 0 }}>←</button>
+                <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.teal }}>
+                  {activeModule.mode === "create" ? (activeModule.name || "New Module") : activeModule.name}
+                </span>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: activeModule.builtin && activeModule.mode !== "create" ? T.amber : T.teal, background: (activeModule.builtin && activeModule.mode !== "create" ? T.amber : T.teal) + "18", border: `1px solid ${(activeModule.builtin && activeModule.mode !== "create" ? T.amber : T.teal)}44`, borderRadius: 4, padding: "2px 8px" }}>
+                  {activeModule.builtin && activeModule.mode !== "create" ? "built-in" : activeModule.mode === "create" ? "new" : "user"}
+                </span>
+                <div style={{ flex: 1 }} />
+                {!activeModule.builtin && activeModule.mode !== "create" && (
+                  <Btn variant="danger" small onClick={async () => {
+                    if (!window.confirm(`Delete module "${activeModule.name}"? This cannot be undone.`)) return;
+                    await api("DELETE", `/modules/${activeModule.id}`);
+                    const mods = await api("GET", "/modules");
+                    setModules(mods);
+                    setActiveModule(null);
+                  }}>Delete</Btn>
+                )}
+              </>
             ) : (
               <>
                 <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.amber, letterSpacing: 1 }}>LabLog</span>
@@ -8815,14 +10584,24 @@ export default function App() {
               editingMeta={editingMeta}
               setEditingMeta={setEditingMeta}
               settings={settings}
-              onSaveSettings={handleSaveSettings} />
+              onSaveSettings={handleSaveSettings}
+              modules={modules} />
           ) : activeBook && activeBookObj ? (
             <AnalysisBookDetail
               book={activeBookObj}
               samples={samples}
               plotCache={plotCache}
               settings={settings}
+              modules={modules}
               onUpdateBook={(updates) => updateBookInPlace(activeBook, updates)} />
+          ) : activeModule ? (
+            <ModuleEditorPage
+              mod={activeModule}
+              onBack={() => setActiveModule(null)}
+              allModules={modules}
+              onSave={async () => { const mods = await api("GET", "/modules"); setModules(mods); }}
+              onDuplicate={(source, defaultId) => setActiveModule({ ...activeModule, id: defaultId, mode: "create", source, builtin: false })}
+            />
           ) : (
             <>
               {/* Samples section */}
@@ -8942,14 +10721,16 @@ export default function App() {
                   <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.textPrimary }}>Modules</h2>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{modules.length}</span>
                   <div style={{ flex: 1 }} />
+                  <button
+                    onClick={() => openModule(null)}
+                    style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.teal, background: T.teal + "15", border: `1px solid ${T.teal}44`, borderRadius: 5, padding: "4px 12px", cursor: "pointer" }}>
+                    + New
+                  </button>
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
                   {modules.map(m => (
                     <div key={m.id}
-                      onClick={async () => {
-                        const res = await api("GET", `/modules/${m.id}/source`);
-                        setModuleSource({ ...m, source: res.source, builtin: res.builtin });
-                      }}
+                      onClick={() => openModule(m.id)}
                       style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "12px 14px", cursor: "pointer", transition: "border-color .12s", display: "flex", flexDirection: "column", gap: 6 }}
                       onMouseEnter={e => e.currentTarget.style.borderColor = T.borderBright}
                       onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
@@ -8958,6 +10739,31 @@ export default function App() {
                         <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: m.builtin ? T.amber : T.teal, background: (m.builtin ? T.amber : T.teal) + "18", border: `1px solid ${(m.builtin ? T.amber : T.teal)}33`, borderRadius: 3, padding: "1px 5px" }}>
                           {m.builtin ? "built-in" : "user"}
                         </span>
+                        {/* Copy button for built-in modules */}
+                        {m.builtin && (
+                          <button
+                            onClick={async e => {
+                              e.stopPropagation();
+                              await openModule(m.id, { mode: "create", id: `copy_of_${m.id}`, builtin: false });
+                            }}
+                            style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.teal, background: "none", border: `1px solid ${T.teal}44`, borderRadius: 3, padding: "1px 6px", cursor: "pointer" }}>
+                            copy
+                          </button>
+                        )}
+                        {/* Delete button for user modules */}
+                        {!m.builtin && (
+                          <button
+                            onClick={async e => {
+                              e.stopPropagation();
+                              if (!window.confirm(`Delete module "${m.name}"? This cannot be undone.`)) return;
+                              await api("DELETE", `/modules/${m.id}`);
+                              const mods = await api("GET", "/modules");
+                              setModules(mods);
+                            }}
+                            style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.red, background: "none", border: "none", padding: "0 2px", cursor: "pointer", lineHeight: 1, opacity: 0.7 }}>
+                            ✕
+                          </button>
+                        )}
                       </div>
                       <p style={{ margin: 0, fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textSecondary, lineHeight: 1.5 }}>{m.description}</p>
                       <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
@@ -8980,8 +10786,6 @@ export default function App() {
       {adding && <AddSampleModal onAdd={addSample} onClose={() => setAdding(false)} folders={folders} settings={settings} />}
       {templateSample && <AddSampleModal onAdd={s => { addSample(s); setTemplateSample(null); }} onClose={() => setTemplateSample(null)} folders={folders} template={templateSample} settings={settings} />}
       {exportOpen   && <ExportModal samples={samples} onClose={() => setExportOpen(false)} />}
-      {moduleSource && <ModuleSourceModal mod={moduleSource} onClose={() => setModuleSource(null)}
-        onSave={async () => { const mods = await api("GET", "/modules"); setModules(mods); }} />}
       {viewDataOpen && <ViewDataModal sampleId={active} files={viewDataFiles} loading={viewDataLoading} onClose={() => setViewDataOpen(false)}
         onDeleteFile={async (filename) => {
           await api("DELETE", `/samples/${active}/files/${encodeURIComponent(filename)}`);
