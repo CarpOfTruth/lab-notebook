@@ -1,0 +1,100 @@
+{
+  "delimiter": "\t",
+  "skip_rows": 41,
+  "columns": {
+    "0": "point",
+    "1": "time_ms",
+    "2": "voltage",
+    "3": "polarization"
+  },
+  "meta_assignments": {
+    "Sample Area (cm2)": "area_cm2",
+    "Sample Thickness (microns)": "thickness_um",
+    "Volts": "drive_volts",
+    "DCBias": "dc_bias"
+  },
+  "proc_code": "# \u2500\u2500 Auto-generated from Data assignments \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nDELIMITER = \"\t\"\nSKIP_ROWS = 41\n\n_text = file_bytes.decode(\"utf-8\", errors=\"replace\")\n_rows = []\nfor _line in _text.splitlines()[SKIP_ROWS:]:\n    _cells = _line.strip().split(DELIMITER)\n    try:\n        _rows.append([float(c) for c in _cells])\n    except ValueError:\n        continue\n\n# Columns\npoint        = [r[0] for r in _rows]  # Point\ntime_ms      = [r[1] for r in _rows]  # Time (ms)\nvoltage      = [r[2] for r in _rows]  # Drive Voltage\npolarization = [r[3] for r in _rows]  # Measured Polarization (uC/cm2)\n\n# Header metadata\ndef _hdr(key):\n    for _ln in _text.splitlines():\n        _p = _ln.strip().split(\"\t\", 1)\n        if len(_p) == 2 and _p[0].strip().rstrip(\":\") == key:\n            try: return float(_p[1].strip().split()[0])\n            except: return _p[1].strip()\n    return None\n\narea_cm2     = _hdr(\"Sample Area (cm2)\")          # 3.14e-06\nthickness_um = _hdr(\"Sample Thickness (microns)\")  # 3.00e-02\ndrive_volts  = _hdr(\"Volts\")                       # 0.75\ndc_bias      = _hdr(\"DCBias\")                      # 0.25\n\n# \u2500\u2500 Transformation \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n# Thickness: prefer sample record (meta), fall back to file header\nthickness_nm = meta.get(\"thickness_nm\") or (\n    (thickness_um * 1000) if thickness_um else 0.0\n)\n\n# Voltage \u2192 electric field (kV/cm) when thickness is known and values look like volts\nxs = list(voltage)\nx_unit = \"V\"\nmax_abs_x = max(abs(v) for v in xs) if xs else 0\nif max_abs_x < 50 and thickness_nm > 0:\n    thickness_cm = thickness_nm * 1e-7          # nm \u2192 cm\n    xs = [v / thickness_cm / 1e3 for v in xs]  # V \u2192 kV/cm\n    x_unit = \"kV/cm\"\n\n# Polarization: Vision files export \u00b5C/cm\u00b2 directly.\n# Guard against C/m\u00b2 inputs (|max| < 1e-3) just in case.\nys = list(polarization)\ny_unit = \"\u00b5C/cm\u00b2\"\nmax_abs_y = max(abs(p) for p in ys) if ys else 0\nif 0 < max_abs_y < 1e-3:\n    ys = [p * 100 for p in ys]  # C/m\u00b2 \u2192 \u00b5C/cm\u00b2\n\n# Area: header value is in cm\u00b2, convert to m\u00b2 for consistency\narea_m2 = (area_cm2 * 1e-4) if area_cm2 else meta.get(\"area_m2\")\n\n# Area correction: scales both the effective area and polarization.\n# If correction > 1 the real electrode is larger \u2192 lower polarization density.\narea_correction = meta.get(\"area_correction\", 1.0) or 1.0\nif area_correction != 1.0:\n    ys = [p / area_correction for p in ys]\nif area_m2 is not None:\n    area_m2 = area_m2 * area_correction\n\n# Split the double-bipolar sweep into first / second loop.\n# Finds the midpoint index closest to the starting voltage.\ndef _split_loops(pts):\n    n = len(pts)\n    if n < 4:\n        return pts, pts\n    start_x = pts[0][\"x\"]\n    mid = n // 2\n    window = max(1, int(n * 0.15))\n    best_idx, best_d = mid, float(\"inf\")\n    for i in range(max(1, mid - window), min(n - 1, mid + window + 1)):\n        d = abs(pts[i][\"x\"] - start_x)\n        if d < best_d:\n            best_d, best_idx = d, i\n    return pts[:best_idx], pts[best_idx:]\n\npoints = [{\"x\": xs[i], \"y\": ys[i]} for i in range(len(xs))]\nfirst, second = _split_loops(points)\n\nreturn {\n    \"points\":  points,\n    \"first\":   first,\n    \"second\":  second,\n    \"x_unit\":  x_unit,\n    \"y_unit\":  y_unit,\n    \"area_m2\": area_m2,\n    # Flat arrays for visual plot config\n    \"x\":       [p[\"x\"] for p in second],\n    \"y\":       [p[\"y\"] for p in second],\n    \"x_all\":   [p[\"x\"] for p in points],\n    \"y_all\":   [p[\"y\"] for p in points],\n    \"x_label\": f\"Electric Field ({x_unit})\" if x_unit == \"kV/cm\" else f\"Voltage ({x_unit})\",\n    \"y_label\": f\"Polarization ({y_unit})\",\n    \"thickness_nm\": thickness_nm,\n}",
+  "plot_config": {
+    "x_var": "x",
+    "y_var": "y",
+    "x_label": "",
+    "y_label": "",
+    "x_scale": "linear",
+    "y_scale": "linear",
+    "color": "#fc8181"
+  },
+  "analysis_metrics": [
+    {
+      "name": "ec",
+      "label": "Coercive Field",
+      "unit": "kV/cm"
+    },
+    {
+      "name": "imprint",
+      "label": "Imprint Field",
+      "unit": "kV/cm"
+    },
+    {
+      "name": "imprint_V",
+      "label": "Imprint Voltage",
+      "unit": "V"
+    },
+    {
+      "name": "pr_pos",
+      "label": "Pr (positive)",
+      "unit": "\u00b5C/cm\u00b2"
+    },
+    {
+      "name": "pr_neg",
+      "label": "Pr (negative)",
+      "unit": "\u00b5C/cm\u00b2"
+    },
+    {
+      "name": "pr_imp_pos",
+      "label": "Pr at imprint (pos)",
+      "unit": "\u00b5C/cm\u00b2"
+    },
+    {
+      "name": "pr_imp_neg",
+      "label": "Pr at imprint (neg)",
+      "unit": "\u00b5C/cm\u00b2"
+    },
+    {
+      "name": "pmax",
+      "label": "Saturation Pol.",
+      "unit": "\u00b5C/cm\u00b2"
+    }
+  ],
+  "analysis_code": "# Analysis computation \u2014 `result` is the dict returned by Processing.\n# x = electric field (kV/cm), y = polarization (\u00b5C/cm\u00b2) \u2014 second loop.\nx = result[\"x\"]\ny = result[\"y\"]\npts = list(zip(x, y))\n\ndef _interp_at(pts, axis, target):\n    \"\"\"Values of the other axis where `axis` crosses `target` (linear interp).\"\"\"\n    other = 1 - axis\n    vals = []\n    for i in range(len(pts) - 1):\n        a0, a1 = pts[i][axis], pts[i + 1][axis]\n        if (a0 - target) * (a1 - target) <= 0 and a1 != a0:\n            t = (target - a0) / (a1 - a0)\n            vals.append(pts[i][other] + t * (pts[i + 1][other] - pts[i][other]))\n    return vals\n\n# Coercive fields: E values where P = 0\nec_vals = _interp_at(pts, 1, 0)\nec_pos  = max(ec_vals, default=0.0)\nec_neg  = min(ec_vals, default=0.0)\nec      = (ec_pos - ec_neg) / 2\nimprint = (ec_pos + ec_neg) / 2\n\n# Saturation polarization\npmax = max((abs(p) for p in y), default=0.0)\n\n# Pr: P values where E = 0\npr_vals = _interp_at(pts, 0, 0)\npr_pos  = max(pr_vals, default=None)\npr_neg  = min(pr_vals, default=None)\n\n# Pr at imprint: P values where E = imprint\npr_imp_vals = _interp_at(pts, 0, imprint)\npr_imp_pos  = max(pr_imp_vals, default=None)\npr_imp_neg  = min(pr_imp_vals, default=None)\n\nreturn {\n    \"ec\":         ec,\n    \"imprint\":    imprint,\n    \"pmax\":       pmax,\n    \"pr_pos\":     pr_pos,\n    \"pr_neg\":     pr_neg,\n    \"pr_imp_pos\": pr_imp_pos,\n    \"pr_imp_neg\": pr_imp_neg,\n    \"imprint_V\":   imprint * (result.get(\"thickness_nm\", 0) * 1e-7) * 1e3 if result.get(\"thickness_nm\") else None,\n}",
+  "section": "electrical",
+  "card_controls": [
+    {
+      "name": "loop",
+      "type": "toggle",
+      "choices": [
+        "all",
+        "2nd"
+      ],
+      "default": "2nd",
+      "plot_overrides": {
+        "all": {
+          "x_var": "x_all",
+          "y_var": "y_all"
+        },
+        "2nd": {
+          "x_var": "x",
+          "y_var": "y"
+        }
+      }
+    },
+    {
+      "name": "area",
+      "type": "area",
+      "default": "1.0"
+    }
+  ],
+  "proc_block2": "# \u2500\u2500 Transformation \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n# Thickness: prefer sample record (meta), fall back to file header\nthickness_nm = meta.get(\"thickness_nm\") or (\n    (thickness_um * 1000) if thickness_um else 0.0\n)\n\n# Voltage \u2192 electric field (kV/cm) when thickness is known and values look like volts\nxs = list(voltage)\nx_unit = \"V\"\nmax_abs_x = max(abs(v) for v in xs) if xs else 0\nif max_abs_x < 50 and thickness_nm > 0:\n    thickness_cm = thickness_nm * 1e-7          # nm \u2192 cm\n    xs = [v / thickness_cm / 1e3 for v in xs]  # V \u2192 kV/cm\n    x_unit = \"kV/cm\"\n\n# Polarization: Vision files export \u00b5C/cm\u00b2 directly.\n# Guard against C/m\u00b2 inputs (|max| < 1e-3) just in case.\nys = list(polarization)\ny_unit = \"\u00b5C/cm\u00b2\"\nmax_abs_y = max(abs(p) for p in ys) if ys else 0\nif 0 < max_abs_y < 1e-3:\n    ys = [p * 100 for p in ys]  # C/m\u00b2 \u2192 \u00b5C/cm\u00b2\n\n# Area: header value is in cm\u00b2, convert to m\u00b2 for consistency\narea_m2 = (area_cm2 * 1e-4) if area_cm2 else meta.get(\"area_m2\")\n\n# Area correction: scales both the effective area and polarization.\n# If correction > 1 the real electrode is larger \u2192 lower polarization density.\narea_correction = meta.get(\"area_correction\", 1.0) or 1.0\nif area_correction != 1.0:\n    ys = [p / area_correction for p in ys]\nif area_m2 is not None:\n    area_m2 = area_m2 * area_correction\n\n# Split the double-bipolar sweep into first / second loop.\n# Finds the midpoint index closest to the starting voltage.\ndef _split_loops(pts):\n    n = len(pts)\n    if n < 4:\n        return pts, pts\n    start_x = pts[0][\"x\"]\n    mid = n // 2\n    window = max(1, int(n * 0.15))\n    best_idx, best_d = mid, float(\"inf\")\n    for i in range(max(1, mid - window), min(n - 1, mid + window + 1)):\n        d = abs(pts[i][\"x\"] - start_x)\n        if d < best_d:\n            best_d, best_idx = d, i\n    return pts[:best_idx], pts[best_idx:]\n\npoints = [{\"x\": xs[i], \"y\": ys[i]} for i in range(len(xs))]\nfirst, second = _split_loops(points)",
+  "proc_block3": "return {\n    \"points\":  points,\n    \"first\":   first,\n    \"second\":  second,\n    \"x_unit\":  x_unit,\n    \"y_unit\":  y_unit,\n    \"area_m2\": area_m2,\n    # Flat arrays for visual plot config\n    \"x\":       [p[\"x\"] for p in second],\n    \"y\":       [p[\"y\"] for p in second],\n    \"x_all\":   [p[\"x\"] for p in points],\n    \"y_all\":   [p[\"y\"] for p in points],\n    \"x_label\": f\"Electric Field ({x_unit})\" if x_unit == \"kV/cm\" else f\"Voltage ({x_unit})\",\n    \"y_label\": f\"Polarization ({y_unit})\",\n    \"thickness_nm\": thickness_nm,\n}",
+  "analysis_block2": "# Analysis computation \u2014 `result` is the dict returned by Processing.\n# x = electric field (kV/cm), y = polarization (\u00b5C/cm\u00b2) \u2014 second loop.\nx = result[\"x\"]\ny = result[\"y\"]\npts = list(zip(x, y))\n\ndef _interp_at(pts, axis, target):\n    \"\"\"Values of the other axis where `axis` crosses `target` (linear interp).\"\"\"\n    other = 1 - axis\n    vals = []\n    for i in range(len(pts) - 1):\n        a0, a1 = pts[i][axis], pts[i + 1][axis]\n        if (a0 - target) * (a1 - target) <= 0 and a1 != a0:\n            t = (target - a0) / (a1 - a0)\n            vals.append(pts[i][other] + t * (pts[i + 1][other] - pts[i][other]))\n    return vals\n\n# Coercive fields: E values where P = 0\nec_vals = _interp_at(pts, 1, 0)\nec_pos  = max(ec_vals, default=0.0)\nec_neg  = min(ec_vals, default=0.0)\nec      = (ec_pos - ec_neg) / 2\nimprint = (ec_pos + ec_neg) / 2\n\n# Saturation polarization\npmax = max((abs(p) for p in y), default=0.0)\n\n# Pr: P values where E = 0\npr_vals = _interp_at(pts, 0, 0)\npr_pos  = max(pr_vals, default=None)\npr_neg  = min(pr_vals, default=None)\n\n# Pr at imprint: P values where E = imprint\npr_imp_vals = _interp_at(pts, 0, imprint)\npr_imp_pos  = max(pr_imp_vals, default=None)\npr_imp_neg  = min(pr_imp_vals, default=None)",
+  "analysis_block3": "return {\n    \"ec\":         ec,\n    \"imprint\":    imprint,\n    \"pmax\":       pmax,\n    \"pr_pos\":     pr_pos,\n    \"pr_neg\":     pr_neg,\n    \"pr_imp_pos\": pr_imp_pos,\n    \"pr_imp_neg\": pr_imp_neg,\n    \"imprint_V\":   imprint * (result.get(\"thickness_nm\", 0) * 1e-7) * 1e3 if result.get(\"thickness_nm\") else None,\n}"
+}

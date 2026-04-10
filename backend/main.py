@@ -13,7 +13,8 @@ FILES_DIR   = DATA_DIR / "files"
 DB_PATH     = DATA_DIR / "lablog.db"
 EXAMPLES_DIR         = DATA_DIR / "module_examples"          # user-uploaded (gitignored)
 BUILTIN_EXAMPLES_DIR = BASE_DIR / "modules" / "examples"     # shipped with code (tracked)
-SCHEMAS_DIR          = DATA_DIR / "module_schemas"
+SCHEMAS_DIR          = DATA_DIR / "module_schemas"            # user-saved (gitignored)
+BUILTIN_SCHEMAS_DIR  = BASE_DIR / "modules" / "schemas"      # shipped with code (tracked)
 
 DATA_DIR.mkdir(exist_ok=True)
 FILES_DIR.mkdir(exist_ok=True)
@@ -31,6 +32,18 @@ def _find_example(module_id: str):
     if builtin:
         return builtin[0], True
     return None, False
+
+
+def _load_schema(module_id: str) -> dict | None:
+    """Return schema dict for a module.
+    User-saved schema takes precedence; falls back to built-in shipped schema."""
+    user_path = SCHEMAS_DIR / f"{module_id}.json"
+    if user_path.exists():
+        return json.loads(user_path.read_text())
+    builtin_path = BUILTIN_SCHEMAS_DIR / f"{module_id}.json"
+    if builtin_path.exists():
+        return json.loads(builtin_path.read_text())
+    return None
 
 config_path = BASE_DIR / "config.json"
 config = json.loads(config_path.read_text()) if config_path.exists() else {}
@@ -701,18 +714,11 @@ def list_modules():
     result = []
     for m in mod_registry.all_modules():
         info = m.to_info()
-        cfg_path = SCHEMAS_DIR / f"{m.id}.json"
-        if cfg_path.exists():
-            cfg = json.loads(cfg_path.read_text())
-            info["section"]          = cfg.get("section", "")
-            info["card_controls"]    = cfg.get("card_controls", [])
-            info["analysis_metrics"] = cfg.get("analysis_metrics", [])
-            info["analysis_code"]    = cfg.get("analysis_code", "")
-        else:
-            info["section"]          = ""
-            info["card_controls"]    = []
-            info["analysis_metrics"] = []
-            info["analysis_code"]    = ""
+        cfg = _load_schema(m.id) or {}
+        info["section"]          = cfg.get("section", "")
+        info["card_controls"]    = cfg.get("card_controls", [])
+        info["analysis_metrics"] = cfg.get("analysis_metrics", [])
+        info["analysis_code"]    = cfg.get("analysis_code", "")
         result.append(info)
     return result
 
@@ -1017,10 +1023,8 @@ def delete_module_example(module_id: str):
 @app.get("/api/modules/{module_id}/config")
 def get_module_config(module_id: str):
     """Return the visual editor config JSON for a module."""
-    path = SCHEMAS_DIR / f"{module_id}.json"
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text())
+    schema = _load_schema(module_id)
+    return schema if schema is not None else {}
 
 
 @app.put("/api/modules/{module_id}/config")
