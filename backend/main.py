@@ -11,13 +11,26 @@ BASE_DIR    = Path(__file__).parent
 DATA_DIR    = BASE_DIR / "data"
 FILES_DIR   = DATA_DIR / "files"
 DB_PATH     = DATA_DIR / "lablog.db"
-EXAMPLES_DIR = DATA_DIR / "module_examples"
-SCHEMAS_DIR  = DATA_DIR / "module_schemas"
+EXAMPLES_DIR         = DATA_DIR / "module_examples"          # user-uploaded (gitignored)
+BUILTIN_EXAMPLES_DIR = BASE_DIR / "modules" / "examples"     # shipped with code (tracked)
+SCHEMAS_DIR          = DATA_DIR / "module_schemas"
 
 DATA_DIR.mkdir(exist_ok=True)
 FILES_DIR.mkdir(exist_ok=True)
 EXAMPLES_DIR.mkdir(exist_ok=True)
 SCHEMAS_DIR.mkdir(exist_ok=True)
+
+
+def _find_example(module_id: str):
+    """Return (path, is_builtin) for a module's example file.
+    User-uploaded file takes precedence over the shipped built-in."""
+    user = list(EXAMPLES_DIR.glob(f"{module_id}.*"))
+    if user:
+        return user[0], False
+    builtin = list(BUILTIN_EXAMPLES_DIR.glob(f"{module_id}.*"))
+    if builtin:
+        return builtin[0], True
+    return None, False
 
 config_path = BASE_DIR / "config.json"
 config = json.loads(config_path.read_text()) if config_path.exists() else {}
@@ -983,20 +996,19 @@ async def upload_module_example(module_id: str, file: UploadFile,
 def get_module_example(module_id: str, delimiter: str = "auto",
                        skip_rows: Optional[int] = None):
     """Return sniff preview of the stored example file."""
-    files = list(EXAMPLES_DIR.glob(f"{module_id}.*"))
-    if not files:
+    f, _ = _find_example(module_id)
+    if not f:
         raise HTTPException(404, f"No example file for module '{module_id}'")
-    f = files[0]
     sniff = _sniff_file(f.read_bytes(), delimiter, skip_rows)
     return {"filename": f.name, **sniff}
 
 
 @app.delete("/api/modules/{module_id}/example")
 def delete_module_example(module_id: str):
-    """Delete the stored example file for a module."""
+    """Delete the user-uploaded example file for a module (built-in examples are not deleted)."""
     files = list(EXAMPLES_DIR.glob(f"{module_id}.*"))
     if not files:
-        raise HTTPException(404, "No example file found")
+        raise HTTPException(404, "No user-uploaded example file found")
     for f in files:
         f.unlink()
     return {"ok": True}
