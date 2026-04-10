@@ -7,9 +7,11 @@
     "doc": "docs"
   },
   "scripts": {
-    "setup": "cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -q && (cp config.example.json config.json 2>/dev/null || true) && cd ../frontend && npm install",
-    "start": "concurrently -n backend,frontend -c cyan,yellow \"cd backend && .venv/bin/uvicorn main:app --reload\" \"cd frontend && npm run dev\"",
-    "seed":  "cd backend && .venv/bin/python3 seed_demo.py"
+    "setup":           "node scripts/setup.js",
+    "start":           "concurrently -n backend,frontend -c cyan,yellow \"node scripts/start-backend.js\" \"node scripts/start-frontend.js\"",
+    "start:backend":   "node scripts/start-backend.js",
+    "start:frontend":  "node scripts/start-frontend.js",
+    "seed":            "node scripts/seed.js"
   },
   "repository": {
     "type": "git",

@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.tool_input.command // \"\"'); if echo \"$CMD\" | grep -qE 'gh pr create' && echo \"$CMD\" | grep -qE -- '--base[[:space:]]+main|--base=main'; then echo '{\"decision\": \"block\", \"reason\": \"PRs must target dev, not main.\", \"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"deny\", \"permissionDecisionReason\": \"PRs must target dev, not main. Use --base dev instead. Only merge to main when changes are stable and reviewed.\"}}'; fi",
+            "statusMessage": "Checking branch policy…"
+          }
+        ]
+      }
+    ]
+  }
+}
