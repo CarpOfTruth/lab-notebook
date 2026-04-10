@@ -1056,11 +1056,11 @@ def run_module_processing(module_id: str, body: dict):
     """Execute processing code against the stored example file and return the result."""
     import traceback as tb
     code = body.get("code", "")
-    files = list(EXAMPLES_DIR.glob(f"{module_id}.*"))
-    if not files:
+    f, _ = _find_example(module_id)
+    if not f:
         raise HTTPException(404, "No example file for this module")
-    file_bytes = files[0].read_bytes()
-    filename   = files[0].name
+    file_bytes = f.read_bytes()
+    filename   = f.name
     # Wrap user code (which uses `return`) in a function
     indented = "\n".join(f"    {line}" for line in code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
@@ -1085,11 +1085,11 @@ def preview_module_plot(module_id: str, body: dict):
     x_scale = plot_cfg.get("x_scale") or "linear"
     y_scale = plot_cfg.get("y_scale") or "linear"
 
-    files = list(EXAMPLES_DIR.glob(f"{module_id}.*"))
-    if not files:
+    f, _ = _find_example(module_id)
+    if not f:
         raise HTTPException(404, "No example file for this module")
-    file_bytes = files[0].read_bytes()
-    filename   = files[0].name
+    file_bytes = f.read_bytes()
+    filename   = f.name
     # Run processing code
     indented = "\n".join(f"    {line}" for line in code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
@@ -1261,11 +1261,11 @@ def compute_module_analysis(module_id: str, body: dict):
     proc_code     = body.get("proc_code", "")
     analysis_code = body.get("analysis_code", "")
 
-    files = list(EXAMPLES_DIR.glob(f"{module_id}.*"))
-    if not files:
+    f, _ = _find_example(module_id)
+    if not f:
         raise HTTPException(404, "No example file for this module")
-    file_bytes = files[0].read_bytes()
-    filename   = files[0].name
+    file_bytes = f.read_bytes()
+    filename   = f.name
 
     # Run processing code
     indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
