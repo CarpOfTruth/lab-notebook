@@ -5643,10 +5643,10 @@ function FolderTile({ folder, samples, childContent = null, plotCache, depth = 0
   );
 }
 
-function AddFolderModal({ onSave, onClose, existing, allFolders = [] }) {
+function AddFolderModal({ onSave, onClose, existing, allFolders = [], defaultForBooks = false }) {
   const [name,     setName]     = useState(existing?.name || "");
   const [color,    setColor]    = useState(existing?.color || COLOR_OPTIONS[0]);
-  const [forBooks, setForBooks] = useState(existing?.book_folder ?? false);
+  const [forBooks, setForBooks] = useState(existing?.book_folder ?? defaultForBooks);
   const [parentId, setParentId] = useState(existing?.parent_id || "");
 
   // Prevent nesting a folder into itself or its descendants
@@ -10240,7 +10240,8 @@ export default function App() {
   const [draggingSampleId, setDraggingSampleId] = useState(null);
   const [draggingBookId,   setDraggingBookId]   = useState(null);
   const [draggingFolderId, setDraggingFolderId] = useState(null);
-  const [addingFolder, setAddingFolder] = useState(false);
+  const [addingFolder,        setAddingFolder]        = useState(false);
+  const [folderDefaultForBooks, setFolderDefaultForBooks] = useState(false);
   const [editingFolder, setEditingFolder] = useState(null); // folder object
   const [addingBook,    setAddingBook]    = useState(false);
   const [editingBook,   setEditingBook]   = useState(null);
@@ -10728,15 +10729,6 @@ export default function App() {
                 <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.amber, letterSpacing: 1 }}>LabLog</span>
                 <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>ferroelectric oxide films</span>
                 <div style={{ flex: 1 }} />
-                <Btn variant="ghost" small onClick={() => setExportOpen(true)}>Export</Btn>
-                <label style={{ cursor: importing ? "wait" : "pointer" }}>
-                  <input type="file" accept=".zip" style={{ display: "none" }} onChange={handleImportSample} disabled={importing} />
-                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", borderRadius: 4, border: `1px solid ${T.border}`, background: T.bg2, color: importing ? T.textDim : T.textSecondary, cursor: "inherit", userSelect: "none" }}>
-                    {importing ? "Importing…" : "Import"}
-                  </span>
-                </label>
-                {importError && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={importError}>{importError}</span>}
-                <Btn variant="ghost" small onClick={() => setAddingFolder(true)}>+ Folder</Btn>
                 <button onClick={() => setSettingsOpen(true)}
                   title="Settings"
                   style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "2px 4px", borderRadius: 4, display: "flex", alignItems: "center" }}>⚙</button>
@@ -10799,6 +10791,13 @@ export default function App() {
                   <h1 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 26, color: T.textPrimary }}>Samples</h1>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{samples.length} total</span>
                   <div style={{ flex: 1 }} />
+                  <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", borderRadius: 6, border: `1px solid ${T.border}`, background: "transparent", color: importing ? T.textDim : T.textSecondary, cursor: importing ? "wait" : "pointer", userSelect: "none", marginRight: 4 }}>
+                    {importing ? "Importing…" : "Import"}
+                    <input type="file" accept=".zip" style={{ display: "none" }} onChange={handleImportSample} disabled={importing} />
+                  </label>
+                  {importError && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, marginRight: 6, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={importError}>{importError}</span>}
+                  <Btn variant="ghost" small onClick={() => setExportOpen(true)}>Export</Btn>
+                  <Btn variant="ghost" small onClick={() => { setFolderDefaultForBooks(false); setAddingFolder(true); }}>+ Folder</Btn>
                   <Btn variant="primary" small onClick={() => setAdding(true)}>+ New Sample</Btn>
                 </div>
 
@@ -10851,6 +10850,7 @@ export default function App() {
                   <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.textPrimary }}>Analysis Books</h2>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{books.length}</span>
                   <div style={{ flex: 1 }} />
+                  <Btn variant="ghost" small onClick={() => { setFolderDefaultForBooks(true); setAddingFolder(true); }}>+ Folder</Btn>
                   <Btn variant="primary" small onClick={() => setAddingBook(true)}>+ New Book</Btn>
                 </div>
                 {(() => {
@@ -10910,9 +10910,9 @@ export default function App() {
                   <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.textPrimary }}>Modules</h2>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{modules.length}</span>
                   <div style={{ flex: 1 }} />
-                  {/* Import */}
-                  <label style={{ marginRight: 6 }}>
-                    <Btn variant="ghost" small>Import</Btn>
+                  {/* Import module zip */}
+                  <label style={{ marginRight: 6, cursor: "pointer" }}>
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", borderRadius: 6, border: `1px solid ${T.border}`, background: "transparent", color: T.textSecondary, cursor: "pointer", userSelect: "none" }}>Import</span>
                     <input type="file" accept=".zip" style={{ display: "none" }} onChange={async e => {
                       const f = e.target.files?.[0];
                       if (!f) return;
@@ -10922,9 +10922,12 @@ export default function App() {
                       const res = await fetch(`${API_BASE}/modules/import`, { method: "POST", body: form });
                       const data = await res.json();
                       if (!res.ok) { alert(data.detail || "Import failed"); return; }
+                      // Refresh module list, then open — use fresh list to avoid stale state
                       const mods = await api("GET", "/modules");
                       setModules(mods);
-                      openModule(data.module_id);
+                      const modMeta = mods.find(m => m.id === data.module_id) || {};
+                      const srcRes  = await api("GET", `/modules/${data.module_id}/source`);
+                      setActiveModule({ ...modMeta, source: srcRes.source, builtin: srcRes.builtin, mode: srcRes.builtin ? "view" : "edit" });
                     }} />
                   </label>
                   <Btn variant="primary" small onClick={() => openModule(null)}>+ New Module</Btn>
@@ -10998,7 +11001,7 @@ export default function App() {
         }} />}
       {settingsOpen && <SettingsModal settings={settings} onSave={handleSaveSettings} onClose={() => setSettingsOpen(false)} />}
       {(addingFolder || editingFolder) && (
-        <AddFolderModal onSave={saveFolder} onClose={() => { setAddingFolder(false); setEditingFolder(null); }} existing={editingFolder} allFolders={folders} />
+        <AddFolderModal onSave={saveFolder} onClose={() => { setAddingFolder(false); setEditingFolder(null); }} existing={editingFolder} allFolders={folders} defaultForBooks={folderDefaultForBooks} />
       )}
       {(addingBook || editingBook) && (
         <AddBookModal onSave={saveBook} onClose={() => { setAddingBook(false); setEditingBook(null); }} existing={editingBook} samples={samples} folders={folders} bookFolders={folders.filter(f => f.book_folder)} />
