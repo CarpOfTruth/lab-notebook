@@ -10922,9 +10922,12 @@ export default function App() {
                       const res = await fetch(`${API_BASE}/modules/import`, { method: "POST", body: form });
                       const data = await res.json();
                       if (!res.ok) { alert(data.detail || "Import failed"); return; }
+                      // Refresh module list, then open — use fresh list to avoid stale state
                       const mods = await api("GET", "/modules");
                       setModules(mods);
-                      openModule(data.module_id);
+                      const modMeta = mods.find(m => m.id === data.module_id) || {};
+                      const srcRes  = await api("GET", `/modules/${data.module_id}/source`);
+                      setActiveModule({ ...modMeta, source: srcRes.source, builtin: srcRes.builtin, mode: srcRes.builtin ? "view" : "edit" });
                     }} />
                   </label>
                   <Btn variant="primary" small onClick={() => openModule(null)}>+ New Module</Btn>

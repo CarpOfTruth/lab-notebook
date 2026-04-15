@@ -729,10 +729,12 @@ def get_module_source(module_id: str):
     src = mod_registry.source(module_id)
     if src is None:
         raise HTTPException(404, f"Module '{module_id}' not found")
-    m = mod_registry.get(module_id)
+    # Determine built-in by file location, not author field — so imported
+    # copies of built-in modules are correctly treated as user-editable.
+    user_path = BASE_DIR / "data" / "user_modules" / f"{module_id}.py"
     return {
         "id":      module_id,
-        "builtin": m.author == "built-in" if m else True,
+        "builtin": not user_path.exists(),
         "source":  src,
     }
 
