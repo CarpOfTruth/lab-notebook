@@ -851,6 +851,100 @@ def save_module_source(module_id: str, body: dict):
     return {"ok": True, "id": inst.id, "name": inst.name}
 
 
+@app.get("/api/modules/{module_id}/export")
+def export_module(module_id: str):
+    """Export a module as a self-contained .labmodule.zip archive."""
+    from fastapi.responses import StreamingResponse
+    import zipfile, io
+    from datetime import datetime, timezone
+
+    schema      = _load_schema(module_id)
+    source_code = mod_registry.source(module_id)
+    example_path, _ = _find_example(module_id)
+    m = mod_registry.get(module_id)
+
+    if source_code is None and schema is None:
+        raise HTTPException(404, f"Module '{module_id}' not found")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        manifest = {
+            "module_id":   module_id,
+            "name":        m.name if m else module_id,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "format":      "labmodule/1.0",
+            "has_example": example_path is not None,
+        }
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+        if schema:
+            zf.writestr("schema.json", json.dumps(schema, indent=2))
+        if source_code:
+            zf.writestr("source.py", source_code)
+        if example_path:
+            zf.write(str(example_path), f"example{example_path.suffix}")
+
+    buf.seek(0)
+    fname = f"{module_id}.labmodule.zip"
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@app.post("/api/modules/import")
+async def import_module(file: UploadFile = File(...)):
+    """Import a .labmodule.zip archive — installs source, schema, and example file."""
+    import zipfile, io
+
+    data = await file.read()
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "Not a valid zip file")
+
+    names = zf.namelist()
+
+    # Read manifest to get module_id
+    if "manifest.json" not in names:
+        raise HTTPException(400, "Archive is missing manifest.json")
+    manifest = json.loads(zf.read("manifest.json"))
+    module_id = manifest.get("module_id")
+    if not module_id:
+        raise HTTPException(400, "manifest.json has no module_id")
+
+    installed = []
+
+    # Install Python source
+    if "source.py" in names:
+        source_code = zf.read("source.py").decode("utf-8")
+        try:
+            mod_registry.save_user_module(module_id, source_code)
+            installed.append("source")
+        except ValueError as e:
+            raise HTTPException(422, f"Invalid module source: {e}")
+
+    # Install schema / config
+    if "schema.json" in names:
+        schema = json.loads(zf.read("schema.json"))
+        schema_path = SCHEMAS_DIR / f"{module_id}.json"
+        schema_path.write_text(json.dumps(schema, indent=2))
+        installed.append("schema")
+
+    # Install example data file
+    example_entries = [n for n in names if n.startswith("example.")]
+    if example_entries:
+        entry = example_entries[0]
+        ext   = Path(entry).suffix
+        for old in EXAMPLES_DIR.glob(f"{module_id}.*"):
+            old.unlink()
+        dest = EXAMPLES_DIR / f"{module_id}{ext}"
+        dest.write_bytes(zf.read(entry))
+        installed.append("example")
+
+    return {"ok": True, "module_id": module_id, "installed": installed}
+
+
 @app.delete("/api/modules/{module_id}")
 def delete_module(module_id: str):
     """Delete a user module. Built-ins cannot be deleted."""
@@ -954,9 +1048,11 @@ def _sniff_file(file_bytes: bytes, delimiter: str = "auto",
         headers.append(f"col_{len(headers)}")
     headers = headers[:num_cols]
 
-    # Extract key-value metadata from header rows (before the data section)
+    # Extract key-value metadata from header rows (before the data section).
+    # Skip the last pre-data row if it was used as column headers.
+    meta_rows = data_rows[:auto_skip - 1] if auto_skip > 0 and headers else data_rows[:auto_skip]
     header_meta = []
-    for row in data_rows[:auto_skip]:
+    for row in meta_rows:
         if len(row) != 2:
             continue
         key, val = row[0], row[1]
@@ -1081,13 +1177,17 @@ def run_module_processing(module_id: str, body: dict):
 def preview_module_plot(module_id: str, body: dict):
     """Run processing code, then build a Plotly figure from visual plot config."""
     import traceback as tb
-    code = body.get("code", "")
-    plot_cfg = body.get("plot_config", {})
-    x_var   = plot_cfg.get("x_var") or "x"
-    y_var   = plot_cfg.get("y_var") or "y"
-    color   = plot_cfg.get("color") or "#94a3b8"
-    x_scale = plot_cfg.get("x_scale") or "linear"
-    y_scale = plot_cfg.get("y_scale") or "linear"
+    code       = body.get("code", "")
+    plot_cfg   = body.get("plot_config", {})
+    x_var      = plot_cfg.get("x_var") or "x"
+    y_var      = plot_cfg.get("y_var") or "y"
+    color      = plot_cfg.get("color") or "#94a3b8"
+    opacity    = float(plot_cfg.get("opacity") or 1.0)
+    show_fit   = plot_cfg.get("show_fit", True)
+    fit_color  = plot_cfg.get("fit_color") or None
+    fit_opacity= float(plot_cfg.get("fit_opacity") or 0.6)
+    x_scale    = plot_cfg.get("x_scale") or "linear"
+    y_scale    = plot_cfg.get("y_scale") or "linear"
 
     f, _ = _find_example(module_id)
     if not f:
@@ -1105,33 +1205,59 @@ def preview_module_plot(module_id: str, body: dict):
         return {"ok": False, "stage": "processing", "error": str(exc), "traceback": tb.format_exc()}
     if not isinstance(data, dict):
         return {"ok": False, "stage": "plot", "error": "Processing result must be a dict"}
-    # Extract x/y arrays from result
+    # Extract x/y arrays from result — handle both lists and numpy arrays
+    import numpy as np
+    def _to_list(v):
+        if isinstance(v, np.ndarray):
+            return v.tolist()
+        return v if isinstance(v, list) else list(v)
+
+    def _is_numeric_array(v):
+        if isinstance(v, np.ndarray):
+            return v.ndim == 1 and np.issubdtype(v.dtype, np.number) and len(v) > 0
+        return isinstance(v, list) and v and isinstance(v[0], (int, float))
+
     x_data = data.get(x_var)
     y_data = data.get(y_var)
-    if not x_data or not y_data:
-        available = [k for k, v in data.items() if isinstance(v, list) and v and isinstance(v[0], (int, float))]
+    missing = (x_data is None or (hasattr(x_data, '__len__') and len(x_data) == 0))
+    missing = missing or (y_data is None or (hasattr(y_data, '__len__') and len(y_data) == 0))
+    if missing:
+        available = [k for k, v in data.items() if _is_numeric_array(v)]
         return {"ok": False, "stage": "plot",
                 "error": f"Variable '{x_var}' or '{y_var}' not found or empty. "
                          f"Available array keys: {available}"}
+    x_data = _to_list(x_data)
+    y_data = _to_list(y_data)
     # Derive axis labels: prefer explicit config, fall back to result metadata
     x_label = plot_cfg.get("x_label") or data.get("x_label") or x_var
     y_label = plot_cfg.get("y_label") or data.get("y_label") or y_var
-    figure = {
-        "data": [{
-            "x": x_data, "y": y_data,
+
+    traces = [{
+        "x": x_data, "y": y_data,
+        "type": "scatter", "mode": "lines",
+        "opacity": opacity,
+        "line": {"color": color, "width": 1.5},
+        "hovertemplate": f"%{{x:.3g}} {x_label}<br>%{{y:.3g}} {y_label}<extra></extra>",
+    }]
+    # Fit overlay — add if x_fit/y_fit in result and show_fit is True
+    if show_fit and data.get("x_fit") and data.get("y_fit"):
+        traces.append({
+            "x": _to_list(data["x_fit"]), "y": _to_list(data["y_fit"]),
             "type": "scatter", "mode": "lines",
-            "line": {"color": color, "width": 1.5},
-            "hovertemplate": f"%{{x:.3g}} {x_label}<br>%{{y:.3g}} {y_label}<extra></extra>",
-        }],
+            "opacity": fit_opacity,
+            "line": {"color": fit_color or color, "width": 1.5, "dash": "dash"},
+            "hovertemplate": f"fit %{{x:.3g}} {x_label}<br>%{{y:.3g}} {y_label}<extra></extra>",
+        })
+
+    figure = {
+        "data": traces,
         "layout": {
             "xaxis": {"title": x_label, "type": x_scale, "zeroline": True, "zerolinewidth": 1},
             "yaxis": {"title": y_label, "type": y_scale, "zeroline": True, "zerolinewidth": 1},
             "margin": {"t": 20, "r": 20, "b": 56, "l": 72},
             "showlegend": False, "hovermode": "closest",
         },
-        # Pass available array keys back so frontend can populate dropdowns
-        "available_vars": [k for k, v in data.items()
-                           if isinstance(v, list) and v and isinstance(v[0], (int, float))],
+        "available_vars": [k for k, v in data.items() if _is_numeric_array(v)],
     }
     return {"ok": True, "figure": figure}
 

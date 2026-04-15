@@ -9,7 +9,7 @@ const Plot = lazy(() => import("react-plotly.js").then(m => {
 
 // ── API client ────────────────────────────────────────────────────────────────
 
-const API_BASE = "http://localhost:8000/api";
+const API_BASE = "/api";
 
 async function api(method, path, body) {
   const opts = { method, headers: {} };
@@ -3760,6 +3760,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
   const [metaAssignments, setMetaAssignments] = useState({}); // { key: varName }
 
   // ── Processing section state ──────────────────────────────────────────────
+  const [block1Regen, setBlock1Regen] = useState(false); // flash state for regenerate button
   const [procBlock2,  setProcBlock2]  = useState("");  // user transform (editable)
   const [procBlock3,  setProcBlock3]  = useState("");  // return dict (editable, resettable)
   const [procRunning, setProcRunning] = useState(false);
@@ -3767,7 +3768,8 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
   const [procError,   setProcError]   = useState(null);
 
   // ── Plot section state ────────────────────────────────────────────────────
-  const [plotConfig,  setPlotConfig]  = useState({ x_var: "", y_var: "", x_label: "", y_label: "", x_scale: "linear", y_scale: "linear", color: "" });
+  const [plotConfig,  setPlotConfig]  = useState({ x_var: "", y_var: "", x_label: "", y_label: "", x_scale: "linear", y_scale: "linear", color: "", show_fit: true, primary: "data", secondary_opacity: 0.35 });
+  const _fitMemory = useRef({ primary: "fit", secondary_opacity: 0.25 }); // remembered fit prefs
   const [plotVars,    setPlotVars]    = useState([]); // available array keys from last proc run
   const [plotFigure,  setPlotFigure]  = useState(null);
   const [plotLoading, setPlotLoading] = useState(false);
@@ -3785,8 +3787,14 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
   const [cardSection,   setCardSection]   = useState("");          // "electrical"|"structural"|...
   const [cardControls,  setCardControls]  = useState([]);          // [{name,type,choices,default,plot_overrides}]
 
+  const defaultProcBlock2 = () =>
+    `# Transform the imported variables into your desired output.\n# Variables from Block 1 are numpy arrays and in scope.\n# Example:\n# xs = voltage * 1000\n# ys = charge / area_m2`;
+
   const defaultProcBlock3 = () =>
     `return {\n    "x": ,        # required\n    "y": ,        # required\n    # "x_label": "",\n    # "y_label": "",\n    # "x_fit":   [],\n    # "y_fit":   [],\n    # "area_m2": None,\n}`;
+
+  const defaultAnalysisBlock2 = () =>
+    `# Extract metrics from the processing result.\n# result dict is in scope — use result["x"], result["y"], etc.\n# Example:\n# ec = (result["x_pos"] + abs(result["x_neg"])) / 2`;
 
   const defaultAnalysisBlock3 = () =>
     `return {\n    # "metric_name": value,\n}`;
@@ -3799,34 +3807,40 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       if (cfg.meta_assignments) setMetaAssignments(cfg.meta_assignments);
       // Three-block proc: prefer explicit block fields; fall back to splitting proc_code
       if (cfg.proc_block2 != null) {
-        setProcBlock2(cfg.proc_block2);
-        setProcBlock3(cfg.proc_block3 ?? defaultProcBlock3());
+        setProcBlock2(cfg.proc_block2 || defaultProcBlock2());
+        setProcBlock3(cfg.proc_block3 || defaultProcBlock3());
       } else if (cfg.proc_code) {
         // Backward compat: split on last `return` line
         const idx = cfg.proc_code.lastIndexOf("\nreturn ");
         if (idx !== -1) {
-          setProcBlock2(cfg.proc_code.slice(0, idx).trim());
-          setProcBlock3(cfg.proc_code.slice(idx + 1).trim());
+          setProcBlock2(cfg.proc_code.slice(0, idx).trim() || defaultProcBlock2());
+          setProcBlock3(cfg.proc_code.slice(idx + 1).trim() || defaultProcBlock3());
         } else {
-          setProcBlock2(cfg.proc_code);
+          setProcBlock2(cfg.proc_code || defaultProcBlock2());
           setProcBlock3(defaultProcBlock3());
         }
+      } else {
+        setProcBlock2(defaultProcBlock2());
+        setProcBlock3(defaultProcBlock3());
       }
       if (cfg.plot_config)       setPlotConfig(cfg.plot_config);
       if (cfg.analysis_metrics) setAnalysisMetrics(cfg.analysis_metrics);
       // Three-block analysis: prefer explicit block fields; fall back to splitting analysis_code
       if (cfg.analysis_block2 != null) {
-        setAnalysisBlock2(cfg.analysis_block2);
-        setAnalysisBlock3(cfg.analysis_block3 ?? defaultAnalysisBlock3());
+        setAnalysisBlock2(cfg.analysis_block2 || defaultAnalysisBlock2());
+        setAnalysisBlock3(cfg.analysis_block3 || defaultAnalysisBlock3());
       } else if (cfg.analysis_code) {
         const idx = cfg.analysis_code.lastIndexOf("\nreturn ");
         if (idx !== -1) {
-          setAnalysisBlock2(cfg.analysis_code.slice(0, idx).trim());
-          setAnalysisBlock3(cfg.analysis_code.slice(idx + 1).trim());
+          setAnalysisBlock2(cfg.analysis_code.slice(0, idx).trim() || defaultAnalysisBlock2());
+          setAnalysisBlock3(cfg.analysis_code.slice(idx + 1).trim() || defaultAnalysisBlock3());
         } else {
-          setAnalysisBlock2(cfg.analysis_code);
+          setAnalysisBlock2(cfg.analysis_code || defaultAnalysisBlock2());
           setAnalysisBlock3(defaultAnalysisBlock3());
         }
+      } else {
+        setAnalysisBlock2(defaultAnalysisBlock2());
+        setAnalysisBlock3(defaultAnalysisBlock3());
       }
       if (cfg.section)          setCardSection(cfg.section);
       if (cfg.card_controls)    setCardControls(cfg.card_controls);
@@ -3893,7 +3907,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       proc_block2: procBlock2,
       proc_block3: procBlock3,
       proc_code: fullProcCode(),       // backward compat
-      plot_config: plotConfig,
+      plot_config: { ...plotConfig, color: effectiveColor, opacity: dataOpacity, fit_color: effectiveColor, fit_opacity: fitOpacity },
       analysis_metrics: analysisMetrics,
       analysis_block2: analysisBlock2,
       analysis_block3: analysisBlock3,
@@ -3903,6 +3917,25 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
     };
     await api("PUT", `/modules/${id}/config`, cfg);
   };
+
+  // ── Plot aesthetics helpers ───────────────────────────────────────────────
+  const SECTION_COLORS = {
+    electrical:    "#4fd1c5",
+    structural:    "#818cf8",
+    scanning_probe:"#fb923c",
+    optical:       "#60a5fa",
+    other:         "#94a3b8",
+  };
+  const COLOR_PALETTE = [
+    "#4fd1c5","#60a5fa","#818cf8","#fb923c",
+    "#f43f5e","#d97706","#34d399","#e879f9","#94a3b8",
+  ];
+  const sectionDefaultColor = SECTION_COLORS[cardSection] || "#94a3b8";
+  const effectiveColor = plotConfig.color || sectionDefaultColor;
+  const dataOpacity = plotConfig.primary === "data" ? 1 : plotConfig.secondary_opacity;
+  const fitOpacity  = plotConfig.primary === "fit"  ? 1 : plotConfig.secondary_opacity;
+
+  const hasFitData = procResult && procResult.x_fit && procResult.y_fit;
 
   const generateBlock1 = () => {
     if (!exInfo) return "";
@@ -3919,6 +3952,9 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
 
     const lines = [];
     lines.push(`# ── Block 1: Auto-generated imports — do not edit ────────────────────`);
+    lines.push(`import numpy as np`);
+    lines.push(`import scipy`);
+    lines.push(``);
     if (delim) lines.push(`DELIMITER = ${delimRepr}`);
     lines.push(`SKIP_ROWS = ${skipRows}`);
     lines.push(``);
@@ -3932,12 +3968,13 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       lines.push(`        _rows.append([float(c) for c in _cells])`);
       lines.push(`    except ValueError:`);
       lines.push(`        continue`);
+      lines.push(`_arr = np.array(_rows)`);
       lines.push(``);
       lines.push(`# Columns`);
       const maxV = Math.max(...namedCols.map(([, v]) => v.length));
       for (const [idx, varName] of namedCols) {
         const hdr = headers[Number(idx)] || `col_${idx}`;
-        lines.push(`${varName.padEnd(maxV)} = [r[${idx}] for r in _rows]  # ${hdr}`);
+        lines.push(`${varName.padEnd(maxV)} = _arr[:, ${idx}]  # ${hdr}`);
       }
       lines.push(``);
     }
@@ -3987,7 +4024,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
     if (!code.trim()) return;
     setPlotLoading(true); setPlotFigure(null); setPlotError(null);
     try {
-      const res = await api("POST", `/modules/${mod.id}/preview-plot`, { code, plot_config: plotConfig });
+      const res = await api("POST", `/modules/${mod.id}/preview-plot`, { code, plot_config: { ...plotConfig, color: effectiveColor, opacity: dataOpacity, fit_color: effectiveColor, fit_opacity: fitOpacity } });
       if (res.ok) {
         setPlotFigure(res.figure);
         if (res.figure.available_vars?.length) setPlotVars(res.figure.available_vars);
@@ -3995,6 +4032,17 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
     } catch (e) { setPlotError(e.message || "Request failed"); }
     setPlotLoading(false);
   };
+
+  // Auto-replot when plot config changes, if a figure already exists
+  const _plotFigureRef = useRef(null);
+  useEffect(() => { _plotFigureRef.current = plotFigure; }, [plotFigure]);
+  const _previewPlotRef = useRef(null);
+  _previewPlotRef.current = handlePreviewPlot;
+  useEffect(() => {
+    if (!_plotFigureRef.current) return;
+    const t = setTimeout(() => _previewPlotRef.current?.(), 350);
+    return () => clearTimeout(t);
+  }, [JSON.stringify(plotConfig)]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleComputeAnalysis = async () => {
     const proc_code = fullProcCode();
@@ -4076,26 +4124,44 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
 
   // ── Tab bar ──────────────────────────────────────────────────────────────
   const tabBar = (
-    <div style={{ display: "flex", alignItems: "center", gap: 2, marginBottom: 24, borderBottom: `1px solid ${T.border}`, paddingBottom: 0 }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 2, marginBottom: 28,
+      position: "sticky", top: 52, zIndex: 200,
+      background: T.bg0, borderBottom: `1px solid ${T.border}`,
+      marginLeft: -20, marginRight: -20, paddingLeft: 20, paddingRight: 20,
+      paddingTop: 8, paddingBottom: 8 }}>
       {[["visual", "Visual Editor"], ["source", "Source"]].map(([t, label]) => (
         <button key={t} onClick={() => setTab(t)} style={{
-          fontFamily: mono, fontSize: 11, padding: "8px 18px", cursor: "pointer",
+          fontFamily: mono, fontSize: 11, padding: "4px 16px", cursor: "pointer",
           background: "none", border: "none",
           color: tab === t ? T.teal : T.textDim,
           borderBottom: `2px solid ${tab === t ? T.teal : "transparent"}`,
-          marginBottom: -1,
+          marginBottom: -9,
         }}>{label}</button>
       ))}
       <div style={{ flex: 1 }} />
       {error && <span style={{ fontFamily: mono, fontSize: 10, color: T.red, marginRight: 8 }}>{error}</span>}
+      {!isCreate && (
+        <button onClick={async () => {
+          const resp = await fetch(`${API_BASE}/modules/${mod.id}/export`);
+          if (!resp.ok) return;
+          const blob = await resp.blob();
+          const url  = URL.createObjectURL(blob);
+          const a    = document.createElement("a");
+          a.href = url; a.download = `${mod.id}.labmodule.zip`; a.click();
+          URL.revokeObjectURL(url);
+        }} style={{ fontFamily: mono, fontSize: 11, padding: "3px 12px", borderRadius: 5,
+          border: `1px solid ${T.border}`, background: "none", color: T.textDim, cursor: "pointer", marginRight: 6 }}>
+          Export ↓
+        </button>
+      )}
       {isBuiltin ? (
         <button onClick={() => onDuplicate?.(source, `copy_of_${mod.id}`)}
-          style={{ fontFamily: mono, fontSize: 11, padding: "5px 14px", borderRadius: 5, border: `1px solid ${T.teal}44`, background: "none", color: T.teal, cursor: "pointer", marginBottom: 8 }}>
+          style={{ fontFamily: mono, fontSize: 11, padding: "3px 12px", borderRadius: 5, border: `1px solid ${T.teal}44`, background: "none", color: T.teal, cursor: "pointer" }}>
           Duplicate
         </button>
       ) : (
         <button onClick={handleSave} disabled={saving || (isCreate && !idValid)}
-          style={{ fontFamily: mono, fontSize: 11, padding: "5px 16px", borderRadius: 5, marginBottom: 8,
+          style={{ fontFamily: mono, fontSize: 11, padding: "3px 14px", borderRadius: 5,
             border: `1px solid ${saved ? T.teal : T.amber}`,
             background: saved ? T.teal + "22" : T.amber + "22",
             color: saved ? T.teal : T.amber,
@@ -4492,10 +4558,15 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
               Block 1 — Column Imports <span style={{ color: T.textDim, fontWeight: 400 }}>(auto-generated · read-only)</span>
             </span>
             {exInfo && (
-              <button onClick={() => {/* Block 1 is always regenerated — no state to update */}}
-                title="Block 1 regenerates automatically from Data assignments"
-                style={{ fontFamily: mono, fontSize: 10, padding: "2px 8px", borderRadius: 3, border: `1px solid ${T.border}`, background: "none", color: T.textDim, cursor: "default", opacity: 0.5 }}>
-                auto
+              <button
+                onClick={() => { setBlock1Regen(true); setTimeout(() => setBlock1Regen(false), 1500); }}
+                title="Regenerate Block 1 from current Data assignments"
+                style={{ fontFamily: mono, fontSize: 10, padding: "2px 8px", borderRadius: 3,
+                  border: `1px solid ${block1Regen ? T.teal : T.border}`,
+                  background: block1Regen ? T.teal + "22" : "none",
+                  color: block1Regen ? T.teal : T.textDim, cursor: "pointer",
+                  transition: "all .2s" }}>
+                {block1Regen ? "✓ Regenerated" : "Regenerate"}
               </button>
             )}
           </div>
@@ -4517,17 +4588,26 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
 
         {/* Block 2 — User transform */}
         <div style={{ marginBottom: 10 }}>
-          <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderBottom: "none",
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+            background: T.bg1, border: `1px solid ${T.border}`, borderBottom: "none",
             borderRadius: "8px 8px 0 0", padding: "6px 14px" }}>
             <span style={{ fontFamily: mono, fontSize: 10, color: T.amber, letterSpacing: "0.05em", textTransform: "uppercase" }}>
               Block 2 — Processing
             </span>
+            <button onClick={handleRunProc} disabled={procRunning || !exInfo}
+              style={{ fontFamily: mono, fontSize: 10, padding: "2px 8px", borderRadius: 3,
+                border: `1px solid ${exInfo ? T.teal + "66" : T.border}`,
+                background: "none", color: exInfo ? T.teal : T.textDim,
+                cursor: (exInfo && !procRunning) ? "pointer" : "not-allowed" }}>
+              {procRunning ? "Running…" : "▶ Run"}
+            </button>
           </div>
           <textarea
             value={procBlock2}
             onChange={e => setProcBlock2(e.target.value)}
+            onKeyDown={e => { if (e.ctrlKey && e.key === "Enter") { e.preventDefault(); handleRunProc(); } }}
             spellCheck={false}
-            placeholder={"# Transform the imported variables into your desired output.\n# Variables from Block 1 are in scope.\n# Example:\n# xs = [v * 1000 for v in voltage]\n# ys = [c / area_m2 for c in charge]"}
+            placeholder=""
             style={{
               width: "100%", minHeight: 160, resize: "vertical",
               fontFamily: mono, fontSize: 12, lineHeight: 1.7,
@@ -4556,6 +4636,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
           <textarea
             value={procBlock3}
             onChange={e => setProcBlock3(e.target.value)}
+            onKeyDown={e => { if (e.ctrlKey && e.key === "Enter") { e.preventDefault(); handleRunProc(); } }}
             spellCheck={false}
             placeholder={defaultProcBlock3()}
             style={{
@@ -4575,9 +4656,44 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
             <div style={{ fontFamily: mono, fontSize: 10, color: procError ? T.red : T.teal, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.05em" }}>
               {procError ? "Error" : "Result"}
             </div>
-            <pre style={{ fontFamily: mono, fontSize: 11, color: procError ? T.red : T.textSecondary, margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 320, overflow: "auto" }}>
-              {procError || JSON.stringify(procResult, null, 2)}
-            </pre>
+            {procError ? (
+              <pre style={{ fontFamily: mono, fontSize: 11, color: T.red, margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 320, overflow: "auto" }}>
+                {procError}
+              </pre>
+            ) : (
+              <table style={{ fontFamily: mono, fontSize: 11, borderCollapse: "collapse", width: "100%" }}>
+                <thead>
+                  <tr>
+                    {["key", "type", "shape / value"].map(h => (
+                      <td key={h} style={{ color: T.textDim, paddingBottom: 6, paddingRight: 24, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.04em" }}>{h}</td>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(procResult).map(([k, v]) => {
+                    const isArr = Array.isArray(v);
+                    const isNested = isArr && v.length > 0 && Array.isArray(v[0]);
+                    const typeLabel = isNested ? `array[${v.length}][${v[0].length}]`
+                      : isArr ? `array[${v.length}]`
+                      : v === null ? "null"
+                      : typeof v;
+                    const preview = isNested
+                      ? `[[${v[0].slice(0,3).map(x => typeof x === "number" ? +x.toPrecision(4) : x).join(", ")}…], …]`
+                      : isArr
+                      ? `[${v.slice(0, 5).map(x => typeof x === "number" ? +x.toPrecision(4) : x).join(", ")}${v.length > 5 ? ", …" : ""}]`
+                      : typeof v === "number" ? +v.toPrecision(6)
+                      : JSON.stringify(v);
+                    return (
+                      <tr key={k} style={{ borderTop: `1px solid ${T.border}` }}>
+                        <td style={{ color: T.teal, padding: "5px 24px 5px 0", whiteSpace: "nowrap" }}>{k}</td>
+                        <td style={{ color: T.textDim, padding: "5px 24px 5px 0", whiteSpace: "nowrap" }}>{typeLabel}</td>
+                        <td style={{ color: T.textSecondary, padding: "5px 0" }}>{preview}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
           </div>
         )}
       </div>
@@ -4653,6 +4769,79 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
               <option value="log">Log</option>
             </select>
           </div>
+        </div>
+
+        {/* Aesthetics */}
+        <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 16, flexWrap: "wrap" }}>
+          {/* Color swatches */}
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginRight: 2 }}>Color</span>
+            {/* Auto (section default) */}
+            <button onClick={() => setPlotConfig(c => ({ ...c, color: "" }))} title="Section default"
+              style={{ width: 22, height: 22, borderRadius: 4, background: sectionDefaultColor, padding: 0, cursor: "pointer", flexShrink: 0,
+                border: plotConfig.color === "" ? `2px solid ${T.textPrimary}` : "2px solid transparent",
+                display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <span style={{ fontFamily: mono, fontSize: 8, color: "rgba(255,255,255,0.85)", fontWeight: "bold", pointerEvents: "none" }}>A</span>
+            </button>
+            {COLOR_PALETTE.map(hex => (
+              <button key={hex} onClick={() => setPlotConfig(c => ({ ...c, color: hex }))} title={hex}
+                style={{ width: 22, height: 22, borderRadius: 4, background: hex, padding: 0, cursor: "pointer", flexShrink: 0,
+                  border: plotConfig.color === hex ? `2px solid ${T.textPrimary}` : "2px solid transparent" }} />
+            ))}
+          </div>
+
+          <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
+
+          {/* Fit overlay toggle */}
+          <label style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
+            <input type="checkbox" checked={plotConfig.show_fit}
+              onChange={e => {
+                if (e.target.checked) {
+                  setPlotConfig(c => ({ ...c, show_fit: true, ..._fitMemory.current }));
+                } else {
+                  setPlotConfig(c => {
+                    _fitMemory.current = { primary: c.primary, secondary_opacity: c.secondary_opacity };
+                    return { ...c, show_fit: false, primary: "data", secondary_opacity: 1.0 };
+                  });
+                }
+              }} />
+            <span style={{ fontFamily: mono, fontSize: 10, color: T.textSecondary, whiteSpace: "nowrap" }}>Fit overlay</span>
+          </label>
+          {!hasFitData && <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim }}>(no x_fit/y_fit yet)</span>}
+
+          {plotConfig.show_fit && <>
+            <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
+
+            {/* Primary trace */}
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Primary</span>
+              {[["data", "Data"], ["fit", "Fit"]].map(([val, lbl]) => (
+                <button key={val} onClick={() => setPlotConfig(c => ({ ...c, primary: val }))}
+                  style={{ fontFamily: mono, fontSize: 10, padding: "3px 10px", borderRadius: 4, cursor: "pointer",
+                    border: `1px solid ${plotConfig.primary === val ? T.teal : T.border}`,
+                    background: plotConfig.primary === val ? T.teal + "22" : "none",
+                    color: plotConfig.primary === val ? T.teal : T.textDim }}>
+                  {lbl}
+                </button>
+              ))}
+            </div>
+
+            <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
+
+            {/* Opacity ratio */}
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Opacity</span>
+              {[[1.0,"100/100"],[0.5,"100/50"],[0.25,"100/25"],[0.1,"100/10"]].map(([val, lbl]) => (
+                <button key={lbl} onClick={() => setPlotConfig(c => ({ ...c, secondary_opacity: val }))}
+                  style={{ fontFamily: mono, fontSize: 10, padding: "3px 10px", borderRadius: 4, cursor: "pointer",
+                    border: `1px solid ${plotConfig.secondary_opacity === val ? T.teal : T.border}`,
+                    background: plotConfig.secondary_opacity === val ? T.teal + "22" : "none",
+                    color: plotConfig.secondary_opacity === val ? T.teal : T.textDim }}>
+                  {lbl}
+                </button>
+              ))}
+            </div>
+          </>}
         </div>
 
         {/* Error */}
@@ -4778,7 +4967,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
           </div>
           <textarea value={analysisBlock2} onChange={e => setAnalysisBlock2(e.target.value)}
             spellCheck={false}
-            placeholder={"# Extract metrics from the processing result.\n# result dict is in scope — use result[\"x\"], result[\"y\"], etc.\n# Example:\n# ec = (result[\"x_pos\"] + abs(result[\"x_neg\"])) / 2"}
+            placeholder=""
             style={{ width: "100%", minHeight: 140, resize: "vertical", fontFamily: mono, fontSize: 12, lineHeight: 1.7,
               background: T.bg0, color: T.textPrimary,
               border: `1px solid ${T.border}`, borderTop: "none", borderBottom: "none",
@@ -10657,7 +10846,7 @@ export default function App() {
               </div>
 
               {/* Analysis Books section */}
-              <div>
+              <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 28, marginTop: 4 }}>
                 <div style={{ marginBottom: 14, display: "flex", alignItems: "baseline", gap: 12 }}>
                   <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.textPrimary }}>Analysis Books</h2>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{books.length}</span>
@@ -10716,16 +10905,29 @@ export default function App() {
               </div>
 
               {/* Modules section */}
-              <div style={{ marginTop: 8 }}>
+              <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 28, marginTop: 20 }}>
                 <div style={{ marginBottom: 14, display: "flex", alignItems: "baseline", gap: 12 }}>
                   <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.textPrimary }}>Modules</h2>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{modules.length}</span>
                   <div style={{ flex: 1 }} />
-                  <button
-                    onClick={() => openModule(null)}
-                    style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.teal, background: T.teal + "15", border: `1px solid ${T.teal}44`, borderRadius: 5, padding: "4px 12px", cursor: "pointer" }}>
-                    + New
-                  </button>
+                  {/* Import */}
+                  <label style={{ marginRight: 6 }}>
+                    <Btn variant="ghost" small>Import</Btn>
+                    <input type="file" accept=".zip" style={{ display: "none" }} onChange={async e => {
+                      const f = e.target.files?.[0];
+                      if (!f) return;
+                      e.target.value = "";
+                      const form = new FormData();
+                      form.append("file", f);
+                      const res = await fetch(`${API_BASE}/modules/import`, { method: "POST", body: form });
+                      const data = await res.json();
+                      if (!res.ok) { alert(data.detail || "Import failed"); return; }
+                      const mods = await api("GET", "/modules");
+                      setModules(mods);
+                      openModule(data.module_id);
+                    }} />
+                  </label>
+                  <Btn variant="primary" small onClick={() => openModule(null)}>+ New Module</Btn>
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
                   {modules.map(m => (
