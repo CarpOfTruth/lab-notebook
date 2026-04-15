@@ -4,13 +4,13 @@
     {
       "name": "frontend",
       "runtimeExecutable": "/Users/admin/Projects/Lab Notebook/frontend/node_modules/.bin/vite",
-      "runtimeArgs": ["/Users/admin/Projects/Lab Notebook/.claude/worktrees/cranky-wu/frontend", "--config", "/Users/admin/Projects/Lab Notebook/frontend/vite.config.js"],
+      "runtimeArgs": ["/Users/admin/Projects/Lab Notebook/frontend", "--config", "/Users/admin/Projects/Lab Notebook/frontend/vite.config.js"],
       "port": 5173
     },
     {
       "name": "backend",
-      "runtimeExecutable": "sh",
-      "runtimeArgs": ["-c", "cd '/Users/admin/Projects/Lab Notebook/.claude/worktrees/cranky-wu/backend' && '/Users/admin/Projects/Lab Notebook/backend/.venv/bin/uvicorn' main:app --reload --port 8000"],
+      "runtimeExecutable": "/Users/admin/Projects/Lab Notebook/backend/.venv/bin/uvicorn",
+      "runtimeArgs": ["main:app", "--reload", "--port", "8000", "--app-dir", "/Users/admin/Projects/Lab Notebook/backend"],
       "port": 8000
     }
   ]
