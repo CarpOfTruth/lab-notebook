@@ -321,6 +321,17 @@ const Btn = ({ children, onClick, variant = "primary", small, disabled }) => {
   return <button style={styles[variant]} onClick={onClick} disabled={disabled}>{children}</button>;
 };
 
+// File-picker button — identical to <Btn> but triggers a hidden <input type="file">
+const FileBtn = ({ children, accept, onChange, disabled, variant = "ghost", small = true }) => {
+  const ref = React.useRef();
+  return (
+    <>
+      <Btn variant={variant} small={small} disabled={disabled} onClick={() => ref.current?.click()}>{children}</Btn>
+      <input ref={ref} type="file" accept={accept} style={{ display: "none" }} onChange={e => { onChange(e); e.target.value = ""; }} disabled={disabled} />
+    </>
+  );
+};
+
 const Label = ({ children }) => (
   <label style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>{children}</label>
 );
@@ -10908,10 +10919,9 @@ export default function App() {
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{samples.length} total</span>
                   <div style={{ flex: 1 }} />
                   <Btn variant="ghost" small onClick={() => setAddingSampleFolder(true)}>+ Folder</Btn>
-                  <label style={{ display: "inline-flex", alignItems: "center", border: `1px solid ${T.border}`, cursor: importing ? "wait" : "pointer", borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", transition: "all .15s", background: "transparent", color: importing ? T.textDim : T.textSecondary, userSelect: "none", lineHeight: 1 }}>
+                  <FileBtn accept=".zip" onChange={handleImportSample} disabled={importing}>
                     {importing ? "Importing…" : "Import"}
-                    <input type="file" accept=".zip" style={{ display: "none" }} onChange={handleImportSample} disabled={importing} />
-                  </label>
+                  </FileBtn>
                   {importError && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={importError}>{importError}</span>}
                   {/* Export hidden for now — keep for future reintroduction */}
                   {false && <Btn variant="ghost" small onClick={() => setExportOpen(true)}>Export</Btn>}
@@ -10968,20 +10978,16 @@ export default function App() {
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{books.length}</span>
                   <div style={{ flex: 1 }} />
                   <Btn variant="ghost" small onClick={() => setAddingBookFolder(true)}>+ Folder</Btn>
-                  <label style={{ display: "inline-flex", alignItems: "center", border: `1px solid ${T.border}`, cursor: "pointer", borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", transition: "all .15s", background: "transparent", color: T.textSecondary, userSelect: "none", lineHeight: 1 }}>
-                    Import
-                    <input type="file" accept=".zip" style={{ display: "none" }} onChange={async e => {
+                  <FileBtn accept=".zip" onChange={async e => {
                       const f = e.target.files?.[0];
                       if (!f) return;
-                      e.target.value = "";
                       const form = new FormData();
                       form.append("file", f);
                       const res = await fetch(`${API_BASE}/books/import-preview`, { method: "POST", body: form });
                       const data = await res.json();
                       if (!res.ok) { alert(data.detail || "Could not read book file"); return; }
                       setBookImportPreview({ ...data, _file: f });
-                    }} />
-                  </label>
+                    }}>Import</FileBtn>
                   <Btn variant="primary" small onClick={() => setAddingBook(true)}>+ New Book</Btn>
                 </div>
                 {(() => {
@@ -11043,25 +11049,20 @@ export default function App() {
                   <div style={{ flex: 1 }} />
                   <Btn variant="ghost" small onClick={() => setAddingModuleFolder(true)}>+ Folder</Btn>
                   {/* Import module zip */}
-                  <label style={{ display: "inline-flex", alignItems: "center", border: `1px solid ${T.border}`, cursor: "pointer", borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", transition: "all .15s", background: "transparent", color: T.textSecondary, userSelect: "none", lineHeight: 1 }}>
-                    Import
-                    <input type="file" accept=".zip" style={{ display: "none" }} onChange={async e => {
+                  <FileBtn accept=".zip" onChange={async e => {
                       const f = e.target.files?.[0];
                       if (!f) return;
-                      e.target.value = "";
                       const form = new FormData();
                       form.append("file", f);
                       const res = await fetch(`${API_BASE}/modules/import`, { method: "POST", body: form });
                       const data = await res.json();
                       if (!res.ok) { alert(data.detail || "Import failed"); return; }
-                      // Refresh module list, then open — use fresh list to avoid stale state
                       const mods = await api("GET", "/modules");
                       setModules(mods);
                       const modMeta = mods.find(m => m.id === data.module_id) || {};
                       const srcRes  = await api("GET", `/modules/${data.module_id}/source`);
                       setActiveModule({ ...modMeta, source: srcRes.source, builtin: srcRes.builtin, mode: srcRes.builtin ? "view" : "edit" });
-                    }} />
-                  </label>
+                    }}>Import</FileBtn>
                   <Btn variant="primary" small onClick={() => openModule(null)}>+ New Module</Btn>
                 </div>
                 {(() => {
