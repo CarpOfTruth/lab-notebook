@@ -323,7 +323,7 @@ const Btn = ({ children, onClick, variant = "primary", small, disabled }) => {
 
 // File-picker button — identical to <Btn> but triggers a hidden <input type="file">
 const FileBtn = ({ children, accept, onChange, disabled, variant = "ghost", small = true }) => {
-  const ref = React.useRef();
+  const ref = useRef();
   return (
     <>
       <Btn variant={variant} small={small} disabled={disabled} onClick={() => ref.current?.click()}>{children}</Btn>
