@@ -130,6 +130,10 @@ def init_db():
         except sqlite3.OperationalError:
             pass
         try:
+            conn.execute("ALTER TABLE folders ADD COLUMN module_folder INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
             conn.execute("ALTER TABLE samples ADD COLUMN xrd_peaks TEXT DEFAULT '[]'")
         except sqlite3.OperationalError:
             pass
@@ -183,8 +187,12 @@ def list_folders():
 def create_folder(folder: dict):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO folders (id, name, color, book_folder, parent_id, sort_order) VALUES (:id, :name, :color, :book_folder, :parent_id, :sort_order)",
-            {"id": folder["id"], "name": folder["name"], "color": folder.get("color", "#4a5568"), "book_folder": 1 if folder.get("book_folder") else 0, "parent_id": folder.get("parent_id") or None, "sort_order": folder.get("sort_order", 0)},
+            "INSERT INTO folders (id, name, color, book_folder, module_folder, parent_id, sort_order) VALUES (:id, :name, :color, :book_folder, :module_folder, :parent_id, :sort_order)",
+            {"id": folder["id"], "name": folder["name"], "color": folder.get("color", "#4a5568"),
+             "book_folder": 1 if folder.get("book_folder") else 0,
+             "module_folder": 1 if folder.get("module_folder") else 0,
+             "parent_id": folder.get("parent_id") or None,
+             "sort_order": folder.get("sort_order", 0)},
         )
         conn.commit()
     return {"ok": True, "id": folder["id"]}
@@ -193,8 +201,12 @@ def create_folder(folder: dict):
 def update_folder(folder_id: str, folder: dict):
     with get_db() as conn:
         conn.execute(
-            "UPDATE folders SET name=:name, color=:color, book_folder=:book_folder, parent_id=:parent_id, sort_order=:sort_order WHERE id=:id",
-            {"id": folder_id, "name": folder["name"], "color": folder.get("color", "#4a5568"), "book_folder": 1 if folder.get("book_folder") else 0, "parent_id": folder.get("parent_id") or None, "sort_order": folder.get("sort_order", 0)},
+            "UPDATE folders SET name=:name, color=:color, book_folder=:book_folder, module_folder=:module_folder, parent_id=:parent_id, sort_order=:sort_order WHERE id=:id",
+            {"id": folder_id, "name": folder["name"], "color": folder.get("color", "#4a5568"),
+             "book_folder": 1 if folder.get("book_folder") else 0,
+             "module_folder": 1 if folder.get("module_folder") else 0,
+             "parent_id": folder.get("parent_id") or None,
+             "sort_order": folder.get("sort_order", 0)},
         )
         conn.commit()
     return {"ok": True}
@@ -719,6 +731,7 @@ def list_modules():
         info["card_controls"]    = cfg.get("card_controls", [])
         info["analysis_metrics"] = cfg.get("analysis_metrics", [])
         info["analysis_code"]    = cfg.get("analysis_code", "")
+        info["folder_id"]        = cfg.get("folder_id", None)
         result.append(info)
     return result
 
@@ -945,6 +958,288 @@ async def import_module(file: UploadFile = File(...)):
         installed.append("example")
 
     return {"ok": True, "module_id": module_id, "installed": installed}
+
+
+@app.get("/api/books/{book_id}/export")
+def export_book(book_id: str, include_files: bool = True):
+    """Export an analysis book as a zip — includes book config, sample metadata,
+    referenced module schemas/source, and optionally sample data files."""
+    from fastapi.responses import StreamingResponse
+    import zipfile, io
+    from datetime import datetime, timezone
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM analysis_books WHERE id=?", (book_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Book not found")
+
+    book = row_to_book(row)
+    sample_ids = book.get("sample_ids") or []
+    if not sample_ids and book.get("config", {}).get("sample_order"):
+        sample_ids = book["config"]["sample_order"]
+
+    # Collect samples
+    samples_data = []
+    with get_db() as conn:
+        for sid in sample_ids:
+            srow = conn.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+            if srow:
+                samples_data.append(row_to_sample(srow))
+
+    # Collect module IDs referenced by any sample's filenames
+    module_ids = set()
+    for s in samples_data:
+        module_ids.update(s.get("filenames", {}).keys())
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        manifest = {
+            "book_id": book_id,
+            "book_name": book["name"],
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "format": "labbook/1.0",
+            "sample_ids": sample_ids,
+            "module_ids": list(module_ids),
+            "include_files": include_files,
+        }
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+        zf.writestr("book.json", json.dumps(book, indent=2, default=str))
+
+        # Samples
+        for s in samples_data:
+            sid = s["id"]
+            zf.writestr(f"samples/{sid}/metadata.json", json.dumps(s, indent=2, default=str))
+            if include_files:
+                sdir = FILES_DIR / sid
+                if sdir.exists():
+                    for p in sorted(sdir.iterdir()):
+                        if p.is_file():
+                            zf.write(str(p), f"samples/{sid}/files/{p.name}")
+
+        # Modules
+        for mid in module_ids:
+            schema = _load_schema(mid)
+            if schema:
+                zf.writestr(f"modules/{mid}/schema.json", json.dumps(schema, indent=2))
+            src = mod_registry.source(mid)
+            if src:
+                zf.writestr(f"modules/{mid}/source.py", src)
+            ex_path, _ = _find_example(mid)
+            if ex_path:
+                zf.write(str(ex_path), f"modules/{mid}/example{ex_path.suffix}")
+
+    buf.seek(0)
+    fname = f"{book['name'].replace(' ', '_')}.labbook.zip"
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@app.post("/api/books/import-preview")
+async def import_book_preview(file: UploadFile = File(...)):
+    """Read a .labbook.zip and return a preview of what would be imported, without writing anything."""
+    import zipfile, io as _io
+
+    data = await file.read()
+    try:
+        zf = zipfile.ZipFile(_io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "Not a valid zip file")
+
+    names = zf.namelist()
+    if "manifest.json" not in names:
+        raise HTTPException(400, "Not a valid .labbook.zip (missing manifest.json)")
+    manifest = json.loads(zf.read("manifest.json"))
+    if manifest.get("format", "").split("/")[0] != "labbook":
+        raise HTTPException(400, "This zip is not a book export (use module Import for .labmodule.zip)")
+
+    book = json.loads(zf.read("book.json")) if "book.json" in names else {}
+
+    # Check each sample for conflicts
+    sample_entries = {}
+    for n in names:
+        parts = n.split("/")
+        if len(parts) >= 3 and parts[0] == "samples" and parts[2] == "metadata.json":
+            sid = parts[1]
+            meta = json.loads(zf.read(n))
+            sample_entries[sid] = meta
+
+    with get_db() as conn:
+        existing_ids = {r[0] for r in conn.execute("SELECT id FROM samples").fetchall()}
+
+    def _propose(sid):
+        candidate = f"{sid}_imp"
+        n = 2
+        while candidate in existing_ids or candidate in {v["proposed_id"] for v in samples_preview if "proposed_id" in v}:
+            candidate = f"{sid}_imp{n}"
+            n += 1
+        return candidate
+
+    samples_preview = []
+    for sid, meta in sample_entries.items():
+        exists = sid in existing_ids
+        entry = {"original_id": sid, "exists": exists, "has_files": any(f"samples/{sid}/files/" in n for n in names)}
+        if exists:
+            entry["proposed_id"] = _propose(sid)
+        else:
+            entry["proposed_id"] = sid
+        samples_preview.append(entry)
+
+    return {
+        "book": {"id": book.get("id", ""), "name": book.get("name", "Imported Book")},
+        "samples": samples_preview,
+        "modules": manifest.get("module_ids", []),
+        "has_files": manifest.get("include_files", False),
+    }
+
+
+@app.post("/api/books/import")
+async def import_book(file: UploadFile = File(...), config: str = "{}"):
+    """Import a .labbook.zip. config is a JSON string: { sample_renames, create_folder, folder_name }"""
+    import zipfile, io as _io
+
+    cfg = json.loads(config)
+    sample_renames = cfg.get("sample_renames", {})   # { original_id: new_id }
+    create_folder = cfg.get("create_folder", False)
+    folder_name = cfg.get("folder_name", "Imported")
+
+    data = await file.read()
+    try:
+        zf = zipfile.ZipFile(_io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "Not a valid zip file")
+
+    names = zf.namelist()
+    book = json.loads(zf.read("book.json")) if "book.json" in names else {}
+
+    # Create folder for new samples if requested
+    folder_id = None
+    if create_folder:
+        folder_id = str(int(__import__("time").time() * 1000))
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO folders (id, name, color, book_folder, module_folder, sort_order) VALUES (?, ?, ?, 0, 0, 0)",
+                (folder_id, folder_name, "#4a5568")
+            )
+            conn.commit()
+
+    # Import modules
+    module_dirs = set()
+    for n in names:
+        parts = n.split("/")
+        if len(parts) >= 2 and parts[0] == "modules":
+            module_dirs.add(parts[1])
+
+    for mid in module_dirs:
+        if not mid:
+            continue
+        if f"modules/{mid}/schema.json" in names:
+            schema = json.loads(zf.read(f"modules/{mid}/schema.json"))
+            (SCHEMAS_DIR / f"{mid}.json").write_text(json.dumps(schema, indent=2))
+        if f"modules/{mid}/source.py" in names:
+            src = zf.read(f"modules/{mid}/source.py").decode("utf-8")
+            try:
+                mod_registry.save_user_module(mid, src)
+            except Exception:
+                pass
+        ex_entries = [n for n in names if n.startswith(f"modules/{mid}/example.")]
+        if ex_entries:
+            ext = Path(ex_entries[0]).suffix
+            for old in EXAMPLES_DIR.glob(f"{mid}.*"):
+                old.unlink()
+            (EXAMPLES_DIR / f"{mid}{ext}").write_bytes(zf.read(ex_entries[0]))
+
+    # Import samples
+    created = []
+    renamed = []
+    skipped = []
+
+    sample_dirs = set()
+    for n in names:
+        parts = n.split("/")
+        if len(parts) >= 3 and parts[0] == "samples" and parts[2] == "metadata.json":
+            sample_dirs.add(parts[1])
+
+    with get_db() as conn:
+        existing_ids = {r[0] for r in conn.execute("SELECT id FROM samples").fetchall()}
+
+    id_map = {}  # original_id -> actual_id used
+    for orig_id in sample_dirs:
+        new_id = sample_renames.get(orig_id, orig_id)
+        id_map[orig_id] = new_id
+        if new_id in existing_ids:
+            skipped.append(orig_id)
+            continue
+        meta = json.loads(zf.read(f"samples/{orig_id}/metadata.json"))
+        meta["id"] = new_id
+        meta["folder_id"] = folder_id
+        with get_db() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO samples
+                  (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
+                   technique, folder_id, layers, filenames, xrd_peaks, lot, bin)
+                VALUES
+                  (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
+                   :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin)
+            """, {
+                "id": new_id,
+                "date": meta.get("date"),
+                "substrate": meta.get("substrate"),
+                "notes": meta.get("notes"),
+                "thickness_nm": meta.get("thickness_nm"),
+                "area_m2": meta.get("area_m2"),
+                "area_correction": meta.get("area_correction", 1.0),
+                "technique": meta.get("technique", "sputter"),
+                "folder_id": folder_id,
+                "layers": json.dumps(meta.get("layers", [])),
+                "filenames": json.dumps(meta.get("filenames", {})),
+                "xrd_peaks": json.dumps(meta.get("xrd_peaks", [])),
+                "lot": meta.get("lot"),
+                "bin": meta.get("bin"),
+            })
+            conn.commit()
+        # Restore data files
+        file_entries = [n for n in names if n.startswith(f"samples/{orig_id}/files/") and not n.endswith("/")]
+        if file_entries:
+            dest_dir = FILES_DIR / new_id
+            dest_dir.mkdir(exist_ok=True)
+            for entry in file_entries:
+                dest = dest_dir / Path(entry).name
+                dest.write_bytes(zf.read(entry))
+        if orig_id != new_id:
+            renamed.append({"original": orig_id, "new": new_id})
+        else:
+            created.append(new_id)
+
+    # Import book — update sample IDs if any were renamed
+    book_sample_ids = book.get("sample_ids") or []
+    remapped_ids = [id_map.get(sid, sid) for sid in book_sample_ids]
+
+    book_cfg = book.get("config", {})
+    if "sample_order" in book_cfg:
+        book_cfg["sample_order"] = [id_map.get(sid, sid) for sid in book_cfg["sample_order"]]
+
+    book_id = book.get("id") or str(int(__import__("time").time() * 1000))
+    with get_db() as conn:
+        existing_book = conn.execute("SELECT id FROM analysis_books WHERE id=?", (book_id,)).fetchone()
+        if existing_book:
+            book_id = f"{book_id}_imp"
+        conn.execute(
+            "INSERT INTO analysis_books (id, name, sample_ids, config) VALUES (?, ?, ?, ?)",
+            (book_id, book.get("name", "Imported Book"), json.dumps(remapped_ids), json.dumps(book_cfg))
+        )
+        conn.commit()
+
+    return {
+        "ok": True,
+        "book_id": book_id,
+        "created": created,
+        "renamed": renamed,
+        "skipped": skipped,
+        "folder_id": folder_id,
+    }
 
 
 @app.delete("/api/modules/{module_id}")

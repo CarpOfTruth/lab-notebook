@@ -3728,7 +3728,7 @@ function ModuleSourceModal({ mod, onClose, onSave, existingIds = [] }) {
 // Full-page module editor — navigated to like SampleDetail / AnalysisBookDetail.
 // mod: { id, name, builtin, source, mode: "view"|"edit"|"create", version, accepts, description }
 
-function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModules = [] }) {
+function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModules = [], folders = [] }) {
   const [tab,        setTab]        = useState("visual");
   const [source,     setSource]     = useState(mod.source || "");
   const [saving,     setSaving]     = useState(false);
@@ -3739,11 +3739,12 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
   const isCreate  = mod.mode === "create";
 
   // ── Identity fields ──────────────────────────────────────────────────────
-  const [mName,   setMName]   = useState(mod.name        || "");
-  const [mId,     setMId]     = useState(mod.id          || "");
-  const [mDesc,   setMDesc]   = useState(mod.description || "");
-  const [mVer,    setMVer]    = useState(mod.version     || "1.0");
-  const [mAuthor, setMAuthor] = useState(mod.author      || "");
+  const [mName,     setMName]     = useState(mod.name        || "");
+  const [mId,       setMId]       = useState(mod.id          || "");
+  const [mDesc,     setMDesc]     = useState(mod.description || "");
+  const [mVer,      setMVer]      = useState(mod.version     || "1.0");
+  const [mAuthor,   setMAuthor]   = useState(mod.author      || "");
+  const [mFolderId, setMFolderId] = useState(mod.folder_id   || "");
   const [mAccepts, setMAccepts] = useState(mod.accepts   || []);
   const [mNotes,  setMNotes]  = useState(() => {
     const m = (mod.source || "").match(/"""([\s\S]*?)"""/);
@@ -3914,6 +3915,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       analysis_code: fullAnalysisCode(), // backward compat
       section: cardSection,
       card_controls: cardControls,
+      folder_id: mFolderId || null,
     };
     await api("PUT", `/modules/${id}/config`, cfg);
   };
@@ -4231,6 +4233,18 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
             )}
           </div>
         </div>
+        {!isBuiltin && folders.filter(f => f.module_folder).length > 0 && (
+          <div>
+            <span style={label}>Folder</span>
+            <select value={mFolderId} onChange={e => setMFolderId(e.target.value)}
+              style={{ ...field(), cursor: "pointer" }}>
+              <option value="">— None —</option>
+              {folders.filter(f => f.module_folder).map(f => (
+                <option key={f.id} value={f.id}>{f.name}</option>
+              ))}
+            </select>
+          </div>
+        )}
         <div>
           <span style={label}>Usage notes</span>
           <textarea value={mNotes} onChange={e => !isBuiltin && setMNotes(e.target.value)} readOnly={isBuiltin}
@@ -5206,6 +5220,66 @@ function ExportModal({ samples, onClose }) {
   );
 }
 
+function BookImportModal({ preview, onConfirm, onClose }) {
+  const anyConflicts = preview.samples.some(s => s.exists);
+  const [createFolder, setCreateFolder] = useState(anyConflicts);
+  const [folderName,   setFolderName]   = useState(`${preview.book.name} (imported)`);
+  const renames = Object.fromEntries(preview.samples.map(s => [s.original_id, s.proposed_id]));
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 480, display: "flex", flexDirection: "column", gap: 16, maxHeight: "80vh", overflow: "auto" }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.blue, fontSize: 20 }}>Import Book</h2>
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary }}>
+          <span style={{ color: T.textPrimary, fontWeight: 600 }}>{preview.book.name}</span>
+          {" "}&mdash; {preview.samples.length} sample{preview.samples.length !== 1 ? "s" : ""}
+          {preview.modules.length > 0 && `, ${preview.modules.length} module${preview.modules.length !== 1 ? "s" : ""}`}
+        </div>
+
+        {/* Sample list */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>Samples</span>
+          {preview.samples.map(s => (
+            <div key={s.original_id} style={{ display: "flex", alignItems: "center", gap: 8, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 8px", borderRadius: 5, background: T.bg2 }}>
+              {s.exists ? (
+                <>
+                  <span style={{ color: T.amber }}>⚠</span>
+                  <span style={{ color: T.textDim, textDecoration: "line-through" }}>{s.original_id}</span>
+                  <span style={{ color: T.textDim }}>→</span>
+                  <span style={{ color: T.textPrimary }}>{s.proposed_id}</span>
+                  <span style={{ color: T.amber, fontSize: 9 }}>renamed (conflict)</span>
+                </>
+              ) : (
+                <>
+                  <span style={{ color: T.teal }}>✓</span>
+                  <span style={{ color: T.textPrimary }}>{s.original_id}</span>
+                  <span style={{ color: T.textDim, fontSize: 9 }}>new</span>
+                </>
+              )}
+              {s.has_files && <span style={{ color: T.textDim, fontSize: 9, marginLeft: "auto" }}>+ data files</span>}
+            </div>
+          ))}
+        </div>
+
+        {/* Folder option */}
+        <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+          <input type="checkbox" checked={createFolder} onChange={e => setCreateFolder(e.target.checked)} />
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textSecondary }}>Create a sample folder for new imports</span>
+        </label>
+        {createFolder && (
+          <input value={folderName} onChange={e => setFolderName(e.target.value)}
+            style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, padding: "6px 10px", color: T.textPrimary, outline: "none" }} />
+        )}
+
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn onClick={() => onConfirm({ sample_renames: renames, create_folder: createFolder, folder_name: folderName })}>Import</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── SettingsModal ─────────────────────────────────────────────────────────────
 
 function SettingsModal({ settings, onSave, onClose }) {
@@ -5643,46 +5717,26 @@ function FolderTile({ folder, samples, childContent = null, plotCache, depth = 0
   );
 }
 
-function AddFolderModal({ onSave, onClose, existing, allFolders = [], defaultForBooks = false }) {
+// ── Folder modals — one per context, no shared type toggle ────────────────
+function AddSampleFolderModal({ onSave, onClose, existing, allFolders = [] }) {
   const [name,     setName]     = useState(existing?.name || "");
   const [color,    setColor]    = useState(existing?.color || COLOR_OPTIONS[0]);
-  const [forBooks, setForBooks] = useState(existing?.book_folder ?? defaultForBooks);
   const [parentId, setParentId] = useState(existing?.parent_id || "");
-
-  // Prevent nesting a folder into itself or its descendants
-  const getDescendantIds = (id, set = new Set()) => {
-    set.add(id);
-    allFolders.filter(f => f.parent_id === id).forEach(c => getDescendantIds(c.id, set));
-    return set;
-  };
+  const sampleFolders = allFolders.filter(f => !f.book_folder && !f.module_folder);
+  const getDescendantIds = (id, set = new Set()) => { set.add(id); sampleFolders.filter(f => f.parent_id === id).forEach(c => getDescendantIds(c.id, set)); return set; };
   const excludeIds = existing ? getDescendantIds(existing.id) : new Set();
-  const parentOptions = allFolders.filter(f => !!f.book_folder === forBooks && !excludeIds.has(f.id));
-
+  const parentOptions = sampleFolders.filter(f => !excludeIds.has(f.id));
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
-      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 360, display: "flex", flexDirection: "column", gap: 16 }}>
-        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 20 }}>{existing ? "Edit Folder" : "New Folder"}</h2>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 20 }}>{existing ? "Edit Folder" : "New Sample Folder"}</h2>
         <Input label="Name" value={name} onChange={setName} placeholder="e.g. BTO Series" />
-        {/* Samples / Analysis Books segmented toggle */}
-        <div style={{ display: "flex", background: T.bg2, borderRadius: 8, padding: 3, gap: 2 }}>
-          {[{ label: "Samples", value: false }, { label: "Analysis Books", value: true }].map(opt => (
-            <button key={String(opt.value)} onClick={() => { setForBooks(opt.value); setParentId(""); }}
-              style={{ flex: 1, padding: "6px 0", border: "none", borderRadius: 6, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 11, letterSpacing: 0.3, transition: "background .15s, color .15s",
-                background: forBooks === opt.value ? T.bg0 : "transparent",
-                color: forBooks === opt.value ? (opt.value ? T.blue : T.amber) : T.textDim,
-                fontWeight: forBooks === opt.value ? 600 : 400,
-                boxShadow: forBooks === opt.value ? "0 1px 3px rgba(0,0,0,.25)" : "none" }}>
-              {opt.label}
-            </button>
-          ))}
-        </div>
-        {/* Parent folder selector */}
         {parentOptions.length > 0 && (
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <Label>Parent Folder</Label>
             <select value={parentId} onChange={e => setParentId(e.target.value)}
               style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "7px 10px", outline: "none" }}>
-              <option value="">— None (root level) —</option>
+              <option value="">— None —</option>
               {parentOptions.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
             </select>
           </div>
@@ -5690,17 +5744,58 @@ function AddFolderModal({ onSave, onClose, existing, allFolders = [], defaultFor
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           <Label>Color</Label>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            {COLOR_OPTIONS.map(c => (
-              <div key={c} onClick={() => setColor(c)}
-                style={{ width: 24, height: 24, borderRadius: "50%", background: c, cursor: "pointer", border: color === c ? `3px solid ${T.textPrimary}` : `2px solid transparent`, transition: "border .1s", boxSizing: "border-box" }} />
-            ))}
+            {COLOR_OPTIONS.map(c => <div key={c} onClick={() => setColor(c)} style={{ width: 24, height: 24, borderRadius: "50%", background: c, cursor: "pointer", border: color === c ? `3px solid ${T.textPrimary}` : "2px solid transparent", boxSizing: "border-box" }} />)}
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn onClick={() => { if (name.trim()) onSave({ name: name.trim(), color, book_folder: forBooks, parent_id: parentId || null }); }} disabled={!name.trim()}>
-            {existing ? "Save" : "Create"}
-          </Btn>
+          <Btn onClick={() => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: false, parent_id: parentId || null })} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AddBookFolderModal({ onSave, onClose, existing, allFolders = [] }) {
+  const [name,  setName]  = useState(existing?.name || "");
+  const [color, setColor] = useState(existing?.color || COLOR_OPTIONS[0]);
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.blue, fontSize: 20 }}>{existing ? "Edit Folder" : "New Book Folder"}</h2>
+        <Input label="Name" value={name} onChange={setName} placeholder="e.g. Thickness Study" />
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <Label>Color</Label>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {COLOR_OPTIONS.map(c => <div key={c} onClick={() => setColor(c)} style={{ width: 24, height: 24, borderRadius: "50%", background: c, cursor: "pointer", border: color === c ? `3px solid ${T.textPrimary}` : "2px solid transparent", boxSizing: "border-box" }} />)}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn onClick={() => name.trim() && onSave({ name: name.trim(), color, book_folder: true, module_folder: false, parent_id: null })} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AddModuleFolderModal({ onSave, onClose, existing }) {
+  const [name,  setName]  = useState(existing?.name || "");
+  const [color, setColor] = useState(existing?.color || COLOR_OPTIONS[0]);
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.teal, fontSize: 20 }}>{existing ? "Edit Folder" : "New Module Folder"}</h2>
+        <Input label="Name" value={name} onChange={setName} placeholder="e.g. Electrical" />
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <Label>Color</Label>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {COLOR_OPTIONS.map(c => <div key={c} onClick={() => setColor(c)} style={{ width: 24, height: 24, borderRadius: "50%", background: c, cursor: "pointer", border: color === c ? `3px solid ${T.textPrimary}` : "2px solid transparent", boxSizing: "border-box" }} />)}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn onClick={() => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: true, parent_id: null })} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
         </div>
       </div>
     </div>
@@ -10240,9 +10335,12 @@ export default function App() {
   const [draggingSampleId, setDraggingSampleId] = useState(null);
   const [draggingBookId,   setDraggingBookId]   = useState(null);
   const [draggingFolderId, setDraggingFolderId] = useState(null);
-  const [addingFolder,        setAddingFolder]        = useState(false);
-  const [folderDefaultForBooks, setFolderDefaultForBooks] = useState(false);
-  const [editingFolder, setEditingFolder] = useState(null); // folder object
+  const [addingSampleFolder, setAddingSampleFolder] = useState(false);
+  const [addingBookFolder,   setAddingBookFolder]   = useState(false);
+  const [addingModuleFolder, setAddingModuleFolder] = useState(false);
+  const [editingFolder, setEditingFolder] = useState(null); // folder object being edited — type inferred from its flags
+  const [bookImportPreview, setBookImportPreview] = useState(null);
+  const [bookImporting,     setBookImporting]     = useState(false);
   const [addingBook,    setAddingBook]    = useState(false);
   const [editingBook,   setEditingBook]   = useState(null);
   const [loading,  setLoading]  = useState(true);
@@ -10500,12 +10598,18 @@ export default function App() {
 
   const createFolder = async (data) => {
     const id = String(Date.now());
-    const siblings = folders.filter(f => !!f.book_folder === !!data.book_folder && (f.parent_id ?? null) === (data.parent_id ?? null));
+    const siblings = folders.filter(f =>
+      !!f.book_folder === !!data.book_folder &&
+      !!f.module_folder === !!data.module_folder &&
+      (f.parent_id ?? null) === (data.parent_id ?? null)
+    );
     const sort_order = siblings.length;
     const folder = { id, sort_order, ...data };
     await api("POST", "/folders", folder);
     setFolders(p => [...p, folder]);
-    setAddingFolder(false);
+    setAddingSampleFolder(false);
+    setAddingBookFolder(false);
+    setAddingModuleFolder(false);
   };
 
   const saveFolder = async (data) => {
@@ -10515,7 +10619,10 @@ export default function App() {
     } else {
       await createFolder(data);
     }
-    setEditingFolder(null); setAddingFolder(false);
+    setEditingFolder(null);
+    setAddingSampleFolder(false);
+    setAddingBookFolder(false);
+    setAddingModuleFolder(false);
   };
 
   const deleteFolder = async (id) => {
@@ -10701,6 +10808,14 @@ export default function App() {
                 <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.blue }}>{activeBookObj.name}</span>
                 <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>Analysis Book</span>
                 <div style={{ flex: 1 }} />
+                <Btn variant="ghost" small onClick={async () => {
+                  const incFiles = window.confirm("Include sample data files in the export?\n\nOK = yes (larger file)\nCancel = metadata only");
+                  const resp = await fetch(`${API_BASE}/books/${activeBook}/export?include_files=${incFiles}`);
+                  const blob = await resp.blob();
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a"); a.href = url; a.download = `${activeBookObj.name}.labbook.zip`; a.click();
+                  URL.revokeObjectURL(url);
+                }}>Export Book</Btn>
                 <Btn variant="ghost" small onClick={() => setEditingBook(activeBookObj)}>Edit</Btn>
                 <Btn variant="danger" small onClick={() => { if (window.confirm(`Delete book "${activeBookObj.name}"?`)) { deleteBook(activeBookObj.id); } }}>Delete</Btn>
               </>
@@ -10780,6 +10895,7 @@ export default function App() {
               mod={activeModule}
               onBack={() => setActiveModule(null)}
               allModules={modules}
+              folders={folders}
               onSave={async () => { const mods = await api("GET", "/modules"); setModules(mods); }}
               onDuplicate={(source, defaultId) => setActiveModule({ ...activeModule, id: defaultId, mode: "create", source, builtin: false })}
             />
@@ -10797,7 +10913,7 @@ export default function App() {
                   </label>
                   {importError && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, marginRight: 6, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={importError}>{importError}</span>}
                   <Btn variant="ghost" small onClick={() => setExportOpen(true)}>Export</Btn>
-                  <Btn variant="ghost" small onClick={() => { setFolderDefaultForBooks(false); setAddingFolder(true); }}>+ Folder</Btn>
+                  <Btn variant="ghost" small onClick={() => setAddingSampleFolder(true)}>+ Folder</Btn>
                   <Btn variant="primary" small onClick={() => setAdding(true)}>+ New Sample</Btn>
                 </div>
 
@@ -10850,7 +10966,21 @@ export default function App() {
                   <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.textPrimary }}>Analysis Books</h2>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{books.length}</span>
                   <div style={{ flex: 1 }} />
-                  <Btn variant="ghost" small onClick={() => { setFolderDefaultForBooks(true); setAddingFolder(true); }}>+ Folder</Btn>
+                  <Btn variant="ghost" small onClick={() => setAddingBookFolder(true)}>+ Folder</Btn>
+                  <label style={{ cursor: "pointer" }}>
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", borderRadius: 6, border: `1px solid ${T.border}`, background: "transparent", color: T.textSecondary, cursor: "pointer", userSelect: "none" }}>Import Book</span>
+                    <input type="file" accept=".zip" style={{ display: "none" }} onChange={async e => {
+                      const f = e.target.files?.[0];
+                      if (!f) return;
+                      e.target.value = "";
+                      const form = new FormData();
+                      form.append("file", f);
+                      const res = await fetch(`${API_BASE}/books/import-preview`, { method: "POST", body: form });
+                      const data = await res.json();
+                      if (!res.ok) { alert(data.detail || "Could not read book file"); return; }
+                      setBookImportPreview({ ...data, _file: f });
+                    }} />
+                  </label>
                   <Btn variant="primary" small onClick={() => setAddingBook(true)}>+ New Book</Btn>
                 </div>
                 {(() => {
@@ -10930,10 +11060,13 @@ export default function App() {
                       setActiveModule({ ...modMeta, source: srcRes.source, builtin: srcRes.builtin, mode: srcRes.builtin ? "view" : "edit" });
                     }} />
                   </label>
+                  <Btn variant="ghost" small onClick={() => setAddingModuleFolder(true)}>+ Folder</Btn>
                   <Btn variant="primary" small onClick={() => openModule(null)}>+ New Module</Btn>
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
-                  {modules.map(m => (
+                {(() => {
+                  const modFolders = folders.filter(f => f.module_folder);
+                  const ungroupedMods = modules.filter(m => !m.folder_id || !modFolders.find(f => f.id === m.folder_id));
+                  const ModCard = ({ m }) => (
                     <div key={m.id}
                       onClick={() => openModule(m.id)}
                       style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "12px 14px", cursor: "pointer", transition: "border-color .12s", display: "flex", flexDirection: "column", gap: 6 }}
@@ -10944,44 +11077,50 @@ export default function App() {
                         <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: m.builtin ? T.amber : T.teal, background: (m.builtin ? T.amber : T.teal) + "18", border: `1px solid ${(m.builtin ? T.amber : T.teal)}33`, borderRadius: 3, padding: "1px 5px" }}>
                           {m.builtin ? "built-in" : "user"}
                         </span>
-                        {/* Copy button for built-in modules */}
                         {m.builtin && (
-                          <button
-                            onClick={async e => {
-                              e.stopPropagation();
-                              await openModule(m.id, { mode: "create", id: `copy_of_${m.id}`, builtin: false });
-                            }}
-                            style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.teal, background: "none", border: `1px solid ${T.teal}44`, borderRadius: 3, padding: "1px 6px", cursor: "pointer" }}>
-                            copy
-                          </button>
+                          <button onClick={async e => { e.stopPropagation(); await openModule(m.id, { mode: "create", id: `copy_of_${m.id}`, builtin: false }); }}
+                            style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.teal, background: "none", border: `1px solid ${T.teal}44`, borderRadius: 3, padding: "1px 6px", cursor: "pointer" }}>copy</button>
                         )}
-                        {/* Delete button for user modules */}
                         {!m.builtin && (
-                          <button
-                            onClick={async e => {
-                              e.stopPropagation();
-                              if (!window.confirm(`Delete module "${m.name}"? This cannot be undone.`)) return;
-                              await api("DELETE", `/modules/${m.id}`);
-                              const mods = await api("GET", "/modules");
-                              setModules(mods);
-                            }}
-                            style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.red, background: "none", border: "none", padding: "0 2px", cursor: "pointer", lineHeight: 1, opacity: 0.7 }}>
-                            ✕
-                          </button>
+                          <button onClick={async e => { e.stopPropagation(); if (!window.confirm(`Delete module "${m.name}"?`)) return; await api("DELETE", `/modules/${m.id}`); setModules(await api("GET", "/modules")); }}
+                            style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.red, background: "none", border: "none", padding: "0 2px", cursor: "pointer", lineHeight: 1, opacity: 0.7 }}>✕</button>
                         )}
                       </div>
-                      <p style={{ margin: 0, fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textSecondary, lineHeight: 1.5 }}>{m.description}</p>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
-                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>v{m.version}</span>
-                        <span style={{ color: T.border }}>·</span>
-                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{m.accepts?.join(", ")}</span>
+                      {m.description && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, lineHeight: 1.4 }}>{m.description}</div>}
+                      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>
+                        v{m.version || "1.0"}{m.accepts?.length ? " · " + m.accepts.map(a => `.${a}`).join(", ") : ""}
                       </div>
                     </div>
-                  ))}
-                  {modules.length === 0 && (
-                    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>No modules loaded.</div>
-                  )}
-                </div>
+                  );
+                  return (
+                    <>
+                      {modFolders.map(folder => {
+                        const folderMods = modules.filter(m => m.folder_id === folder.id);
+                        if (!folderMods.length) return null;
+                        return (
+                          <div key={folder.id} style={{ marginBottom: 16 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                              <div style={{ width: 8, height: 8, borderRadius: "50%", background: folder.color || T.textDim }} />
+                              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>{folder.name}</span>
+                              <button onClick={() => setEditingFolder(folder)} style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, background: "none", border: "none", color: T.textDim, cursor: "pointer" }}>edit</button>
+                            </div>
+                            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
+                              {folderMods.map(m => <ModCard key={m.id} m={m} />)}
+                            </div>
+                          </div>
+                        );
+                      })}
+                      {ungroupedMods.length > 0 && (
+                        <div>
+                          {modFolders.length > 0 && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>Ungrouped</div>}
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
+                            {ungroupedMods.map(m => <ModCard key={m.id} m={m} />)}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
             </>
           )}
@@ -11000,8 +11139,36 @@ export default function App() {
           setSamples(p => p.map(s => s.id === active ? updated : s));
         }} />}
       {settingsOpen && <SettingsModal settings={settings} onSave={handleSaveSettings} onClose={() => setSettingsOpen(false)} />}
-      {(addingFolder || editingFolder) && (
-        <AddFolderModal onSave={saveFolder} onClose={() => { setAddingFolder(false); setEditingFolder(null); }} existing={editingFolder} allFolders={folders} defaultForBooks={folderDefaultForBooks} />
+      {(addingSampleFolder || (editingFolder && !editingFolder.book_folder && !editingFolder.module_folder)) && (
+        <AddSampleFolderModal onSave={saveFolder} onClose={() => { setAddingSampleFolder(false); setEditingFolder(null); }} existing={editingFolder && !editingFolder.book_folder && !editingFolder.module_folder ? editingFolder : null} allFolders={folders} />
+      )}
+      {(addingBookFolder || (editingFolder?.book_folder)) && (
+        <AddBookFolderModal onSave={saveFolder} onClose={() => { setAddingBookFolder(false); setEditingFolder(null); }} existing={editingFolder?.book_folder ? editingFolder : null} allFolders={folders} />
+      )}
+      {(addingModuleFolder || (editingFolder?.module_folder)) && (
+        <AddModuleFolderModal onSave={saveFolder} onClose={() => { setAddingModuleFolder(false); setEditingFolder(null); }} existing={editingFolder?.module_folder ? editingFolder : null} />
+      )}
+      {bookImportPreview && (
+        <BookImportModal
+          preview={bookImportPreview}
+          onClose={() => setBookImportPreview(null)}
+          onConfirm={async (cfg) => {
+            setBookImporting(true);
+            setBookImportPreview(null);
+            const form = new FormData();
+            form.append("file", bookImportPreview._file);
+            form.append("config", JSON.stringify(cfg));
+            const res = await fetch(`${API_BASE}/books/import`, { method: "POST", body: form });
+            const data = await res.json();
+            setBookImporting(false);
+            if (!res.ok) { alert(data.detail || "Import failed"); return; }
+            const [freshSamples, freshBooks, freshFolders] = await Promise.all([
+              api("GET", "/samples"), api("GET", "/books"), api("GET", "/folders")
+            ]);
+            setSamples(freshSamples); setBooks(freshBooks); setFolders(freshFolders);
+            alert(`Book imported: ${data.created.length} new sample(s)${data.renamed.length ? `, ${data.renamed.length} renamed` : ""}${data.skipped.length ? `, ${data.skipped.length} skipped (already existed)` : ""}.`);
+          }}
+        />
       )}
       {(addingBook || editingBook) && (
         <AddBookModal onSave={saveBook} onClose={() => { setAddingBook(false); setEditingBook(null); }} existing={editingBook} samples={samples} folders={folders} bookFolders={folders.filter(f => f.book_folder)} />
