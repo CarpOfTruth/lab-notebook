@@ -10780,7 +10780,7 @@ export default function App() {
 
   const byId = (a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" });
   const sortedFolders = [...folders].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.name.localeCompare(b.name));
-  const getSiblings = (parentId, isBook) => sortedFolders.filter(f => !!f.book_folder === isBook && (f.parent_id ?? null) === parentId);
+  const getSiblings = (parentId, isBook) => sortedFolders.filter(f => !!f.book_folder === isBook && !f.module_folder && (f.parent_id ?? null) === parentId);
   const allSampleFolders = folders.filter(f => !f.book_folder);
   const ungrouped = samples.filter(s => !s.folder_id || !allSampleFolders.find(f => f.id === s.folder_id)).sort(byId);
   const [ungroupedDragOver,     setUngroupedDragOver]     = useState(false);
