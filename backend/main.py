@@ -211,6 +211,24 @@ def update_folder(folder_id: str, folder: dict):
         conn.commit()
     return {"ok": True}
 
+@app.patch("/api/modules/{module_id}/folder")
+async def update_module_folder(module_id: str, request: Request):
+    """Set (or clear) the folder_id for a module by updating its schema JSON."""
+    body = await request.json()
+    folder_id = body.get("folder_id")  # None to ungroup
+    schema_path = SCHEMAS_DIR / f"{module_id}.json"
+    if not schema_path.exists():
+        # Fall back to built-in schema path — create a user copy with just folder_id
+        cfg = _load_schema(module_id) or {}
+    else:
+        cfg = json.loads(schema_path.read_text())
+    if folder_id:
+        cfg["folder_id"] = folder_id
+    else:
+        cfg.pop("folder_id", None)
+    schema_path.write_text(json.dumps(cfg, indent=2))
+    return {"ok": True}
+
 @app.delete("/api/folders/{folder_id}")
 def delete_folder(folder_id: str):
     with get_db() as conn:

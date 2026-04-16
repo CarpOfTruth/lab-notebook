@@ -10216,6 +10216,73 @@ function BookFolderTile({ folder, books, childContent = null, depth = 0,
   );
 }
 
+function ModCard({ m, onOpen, onDelete, onDragStart }) {
+  return (
+    <div
+      draggable={!!onDragStart}
+      onDragStart={onDragStart ? e => { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/x-module", m.id); onDragStart(m.id); } : undefined}
+      onClick={() => onOpen?.(m.id)}
+      style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "12px 14px", cursor: "pointer", transition: "border-color .12s", display: "flex", flexDirection: "column", gap: 6 }}
+      onMouseEnter={e => e.currentTarget.style.borderColor = T.borderBright}
+      onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 15, color: T.textPrimary, flex: 1 }}>{m.name}</span>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: m.builtin ? T.amber : T.teal, background: (m.builtin ? T.amber : T.teal) + "18", border: `1px solid ${(m.builtin ? T.amber : T.teal)}33`, borderRadius: 3, padding: "1px 5px" }}>
+          {m.builtin ? "built-in" : "user"}
+        </span>
+        {m.builtin && (
+          <button onClick={e => { e.stopPropagation(); onOpen?.(m.id, { mode: "create", id: `copy_of_${m.id}`, builtin: false }); }}
+            style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.teal, background: "none", border: `1px solid ${T.teal}44`, borderRadius: 3, padding: "1px 6px", cursor: "pointer" }}>copy</button>
+        )}
+        {!m.builtin && (
+          <button onClick={e => { e.stopPropagation(); onDelete?.(m); }}
+            style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.red, background: "none", border: "none", padding: "0 2px", cursor: "pointer", lineHeight: 1, opacity: 0.7 }}>✕</button>
+        )}
+      </div>
+      {m.description && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, lineHeight: 1.4 }}>{m.description}</div>}
+      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>
+        v{m.version || "1.0"}{m.accepts?.length ? " · " + m.accepts.map(a => `.${a}`).join(", ") : ""}
+      </div>
+    </div>
+  );
+}
+
+function ModuleFolderTile({ folder, mods, onOpenModule, onDeleteModule, onEdit, onDelete, onDropModule, onDragStartModule }) {
+  const lsKey = `modfolder-open-${folder.id}`;
+  const [open, setOpen] = useState(() => { try { const v = localStorage.getItem(lsKey); return v === null ? true : v === "1"; } catch { return true; } });
+  const toggleOpen = () => setOpen(v => { const next = !v; try { localStorage.setItem(lsKey, next ? "1" : "0"); } catch {} return next; });
+  const [dragOver, setDragOver] = useState(false);
+  const color = folder.color || T.borderBright;
+  return (
+    <div style={{ marginBottom: 8 }}
+      onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setDragOver(true); }}
+      onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false); }}
+      onDrop={e => { e.preventDefault(); const mid = e.dataTransfer.getData("text/x-module"); if (mid) onDropModule?.(mid, folder.id); setDragOver(false); }}>
+      <div style={{ border: `2px solid ${dragOver ? T.amber : color}`, borderRadius: 10, overflow: "hidden", boxShadow: dragOver ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
+        <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: dragOver ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
+          onClick={toggleOpen}>
+          <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
+          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: T.textPrimary, flex: 1 }}>{folder.name}</span>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>{mods.length}</span>
+          <span style={{ color: T.textDim, fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+          <button onClick={e => { e.stopPropagation(); onEdit?.(); }} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: "0 3px" }}>✎</button>
+          <button onClick={e => { e.stopPropagation(); if (window.confirm(`Delete folder "${folder.name}"? Modules will become ungrouped.`)) onDelete?.(); }} style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, padding: "0 3px" }}>×</button>
+        </div>
+        {open && (
+          <div style={{ padding: 12, background: T.bg0 }}>
+            {mods.length > 0
+              ? <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
+                  {mods.map(m => <ModCard key={m.id} m={m} onOpen={onOpenModule} onDelete={onDeleteModule} onDragStart={onDragStartModule} />)}
+                </div>
+              : <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: dragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>{dragOver ? "Drop here" : "Empty folder"}</div>
+            }
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function AnalysisBookTile({ book, onDelete, onEdit, onDuplicate, onClick, onDragStart }) {
   const orderedIds = book.config?.sample_order?.length ? book.config.sample_order : (book.sample_ids || []);
   const n = orderedIds.length;
@@ -10346,6 +10413,7 @@ export default function App() {
   const [draggingSampleId, setDraggingSampleId] = useState(null);
   const [draggingBookId,   setDraggingBookId]   = useState(null);
   const [draggingFolderId, setDraggingFolderId] = useState(null);
+  const [draggingModuleId, setDraggingModuleId] = useState(null);
   const [addingSampleFolder, setAddingSampleFolder] = useState(false);
   const [addingBookFolder,   setAddingBookFolder]   = useState(false);
   const [addingModuleFolder, setAddingModuleFolder] = useState(false);
@@ -11068,54 +11136,42 @@ export default function App() {
                 {(() => {
                   const modFolders = folders.filter(f => f.module_folder);
                   const ungroupedMods = modules.filter(m => !m.folder_id || !modFolders.find(f => f.id === m.folder_id));
-                  const ModCard = ({ m }) => (
-                    <div key={m.id}
-                      onClick={() => openModule(m.id)}
-                      style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "12px 14px", cursor: "pointer", transition: "border-color .12s", display: "flex", flexDirection: "column", gap: 6 }}
-                      onMouseEnter={e => e.currentTarget.style.borderColor = T.borderBright}
-                      onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 15, color: T.textPrimary, flex: 1 }}>{m.name}</span>
-                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: m.builtin ? T.amber : T.teal, background: (m.builtin ? T.amber : T.teal) + "18", border: `1px solid ${(m.builtin ? T.amber : T.teal)}33`, borderRadius: 3, padding: "1px 5px" }}>
-                          {m.builtin ? "built-in" : "user"}
-                        </span>
-                        {m.builtin && (
-                          <button onClick={async e => { e.stopPropagation(); await openModule(m.id, { mode: "create", id: `copy_of_${m.id}`, builtin: false }); }}
-                            style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.teal, background: "none", border: `1px solid ${T.teal}44`, borderRadius: 3, padding: "1px 6px", cursor: "pointer" }}>copy</button>
-                        )}
-                        {!m.builtin && (
-                          <button onClick={async e => { e.stopPropagation(); if (!window.confirm(`Delete module "${m.name}"?`)) return; await api("DELETE", `/modules/${m.id}`); setModules(await api("GET", "/modules")); }}
-                            style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.red, background: "none", border: "none", padding: "0 2px", cursor: "pointer", lineHeight: 1, opacity: 0.7 }}>✕</button>
-                        )}
-                      </div>
-                      {m.description && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, lineHeight: 1.4 }}>{m.description}</div>}
-                      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>
-                        v{m.version || "1.0"}{m.accepts?.length ? " · " + m.accepts.map(a => `.${a}`).join(", ") : ""}
-                      </div>
-                    </div>
-                  );
+                  const handleDropModule = async (moduleId, folderId) => {
+                    await api("PATCH", `/modules/${moduleId}/folder`, { folder_id: folderId || null });
+                    setModules(await api("GET", "/modules"));
+                    setDraggingModuleId(null);
+                  };
+                  const handleDeleteModule = async m => {
+                    if (!window.confirm(`Delete module "${m.name}"?`)) return;
+                    await api("DELETE", `/modules/${m.id}`);
+                    setModules(await api("GET", "/modules"));
+                  };
+                  const [ungroupedDragOver, setUngroupedDragOver] = [false, () => {}]; // placeholder; use state in parent
                   return (
                     <>
-                      {modFolders.map(folder => {
-                        const folderMods = modules.filter(m => m.folder_id === folder.id);
-                        return (
-                          <div key={folder.id} style={{ marginBottom: 16 }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                              <div style={{ width: 8, height: 8, borderRadius: "50%", background: folder.color || T.textDim }} />
-                              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>{folder.name}</span>
-                              <button onClick={() => setEditingFolder(folder)} style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, background: "none", border: "none", color: T.textDim, cursor: "pointer" }}>edit</button>
-                            </div>
-                            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
-                              {folderMods.map(m => <ModCard key={m.id} m={m} />)}
-                            </div>
-                          </div>
-                        );
-                      })}
-                      {ungroupedMods.length > 0 && (
-                        <div>
+                      {modFolders.map(folder => (
+                        <ModuleFolderTile key={folder.id}
+                          folder={folder}
+                          mods={modules.filter(m => m.folder_id === folder.id)}
+                          onOpenModule={(id, overrides) => openModule(id, overrides)}
+                          onDeleteModule={handleDeleteModule}
+                          onEdit={() => setEditingFolder(folder)}
+                          onDelete={() => deleteFolder(folder.id)}
+                          onDropModule={handleDropModule}
+                          onDragStartModule={setDraggingModuleId} />
+                      ))}
+                      {(ungroupedMods.length > 0 || draggingModuleId) && (
+                        <div
+                          onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
+                          onDrop={e => { e.preventDefault(); const mid = e.dataTransfer.getData("text/x-module"); if (mid) handleDropModule(mid, null); }}>
                           {modFolders.length > 0 && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>Ungrouped</div>}
                           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
-                            {ungroupedMods.map(m => <ModCard key={m.id} m={m} />)}
+                            {ungroupedMods.map(m => (
+                              <ModCard key={m.id} m={m}
+                                onOpen={(id, overrides) => openModule(id, overrides)}
+                                onDelete={handleDeleteModule}
+                                onDragStart={modFolders.length > 0 ? setDraggingModuleId : null} />
+                            ))}
                           </div>
                         </div>
                       )}
