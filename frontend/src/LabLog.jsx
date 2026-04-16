@@ -11098,7 +11098,6 @@ export default function App() {
                     <>
                       {modFolders.map(folder => {
                         const folderMods = modules.filter(m => m.folder_id === folder.id);
-                        if (!folderMods.length) return null;
                         return (
                           <div key={folder.id} style={{ marginBottom: 16 }}>
                             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
