@@ -10907,13 +10907,13 @@ export default function App() {
                   <h1 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 26, color: T.textPrimary }}>Samples</h1>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{samples.length} total</span>
                   <div style={{ flex: 1 }} />
-                  <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", borderRadius: 6, border: `1px solid ${T.border}`, background: "transparent", color: importing ? T.textDim : T.textSecondary, cursor: importing ? "wait" : "pointer", userSelect: "none", marginRight: 4 }}>
+                  <Btn variant="ghost" small onClick={() => setAddingSampleFolder(true)}>+ Folder</Btn>
+                  <label style={{ border: "none", cursor: importing ? "wait" : "pointer", borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", transition: "all .15s", background: "transparent", color: importing ? T.textDim : T.textSecondary, outline: `1px solid ${T.border}`, userSelect: "none" }}>
                     {importing ? "Importing…" : "Import"}
                     <input type="file" accept=".zip" style={{ display: "none" }} onChange={handleImportSample} disabled={importing} />
                   </label>
-                  {importError && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, marginRight: 6, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={importError}>{importError}</span>}
+                  {importError && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={importError}>{importError}</span>}
                   <Btn variant="ghost" small onClick={() => setExportOpen(true)}>Export</Btn>
-                  <Btn variant="ghost" small onClick={() => setAddingSampleFolder(true)}>+ Folder</Btn>
                   <Btn variant="primary" small onClick={() => setAdding(true)}>+ New Sample</Btn>
                 </div>
 
@@ -10967,8 +10967,8 @@ export default function App() {
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{books.length}</span>
                   <div style={{ flex: 1 }} />
                   <Btn variant="ghost" small onClick={() => setAddingBookFolder(true)}>+ Folder</Btn>
-                  <label style={{ cursor: "pointer" }}>
-                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", borderRadius: 6, border: `1px solid ${T.border}`, background: "transparent", color: T.textSecondary, cursor: "pointer", userSelect: "none" }}>Import Book</span>
+                  <label style={{ border: "none", cursor: "pointer", borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", transition: "all .15s", background: "transparent", color: T.textSecondary, outline: `1px solid ${T.border}`, userSelect: "none" }}>
+                    Import
                     <input type="file" accept=".zip" style={{ display: "none" }} onChange={async e => {
                       const f = e.target.files?.[0];
                       if (!f) return;
@@ -11040,9 +11040,10 @@ export default function App() {
                   <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.textPrimary }}>Modules</h2>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{modules.length}</span>
                   <div style={{ flex: 1 }} />
+                  <Btn variant="ghost" small onClick={() => setAddingModuleFolder(true)}>+ Folder</Btn>
                   {/* Import module zip */}
-                  <label style={{ marginRight: 6, cursor: "pointer" }}>
-                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", borderRadius: 6, border: `1px solid ${T.border}`, background: "transparent", color: T.textSecondary, cursor: "pointer", userSelect: "none" }}>Import</span>
+                  <label style={{ border: "none", cursor: "pointer", borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", transition: "all .15s", background: "transparent", color: T.textSecondary, outline: `1px solid ${T.border}`, userSelect: "none" }}>
+                    Import
                     <input type="file" accept=".zip" style={{ display: "none" }} onChange={async e => {
                       const f = e.target.files?.[0];
                       if (!f) return;
@@ -11060,7 +11061,6 @@ export default function App() {
                       setActiveModule({ ...modMeta, source: srcRes.source, builtin: srcRes.builtin, mode: srcRes.builtin ? "view" : "edit" });
                     }} />
                   </label>
-                  <Btn variant="ghost" small onClick={() => setAddingModuleFolder(true)}>+ Folder</Btn>
                   <Btn variant="primary" small onClick={() => openModule(null)}>+ New Module</Btn>
                 </div>
                 {(() => {
