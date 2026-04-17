@@ -5006,34 +5006,69 @@ function ExportModal({ samples, onClose }) {
 }
 
 // ── ImportModal ───────────────────────────────────────────────────────────────
-// Unified import modal for samples, books, and modules.
+// Unified import modal. Opens immediately; file is picked inside.
 // Props:
 //   type        "sample" | "book" | "module"
-//   preview     data from the corresponding /import-preview endpoint
-//   onConfirm   (cfg) => void  — caller posts to actual import endpoint
+//   onConfirm   (cfg, file) => void
 //   onClose     () => void
 
-function ImportModal({ type, preview, onConfirm, onClose }) {
+function ImportModal({ type, onConfirm, onClose }) {
   const mono = { fontFamily: "'DM Mono', monospace" };
 
-  // ── Sample state ──────────────────────────────────────────────────────────
-  const [sampleAction,  setSampleAction]  = useState(preview?.sample?.exists ? "rename" : "overwrite");
-  const [sampleNewId,   setSampleNewId]   = useState(preview?.sample?.proposed_id ?? "");
+  // ── File + preview state ──────────────────────────────────────────────────
+  const [file,       setFile]       = useState(null);
+  const [preview,    setPreview]    = useState(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewErr, setPreviewErr] = useState(null);
+  const [dragOver,   setDragOver]   = useState(false);
+  const fileRef = useRef();
 
-  // ── Book state ────────────────────────────────────────────────────────────
-  const anyBookConflicts = type === "book" && preview?.samples?.some(s => s.exists);
-  const [createFolder, setCreateFolder] = useState(anyBookConflicts);
-  const [folderName,   setFolderName]   = useState(type === "book" ? `${preview?.book?.name ?? ""} (imported)` : "");
+  const previewUrls = {
+    sample: `${API_BASE}/samples/import-preview`,
+    book:   `${API_BASE}/books/import-preview`,
+    module: `${API_BASE}/modules/import-preview`,
+  };
 
-  // ── Module state ──────────────────────────────────────────────────────────
-  const [moduleAction, setModuleAction] = useState(preview?.exists ? "overwrite" : "overwrite");
-  const [moduleNewId,  setModuleNewId]  = useState(preview?.module_id ? `${preview.module_id}_copy` : "");
+  const loadPreview = async (f) => {
+    setFile(f);
+    setPreview(null);
+    setPreviewErr(null);
+    setPreviewing(true);
+    const form = new FormData();
+    form.append("file", f);
+    try {
+      const res  = await fetch(previewUrls[type], { method: "POST", body: form });
+      const data = await res.json();
+      if (!res.ok) { setPreviewErr(data.detail || "Could not read file"); setPreviewing(false); return; }
+      setPreview(data);
+      // Reset resolution state whenever a new file is loaded
+      if (data.sample?.exists)  { setSampleAction("rename"); setSampleNewId(data.sample.proposed_id ?? ""); }
+      else                       { setSampleAction("overwrite"); }
+      if (data.exists)           { setModuleAction("overwrite"); setModuleNewId(`${data.module_id}_copy`); }
+      if (type === "book") {
+        const anyConflicts = data.samples?.some(s => s.exists);
+        setCreateFolder(anyConflicts);
+        setFolderName(`${data.book?.name ?? ""} (imported)`);
+      }
+    } catch (e) { setPreviewErr(e.message); }
+    setPreviewing(false);
+  };
+
+  // ── Resolution state (reset by loadPreview) ───────────────────────────────
+  const [sampleAction, setSampleAction] = useState("overwrite");
+  const [sampleNewId,  setSampleNewId]  = useState("");
+  const [createFolder, setCreateFolder] = useState(false);
+  const [folderName,   setFolderName]   = useState("");
+  const [moduleAction, setModuleAction] = useState("overwrite");
+  const [moduleNewId,  setModuleNewId]  = useState("");
   const [srcExpanded,  setSrcExpanded]  = useState(false);
 
-  // ── Shared shell ──────────────────────────────────────────────────────────
-  const titles = { sample: "Import Sample", book: "Import Book", module: "Import Module" };
+  // ── Shared ────────────────────────────────────────────────────────────────
+  const titles      = { sample: "Import Sample", book: "Import Book", module: "Import Module" };
+  const accepts     = { sample: ".zip", book: ".zip", module: ".zip" };
   const accentColors = { sample: T.amber, book: T.blue, module: T.red };
   const accent = accentColors[type];
+  const inputStyle = { ...mono, fontSize: 12, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, padding: "5px 10px", color: T.textPrimary, outline: "none", width: "100%", boxSizing: "border-box" };
 
   const buildConfig = () => {
     if (type === "sample") return { action: sampleAction, new_id: sampleAction === "rename" ? sampleNewId : undefined };
@@ -5044,13 +5079,11 @@ function ImportModal({ type, preview, onConfirm, onClose }) {
     }
   };
 
-  const canConfirm = () => {
+  const canConfirm = preview && !previewing && (() => {
     if (type === "sample" && sampleAction === "rename") return sampleNewId.trim().length > 0;
     if (type === "module" && moduleAction === "rename") return moduleNewId.trim().length > 0;
     return true;
-  };
-
-  const inputStyle = { ...mono, fontSize: 12, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, padding: "5px 10px", color: T.textPrimary, outline: "none", width: "100%", boxSizing: "border-box" };
+  })();
 
   return (
     <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
@@ -5066,175 +5099,202 @@ function ImportModal({ type, preview, onConfirm, onClose }) {
         {/* Body */}
         <div style={{ padding: "18px 22px", display: "flex", flexDirection: "column", gap: 14, overflowY: "auto" }}>
 
-          {/* ── SAMPLE ─────────────────────────────────────────────────── */}
-          {type === "sample" && (() => {
-            const s = preview.sample;
-            return (
-              <>
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>{s.id}</span>
-                  <span style={{ ...mono, fontSize: 11, color: T.textDim }}>
-                    {s.technique}{s.date ? ` · ${s.date}` : ""}{s.substrate ? ` · ${s.substrate}` : ""}
-                    {s.has_files && " · includes data files"}
-                  </span>
-                </div>
-                {s.exists ? (
-                  <div style={{ background: T.bg2, border: `1px solid ${T.amber}33`, borderRadius: 7, padding: "10px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      <span style={{ color: T.amber }}>⚠</span>
-                      <span style={{ ...mono, fontSize: 11, color: T.amber }}>Sample ID already exists</span>
-                    </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                      {[["overwrite", "Overwrite — replace existing metadata, restore missing files"],
-                        ["rename",    "Import as new ID"],
-                        ["skip",      "Skip — do nothing"]].map(([val, label]) => (
-                        <label key={val} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-                          <input type="radio" name="sampleAction" value={val} checked={sampleAction === val} onChange={() => setSampleAction(val)} />
-                          <span style={{ ...mono, fontSize: 11, color: T.textSecondary }}>{label}</span>
-                        </label>
-                      ))}
-                    </div>
-                    {sampleAction === "rename" && (
-                      <input value={sampleNewId} onChange={e => setSampleNewId(e.target.value)}
-                        placeholder="New sample ID" style={inputStyle} />
-                    )}
-                  </div>
-                ) : (
-                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <span style={{ color: T.teal }}>✓</span>
-                    <span style={{ ...mono, fontSize: 11, color: T.textDim }}>No conflict — will be created</span>
-                  </div>
-                )}
-              </>
-            );
-          })()}
+          {/* File pick zone — always shown at top */}
+          <div>
+            <input ref={fileRef} type="file" accept={accepts[type]} style={{ display: "none" }}
+              onChange={e => { const f = e.target.files?.[0]; e.target.value = ""; if (f) loadPreview(f); }} />
+            {!file ? (
+              <div
+                onClick={() => fileRef.current?.click()}
+                onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={e => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files?.[0]; if (f) loadPreview(f); }}
+                style={{ border: `1px dashed ${dragOver ? accent : T.borderBright}`, borderRadius: 8, padding: "22px 18px", cursor: "pointer", textAlign: "center", display: "flex", flexDirection: "column", gap: 6, alignItems: "center", transition: "border-color .15s", background: dragOver ? accent + "0a" : "transparent" }}>
+                <span style={{ ...mono, fontSize: 22, color: T.textDim, lineHeight: 1 }}>↑</span>
+                <span style={{ ...mono, fontSize: 12, color: T.textSecondary }}>Drop a .zip here</span>
+                <span style={{ ...mono, fontSize: 10, color: T.textDim }}>or click to browse</span>
+              </div>
+            ) : (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, background: T.bg2, borderRadius: 7, padding: "8px 12px" }}>
+                <span style={{ ...mono, fontSize: 11, color: T.textSecondary, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{file.name}</span>
+                <button onClick={() => fileRef.current?.click()}
+                  style={{ ...mono, fontSize: 10, color: T.textDim, background: "none", border: "none", cursor: "pointer", flexShrink: 0, padding: "2px 6px" }}>change</button>
+              </div>
+            )}
+            {previewErr && <div style={{ ...mono, fontSize: 11, color: T.red, marginTop: 8 }}>{previewErr}</div>}
+            {previewing && <div style={{ ...mono, fontSize: 11, color: T.textDim, marginTop: 8 }}>Reading file…</div>}
+          </div>
 
-          {/* ── BOOK ───────────────────────────────────────────────────── */}
-          {type === "book" && (() => {
-            const b = preview;
-            return (
-              <>
-                <div style={{ ...mono, fontSize: 12, color: T.textSecondary }}>
-                  <span style={{ color: T.textPrimary, fontWeight: 600 }}>{b.book.name}</span>
-                  {" "}&mdash; {b.samples.length} sample{b.samples.length !== 1 ? "s" : ""}
-                  {b.modules.length > 0 && `, ${b.modules.length} module${b.modules.length !== 1 ? "s" : ""}`}
-                </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  <span style={{ ...mono, fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>Samples</span>
-                  {b.samples.map(s => (
-                    <div key={s.original_id} style={{ display: "flex", alignItems: "center", gap: 8, ...mono, fontSize: 11, padding: "4px 8px", borderRadius: 5, background: T.bg2 }}>
-                      {s.exists ? (
-                        <>
-                          <span style={{ color: T.amber }}>⚠</span>
-                          <span style={{ color: T.textDim, textDecoration: "line-through" }}>{s.original_id}</span>
-                          <span style={{ color: T.textDim }}>→</span>
-                          <span style={{ color: T.textPrimary }}>{s.proposed_id}</span>
-                          <span style={{ color: T.amber, fontSize: 9 }}>renamed</span>
-                        </>
-                      ) : (
-                        <>
-                          <span style={{ color: T.teal }}>✓</span>
-                          <span style={{ color: T.textPrimary }}>{s.original_id}</span>
-                          <span style={{ color: T.textDim, fontSize: 9 }}>new</span>
-                        </>
+          {/* Preview content — shown once file is loaded */}
+          {preview && <>
+
+            {/* ── SAMPLE ─────────────────────────────────────────────── */}
+            {type === "sample" && (() => {
+              const s = preview.sample;
+              return (
+                <>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>{s.id}</span>
+                    <span style={{ ...mono, fontSize: 11, color: T.textDim }}>
+                      {s.technique}{s.date ? ` · ${s.date}` : ""}{s.substrate ? ` · ${s.substrate}` : ""}
+                      {s.has_files && " · includes data files"}
+                    </span>
+                  </div>
+                  {s.exists ? (
+                    <div style={{ background: T.bg2, border: `1px solid ${T.amber}33`, borderRadius: 7, padding: "10px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ color: T.amber }}>⚠</span>
+                        <span style={{ ...mono, fontSize: 11, color: T.amber }}>Sample ID already exists</span>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        {[["overwrite", "Overwrite — replace existing metadata, restore missing files"],
+                          ["rename",    "Import as new ID"],
+                          ["skip",      "Skip — do nothing"]].map(([val, label]) => (
+                          <label key={val} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                            <input type="radio" name="sampleAction" value={val} checked={sampleAction === val} onChange={() => setSampleAction(val)} />
+                            <span style={{ ...mono, fontSize: 11, color: T.textSecondary }}>{label}</span>
+                          </label>
+                        ))}
+                      </div>
+                      {sampleAction === "rename" && (
+                        <input value={sampleNewId} onChange={e => setSampleNewId(e.target.value)}
+                          placeholder="New sample ID" style={inputStyle} />
                       )}
-                      {s.has_files && <span style={{ color: T.textDim, fontSize: 9, marginLeft: "auto" }}>+ files</span>}
                     </div>
-                  ))}
-                </div>
-                <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-                  <input type="checkbox" checked={createFolder} onChange={e => setCreateFolder(e.target.checked)} />
-                  <span style={{ ...mono, fontSize: 11, color: T.textSecondary }}>Create a sample folder for new imports</span>
-                </label>
-                {createFolder && (
-                  <input value={folderName} onChange={e => setFolderName(e.target.value)} style={inputStyle} />
-                )}
-              </>
-            );
-          })()}
-
-          {/* ── MODULE ─────────────────────────────────────────────────── */}
-          {type === "module" && (() => {
-            const m = preview;
-            return (
-              <>
-                {/* Metadata */}
-                <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                  <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>{m.name || m.module_id}</span>
-                  <span style={{ ...mono, fontSize: 11, color: T.textDim }}>
-                    {m.version ? `v${m.version}` : ""}
-                    {m.author  ? ` · ${m.author}` : ""}
-                    {m.accepts?.length ? ` · ${m.accepts.join(", ")}` : ""}
-                  </span>
-                  {m.description && <span style={{ ...mono, fontSize: 11, color: T.textSecondary, marginTop: 2 }}>{m.description}</span>}
-                  {m.dependencies?.length > 0 && (
-                    <div style={{ marginTop: 4, display: "flex", flexWrap: "wrap", gap: 4 }}>
-                      <span style={{ ...mono, fontSize: 9, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>deps:</span>
-                      {m.dependencies.map(d => (
-                        <span key={d} style={{ ...mono, fontSize: 10, padding: "1px 6px", borderRadius: 4, background: T.bg2, color: T.teal, border: `1px solid ${T.teal}33` }}>{d}</span>
-                      ))}
+                  ) : (
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ color: T.teal }}>✓</span>
+                      <span style={{ ...mono, fontSize: 11, color: T.textDim }}>No conflict — will be created</span>
                     </div>
                   )}
-                </div>
+                </>
+              );
+            })()}
 
-                {/* Source code preview — always shown, security-critical */}
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <span style={{ ...mono, fontSize: 10, color: T.red, textTransform: "uppercase", letterSpacing: 1 }}>Source code</span>
-                    <button onClick={() => setSrcExpanded(p => !p)}
-                      style={{ ...mono, fontSize: 10, color: T.textDim, background: "none", border: "none", cursor: "pointer", padding: "2px 6px" }}>
-                      {srcExpanded ? "collapse" : "expand"}
-                    </button>
+            {/* ── BOOK ─────────────────────────────────────────────────── */}
+            {type === "book" && (() => {
+              const b = preview;
+              return (
+                <>
+                  <div style={{ ...mono, fontSize: 12, color: T.textSecondary }}>
+                    <span style={{ color: T.textPrimary, fontWeight: 600 }}>{b.book.name}</span>
+                    {" "}&mdash; {b.samples.length} sample{b.samples.length !== 1 ? "s" : ""}
+                    {b.modules.length > 0 && `, ${b.modules.length} module${b.modules.length !== 1 ? "s" : ""}`}
                   </div>
-                  <div style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 10px", maxHeight: srcExpanded ? 400 : 120, overflow: "auto", transition: "max-height .2s" }}>
-                    {m.source_code ? (
-                      <pre style={{ ...mono, fontSize: 10, color: T.textSecondary, margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{m.source_code}</pre>
-                    ) : (
-                      <span style={{ ...mono, fontSize: 10, color: T.textDim }}>No source code in archive.</span>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    <span style={{ ...mono, fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>Samples</span>
+                    {b.samples.map(s => (
+                      <div key={s.original_id} style={{ display: "flex", alignItems: "center", gap: 8, ...mono, fontSize: 11, padding: "4px 8px", borderRadius: 5, background: T.bg2 }}>
+                        {s.exists ? (
+                          <>
+                            <span style={{ color: T.amber }}>⚠</span>
+                            <span style={{ color: T.textDim, textDecoration: "line-through" }}>{s.original_id}</span>
+                            <span style={{ color: T.textDim }}>→</span>
+                            <span style={{ color: T.textPrimary }}>{s.proposed_id}</span>
+                            <span style={{ color: T.amber, fontSize: 9 }}>renamed</span>
+                          </>
+                        ) : (
+                          <>
+                            <span style={{ color: T.teal }}>✓</span>
+                            <span style={{ color: T.textPrimary }}>{s.original_id}</span>
+                            <span style={{ color: T.textDim, fontSize: 9 }}>new</span>
+                          </>
+                        )}
+                        {s.has_files && <span style={{ color: T.textDim, fontSize: 9, marginLeft: "auto" }}>+ files</span>}
+                      </div>
+                    ))}
+                  </div>
+                  <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                    <input type="checkbox" checked={createFolder} onChange={e => setCreateFolder(e.target.checked)} />
+                    <span style={{ ...mono, fontSize: 11, color: T.textSecondary }}>Create a sample folder for new imports</span>
+                  </label>
+                  {createFolder && (
+                    <input value={folderName} onChange={e => setFolderName(e.target.value)} style={inputStyle} />
+                  )}
+                </>
+              );
+            })()}
+
+            {/* ── MODULE ───────────────────────────────────────────────── */}
+            {type === "module" && (() => {
+              const m = preview;
+              return (
+                <>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                    <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>{m.name || m.module_id}</span>
+                    <span style={{ ...mono, fontSize: 11, color: T.textDim }}>
+                      {m.version ? `v${m.version}` : ""}
+                      {m.author  ? ` · ${m.author}` : ""}
+                      {m.accepts?.length ? ` · ${m.accepts.join(", ")}` : ""}
+                    </span>
+                    {m.description && <span style={{ ...mono, fontSize: 11, color: T.textSecondary, marginTop: 2 }}>{m.description}</span>}
+                    {m.dependencies?.length > 0 && (
+                      <div style={{ marginTop: 4, display: "flex", flexWrap: "wrap", gap: 4 }}>
+                        <span style={{ ...mono, fontSize: 9, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>deps:</span>
+                        {m.dependencies.map(d => (
+                          <span key={d} style={{ ...mono, fontSize: 10, padding: "1px 6px", borderRadius: 4, background: T.bg2, color: T.teal, border: `1px solid ${T.teal}33` }}>{d}</span>
+                        ))}
+                      </div>
                     )}
                   </div>
-                  <span style={{ ...mono, fontSize: 9, color: T.textDim }}>
-                    ⚠ Module source executes as Python on your local server. Only import from sources you trust.
-                  </span>
-                </div>
-
-                {/* Conflict */}
-                {m.exists && (
-                  <div style={{ background: T.bg2, border: `1px solid ${T.amber}33`, borderRadius: 7, padding: "10px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      <span style={{ color: T.amber }}>⚠</span>
-                      <span style={{ ...mono, fontSize: 11, color: T.amber }}>
-                        Module ID already exists{m.builtin ? " (built-in)" : ""}
-                      </span>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                      <span style={{ ...mono, fontSize: 10, color: T.red, textTransform: "uppercase", letterSpacing: 1 }}>Source code</span>
+                      <button onClick={() => setSrcExpanded(p => !p)}
+                        style={{ ...mono, fontSize: 10, color: T.textDim, background: "none", border: "none", cursor: "pointer", padding: "2px 6px" }}>
+                        {srcExpanded ? "collapse" : "expand"}
+                      </button>
                     </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                      {[["overwrite", m.builtin ? "Overwrite built-in (not recommended)" : "Overwrite existing"],
-                        ["rename",    "Install as new ID"],
-                        ["skip",      "Skip — cancel import"]].map(([val, label]) => (
-                        <label key={val} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-                          <input type="radio" name="moduleAction" value={val} checked={moduleAction === val} onChange={() => setModuleAction(val)} />
-                          <span style={{ ...mono, fontSize: 11, color: val === "overwrite" && m.builtin ? T.amber : T.textSecondary }}>{label}</span>
-                        </label>
-                      ))}
+                    <div style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 10px", maxHeight: srcExpanded ? 400 : 120, overflow: "auto", transition: "max-height .2s" }}>
+                      {m.source_code ? (
+                        <pre style={{ ...mono, fontSize: 10, color: T.textSecondary, margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{m.source_code}</pre>
+                      ) : (
+                        <span style={{ ...mono, fontSize: 10, color: T.textDim }}>No source code in archive.</span>
+                      )}
                     </div>
-                    {moduleAction === "rename" && (
-                      <input value={moduleNewId} onChange={e => setModuleNewId(e.target.value)}
-                        placeholder="New module ID" style={inputStyle} />
-                    )}
+                    <span style={{ ...mono, fontSize: 9, color: T.textDim }}>
+                      ⚠ Module source executes as Python on your local server. Only import from sources you trust.
+                    </span>
                   </div>
-                )}
-              </>
-            );
-          })()}
+                  {m.exists && (
+                    <div style={{ background: T.bg2, border: `1px solid ${T.amber}33`, borderRadius: 7, padding: "10px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ color: T.amber }}>⚠</span>
+                        <span style={{ ...mono, fontSize: 11, color: T.amber }}>
+                          Module ID already exists{m.builtin ? " (built-in)" : ""}
+                        </span>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        {[["overwrite", m.builtin ? "Overwrite built-in (not recommended)" : "Overwrite existing"],
+                          ["rename",    "Install as new ID"],
+                          ["skip",      "Skip — cancel import"]].map(([val, label]) => (
+                          <label key={val} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                            <input type="radio" name="moduleAction" value={val} checked={moduleAction === val} onChange={() => setModuleAction(val)} />
+                            <span style={{ ...mono, fontSize: 11, color: val === "overwrite" && m.builtin ? T.amber : T.textSecondary }}>{label}</span>
+                          </label>
+                        ))}
+                      </div>
+                      {moduleAction === "rename" && (
+                        <input value={moduleNewId} onChange={e => setModuleNewId(e.target.value)}
+                          placeholder="New module ID" style={inputStyle} />
+                      )}
+                    </div>
+                  )}
+                </>
+              );
+            })()}
 
+          </>}
         </div>
 
         {/* Footer */}
         <div style={{ padding: "14px 22px", borderTop: `1px solid ${T.border}`, display: "flex", gap: 8, justifyContent: "flex-end", flexShrink: 0 }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn disabled={!canConfirm()} onClick={() => onConfirm(buildConfig())}>
-            {type === "sample" && sampleAction === "skip" ? "Skip" : "Import"}
-          </Btn>
+          {preview && (
+            <Btn disabled={!canConfirm} onClick={() => onConfirm(buildConfig(), file)}>
+              {type === "sample" && sampleAction === "skip" ? "Skip" : "Import"}
+            </Btn>
+          )}
         </div>
 
       </div>
@@ -10369,8 +10429,8 @@ export default function App() {
   const [addingBookFolder,   setAddingBookFolder]   = useState(false);
   const [addingModuleFolder, setAddingModuleFolder] = useState(false);
   const [editingFolder, setEditingFolder] = useState(null); // folder object being edited — type inferred from its flags
-  const [importPreview, setImportPreview] = useState(null);  // { type, preview, _file }
-  const [importing,     setImporting]     = useState(false); // true while posting to actual import endpoint
+  const [importModalType, setImportModalType] = useState(null); // "sample"|"book"|"module"|null
+  const [importing,       setImporting]       = useState(false);
   const [addingBook,    setAddingBook]    = useState(false);
   const [editingBook,   setEditingBook]   = useState(null);
   const [loading,  setLoading]  = useState(true);
@@ -10524,47 +10584,28 @@ export default function App() {
     a.click();
   };
 
-  // ── Unified import flow ──────────────────────────────────────────────────
-  // Preview: call /import-preview, store result → triggers ImportModal
-  // Confirm: called by ImportModal with resolved config → posts to /import
+  // ── Unified import confirm ────────────────────────────────────────────────
+  // Called by ImportModal with (cfg, file) after user resolves conflicts.
 
-  const handleImportFile = async (type, file) => {
-    const previewUrls = {
-      sample: `${API_BASE}/samples/import-preview`,
-      book:   `${API_BASE}/books/import-preview`,
-      module: `${API_BASE}/modules/import-preview`,
-    };
-    const form = new FormData();
-    form.append("file", file);
-    try {
-      const res  = await fetch(previewUrls[type], { method: "POST", body: form });
-      const data = await res.json();
-      if (!res.ok) { alert(data.detail || "Could not read file"); return; }
-      setImportPreview({ type, preview: data, _file: file });
-    } catch (e) { alert(`Preview failed: ${e.message}`); }
-  };
-
-  const handleImportConfirm = async (cfg) => {
-    const { type, _file } = importPreview;
+  const handleImportConfirm = async (cfg, file) => {
+    const type = importModalType;
+    setImportModalType(null);
     setImporting(true);
-    setImportPreview(null);
     try {
       const form = new FormData();
-      form.append("file", _file);
+      form.append("file", file);
+      form.append("config", JSON.stringify(cfg));
 
       if (type === "sample") {
-        form.append("config", JSON.stringify(cfg));
         const res  = await fetch(`${API_BASE}/samples/import`, { method: "POST", body: form });
         const data = await res.json();
         if (!res.ok) { alert(data.detail || "Import failed"); return; }
         if (!data.skipped) {
-          const updated = await api("GET", "/samples");
-          setSamples(updated);
+          setSamples(await api("GET", "/samples"));
           setActive(data.id);
         }
 
       } else if (type === "book") {
-        form.append("config", JSON.stringify(cfg));
         const res  = await fetch(`${API_BASE}/books/import`, { method: "POST", body: form });
         const data = await res.json();
         if (!res.ok) { alert(data.detail || "Import failed"); return; }
@@ -10574,7 +10615,6 @@ export default function App() {
         setFolders(await api("GET", "/folders"));
 
       } else if (type === "module") {
-        form.append("config", JSON.stringify(cfg));
         const res  = await fetch(`${API_BASE}/modules/import`, { method: "POST", body: form });
         const data = await res.json();
         if (!res.ok) { alert(data.detail || "Import failed"); return; }
@@ -10958,9 +10998,9 @@ export default function App() {
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{samples.length} total</span>
                   <div style={{ flex: 1 }} />
                   <Btn variant="ghost" small onClick={() => setAddingSampleFolder(true)}>+ Folder</Btn>
-                  <FileBtn accept=".zip" onChange={e => { const f = e.target.files?.[0]; if (f) handleImportFile("sample", f); }} disabled={importing}>
+                  <Btn variant="ghost" small onClick={() => setImportModalType("sample")} disabled={importing}>
                     {importing ? "Importing…" : "Import"}
-                  </FileBtn>
+                  </Btn>
                   {/* Export hidden for now — keep for future reintroduction */}
                   {false && <Btn variant="ghost" small onClick={() => setExportOpen(true)}>Export</Btn>}
                   <Btn variant="primary" small onClick={() => setAdding(true)}>+ New Sample</Btn>
@@ -11016,7 +11056,7 @@ export default function App() {
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{books.length}</span>
                   <div style={{ flex: 1 }} />
                   <Btn variant="ghost" small onClick={() => setAddingBookFolder(true)}>+ Folder</Btn>
-                  <FileBtn accept=".zip" onChange={e => { const f = e.target.files?.[0]; if (f) handleImportFile("book", f); }}>Import</FileBtn>
+                  <Btn variant="ghost" small onClick={() => setImportModalType("book")}>Import</Btn>
                   <Btn variant="primary" small onClick={() => setAddingBook(true)}>+ New Book</Btn>
                 </div>
                 {(() => {
@@ -11077,7 +11117,7 @@ export default function App() {
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{modules.length}</span>
                   <div style={{ flex: 1 }} />
                   <Btn variant="ghost" small onClick={() => setAddingModuleFolder(true)}>+ Folder</Btn>
-                  <FileBtn accept=".zip" onChange={e => { const f = e.target.files?.[0]; if (f) handleImportFile("module", f); }}>Import</FileBtn>
+                  <Btn variant="ghost" small onClick={() => setImportModalType("module")}>Import</Btn>
                   <Btn variant="primary" small onClick={() => openModule(null)}>+ New Module</Btn>
                 </div>
                 {(() => {
@@ -11152,11 +11192,10 @@ export default function App() {
       {(addingModuleFolder || (editingFolder?.module_folder)) && (
         <AddModuleFolderModal onSave={saveFolder} onClose={() => { setAddingModuleFolder(false); setEditingFolder(null); }} existing={editingFolder?.module_folder ? editingFolder : null} />
       )}
-      {importPreview && (
+      {importModalType && (
         <ImportModal
-          type={importPreview.type}
-          preview={importPreview.preview}
-          onClose={() => setImportPreview(null)}
+          type={importModalType}
+          onClose={() => setImportModalType(null)}
           onConfirm={handleImportConfirm}
         />
       )}
