@@ -403,15 +403,9 @@ def get_file(sample_id: str, filename: str):
     return FileResponse(path)
 
 
-@app.post("/api/samples/import")
-async def import_sample(file: UploadFile = File(...), merge: bool = False):
-    """
-    Accept a .zip produced by /export.
-
-    merge=false (default): fail with 409 if the sample ID already exists.
-    merge=true: overwrite all metadata fields (except folder_id) and restore
-                any data files that don't already exist on disk.
-    """
+@app.post("/api/samples/import-preview")
+async def import_sample_preview(file: UploadFile = File(...)):
+    """Read a .zip sample export and return a conflict preview without writing anything."""
     import zipfile, io as _io
 
     data = await file.read()
@@ -434,6 +428,81 @@ async def import_sample(file: UploadFile = File(...), merge: bool = False):
     if not sample_id:
         raise HTTPException(400, "sample.json has no 'id' field")
 
+    has_files = any("/files/" in n and not n.endswith("/") for n in names)
+
+    with get_db() as conn:
+        existing_ids = {r[0] for r in conn.execute("SELECT id FROM samples").fetchall()}
+
+    exists = sample_id in existing_ids
+
+    def _propose(sid):
+        candidate = f"{sid}_imp"
+        n = 2
+        while candidate in existing_ids:
+            candidate = f"{sid}_imp{n}"
+            n += 1
+        return candidate
+
+    return {
+        "sample": {
+            "id":        sample_id,
+            "name":      sample_data.get("id"),
+            "technique": sample_data.get("technique", "sputter"),
+            "date":      sample_data.get("date"),
+            "substrate": sample_data.get("substrate"),
+            "exists":    exists,
+            "proposed_id": _propose(sample_id) if exists else sample_id,
+            "has_files": has_files,
+        }
+    }
+
+
+@app.post("/api/samples/import")
+async def import_sample(file: UploadFile = File(...), merge: bool = False, config: str = "{}"):
+    """
+    Accept a .zip produced by /export.
+
+    config JSON: { action: "overwrite"|"rename"|"skip", new_id: str }
+      - action "overwrite" (default): overwrite metadata, restore missing files
+      - action "rename": import under new_id instead of original
+      - action "skip": no-op, return ok immediately
+    merge param is kept for backward compatibility (treated as action=overwrite).
+    """
+    import zipfile, io as _io
+
+    cfg = json.loads(config)
+    action = cfg.get("action", "overwrite" if merge else "overwrite")
+    new_id = cfg.get("new_id")  # used when action == "rename"
+
+    data = await file.read()
+    try:
+        zf = zipfile.ZipFile(_io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "Not a valid zip file")
+
+    names = zf.namelist()
+    json_names = [n for n in names if n.endswith("/sample.json")]
+    if not json_names:
+        raise HTTPException(400, "zip does not contain sample.json")
+
+    try:
+        sample_data = json.loads(zf.read(json_names[0]))
+    except Exception:
+        raise HTTPException(400, "Could not parse sample.json")
+
+    original_id = sample_data.get("id")
+    if not original_id:
+        raise HTTPException(400, "sample.json has no 'id' field")
+
+    # Resolve the actual import ID
+    if action == "rename" and new_id:
+        sample_id = new_id
+    else:
+        sample_id = original_id
+
+    if action == "skip":
+        return {"ok": True, "id": sample_id, "skipped": True}
+
     params = {
         "id":            sample_id,
         "date":          sample_data.get("date"),
@@ -452,10 +521,10 @@ async def import_sample(file: UploadFile = File(...), merge: bool = False):
 
     with get_db() as conn:
         exists = conn.execute("SELECT id FROM samples WHERE id=?", (sample_id,)).fetchone()
-        if exists and not merge:
+        if exists and action not in ("overwrite",) and not merge:
             raise HTTPException(409, f"Sample '{sample_id}' already exists")
         if exists:
-            # Merge: overwrite metadata, preserve folder_id
+            # Overwrite: update metadata, preserve folder_id
             conn.execute("""
                 UPDATE samples SET
                   date=:date, substrate=:substrate, notes=:notes,
@@ -476,7 +545,7 @@ async def import_sample(file: UploadFile = File(...), merge: bool = False):
             """, params)
         conn.commit()
 
-    # Restore data files — on merge, skip files that already exist on disk
+    # Restore data files — on overwrite, skip files that already exist on disk
     file_entries = [n for n in names if "/files/" in n and not n.endswith("/")]
     dest_dir = FILES_DIR / sample_id
     files_written = 0
@@ -485,7 +554,7 @@ async def import_sample(file: UploadFile = File(...), merge: bool = False):
         dest_dir.mkdir(exist_ok=True)
         for entry in file_entries:
             dest = dest_dir / Path(entry).name
-            if merge and dest.exists():
+            if (merge or action == "overwrite") and dest.exists():
                 files_skipped += 1
                 continue
             dest.write_bytes(zf.read(entry))
@@ -925,10 +994,66 @@ def export_module(module_id: str):
     )
 
 
-@app.post("/api/modules/import")
-async def import_module(file: UploadFile = File(...)):
-    """Import a .labmodule.zip archive — installs source, schema, and example file."""
+@app.post("/api/modules/import-preview")
+async def import_module_preview(file: UploadFile = File(...)):
+    """Read a .labmodule.zip and return metadata + source for user review, without installing anything."""
     import zipfile, io
+
+    data = await file.read()
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "Not a valid zip file")
+
+    names = zf.namelist()
+
+    if "manifest.json" not in names:
+        raise HTTPException(400, "Archive is missing manifest.json")
+    manifest = json.loads(zf.read("manifest.json"))
+    if manifest.get("format", "").split("/")[0] == "labbook":
+        raise HTTPException(400, "This is a book archive — use book Import instead")
+
+    module_id = manifest.get("module_id")
+    if not module_id:
+        raise HTTPException(400, "manifest.json has no module_id")
+
+    schema = {}
+    if "schema.json" in names:
+        schema = json.loads(zf.read("schema.json"))
+
+    source_code = None
+    if "source.py" in names:
+        source_code = zf.read("source.py").decode("utf-8")
+
+    # Check if module already exists (user module or built-in)
+    user_path    = BASE_DIR / "data" / "user_modules" / f"{module_id}.py"
+    builtin_path = BASE_DIR / "modules" / f"{module_id}.py"
+    exists = user_path.exists() or builtin_path.exists()
+
+    return {
+        "module_id":    module_id,
+        "name":         schema.get("name", module_id),
+        "version":      schema.get("version", ""),
+        "author":       schema.get("author", ""),
+        "description":  schema.get("description", ""),
+        "accepts":      schema.get("accepts", []),
+        "dependencies": schema.get("dependencies", []),
+        "exists":       exists,
+        "builtin":      builtin_path.exists(),
+        "source_code":  source_code,
+    }
+
+
+@app.post("/api/modules/import")
+async def import_module(file: UploadFile = File(...), config: str = "{}"):
+    """Import a .labmodule.zip archive — installs source, schema, and example file.
+    config JSON: { action: "overwrite"|"rename"|"skip", new_id: str }
+    """
+    import zipfile, io
+
+    cfg = json.loads(config)
+    action = cfg.get("action", "overwrite")
+    new_id = cfg.get("new_id")
 
     data = await file.read()
     try:
@@ -942,9 +1067,17 @@ async def import_module(file: UploadFile = File(...)):
     if "manifest.json" not in names:
         raise HTTPException(400, "Archive is missing manifest.json")
     manifest = json.loads(zf.read("manifest.json"))
-    module_id = manifest.get("module_id")
-    if not module_id:
+    original_id = manifest.get("module_id")
+    if not original_id:
         raise HTTPException(400, "manifest.json has no module_id")
+
+    if action == "rename" and new_id:
+        module_id = new_id
+    else:
+        module_id = original_id
+
+    if action == "skip":
+        return {"ok": True, "module_id": module_id, "skipped": True}
 
     installed = []
 
@@ -957,9 +1090,11 @@ async def import_module(file: UploadFile = File(...)):
         except ValueError as e:
             raise HTTPException(422, f"Invalid module source: {e}")
 
-    # Install schema / config
+    # Install schema / config (update module_id in schema if renamed)
     if "schema.json" in names:
         schema = json.loads(zf.read("schema.json"))
+        if action == "rename" and new_id:
+            schema["id"] = new_id
         schema_path = SCHEMAS_DIR / f"{module_id}.json"
         schema_path.write_text(json.dumps(schema, indent=2))
         installed.append("schema")

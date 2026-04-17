@@ -5005,61 +5005,238 @@ function ExportModal({ samples, onClose }) {
   );
 }
 
-function BookImportModal({ preview, onConfirm, onClose }) {
-  const anyConflicts = preview.samples.some(s => s.exists);
-  const [createFolder, setCreateFolder] = useState(anyConflicts);
-  const [folderName,   setFolderName]   = useState(`${preview.book.name} (imported)`);
-  const renames = Object.fromEntries(preview.samples.map(s => [s.original_id, s.proposed_id]));
+// ── ImportModal ───────────────────────────────────────────────────────────────
+// Unified import modal for samples, books, and modules.
+// Props:
+//   type        "sample" | "book" | "module"
+//   preview     data from the corresponding /import-preview endpoint
+//   onConfirm   (cfg) => void  — caller posts to actual import endpoint
+//   onClose     () => void
+
+function ImportModal({ type, preview, onConfirm, onClose }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+
+  // ── Sample state ──────────────────────────────────────────────────────────
+  const [sampleAction,  setSampleAction]  = useState(preview?.sample?.exists ? "rename" : "overwrite");
+  const [sampleNewId,   setSampleNewId]   = useState(preview?.sample?.proposed_id ?? "");
+
+  // ── Book state ────────────────────────────────────────────────────────────
+  const anyBookConflicts = type === "book" && preview?.samples?.some(s => s.exists);
+  const [createFolder, setCreateFolder] = useState(anyBookConflicts);
+  const [folderName,   setFolderName]   = useState(type === "book" ? `${preview?.book?.name ?? ""} (imported)` : "");
+
+  // ── Module state ──────────────────────────────────────────────────────────
+  const [moduleAction, setModuleAction] = useState(preview?.exists ? "overwrite" : "overwrite");
+  const [moduleNewId,  setModuleNewId]  = useState(preview?.module_id ? `${preview.module_id}_copy` : "");
+  const [srcExpanded,  setSrcExpanded]  = useState(false);
+
+  // ── Shared shell ──────────────────────────────────────────────────────────
+  const titles = { sample: "Import Sample", book: "Import Book", module: "Import Module" };
+  const accentColors = { sample: T.amber, book: T.blue, module: T.red };
+  const accent = accentColors[type];
+
+  const buildConfig = () => {
+    if (type === "sample") return { action: sampleAction, new_id: sampleAction === "rename" ? sampleNewId : undefined };
+    if (type === "module") return { action: moduleAction, new_id: moduleAction === "rename" ? moduleNewId : undefined };
+    if (type === "book") {
+      const renames = Object.fromEntries((preview?.samples ?? []).map(s => [s.original_id, s.proposed_id]));
+      return { sample_renames: renames, create_folder: createFolder, folder_name: folderName };
+    }
+  };
+
+  const canConfirm = () => {
+    if (type === "sample" && sampleAction === "rename") return sampleNewId.trim().length > 0;
+    if (type === "module" && moduleAction === "rename") return moduleNewId.trim().length > 0;
+    return true;
+  };
+
+  const inputStyle = { ...mono, fontSize: 12, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, padding: "5px 10px", color: T.textPrimary, outline: "none", width: "100%", boxSizing: "border-box" };
 
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
-      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 480, display: "flex", flexDirection: "column", gap: 16, maxHeight: "80vh", overflow: "auto" }}>
-        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.blue, fontSize: 20 }}>Import Book</h2>
-        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary }}>
-          <span style={{ color: T.textPrimary, fontWeight: 600 }}>{preview.book.name}</span>
-          {" "}&mdash; {preview.samples.length} sample{preview.samples.length !== 1 ? "s" : ""}
-          {preview.modules.length > 0 && `, ${preview.modules.length} module${preview.modules.length !== 1 ? "s" : ""}`}
+    <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, width: type === "module" ? 540 : 480, display: "flex", flexDirection: "column", maxHeight: "85vh", overflow: "hidden" }}>
+
+        {/* Header */}
+        <div style={{ padding: "16px 22px", borderBottom: `1px solid ${T.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+          <span style={{ ...mono, fontSize: 14, color: accent, fontWeight: 600 }}>{titles[type]}</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1 }}>✕</button>
         </div>
 
-        {/* Sample list */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>Samples</span>
-          {preview.samples.map(s => (
-            <div key={s.original_id} style={{ display: "flex", alignItems: "center", gap: 8, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 8px", borderRadius: 5, background: T.bg2 }}>
-              {s.exists ? (
-                <>
-                  <span style={{ color: T.amber }}>⚠</span>
-                  <span style={{ color: T.textDim, textDecoration: "line-through" }}>{s.original_id}</span>
-                  <span style={{ color: T.textDim }}>→</span>
-                  <span style={{ color: T.textPrimary }}>{s.proposed_id}</span>
-                  <span style={{ color: T.amber, fontSize: 9 }}>renamed (conflict)</span>
-                </>
-              ) : (
-                <>
-                  <span style={{ color: T.teal }}>✓</span>
-                  <span style={{ color: T.textPrimary }}>{s.original_id}</span>
-                  <span style={{ color: T.textDim, fontSize: 9 }}>new</span>
-                </>
-              )}
-              {s.has_files && <span style={{ color: T.textDim, fontSize: 9, marginLeft: "auto" }}>+ data files</span>}
-            </div>
-          ))}
+        {/* Body */}
+        <div style={{ padding: "18px 22px", display: "flex", flexDirection: "column", gap: 14, overflowY: "auto" }}>
+
+          {/* ── SAMPLE ─────────────────────────────────────────────────── */}
+          {type === "sample" && (() => {
+            const s = preview.sample;
+            return (
+              <>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>{s.id}</span>
+                  <span style={{ ...mono, fontSize: 11, color: T.textDim }}>
+                    {s.technique}{s.date ? ` · ${s.date}` : ""}{s.substrate ? ` · ${s.substrate}` : ""}
+                    {s.has_files && " · includes data files"}
+                  </span>
+                </div>
+                {s.exists ? (
+                  <div style={{ background: T.bg2, border: `1px solid ${T.amber}33`, borderRadius: 7, padding: "10px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ color: T.amber }}>⚠</span>
+                      <span style={{ ...mono, fontSize: 11, color: T.amber }}>Sample ID already exists</span>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {[["overwrite", "Overwrite — replace existing metadata, restore missing files"],
+                        ["rename",    "Import as new ID"],
+                        ["skip",      "Skip — do nothing"]].map(([val, label]) => (
+                        <label key={val} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                          <input type="radio" name="sampleAction" value={val} checked={sampleAction === val} onChange={() => setSampleAction(val)} />
+                          <span style={{ ...mono, fontSize: 11, color: T.textSecondary }}>{label}</span>
+                        </label>
+                      ))}
+                    </div>
+                    {sampleAction === "rename" && (
+                      <input value={sampleNewId} onChange={e => setSampleNewId(e.target.value)}
+                        placeholder="New sample ID" style={inputStyle} />
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ color: T.teal }}>✓</span>
+                    <span style={{ ...mono, fontSize: 11, color: T.textDim }}>No conflict — will be created</span>
+                  </div>
+                )}
+              </>
+            );
+          })()}
+
+          {/* ── BOOK ───────────────────────────────────────────────────── */}
+          {type === "book" && (() => {
+            const b = preview;
+            return (
+              <>
+                <div style={{ ...mono, fontSize: 12, color: T.textSecondary }}>
+                  <span style={{ color: T.textPrimary, fontWeight: 600 }}>{b.book.name}</span>
+                  {" "}&mdash; {b.samples.length} sample{b.samples.length !== 1 ? "s" : ""}
+                  {b.modules.length > 0 && `, ${b.modules.length} module${b.modules.length !== 1 ? "s" : ""}`}
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <span style={{ ...mono, fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>Samples</span>
+                  {b.samples.map(s => (
+                    <div key={s.original_id} style={{ display: "flex", alignItems: "center", gap: 8, ...mono, fontSize: 11, padding: "4px 8px", borderRadius: 5, background: T.bg2 }}>
+                      {s.exists ? (
+                        <>
+                          <span style={{ color: T.amber }}>⚠</span>
+                          <span style={{ color: T.textDim, textDecoration: "line-through" }}>{s.original_id}</span>
+                          <span style={{ color: T.textDim }}>→</span>
+                          <span style={{ color: T.textPrimary }}>{s.proposed_id}</span>
+                          <span style={{ color: T.amber, fontSize: 9 }}>renamed</span>
+                        </>
+                      ) : (
+                        <>
+                          <span style={{ color: T.teal }}>✓</span>
+                          <span style={{ color: T.textPrimary }}>{s.original_id}</span>
+                          <span style={{ color: T.textDim, fontSize: 9 }}>new</span>
+                        </>
+                      )}
+                      {s.has_files && <span style={{ color: T.textDim, fontSize: 9, marginLeft: "auto" }}>+ files</span>}
+                    </div>
+                  ))}
+                </div>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                  <input type="checkbox" checked={createFolder} onChange={e => setCreateFolder(e.target.checked)} />
+                  <span style={{ ...mono, fontSize: 11, color: T.textSecondary }}>Create a sample folder for new imports</span>
+                </label>
+                {createFolder && (
+                  <input value={folderName} onChange={e => setFolderName(e.target.value)} style={inputStyle} />
+                )}
+              </>
+            );
+          })()}
+
+          {/* ── MODULE ─────────────────────────────────────────────────── */}
+          {type === "module" && (() => {
+            const m = preview;
+            return (
+              <>
+                {/* Metadata */}
+                <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                  <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>{m.name || m.module_id}</span>
+                  <span style={{ ...mono, fontSize: 11, color: T.textDim }}>
+                    {m.version ? `v${m.version}` : ""}
+                    {m.author  ? ` · ${m.author}` : ""}
+                    {m.accepts?.length ? ` · ${m.accepts.join(", ")}` : ""}
+                  </span>
+                  {m.description && <span style={{ ...mono, fontSize: 11, color: T.textSecondary, marginTop: 2 }}>{m.description}</span>}
+                  {m.dependencies?.length > 0 && (
+                    <div style={{ marginTop: 4, display: "flex", flexWrap: "wrap", gap: 4 }}>
+                      <span style={{ ...mono, fontSize: 9, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>deps:</span>
+                      {m.dependencies.map(d => (
+                        <span key={d} style={{ ...mono, fontSize: 10, padding: "1px 6px", borderRadius: 4, background: T.bg2, color: T.teal, border: `1px solid ${T.teal}33` }}>{d}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Source code preview — always shown, security-critical */}
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <span style={{ ...mono, fontSize: 10, color: T.red, textTransform: "uppercase", letterSpacing: 1 }}>Source code</span>
+                    <button onClick={() => setSrcExpanded(p => !p)}
+                      style={{ ...mono, fontSize: 10, color: T.textDim, background: "none", border: "none", cursor: "pointer", padding: "2px 6px" }}>
+                      {srcExpanded ? "collapse" : "expand"}
+                    </button>
+                  </div>
+                  <div style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 10px", maxHeight: srcExpanded ? 400 : 120, overflow: "auto", transition: "max-height .2s" }}>
+                    {m.source_code ? (
+                      <pre style={{ ...mono, fontSize: 10, color: T.textSecondary, margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{m.source_code}</pre>
+                    ) : (
+                      <span style={{ ...mono, fontSize: 10, color: T.textDim }}>No source code in archive.</span>
+                    )}
+                  </div>
+                  <span style={{ ...mono, fontSize: 9, color: T.textDim }}>
+                    ⚠ Module source executes as Python on your local server. Only import from sources you trust.
+                  </span>
+                </div>
+
+                {/* Conflict */}
+                {m.exists && (
+                  <div style={{ background: T.bg2, border: `1px solid ${T.amber}33`, borderRadius: 7, padding: "10px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ color: T.amber }}>⚠</span>
+                      <span style={{ ...mono, fontSize: 11, color: T.amber }}>
+                        Module ID already exists{m.builtin ? " (built-in)" : ""}
+                      </span>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {[["overwrite", m.builtin ? "Overwrite built-in (not recommended)" : "Overwrite existing"],
+                        ["rename",    "Install as new ID"],
+                        ["skip",      "Skip — cancel import"]].map(([val, label]) => (
+                        <label key={val} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                          <input type="radio" name="moduleAction" value={val} checked={moduleAction === val} onChange={() => setModuleAction(val)} />
+                          <span style={{ ...mono, fontSize: 11, color: val === "overwrite" && m.builtin ? T.amber : T.textSecondary }}>{label}</span>
+                        </label>
+                      ))}
+                    </div>
+                    {moduleAction === "rename" && (
+                      <input value={moduleNewId} onChange={e => setModuleNewId(e.target.value)}
+                        placeholder="New module ID" style={inputStyle} />
+                    )}
+                  </div>
+                )}
+              </>
+            );
+          })()}
+
         </div>
 
-        {/* Folder option */}
-        <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-          <input type="checkbox" checked={createFolder} onChange={e => setCreateFolder(e.target.checked)} />
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textSecondary }}>Create a sample folder for new imports</span>
-        </label>
-        {createFolder && (
-          <input value={folderName} onChange={e => setFolderName(e.target.value)}
-            style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, padding: "6px 10px", color: T.textPrimary, outline: "none" }} />
-        )}
-
-        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+        {/* Footer */}
+        <div style={{ padding: "14px 22px", borderTop: `1px solid ${T.border}`, display: "flex", gap: 8, justifyContent: "flex-end", flexShrink: 0 }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn onClick={() => onConfirm({ sample_renames: renames, create_folder: createFolder, folder_name: folderName })}>Import</Btn>
+          <Btn disabled={!canConfirm()} onClick={() => onConfirm(buildConfig())}>
+            {type === "sample" && sampleAction === "skip" ? "Skip" : "Import"}
+          </Btn>
         </div>
+
       </div>
     </div>
   );
@@ -10192,8 +10369,8 @@ export default function App() {
   const [addingBookFolder,   setAddingBookFolder]   = useState(false);
   const [addingModuleFolder, setAddingModuleFolder] = useState(false);
   const [editingFolder, setEditingFolder] = useState(null); // folder object being edited — type inferred from its flags
-  const [bookImportPreview, setBookImportPreview] = useState(null);
-  const [bookImporting,     setBookImporting]     = useState(false);
+  const [importPreview, setImportPreview] = useState(null);  // { type, preview, _file }
+  const [importing,     setImporting]     = useState(false); // true while posting to actual import endpoint
   const [addingBook,    setAddingBook]    = useState(false);
   const [editingBook,   setEditingBook]   = useState(null);
   const [loading,  setLoading]  = useState(true);
@@ -10203,8 +10380,6 @@ export default function App() {
   const [exportOpen,    setExportOpen]    = useState(false);
   const [modules,       setModules]       = useState([]);
   const [activeModule,  setActiveModule]  = useState(null); // full module editor state: { id, name, builtin, source, mode, ... }
-  const [importError,   setImportError]   = useState(null);
-  const [importing,     setImporting]     = useState(false);
   const [viewDataOpen,  setViewDataOpen]  = useState(false);  // View Data modal
   const [viewDataFiles, setViewDataFiles] = useState([]);
   const [viewDataLoading, setViewDataLoading] = useState(false);
@@ -10349,48 +10524,70 @@ export default function App() {
     a.click();
   };
 
-  const handleImportSample = async (e) => {
-    const file = e.target.files?.[0];
-    e.target.value = "";          // reset so same file can be re-selected
-    if (!file) return;
-    setImporting(true);
-    setImportError(null);
-    try {
-      await doImport(file, false);
-    } catch (err) {
-      setImportError(err.message);
-    }
-    setImporting(false);
-  };
+  // ── Unified import flow ──────────────────────────────────────────────────
+  // Preview: call /import-preview, store result → triggers ImportModal
+  // Confirm: called by ImportModal with resolved config → posts to /import
 
-  const doImport = async (file, merge) => {
+  const handleImportFile = async (type, file) => {
+    const previewUrls = {
+      sample: `${API_BASE}/samples/import-preview`,
+      book:   `${API_BASE}/books/import-preview`,
+      module: `${API_BASE}/modules/import-preview`,
+    };
     const form = new FormData();
     form.append("file", file);
-    const url = `${API_BASE}/samples/import${merge ? "?merge=true" : ""}`;
-    const res = await fetch(url, { method: "POST", body: form });
-    const json = await res.json();
-    if (res.status === 409) {
-      const sampleId = json.detail?.match(/'([^']+)'/)?.[1] ?? "this sample";
-      const ok = window.confirm(
-        `'${sampleId}' already exists.\n\n` +
-        `Merge? Metadata will be overwritten. Existing data files will be kept; missing ones restored.`
-      );
-      if (!ok) return;
-      // re-read the file bytes since FormData body was already consumed
-      const mergeForm = new FormData();
-      mergeForm.append("file", file);
-      const mergeRes = await fetch(`${API_BASE}/samples/import?merge=true`, { method: "POST", body: mergeForm });
-      const mergeJson = await mergeRes.json();
-      if (!mergeRes.ok) throw new Error(mergeJson.detail || "Merge failed");
-      const updated = await api("GET", "/samples");
-      setSamples(updated);
-      setActive(mergeJson.id);
-      return;
-    }
-    if (!res.ok) throw new Error(json.detail || "Import failed");
-    const updated = await api("GET", "/samples");
-    setSamples(updated);
-    setActive(json.id);
+    try {
+      const res  = await fetch(previewUrls[type], { method: "POST", body: form });
+      const data = await res.json();
+      if (!res.ok) { alert(data.detail || "Could not read file"); return; }
+      setImportPreview({ type, preview: data, _file: file });
+    } catch (e) { alert(`Preview failed: ${e.message}`); }
+  };
+
+  const handleImportConfirm = async (cfg) => {
+    const { type, _file } = importPreview;
+    setImporting(true);
+    setImportPreview(null);
+    try {
+      const form = new FormData();
+      form.append("file", _file);
+
+      if (type === "sample") {
+        form.append("config", JSON.stringify(cfg));
+        const res  = await fetch(`${API_BASE}/samples/import`, { method: "POST", body: form });
+        const data = await res.json();
+        if (!res.ok) { alert(data.detail || "Import failed"); return; }
+        if (!data.skipped) {
+          const updated = await api("GET", "/samples");
+          setSamples(updated);
+          setActive(data.id);
+        }
+
+      } else if (type === "book") {
+        form.append("config", JSON.stringify(cfg));
+        const res  = await fetch(`${API_BASE}/books/import`, { method: "POST", body: form });
+        const data = await res.json();
+        if (!res.ok) { alert(data.detail || "Import failed"); return; }
+        const [updatedSamples, updatedBooks] = await Promise.all([api("GET", "/samples"), api("GET", "/analysis-books")]);
+        setSamples(updatedSamples);
+        setBooks(updatedBooks);
+        setFolders(await api("GET", "/folders"));
+
+      } else if (type === "module") {
+        form.append("config", JSON.stringify(cfg));
+        const res  = await fetch(`${API_BASE}/modules/import`, { method: "POST", body: form });
+        const data = await res.json();
+        if (!res.ok) { alert(data.detail || "Import failed"); return; }
+        if (!data.skipped) {
+          const mods = await api("GET", "/modules");
+          setModules(mods);
+          const modMeta = mods.find(m => m.id === data.module_id) || {};
+          const srcRes  = await api("GET", `/modules/${data.module_id}/source`);
+          setActiveModule({ ...modMeta, source: srcRes.source, builtin: srcRes.builtin, mode: srcRes.builtin ? "view" : "edit" });
+        }
+      }
+    } catch (e) { alert(`Import failed: ${e.message}`); }
+    setImporting(false);
   };
 
   const handleReparseFiles = async () => {
@@ -10761,10 +10958,9 @@ export default function App() {
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{samples.length} total</span>
                   <div style={{ flex: 1 }} />
                   <Btn variant="ghost" small onClick={() => setAddingSampleFolder(true)}>+ Folder</Btn>
-                  <FileBtn accept=".zip" onChange={handleImportSample} disabled={importing}>
+                  <FileBtn accept=".zip" onChange={e => { const f = e.target.files?.[0]; if (f) handleImportFile("sample", f); }} disabled={importing}>
                     {importing ? "Importing…" : "Import"}
                   </FileBtn>
-                  {importError && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={importError}>{importError}</span>}
                   {/* Export hidden for now — keep for future reintroduction */}
                   {false && <Btn variant="ghost" small onClick={() => setExportOpen(true)}>Export</Btn>}
                   <Btn variant="primary" small onClick={() => setAdding(true)}>+ New Sample</Btn>
@@ -10820,16 +11016,7 @@ export default function App() {
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{books.length}</span>
                   <div style={{ flex: 1 }} />
                   <Btn variant="ghost" small onClick={() => setAddingBookFolder(true)}>+ Folder</Btn>
-                  <FileBtn accept=".zip" onChange={async e => {
-                      const f = e.target.files?.[0];
-                      if (!f) return;
-                      const form = new FormData();
-                      form.append("file", f);
-                      const res = await fetch(`${API_BASE}/books/import-preview`, { method: "POST", body: form });
-                      const data = await res.json();
-                      if (!res.ok) { alert(data.detail || "Could not read book file"); return; }
-                      setBookImportPreview({ ...data, _file: f });
-                    }}>Import</FileBtn>
+                  <FileBtn accept=".zip" onChange={e => { const f = e.target.files?.[0]; if (f) handleImportFile("book", f); }}>Import</FileBtn>
                   <Btn variant="primary" small onClick={() => setAddingBook(true)}>+ New Book</Btn>
                 </div>
                 {(() => {
@@ -10890,21 +11077,7 @@ export default function App() {
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{modules.length}</span>
                   <div style={{ flex: 1 }} />
                   <Btn variant="ghost" small onClick={() => setAddingModuleFolder(true)}>+ Folder</Btn>
-                  {/* Import module zip */}
-                  <FileBtn accept=".zip" onChange={async e => {
-                      const f = e.target.files?.[0];
-                      if (!f) return;
-                      const form = new FormData();
-                      form.append("file", f);
-                      const res = await fetch(`${API_BASE}/modules/import`, { method: "POST", body: form });
-                      const data = await res.json();
-                      if (!res.ok) { alert(data.detail || "Import failed"); return; }
-                      const mods = await api("GET", "/modules");
-                      setModules(mods);
-                      const modMeta = mods.find(m => m.id === data.module_id) || {};
-                      const srcRes  = await api("GET", `/modules/${data.module_id}/source`);
-                      setActiveModule({ ...modMeta, source: srcRes.source, builtin: srcRes.builtin, mode: srcRes.builtin ? "view" : "edit" });
-                    }}>Import</FileBtn>
+                  <FileBtn accept=".zip" onChange={e => { const f = e.target.files?.[0]; if (f) handleImportFile("module", f); }}>Import</FileBtn>
                   <Btn variant="primary" small onClick={() => openModule(null)}>+ New Module</Btn>
                 </div>
                 {(() => {
@@ -10979,26 +11152,12 @@ export default function App() {
       {(addingModuleFolder || (editingFolder?.module_folder)) && (
         <AddModuleFolderModal onSave={saveFolder} onClose={() => { setAddingModuleFolder(false); setEditingFolder(null); }} existing={editingFolder?.module_folder ? editingFolder : null} />
       )}
-      {bookImportPreview && (
-        <BookImportModal
-          preview={bookImportPreview}
-          onClose={() => setBookImportPreview(null)}
-          onConfirm={async (cfg) => {
-            setBookImporting(true);
-            setBookImportPreview(null);
-            const form = new FormData();
-            form.append("file", bookImportPreview._file);
-            form.append("config", JSON.stringify(cfg));
-            const res = await fetch(`${API_BASE}/books/import`, { method: "POST", body: form });
-            const data = await res.json();
-            setBookImporting(false);
-            if (!res.ok) { alert(data.detail || "Import failed"); return; }
-            const [freshSamples, freshBooks, freshFolders] = await Promise.all([
-              api("GET", "/samples"), api("GET", "/books"), api("GET", "/folders")
-            ]);
-            setSamples(freshSamples); setBooks(freshBooks); setFolders(freshFolders);
-            alert(`Book imported: ${data.created.length} new sample(s)${data.renamed.length ? `, ${data.renamed.length} renamed` : ""}${data.skipped.length ? `, ${data.skipped.length} skipped (already existed)` : ""}.`);
-          }}
+      {importPreview && (
+        <ImportModal
+          type={importPreview.type}
+          preview={importPreview.preview}
+          onClose={() => setImportPreview(null)}
+          onConfirm={handleImportConfirm}
         />
       )}
       {(addingBook || editingBook) && (
