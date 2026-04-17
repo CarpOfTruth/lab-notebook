@@ -10,10 +10,10 @@ All work happens on **dev**. Nothing merges to main without explicit approval.
 
 ### Tier 1 — True Foundation
 No dependencies. Everything downstream builds on these.
-1. Universal import framework
-2. Growth parameters in settings
-3. Materials library — must be scoped correctly from the start (lab-specific properties + crystallographic/physical data). Modules will be written against it; retrofitting the scope later is costly.
-4. Search and filter (depends on #2)
+1. ✅ Universal import framework
+2. ✅ Growth parameters in settings
+3. Library infrastructure (Techniques + Materials) — the right framing is not "a crystal database" but a general pattern for named, queryable data collections that modules and system utilities hook into. Techniques and Materials are the first two instances. Retrofitting this later is painful; modules will be written against it.
+4. ✅ Search and filter (depends on #2)
 
 ### Tier 2 — Module Infrastructure
 Unlocks large classes of features. Should be in place before the module system grows significantly.
@@ -80,59 +80,96 @@ All Import buttons in the app call the same component pointed at their endpoint.
 
 ---
 
-### 2. Growth Parameters in Settings
+### 2. ✅ Growth Parameters in Settings
 
-User-defined field schema per deposition technique (PLD, Sputter, etc.) stored in settings.
+Custom per-technique params defined in Settings: `{ id, name, unit, default }`. IDs are stable slugs generated at creation and never change on rename. Values stored in `layer.custom[param.id]`. Custom params appear in the layer editor (view and edit modes), material library autofill defaults, and the meta analysis axis picker. Will be superseded by the Technique Library (item 3) but designed for forward compatibility — custom params merge naturally into the per-technique param list.
 
-**Field definition:**
+---
+
+### 3. Library Infrastructure (Techniques + Materials)
+
+**Core framing:** a library is a named collection of entries with a user-defined schema. Libraries are importable/exportable, shareable across labs, and uniformly queryable from `proc_code` via the system resource API. Techniques and Materials are the first two instances. Future libraries (substrates, targets, equipment) follow the same shape.
+
+**General library pattern:**
+- Human-readable IDs (e.g. `"BTO_tetragonal"`) — not UUIDs, so partial imports across labs don't break cross-references
+- User-managed field schema within each library's own UI
+- Import/export via universal import framework; conflict resolution: skip/overwrite/rename/merge
+- System resource API: `get_material(id)`, `get_technique(id)`, etc. injected into `proc_code`
+
+#### Technique Library
+
+A technique is a named entity with a fully user-defined param set. Ships with Sputter and PLD pre-populated; all fields are editable (no locked fields). Users can add new techniques (MBE, ALD, CVD, etc.) with whatever params apply.
+
+This replaces the current Settings structure. The distinction between "standard params" and "custom params" disappears — every param for a technique is just a param. Settings retains general defaults (substrate, lot, cap area) and global fallback values per technique, but loses the Material Library rows and Structure Library entirely.
+
+**Per-layer technique:** technique moves from a sample-level flag to a per-layer field, defaulting to the sample's declared technique. The sample-level selector becomes "primary technique" used for display and filtering.
+
+**Technique entry:**
 ```json
-{ "name": "...", "type": "number|text|select", "unit": "...", "default": ..., "required": true, "filterable": true }
+{
+  "id": "sputter",
+  "name": "Sputter",
+  "params": [
+    { "id": "temp",     "name": "Temperature", "unit": "°C" },
+    { "id": "pressure", "name": "Pressure",    "unit": "mTorr" },
+    { "id": "power_w",  "name": "Power",        "unit": "W" }
+  ]
+}
 ```
 
-**Storage:** `settings.json` under `growth_params.PLD`, `growth_params.Sputter`, etc.
+#### Materials Library
 
-**Sample integration:**
-- Fields appear in the Growth section during sample creation and editing
-- Values stored in existing sample metadata JSON
-- Fields auto-appear in meta plot axes
+Standalone — not in Settings. A material is a single-phase substance. Orientation is not baked into the entry (that lives on layers and substrates). Each distinct composition is its own entry.
 
-Adding a field: existing samples show it as empty. Removing a field: data persists silently, field just stops appearing.
+**Material entry:**
+```json
+{
+  "id": "BTO_tetragonal",
+  "name": "BaTiO₃ (tetragonal)",
+  "formula": "BaTiO3",
+  "composition": { "Ba": 1.0, "Ti": 1.0, "O": 3.0 },
+  "parent": "BTO",
+  "crystal": { "space_group": "P4mm", "a": 3.994, "b": 3.994, "c": 4.038, "alpha": 90, "beta": 90, "gamma": 90 },
+  "properties": { "density_g_cm3": 6.02 },
+  "growth_defaults": {
+    "sputter": { "temp": 600, "pressure": 3 },
+    "pld":     { "temp": 670, "energy_mj": 100 }
+  }
+}
+```
 
-Mark filterable fields at definition time — this avoids retrofitting queryability onto fields that were not originally indexed.
+**Entry sections:**
+- **Identity** — id, name, formula string, notes
+- **Composition** — structured element fields with "add element" (`{ Ba: 1.0, Ti: 1.0, O: 3.0 }`). Distinct compositions are separate entries.
+- **Family/parent tag** — optional `parent` for grouping (e.g. all BZTO entries share `parent: "BZTO"`)
+- **Crystallographic** — a, b, c, α, β, γ, space group. User-maintained; blank is fine. Same detail level as the current structure library.
+- **Properties** — user-extensible fields managed within the Materials Library. Add `density_g_cm3` when building an XRR module, etc.
+- **Growth defaults** — per technique, keyed by technique ID. Autofills the layer editor when a material is selected.
+
+**ID convention:** human-readable strings, not UUIDs.
+
+#### System Resource API
+
+Injected into `proc_code` and `analysis_code` at run time:
+
+```python
+get_material(id)     # → full material entry dict, or None
+list_materials()     # → list of all material IDs
+get_technique(id)    # → technique entry dict, or None
+list_techniques()    # → list of all technique IDs
+```
+
+Explicit and sandboxed. This standardises what XRD currently does with layer structure data.
 
 ---
 
-### 3. Search and Filter
+### 4. ✅ Search and Filter
 
-**Filter index table (EAV):**
-```sql
-sample_filter_index (sample_id, field, value_text, value_num)
-```
+EAV filter index `sample_filter_index(sample_id, field, value_text, value_num)`. Written on every sample save; `POST /api/samples/reindex-filter` rebuilds from scratch. `POST /api/samples/filter` accepts conditions with ops: between, gt, gte, lt, lte, eq, contains. AND logic via INTERSECT subqueries.
 
-One row per sample per growth parameter. Written on every sample save; rebuildable from scratch on demand. This table is never the source of truth — it exists only for query performance. Multi-condition queries use INTERSECT subqueries. Future extension: index module output values (e.g. filter by computed `area_m2`).
+`SampleFilter` chip-based UI on the home page. Text fields show value pickers populated from loaded samples — material matches across all layers. Numeric fields show range/comparison op toggle. Active filter shows "N of M" count; folder tiles and ungrouped grid both respect the filtered set.
 
-**Shared `SampleFilter` component** used on the home page (narrow the sample list) and in the book sample picker (narrow available samples). Filter state: `{ field → { type, condition, value } }`. Supports numeric range, categorical match, and text search. Backend receives filter spec, builds SQL, returns matching sample IDs.
-
-Fine at research-lab scale: 10k samples × 20 params = 200k rows, trivial for SQLite.
-
----
-
-### 4. Materials and Growth Conditions Library
-
-**Materials entry:** `{ id (human-readable string), name, lattice_params, properties, notes, ... }`
-
-A materials entry must accommodate two distinct categories of properties, and the design must keep them clearly separated:
-
-- **Lab-specific properties** — growth conditions, deposition parameters, in-house characterization results, notes. These are lab-generated and vary between groups.
-- **Crystallographic and physical properties** — lattice parameters, space group, scattering factors, density, and other literature reference values. These are material constants, not lab-specific. They are needed by physics-based fit modules (XRD, XRR, dielectric) that cannot rely solely on what is passed in `meta`.
-
-Both categories live on the same entry, but the UI and import tooling should distinguish them so users can populate reference values from literature without conflating them with lab-specific data.
-
-**Growth condition entry:** `{ id, name, technique, params }` — params match the growth_params schema for that technique. Growth conditions are named presets of the growth parameter fields, which makes them a natural extension of feature 2.
-
-**Import/export:** uses the universal import framework. Individual entries or bulk. Conflict resolution: skip/overwrite/rename/merge (additive, non-destructive).
-
-**ID convention:** human-readable strings (e.g. `"BTO_cubic"`), not UUIDs. This avoids breakage when libraries are partially imported between labs.
+Future extension: index module output values (e.g. filter by computed Ec or extracted lattice parameter).
 
 ---
 
