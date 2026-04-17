@@ -37,20 +37,22 @@ These require a design walkthrough before implementation. The concepts are clear
 7. Collection file mode
 8. Invisible modules + auto-fire + tunable panel
 9. Run chain button + stale flag system
+10. Module configuration schema
 
 ### Tier 4 — Derived modules
 The most architecturally complex tier. Introduces a DAG execution model and inter-module data contracts.
 
-10. Derived/hybrid module types + Identity block UI
-11. Multi-source DAG execution + cache layer
-12. Inter-module namespace + analysis_code for derived modules
+11. Derived/hybrid module types + Identity block UI
+12. Multi-source DAG execution + cache layer
+13. Inter-module namespace + analysis_code for derived modules
 
 ### Tier 5 — Deferred
 Design these against concrete use cases when real modules drive the requirements. Building them speculatively risks getting the design wrong.
 
-13. Primary flag richness and multi-condition collection analysis
-14. Multi-point meta returns per sample from analysis_code
-15. Derivative module plot/analysis boundary
+14. Primary flag richness and multi-condition collection analysis
+15. Multi-point meta returns per sample from analysis_code
+16. Derivative module plot/analysis boundary
+17. Fit-type module interface
 
 ---
 
@@ -126,6 +128,13 @@ Fine at research-lab scale: 10k samples × 20 params = 200k rows, trivial for SQ
 ### 4. Materials and Growth Conditions Library
 
 **Materials entry:** `{ id (human-readable string), name, lattice_params, properties, notes, ... }`
+
+A materials entry must accommodate two distinct categories of properties, and the design must keep them clearly separated:
+
+- **Lab-specific properties** — growth conditions, deposition parameters, in-house characterization results, notes. These are lab-generated and vary between groups.
+- **Crystallographic and physical properties** — lattice parameters, space group, scattering factors, density, and other literature reference values. These are material constants, not lab-specific. They are needed by physics-based fit modules (XRD, XRR, dielectric) that cannot rely solely on what is passed in `meta`.
+
+Both categories live on the same entry, but the UI and import tooling should distinguish them so users can populate reference values from literature without conflating them with lab-specific data.
 
 **Growth condition entry:** `{ id, name, technique, params }` — params match the growth_params schema for that technique. Growth conditions are named presets of the growth parameter fields, which makes them a natural extension of feature 2.
 
@@ -235,7 +244,33 @@ Scope: per-sample, per-terminal-module. Does not touch other samples.
 
 ---
 
-### 10. Derived/Hybrid Module Types
+### 10. Module Configuration Schema
+
+A structured per-sample configuration system for modules that need richer input than card controls can express.
+
+**What it is:** modules declare a configuration schema in their definition. The system persists a configuration object per sample per module and renders appropriate UI for editing it. This is distinct from card controls (which are transient display parameters) — configuration is persistent, structured, and potentially complex.
+
+**Why:** fit-type modules in particular require configuration that card controls cannot express: layer stacks, model selection, fit bounds, initial guesses, and topology choices. Attempting to squeeze this into card controls produces bad UX. The module configuration schema is the general solution.
+
+**Schema declaration:** the module schema includes a `config_schema` block defining the fields, their types, structure, and defaults. The system generates UI from this declaration. Possible field types include scalar (number, text, select), structured (layer stack rows, parameter tables), and nested objects.
+
+**Persistence:** configuration is stored per `(sample_id, module_id)`. When a module runs, its configuration is passed to `proc_code` alongside the data and card control values. The module author accesses it as a structured object, not a flat dict.
+
+**Configuration presets:** named saved configurations per module (e.g. `"standard BTO stack"`, `"STO substrate baseline"`). A preset can be applied to a sample to populate its configuration from the named template. Presets are stored at the module level, not the sample level. Users build a library of named presets for common configurations and recall them per sample without re-entering values.
+
+**System resource access:** `proc_code` needs a well-defined API for querying system-level resources — specifically the materials library (including crystallographic data) and potentially other system stores. This is not the same as what is passed in `meta`. A `resources` object (or equivalent) is injected alongside the data, providing access to materials entries by ID, so fit modules can look up scattering factors, lattice parameters, etc. without the user having to manually copy values into meta fields.
+
+**Examples of modules that would use this:**
+- XRD fitting: layer stack editor (material, thickness, roughness per layer), model selection (kinematic vs. dynamical diffraction)
+- XRR fitting: same layer stack structure, additional density and SLD columns
+- Dielectric equivalent circuit fitting: circuit topology editor, component bounds and initial values
+- Peak assignment tables: peak positions, assignments, fit windows
+
+This feature is a prerequisite for any fit-type module conversion.
+
+---
+
+### 11. Derived/Hybrid Module Types
 
 **Module type flag** (set in Identity block of editor):
 - **Source** — consumes raw uploaded files → produces output dict
@@ -248,7 +283,7 @@ Scope: per-sample, per-terminal-module. Does not touch other samples.
 
 **Block 1 generation** driven by type:
 - Source: file column imports (as now)
-- Derived: namespaced upstream dicts (see feature 12)
+- Derived: namespaced upstream dicts (see feature 13)
 - Hybrid: both
 
 **No circular dependencies** — enforced at schema save time by checking for cycles in the declared source graph.
@@ -257,7 +292,7 @@ Scope: per-sample, per-terminal-module. Does not touch other samples.
 
 ---
 
-### 11. Multi-source DAG Execution + Cache Layer
+### 12. Multi-source DAG Execution + Cache Layer
 
 **Source declaration:** `source_modules: ["module_id_a", "module_id_b"]` array in schema.
 
@@ -273,7 +308,7 @@ Scope: per-sample, per-terminal-module. Does not touch other samples.
 
 ---
 
-### 12. Inter-module Namespace + analysis_code for Derived Modules
+### 13. Inter-module Namespace + analysis_code for Derived Modules
 
 **Inter-module contract:** derived module `proc_code` receives both `proc_code` and `analysis_code` return dicts from each upstream module, for that sample.
 
@@ -305,21 +340,31 @@ This handles all collision cases: same name in proc vs analysis of one module (d
 
 These items are understood well enough to describe but not well enough to implement correctly without a concrete module driving the design.
 
-**13. Primary flag richness and multi-condition collection analysis**
+**14. Primary flag richness and multi-condition collection analysis**
 
 Two distinct cases: (a) one file designated as primary for card display and simple meta analysis — straightforward; (b) aggregate analysis across a collection (e.g. Ec vs. frequency where each file contributes one point) — handled by `analysis_code` iterating the full file collection. The second case needs a concrete module use case before designing the contract.
 
-**14. Multi-point meta returns per sample**
+**15. Multi-point meta returns per sample**
 
 `analysis_code` returning structured multi-point data (e.g. `{ec_vs_freq: [{freq, ec}, ...]}`) for meta-analysis across samples. Design against a real module when building it.
 
-**15. Derivative module plot/analysis boundary**
+**16. Derivative module plot/analysis boundary**
 
 All modules (source and derived) produce plots via `proc_code` returning `{x, y, ...}`. The open question is what `analysis_code` looks like for derived modules and how its outputs flow into meta-analysis. Workshop when building the first real derived module.
 
 **Card controls + collection module interaction**
 
 If a card control filters a collection to a specific slice, does a derived module downstream see the filtered output or the full collection? This has significant implications for the module contract. Resolve before building collection mode and derived modules together.
+
+**17. Fit-type module interface**
+
+Fit-type modules — XRD fitting, XRR fitting, dielectric equivalent circuit fitting, switching model fits, P-E model fitting — share a set of interface needs that distinguish them from all other module types: external reference data (simulation targets, crystallographic databases), rich per-sample configuration (layer stacks, circuit topologies, bounds, initial guesses), iterative refinement interaction (run, inspect, adjust, re-run), and direct `proc_code` access to system-level resources such as the materials library.
+
+These requirements span multiple planned features: module configuration schema (feature 10), materials library with crystallographic data (feature 4), and potentially a new interactive refinement mode not yet described anywhere. The fit-type interface is a design question that sits at the intersection of all of these.
+
+XRD fitting migration is blocked on: the derived module framework (features 11–13) + the materials library with crystallographic data (feature 4) + module configuration schema (feature 10). Despite being a built-in panel today, XRD fitting is one of the later conversions because the infrastructure it requires is among the most complex.
+
+A dedicated design discussion is required before building any fit-type module infrastructure. Do not begin implementation of fit-type modules until that discussion has produced a clear interface contract.
 
 ---
 
