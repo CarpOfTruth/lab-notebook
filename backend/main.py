@@ -151,6 +151,15 @@ def init_db():
                 value TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sample_filter_index (
+                sample_id  TEXT NOT NULL,
+                field      TEXT NOT NULL,
+                value_text TEXT,
+                value_num  REAL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sfi ON sample_filter_index(field, value_text, value_num)")
         conn.commit()
 
 init_db()
@@ -160,6 +169,69 @@ init_db()
 
 def row_to_dict(row):
     return dict(row)
+
+def _index_sample(conn, sample_id, layers_json, technique, substrate, lot):
+    """Rebuild filter-index rows for one sample. Call inside an open transaction."""
+    conn.execute("DELETE FROM sample_filter_index WHERE sample_id = ?", (sample_id,))
+    rows = []
+
+    def _add(field, text=None, num=None):
+        if text is not None or num is not None:
+            rows.append((sample_id, field, text, num))
+
+    def _num(v):
+        try:
+            return float(v) if v not in (None, "") else None
+        except (ValueError, TypeError):
+            return None
+
+    # Sample-level text fields
+    if technique: _add("technique", text=str(technique).lower())
+    if substrate: _add("substrate", text=str(substrate))
+    if lot:       _add("lot",       text=str(lot))
+
+    # Layer-level fields
+    layers = json.loads(layers_json) if isinstance(layers_json, str) else (layers_json or [])
+    for layer in layers:
+        for idx_field, layer_key in [
+            ("growth_temp",     "temp"),
+            ("growth_pressure", "pressure"),
+            ("growth_o2_pct",   "oxygen_pct"),
+            ("growth_time_s",   "time_s"),
+            ("thickness_nm",    "thickness_nm"),
+            ("growth_freq_hz",  "frequency_hz"),
+        ]:
+            n = _num(layer.get(layer_key))
+            if n is not None:
+                _add(idx_field, num=n)
+
+        # Custom growth params stored in layer.custom
+        for k, v in (layer.get("custom") or {}).items():
+            n = _num(v)
+            if n is not None:
+                _add(f"custom_{k}", num=n)
+            elif v not in (None, ""):
+                _add(f"custom_{k}", text=str(v))
+
+        # Per-target fields (material name + numeric params)
+        for target in (layer.get("targets") or []):
+            mat = (target.get("material") or "").strip()
+            if mat:
+                _add("material", text=mat)
+            for idx_field, t_key in [
+                ("growth_power_w",   "power_W"),
+                ("growth_energy_mj", "energy_mJ"),
+                ("growth_pulses",    "pulses"),
+            ]:
+                n = _num(target.get(t_key))
+                if n is not None:
+                    _add(idx_field, num=n)
+
+    if rows:
+        conn.executemany(
+            "INSERT INTO sample_filter_index (sample_id, field, value_text, value_num) VALUES (?,?,?,?)",
+            rows
+        )
 
 def row_to_sample(row):
     d = dict(row)
@@ -274,6 +346,7 @@ def create_sample(sample: dict):
     with get_db() as conn:
         if conn.execute("SELECT id FROM samples WHERE id=?", (sample["id"],)).fetchone():
             raise HTTPException(409, f"Sample {sample['id']} already exists")
+        layers_json = json.dumps(sample.get("layers", []))
         conn.execute("""
             INSERT INTO samples
               (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
@@ -285,18 +358,21 @@ def create_sample(sample: dict):
             **sample,
             "technique":  sample.get("technique", "sputter"),
             "folder_id":  sample.get("folder_id"),
-            "layers":     json.dumps(sample.get("layers", [])),
+            "layers":     layers_json,
             "filenames":  json.dumps(sample.get("filenames", {})),
             "xrd_peaks":  json.dumps(sample.get("xrd_peaks", [])),
             "lot":        sample.get("lot"),
             "bin":        sample.get("bin"),
         })
+        _index_sample(conn, sample["id"], layers_json,
+                      sample.get("technique", "sputter"), sample.get("substrate"), sample.get("lot"))
         conn.commit()
     return {"ok": True, "id": sample["id"]}
 
 @app.put("/api/samples/{sample_id}")
 def update_sample(sample_id: str, sample: dict):
     with get_db() as conn:
+        layers_json = json.dumps(sample.get("layers", []))
         conn.execute("""
             UPDATE samples SET
               date=:date, substrate=:substrate, notes=:notes,
@@ -315,12 +391,14 @@ def update_sample(sample_id: str, sample: dict):
             "area_correction": sample.get("area_correction", 1.0),
             "technique":  sample.get("technique", "sputter"),
             "folder_id":  sample.get("folder_id"),
-            "layers":     json.dumps(sample.get("layers", [])),
+            "layers":     layers_json,
             "filenames":  json.dumps(sample.get("filenames", {})),
             "xrd_peaks":  json.dumps(sample.get("xrd_peaks", [])),
             "lot":        sample.get("lot"),
             "bin":        sample.get("bin"),
         })
+        _index_sample(conn, sample_id, layers_json,
+                      sample.get("technique", "sputter"), sample.get("substrate"), sample.get("lot"))
         conn.commit()
     return {"ok": True}
 
@@ -339,8 +417,73 @@ def delete_sample(sample_id: str):
         shutil.rmtree(sample_files)
     with get_db() as conn:
         conn.execute("DELETE FROM samples WHERE id=?", (sample_id,))
+        conn.execute("DELETE FROM sample_filter_index WHERE sample_id=?", (sample_id,))
         conn.commit()
     return {"ok": True}
+
+
+# ── Sample filter ────────────────────────────────────────────────────────────
+
+@app.post("/api/samples/filter")
+def filter_samples(body: dict):
+    """Return sample IDs matching ALL supplied conditions (AND logic via INTERSECT)."""
+    conditions = body.get("conditions", [])
+    if not conditions:
+        return {"ids": []}
+
+    parts, params = [], []
+    for cond in conditions:
+        field = cond.get("field", "")
+        op    = cond.get("op", "eq")
+        base  = "SELECT DISTINCT sample_id FROM sample_filter_index WHERE field=?"
+        if op == "between":
+            parts.append(f"{base} AND value_num>=? AND value_num<=?")
+            params += [field, float(cond.get("min", 0)), float(cond.get("max", 0))]
+        elif op in ("gt", "gte", "lt", "lte"):
+            sql_op = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}[op]
+            parts.append(f"{base} AND value_num{sql_op}?")
+            params += [field, float(cond.get("value", 0))]
+        elif op == "eq":
+            val = cond.get("value", "")
+            try:
+                parts.append(f"{base} AND value_num=?")
+                params += [field, float(val)]
+            except (ValueError, TypeError):
+                parts.append(f"{base} AND LOWER(value_text)=LOWER(?)")
+                params += [field, str(val)]
+        elif op == "contains":
+            parts.append(f"{base} AND value_text LIKE ?")
+            params += [field, f"%{cond.get('value', '')}%"]
+        elif op == "neq":
+            # "not equal" — samples that have the field but NOT that value
+            val = cond.get("value", "")
+            try:
+                parts.append(f"SELECT DISTINCT sample_id FROM sample_filter_index WHERE field=? AND (value_num IS NULL OR value_num!=?)")
+                params += [field, float(val)]
+            except (ValueError, TypeError):
+                parts.append(f"SELECT DISTINCT sample_id FROM sample_filter_index WHERE field=? AND (value_text IS NULL OR LOWER(value_text)!=LOWER(?))")
+                params += [field, str(val)]
+
+    if not parts:
+        return {"ids": []}
+
+    query = " INTERSECT ".join(parts)
+    with get_db() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return {"ids": [r[0] for r in rows]}
+
+
+@app.post("/api/samples/reindex-filter")
+def reindex_filter():
+    """Rebuild the entire filter index from scratch (use after bulk imports or schema changes)."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT id, technique, substrate, lot, layers FROM samples").fetchall()
+        conn.execute("DELETE FROM sample_filter_index")
+        for row in rows:
+            _index_sample(conn, row["id"], row["layers"],
+                          row["technique"], row["substrate"], row["lot"])
+        conn.commit()
+    return {"indexed": len(rows)}
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────

@@ -423,6 +423,36 @@ const Sel = ({ label, value, onChange, options }) => (
   </div>
 );
 
+// Recursively builds a flat ordered list of folder options with depth metadata.
+// Pass `filterFn` to restrict which folders are eligible (e.g. sample-only).
+function buildFolderOptions(folders, filterFn, parentId = null, depth = 0) {
+  return folders
+    .filter(f => filterFn(f) && (f.parent_id ?? null) === parentId)
+    .flatMap(f => [
+      { value: f.id, label: f.name, depth },
+      ...buildFolderOptions(folders, filterFn, f.id, depth + 1),
+    ]);
+}
+
+// Folder <select> with depth-indented options. Shares the same visual style as Sel.
+function FolderSelect({ label, value, onChange, folders, filterFn, emptyLabel = "— Ungrouped —" }) {
+  const opts = buildFolderOptions(folders, filterFn);
+  if (!opts.length) return null;
+  const INDENT = "\u00a0\u00a0\u00a0\u00a0";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      {label && <Label>{label}</Label>}
+      <select value={value} onChange={e => onChange(e.target.value)}
+        style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, color: T.textPrimary, padding: "8px 10px", fontFamily: "'DM Mono', monospace", fontSize: 13, outline: "none", cursor: "pointer" }}>
+        <option value="">{emptyLabel}</option>
+        {opts.map(o => (
+          <option key={o.value} value={o.value}>{INDENT.repeat(o.depth)}{o.label}</option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
 // Renders a chemical-formula string with digit sequences as subscripts.
 // e.g. "BaTiO3" → BaTiO₃, "Ba0.5Sr0.5TiO3" → Ba₀.₅Sr₀.₅TiO₃ (via <sub>)
 function ChemName({ name }) {
@@ -1377,6 +1407,7 @@ const DEFAULT_SETTINGS = {
   pld:        { temp: 600, pressure: 2,  frequency_hz: 10, energy_mJ: 60, pulses: 10000 },
   materials:  { sputter: [], pld: [] },
   structures: [],
+  custom_growth_params: { sputter: [], pld: [] },
 };
 
 function mergeSettings(parsed) {
@@ -1390,7 +1421,19 @@ function mergeSettings(parsed) {
       pld:     parsed.materials?.pld     ?? [],
     },
     structures: parsed.structures ?? [],
+    custom_growth_params: {
+      sputter: parsed.custom_growth_params?.sputter ?? [],
+      pld:     parsed.custom_growth_params?.pld     ?? [],
+    },
   };
+}
+
+// Generate a stable, readable ID for a custom growth param.
+// Slug from initial name + 4-char random suffix so it survives renames.
+function makeParamId(name) {
+  const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "param";
+  const suffix = Math.random().toString(36).slice(2, 6);
+  return `${slug}_${suffix}`;
 }
 
 // Parse a CIF file text and return { name, a, b, c, alpha, beta, gamma }
@@ -1458,12 +1501,19 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
         if (entry.oxygen_pct != null && entry.oxygen_pct !== "") layerDefaults.oxygen_pct = entry.oxygen_pct;
         if (entry.time_s     != null && entry.time_s     !== "") layerDefaults.time_s     = entry.time_s;
       } else {
-        if (entry.energy_mJ    != null && entry.energy_mJ    !== "") merged.energy_mJ           = entry.energy_mJ;
-        if (entry.pulses       != null && entry.pulses       !== "") merged.pulses               = entry.pulses;
-        if (entry.temp         != null && entry.temp         !== "") layerDefaults.temp           = entry.temp;
-        if (entry.pressure     != null && entry.pressure     !== "") layerDefaults.pressure       = entry.pressure;
-        if (entry.frequency_hz != null && entry.frequency_hz !== "") layerDefaults.frequency_hz  = entry.frequency_hz;
+        if (entry.energy_mJ    != null && entry.energy_mJ    !== "") merged.energy_mJ          = entry.energy_mJ;
+        if (entry.pulses       != null && entry.pulses       !== "") merged.pulses              = entry.pulses;
+        if (entry.temp         != null && entry.temp         !== "") layerDefaults.temp         = entry.temp;
+        if (entry.pressure     != null && entry.pressure     !== "") layerDefaults.pressure     = entry.pressure;
+        if (entry.frequency_hz != null && entry.frequency_hz !== "") layerDefaults.frequency_hz = entry.frequency_hz;
       }
+      // Autofill custom growth params from material library entry
+      const customParams = settings?.custom_growth_params?.[technique] || [];
+      const customFill = {};
+      for (const p of customParams) {
+        if (entry[p.id] != null && entry[p.id] !== "") customFill[p.id] = entry[p.id];
+      }
+      if (Object.keys(customFill).length) layerDefaults.custom = customFill;
       onChange(merged, Object.keys(layerDefaults).length ? layerDefaults : null);
     } else {
       onChange({ ...target, material: v });
@@ -1507,7 +1557,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
   const cancelEdit = (e) => { e.stopPropagation(); if (initialEditing) { onRemove(); } else { setEditing(false); } };
   const handleEditKeyDown = (e) => { if (e.key === "Enter") { e.preventDefault(); onUpdate(draft); setEditing(false); } };
   const setDraftField = (k, v) => setDraft(p => ({ ...p, [k]: v }));
-  const updateTarget = (i, t, layerDefaults)  => setDraft(p => { const ts = [...p.targets]; ts[i] = t; const patch = { ...p, targets: ts }; if (i === 0 && layerDefaults) Object.assign(patch, layerDefaults); return patch; });
+  const updateTarget = (i, t, layerDefaults)  => setDraft(p => { const ts = [...p.targets]; ts[i] = t; const patch = { ...p, targets: ts }; if (i === 0 && layerDefaults) { const { custom: newCustom, ...rest } = layerDefaults; Object.assign(patch, rest); if (newCustom) patch.custom = { ...(patch.custom || {}), ...newCustom }; } return patch; });
   const removeTarget = (i)     => setDraft(p => { const ts = p.targets.filter((_, j) => j !== i); return { ...p, targets: ts }; });
   const addTarget = () => {
     const cfg = settings?.[technique] || {};
@@ -1558,6 +1608,12 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
         {technique === "pld"
           ? <>{sharedField("frequency_hz", "Rep", "Hz")}</>
           : <>{sharedField("oxygen_pct", "O₂", "%")}{sharedField("time_s", "Time", "s")}</>}
+        {(settings?.custom_growth_params?.[technique] || []).filter(p => layer.custom?.[p.id] != null && layer.custom[p.id] !== "").map(p => (
+          <div key={p.id} style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", marginBottom: 1 }}>{p.name || p.id}</div>
+            <div style={{ fontSize: 12, color: T.textPrimary, fontFamily: "'DM Mono', monospace" }}>{layer.custom[p.id]}<span style={{ fontSize: 10, color: T.textDim }}>{p.unit ? ` ${p.unit}` : ""}</span></div>
+          </div>
+        ))}
         <button onClick={startEdit}   style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>✎</button>
         <button onClick={onDuplicate} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 15, padding: 0 }}>+</button>
         <button onClick={onRemove}    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, padding: 0 }}>×</button>
@@ -1625,6 +1681,19 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
             </div>
           </>
         )}
+        {(settings?.custom_growth_params?.[technique] || []).map(p => (
+          <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+              <input
+                value={draft.custom?.[p.id] ?? ""}
+                placeholder={p.default !== "" ? String(p.default) : "—"}
+                onChange={e => setDraft(prev => ({ ...prev, custom: { ...(prev.custom || {}), [p.id]: e.target.value } }))}
+                style={{ ...inputSm, width: 70 }} />
+              {p.unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{p.unit}</span>}
+            </div>
+          </div>
+        ))}
       </div>
       {/* targets */}
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -2042,10 +2111,14 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
           <Input label="Bin"  value={f.bin} onChange={set("bin")} placeholder="e.g. A3" />
         </div>
         <Input label="Notes"      value={f.notes}     onChange={set("notes")}     placeholder="Brief description…" />
-        {folders && folders.length > 0 && (
-          <Sel label="Folder (optional)" value={f.folder_id} onChange={set("folder_id")}
-            options={[{ value: "", label: "— Ungrouped —" }, ...folders.map(fo => ({ value: fo.id, label: fo.name }))]} />
-        )}
+        <FolderSelect
+          label="Folder (optional)"
+          value={f.folder_id}
+          onChange={set("folder_id")}
+          folders={folders || []}
+          filterFn={fo => !fo.book_folder && !fo.module_folder}
+          emptyLabel="— Ungrouped —"
+        />
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
           <Btn onClick={() => {
@@ -4018,18 +4091,22 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
             )}
           </div>
         </div>
-        {!isBuiltin && folders.filter(f => f.module_folder).length > 0 && (
-          <div>
-            <span style={label}>Folder</span>
-            <select value={mFolderId} onChange={e => setMFolderId(e.target.value)}
-              style={{ ...field(), cursor: "pointer" }}>
-              <option value="">— None —</option>
-              {folders.filter(f => f.module_folder).map(f => (
-                <option key={f.id} value={f.id}>{f.name}</option>
-              ))}
-            </select>
-          </div>
-        )}
+        {!isBuiltin && folders.some(f => f.module_folder) && (() => {
+          const INDENT = "\u00a0\u00a0\u00a0\u00a0";
+          const modOpts = buildFolderOptions(folders, f => !!f.module_folder);
+          return (
+            <div>
+              <span style={label}>Folder</span>
+              <select value={mFolderId} onChange={e => setMFolderId(e.target.value)}
+                style={{ ...field(), cursor: "pointer" }}>
+                <option value="">— None —</option>
+                {modOpts.map(o => (
+                  <option key={o.value} value={o.value}>{INDENT.repeat(o.depth)}{o.label}</option>
+                ))}
+              </select>
+            </div>
+          );
+        })()}
         <div>
           <span style={label}>Usage notes</span>
           <textarea value={mNotes} onChange={e => !isBuiltin && setMNotes(e.target.value)} readOnly={isBuiltin}
@@ -5333,6 +5410,66 @@ function SettingsModal({ settings, onSave, onClose }) {
     </div>
   );
 
+  // Custom growth param helpers
+  const addCustomParam = (tech) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.custom_growth_params[tech].push({ id: makeParamId("param"), name: "", unit: "", default: "" });
+    return d;
+  });
+  const removeCustomParam = (tech, i) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.custom_growth_params[tech].splice(i, 1);
+    return d;
+  });
+  const setCustomParam = (tech, i, k, v) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    // If this is the first time the name is being set and the param still has a generic id, regenerate it
+    if (k === "name" && d.custom_growth_params[tech][i].id.startsWith("param_")) {
+      d.custom_growth_params[tech][i].id = makeParamId(v);
+    }
+    d.custom_growth_params[tech][i][k] = v;
+    return d;
+  });
+
+  const renderCustomParams = (tech) => {
+    const params = draft.custom_growth_params?.[tech] || [];
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+        {params.map((p, i) => (
+          <div key={p.id} style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: 2, minWidth: 120 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Name</span>
+              <input value={p.name}
+                onChange={e => setCustomParam(tech, i, "name", e.target.value)}
+                placeholder="e.g. Ar flow"
+                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2, width: 72 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Unit</span>
+              <input value={p.unit}
+                onChange={e => setCustomParam(tech, i, "unit", e.target.value)}
+                placeholder="sccm"
+                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2, width: 72 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Default</span>
+              <input value={p.default}
+                onChange={e => setCustomParam(tech, i, "default", e.target.value)}
+                placeholder="—"
+                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+            </div>
+            <button onClick={() => removeCustomParam(tech, i)}
+              style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 2px", marginBottom: 3 }}>×</button>
+          </div>
+        ))}
+        <button onClick={() => addCustomParam(tech)}
+          style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
+          + Add param
+        </button>
+      </div>
+    );
+  };
+
   // Material library helpers
   const addMat = (tech) => setDraft(p => {
     const d = JSON.parse(JSON.stringify(p));
@@ -5476,6 +5613,9 @@ function SettingsModal({ settings, onSave, onClose }) {
             {matInput(tech, i, "pressure",    "Press",  "mT",   52)}
             {matInput(tech, i, "frequency_hz","Rep",    "Hz",   48)}
           </>)}
+          {(draft.custom_growth_params?.[tech] || []).filter(p => p.name).map(p =>
+            matInput(tech, i, p.id, p.name, p.unit || "", 60)
+          )}
           <button onClick={() => removeMat(tech, i)}
             style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 2px", alignSelf: "flex-end", marginBottom: 1 }}>×</button>
         </div>
@@ -5524,6 +5664,8 @@ function SettingsModal({ settings, onSave, onClose }) {
           {fieldSm("sputter.time_s",     "Time",    "s",  72)}
           {fieldSm("sputter.power_W",    "Power",   "W",  60)}
         </div>
+        <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1.5, marginTop: 6, marginBottom: 2 }}>Custom Sputter Params</div>
+        {renderCustomParams("sputter")}
 
         {/* PLD defaults */}
         {sectionHdr("PLD Defaults")}
@@ -5534,6 +5676,8 @@ function SettingsModal({ settings, onSave, onClose }) {
           {fieldSm("pld.energy_mJ",    "Energy",   "mJ",  60)}
           {fieldSm("pld.pulses",       "Pulses",   "",    72)}
         </div>
+        <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1.5, marginTop: 6, marginBottom: 2 }}>Custom PLD Params</div>
+        {renderCustomParams("pld")}
 
         {/* Material library — Sputter (collapsible) */}
         <button onClick={() => setLibOpen(s => ({ ...s, matSputter: !s.matSputter }))}
@@ -6318,10 +6462,14 @@ function calcTwoTheta(structure, hklStr) {
   return 2 * Math.asin(sinTheta) / deg;
 }
 
-// Calculate (Qx, Qz) for a reflection hkl, assuming [001] surface normal.
-// q2pi=false (default): Q = h/a in nm⁻¹  (factor=10 since a is in Å → 10/a_Å = 1/a_nm)
-// q2pi=true:            Q = 2π·h/a in Å⁻¹ (standard physics convention)
-function calcQxQz(structure, hklStr, q2pi = false) {
+// Calculate (Qx, Qz) for a reflection hkl.
+// q2pi=false (default): Q = 1/d in nm⁻¹  (factor=10 since a is in Å → 10/a_Å = 1/a_nm)
+// q2pi=true:            Q = 2π/d in Å⁻¹  (standard physics convention)
+// orientation: optional { qz_along: [u,v,w], qx_along: [p,q,r] } — reciprocal-space
+//   directions aligned with Qz (surface normal) and Qx (in-plane diffraction axis).
+//   Valid for orthogonal lattices (cubic / tetragonal / orthorhombic).
+//   Defaults to qz=[0,0,1], qx=[1,0,0] when not provided (c-axis normal, a-axis in-plane).
+function calcQxQz(structure, hklStr, q2pi = false, orientation = null) {
   const hkl = parseHKL(hklStr);
   if (!hkl) return null;
   const { h, k, l } = hkl;
@@ -6330,6 +6478,32 @@ function calcQxQz(structure, hklStr, q2pi = false) {
   const c = parseFloat(structure.c);
   if (!a || !c) return null;
   const factor = q2pi ? 2 * Math.PI : 10; // 10/a_Å = 1/a_nm
+
+  if (orientation) {
+    const nDir = orientation.qz_along || [0, 0, 1];
+    const xDir = orientation.qx_along || [1, 0, 0];
+    // Cartesian reciprocal-space vector for this reflection (orthogonal lattice)
+    const gx = h / a, gy = k / b, gz = l / c;
+    // Convert orientation directions to Cartesian reciprocal space
+    let nx = nDir[0] / a, ny = nDir[1] / b, nz = nDir[2] / c;
+    let xx = xDir[0] / a, xy = xDir[1] / b, xz = xDir[2] / c;
+    // Normalise n̂
+    const nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
+    if (nLen < 1e-10) return null;
+    nx /= nLen; ny /= nLen; nz /= nLen;
+    // Gram-Schmidt: remove n̂ component from x̂, then normalise
+    const xdotn = xx*nx + xy*ny + xz*nz;
+    xx -= xdotn*nx; xy -= xdotn*ny; xz -= xdotn*nz;
+    const xLen = Math.sqrt(xx*xx + xy*xy + xz*xz);
+    if (xLen < 1e-10) return null;
+    xx /= xLen; xy /= xLen; xz /= xLen;
+    return {
+      qx: factor * (gx*xx + gy*xy + gz*xz),
+      qz: factor * (gx*nx + gy*ny + gz*nz),
+    };
+  }
+
+  // Default (backward-compatible): c∥z, a∥x
   const qx = h !== 0 ? factor * h / a : factor * k / b;
   const qz = factor * l / c;
   return { qx, qz };
@@ -6405,9 +6579,9 @@ function makeHeatmapColorscale(scaleName, bgFade = 0) {
 
 // Bin raw RSM points into an nx×ny grid using average intensity per cell.
 // bgMethod: null | "percentile" | "median" | "plane"
-//   percentile — subtract bgPct-th percentile of occupied cells
-//   median     — subtract median (bgPct ignored)
-//   plane      — subtract a least-squares linear plane fit
+//   Linear mode  — additive subtraction in intensity space
+//   Log mode     — operates in log10 space: percentile/median mask cells below the
+//                  log-floor; plane fits and subtracts a multiplicative trend (log-plane)
 // Returns { x, y, z, zmin, zmax, xDomain, yDomain } where zmin/zmax are
 // robust 2nd–99.5th percentile bounds for colorscale clipping.
 function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true, bgMethod = null, bgPct = 5) {
@@ -6438,50 +6612,89 @@ function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true,
   const grid = new Float64Array(nx * ny);
   for (let i = 0; i < nx * ny; i++) grid[i] = cntG[i] > 0 ? sumG[i] / cntG[i] : 0;
 
-  // Background subtraction
-  if (bgMethod === "percentile" || bgMethod === "median") {
-    const pct = bgMethod === "median" ? 50 : bgPct;
-    const occ = [];
-    for (let i = 0; i < grid.length; i++) { if (cntG[i] > 0) occ.push(grid[i]); }
-    if (occ.length) {
-      occ.sort((a, b) => a - b);
-      const bg = occ[Math.min(Math.floor(occ.length * pct / 100), occ.length - 1)];
-      for (let i = 0; i < grid.length; i++) { if (cntG[i] > 0) grid[i] = Math.max(0, grid[i] - bg); }
-    }
-  } else if (bgMethod === "plane") {
-    // Least-squares linear plane fit on occupied cells (normalized coords 0..1)
+  // Helper: least-squares plane fit + subtract (reused for both linear and log modes)
+  const fitAndSubtractPlane = (vals, mask) => {
+    // vals[i] is the value to fit; mask[i] truthy = cell participates
     let sx = 0, sy = 0, sz = 0, sxx = 0, sxy = 0, syy = 0, sxz = 0, syz = 0, n = 0;
     for (let i = 0; i < nx * ny; i++) {
-      if (!cntG[i]) continue;
-      const xn = (i % nx) / nx, yn = Math.floor(i / nx) / ny, z = grid[i];
+      if (!mask[i]) continue;
+      const xn = (i % nx) / nx, yn = Math.floor(i / nx) / ny, z = vals[i];
       sx += xn; sy += yn; sz += z; sxx += xn*xn; sxy += xn*yn; syy += yn*yn;
       sxz += xn*z; syz += yn*z; n++;
     }
-    if (n >= 3) {
-      // Solve [n,sx,sy; sx,sxx,sxy; sy,sxy,syy] * [a,b,c] = [sz,sxz,syz]
-      const A = [[n,sx,sy],[sx,sxx,sxy],[sy,sxy,syy]];
-      const B = [sz, sxz, syz];
-      for (let c = 0; c < 3; c++) {
-        let maxR = c;
-        for (let r = c+1; r < 3; r++) if (Math.abs(A[r][c]) > Math.abs(A[maxR][c])) maxR = r;
-        [A[c], A[maxR]] = [A[maxR], A[c]]; [B[c], B[maxR]] = [B[maxR], B[c]];
-        for (let r = c+1; r < 3; r++) {
-          const f = A[r][c] / (A[c][c] || 1e-30);
-          B[r] -= f * B[c];
-          for (let k = c; k < 3; k++) A[r][k] -= f * A[c][k];
+    if (n < 3) return vals;
+    const A = [[n,sx,sy],[sx,sxx,sxy],[sy,sxy,syy]];
+    const B = [sz, sxz, syz];
+    for (let c = 0; c < 3; c++) {
+      let maxR = c;
+      for (let r = c+1; r < 3; r++) if (Math.abs(A[r][c]) > Math.abs(A[maxR][c])) maxR = r;
+      [A[c], A[maxR]] = [A[maxR], A[c]]; [B[c], B[maxR]] = [B[maxR], B[c]];
+      for (let r = c+1; r < 3; r++) {
+        const f = A[r][c] / (A[c][c] || 1e-30);
+        B[r] -= f * B[c];
+        for (let k = c; k < 3; k++) A[r][k] -= f * A[c][k];
+      }
+    }
+    const coef = [0, 0, 0];
+    for (let i = 2; i >= 0; i--) {
+      coef[i] = B[i];
+      for (let j = i+1; j < 3; j++) coef[i] -= A[i][j] * coef[j];
+      coef[i] /= A[i][i] || 1e-30;
+    }
+    const [a, b, cv] = coef;
+    const out = vals.slice();
+    for (let i = 0; i < nx * ny; i++) {
+      if (!mask[i]) continue;
+      out[i] = vals[i] - (a + b * (i % nx) / nx + cv * Math.floor(i / nx) / ny);
+    }
+    return out;
+  };
+
+  // Background subtraction — branches on logIntensity
+  if (bgMethod) {
+    if (!logIntensity) {
+      // ── Linear mode: additive subtraction in intensity space ──────────────
+      if (bgMethod === "percentile" || bgMethod === "median") {
+        const pct = bgMethod === "median" ? 50 : bgPct;
+        const occ = [];
+        for (let i = 0; i < grid.length; i++) { if (cntG[i] > 0) occ.push(grid[i]); }
+        if (occ.length) {
+          occ.sort((a, b) => a - b);
+          const bg = occ[Math.min(Math.floor(occ.length * pct / 100), occ.length - 1)];
+          for (let i = 0; i < grid.length; i++) { if (cntG[i] > 0) grid[i] = Math.max(0, grid[i] - bg); }
         }
+      } else if (bgMethod === "plane") {
+        const result = fitAndSubtractPlane(grid, cntG);
+        for (let i = 0; i < nx * ny; i++) { if (cntG[i] > 0) grid[i] = Math.max(0, result[i]); }
       }
-      const coef = [0,0,0];
-      for (let i = 2; i >= 0; i--) {
-        coef[i] = B[i];
-        for (let j = i+1; j < 3; j++) coef[i] -= A[i][j] * coef[j];
-        coef[i] /= A[i][i] || 1e-30;
-      }
-      const [a, b, c] = coef;
+    } else {
+      // ── Log mode: operate entirely in log10 space ─────────────────────────
+      // Build log10 grid (only for occupied positive cells)
+      const logGrid = new Float64Array(nx * ny);
+      const logMask = new Uint8Array(nx * ny);
       for (let i = 0; i < nx * ny; i++) {
-        if (!cntG[i]) continue;
-        const bg = a + b * (i % nx) / nx + c * Math.floor(i / nx) / ny;
-        grid[i] = Math.max(0, grid[i] - bg);
+        if (cntG[i] > 0 && grid[i] > 0) { logGrid[i] = Math.log10(grid[i]); logMask[i] = 1; }
+      }
+      if (bgMethod === "percentile" || bgMethod === "median") {
+        // Find percentile in log space; mask cells at or below the log floor
+        const pct = bgMethod === "median" ? 50 : bgPct;
+        const logOcc = [];
+        for (let i = 0; i < nx * ny; i++) { if (logMask[i]) logOcc.push(logGrid[i]); }
+        if (logOcc.length) {
+          logOcc.sort((a, b) => a - b);
+          const logFloor = logOcc[Math.min(Math.floor(logOcc.length * pct / 100), logOcc.length - 1)];
+          for (let i = 0; i < nx * ny; i++) {
+            if (logMask[i] && logGrid[i] <= logFloor) cntG[i] = 0; // treat as empty
+          }
+        }
+      } else if (bgMethod === "plane") {
+        // Fit and subtract a plane in log10 space (removes multiplicative gradient)
+        const result = fitAndSubtractPlane(logGrid, logMask);
+        for (let i = 0; i < nx * ny; i++) {
+          if (!logMask[i]) continue;
+          if (result[i] <= 0) { cntG[i] = 0; } // mask cells that went negative
+          else { grid[i] = Math.pow(10, result[i]); } // convert residual back to linear
+        }
       }
     }
   }
@@ -7102,7 +7315,8 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
       const qx = parseFloat(pt.manual_qx), qz = parseFloat(pt.manual_qz);
       pos = (!isNaN(qx) && !isNaN(qz)) ? { qx, qz } : null;
     } else {
-      pos = pointEffStructs[i] ? calcQxQz(pointEffStructs[i], pt.hkl, q2pi) : null;
+      const ori = (pt.qz_along || pt.qx_along) ? { qz_along: pt.qz_along || [0,0,1], qx_along: pt.qx_along || [1,0,0] } : null;
+      pos = pointEffStructs[i] ? calcQxQz(pointEffStructs[i], pt.hkl, q2pi, ori) : null;
     }
     const label = pt.material === "__arbitrary__" ? "Arbitrary" : (pt.material && pt.hkl ? `${pt.material} ${pt.hkl}` : "");
     return pos ? { id: pt.id, qx: pos.qx, qz: pos.qz, color: pt.color, symbol: pt.symbol || "cross", markerSize: pt.markerSize ?? 9, label } : null;
@@ -7127,9 +7341,10 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
         {points.map((pt, i) => {
           const effStruct   = pointEffStructs[i];
           const isArbitrary = pt.material === "__arbitrary__";
+          const ptOri       = (pt.qz_along || pt.qx_along) ? { qz_along: pt.qz_along || [0,0,1], qx_along: pt.qx_along || [1,0,0] } : null;
           const pos         = isArbitrary
             ? (() => { const qx = parseFloat(pt.manual_qx), qz = parseFloat(pt.manual_qz); return (!isNaN(qx) && !isNaN(qz)) ? { qx, qz } : null; })()
-            : (effStruct ? calcQxQz(effStruct, pt.hkl, q2pi) : null);
+            : (effStruct ? calcQxQz(effStruct, pt.hkl, q2pi, ptOri) : null);
           const colorOpen   = openPicker?.id === pt.id && openPicker?.type === "color";
           const cfgOpen     = openPicker?.id === pt.id && openPicker?.type === "strainCfg";
           const shapeOpen   = openPicker?.id === pt.id && openPicker?.type === "shape";
@@ -7181,6 +7396,25 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
                 {cfgOpen && (
                   <div onClick={e => e.stopPropagation()}
                     style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 200, boxShadow: "0 4px 20px rgba(0,0,0,.3), 0 1px 4px rgba(0,0,0,.15)", minWidth: 280, display: "flex", flexDirection: "column", gap: 12 }}>
+                    {/* Crystal orientation */}
+                    <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                      {[["qz_along", "Qz ∥", [0,0,1]], ["qx_along", "Qx ∥", [1,0,0]]].map(([key, label, def]) => {
+                        const vec = pt[key] || def;
+                        return (
+                          <div key={key} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, minWidth: 36 }}>{label}</span>
+                            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>[</span>
+                            {vec.map((v, idx) => (
+                              <DeferredInput key={idx} type="number" value={v} step={1}
+                                onChange={s => { const cur = pt[key] || def; const next = [...cur]; next[idx] = parseInt(s) || 0; updatePoint(pt.id, { [key]: next }); }}
+                                style={{ ...rc, width: 36, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text", padding: "4px 2px" }} />
+                            ))}
+                            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>]</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div style={{ height: 1, background: T.border, margin: "0 -14px" }} />
                     {/* Mode toggle: BULK / STRAINED */}
                     <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}`, alignSelf: "flex-start" }}>
                       {[["bulk", "BULK"], ["strained", "STRAINED"]].map(([m, label], idx, arr) => (
@@ -8270,7 +8504,7 @@ function MetaMarkerPicker({ prefix, config, onUpdate, defaultSymbol = "circle" }
   );
 }
 
-function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {}, config = {}, plotStyle, activeMaterial, structures = [], modules = [], onUpdate }) {
+function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {}, config = {}, plotStyle, activeMaterial, structures = [], modules = [], settings = {}, onUpdate }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const xParamId  = config.x_param  || "";
   const yParamId  = config.y_param  || "";
@@ -8332,7 +8566,33 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
       .filter(Boolean);
   }, [modules, modResults, sampleOrder, sampleMap]);
 
-  const allParamGroups = useMemo(() => [...META_PARAM_GROUPS, ...moduleGroups], [moduleGroups]);
+  const allParamGroups = useMemo(() => {
+    // Inject custom growth params from settings into the Growth group
+    const customSputter = (settings?.custom_growth_params?.sputter || []).filter(p => p.name);
+    const customPld     = (settings?.custom_growth_params?.pld     || []).filter(p => p.name);
+    const customParams  = [...customSputter, ...customPld].map(p => ({
+      id: `custom_growth_${p.id}`,
+      label: p.name,
+      unit: p.unit || "",
+      needsLayer: true,
+      extract: (s, _pc, am) => {
+        if (!s?.layers || !am) return null;
+        for (const layer of s.layers) {
+          if (layer.targets?.length === 1 && layer.targets[0].material === am) {
+            const v = layer.custom?.[p.id];
+            return v != null && v !== "" ? Number(v) : null;
+          }
+        }
+        return null;
+      },
+    }));
+    const baseGroups = META_PARAM_GROUPS.map(g =>
+      g.group === "Growth" && customParams.length
+        ? { ...g, params: [...g.params, ...customParams] }
+        : g
+    );
+    return [...baseGroups, ...moduleGroups];
+  }, [moduleGroups, settings?.custom_growth_params]);
   const allParamsFlat  = useMemo(() => allParamGroups.flatMap(g => g.params.map(p => ({ ...p, group: g.group }))), [allParamGroups]);
 
   const xParam  = allParamsFlat.find(p => p.id === xParamId)  || null;
@@ -8395,7 +8655,8 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
     const hasPE    = sampleOrder.some(sid => plotCache[sid]?.pe?.length > 0);
     const hasDielF = sampleOrder.some(sid => plotCache[sid]?.diel_f?.length > 0);
     const hasDielB = sampleOrder.some(sid => (plotCache[sid]?.diel_b_up?.length || 0) + (plotCache[sid]?.diel_b_down?.length || 0) > 0);
-    const builtinFiltered = META_PARAM_GROUPS.map(g => {
+    // Use allParamGroups so custom growth params are included
+    const builtinFiltered = allParamGroups.filter(g => !moduleGroups.includes(g)).map(g => {
       let params;
       if (g.group === "Growth" || g.group === "Sample") {
         params = g.params.filter(p =>
@@ -8424,7 +8685,7 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
     // Module groups are already pre-filtered to params with ≥1 non-null value
     return [...builtinFiltered, ...moduleGroups];
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sampleOrder, sampleMap, plotCache, activeMaterial, structures, moduleGroups]);
+  }, [sampleOrder, sampleMap, plotCache, activeMaterial, structures, allParamGroups, moduleGroups]);
 
   const addY2BtnStyle = { background: "transparent", border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 8px", cursor: "pointer", letterSpacing: 0.5, textTransform: "uppercase" };
 
@@ -9301,7 +9562,7 @@ function StatisticalAnalysisPanel({ sampleOrder, samples, plotCache, colors, lab
   );
 }
 
-function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, labels = {}, colorScale: bookColorScale = "viridis", structures = [], activeMaterial = null, modules = [], onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver }) {
+function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, labels = {}, colorScale: bookColorScale = "viridis", structures = [], activeMaterial = null, modules = [], settings = {}, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver }) {
   const { type, config } = panel;
   const [cogOpen, setCogOpen] = useState(false);
   const [savedFlash, setSavedFlash] = useState(false);
@@ -9798,7 +10059,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
       {type === "afm"  && <AfmComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
       {type === "de"   && <DEComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
       {type === "df"   && <DfComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
-      {type === "meta" && <MetaAnalysisPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} modules={modules} onUpdate={onUpdate} />}
+      {type === "meta" && <MetaAnalysisPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} modules={modules} settings={settings} onUpdate={onUpdate} />}
       {type === "xrd_pos" && <XRDPeakPositionPanel sampleOrder={sampleOrder} samples={samples} colors={colors} labels={labels} config={config} plotStyle={ps} structures={structures} onUpdate={onUpdate} />}
       {type === "stats"      && <StatisticalAnalysisPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
       {type === "parcoords"  && <ParallelCoordsPanel       sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
@@ -10106,6 +10367,7 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, 
           structures={settings?.structures || []}
           activeMaterial={activeMaterial}
           modules={modules}
+          settings={settings}
           isDragOver={panelDragOverIdx === i && panelDragIdx !== i}
           onDragStart={() => setPanelDragIdx(i)}
           onDragOver={() => setPanelDragOverIdx(i)}
@@ -10364,10 +10626,14 @@ function AddBookModal({ onSave, onClose, existing, samples, folders = [], bookFo
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 480, display: "flex", flexDirection: "column", gap: 16, maxHeight: "80vh" }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.blue, fontSize: 20 }}>{existing ? "Edit Book" : "New Analysis Book"}</h2>
         <Input label="Name" value={name} onChange={setName} placeholder="e.g. Thickness Study" />
-        {bookFolders.length > 0 && (
-          <Sel label="Folder (optional)" value={folderId} onChange={setFolderId}
-            options={[{ value: "", label: "— No folder —" }, ...bookFolders.map(f => ({ value: f.id, label: f.name }))]} />
-        )}
+        <FolderSelect
+          label="Folder (optional)"
+          value={folderId}
+          onChange={setFolderId}
+          folders={folders}
+          filterFn={f => !!f.book_folder && !f.module_folder}
+          emptyLabel="— No folder —"
+        />
         <div style={{ display: "flex", flexDirection: "column", gap: 6, overflow: "hidden" }}>
           <Label>Samples</Label>
           <div style={{ overflowY: "auto", maxHeight: 300, border: `1px solid ${T.border}`, borderRadius: 6, overflow: "hidden auto" }}>
@@ -10402,6 +10668,240 @@ function AddBookModal({ onSave, onClose, existing, samples, folders = [], bookFo
   );
 }
 
+// ── Sample filter ─────────────────────────────────────────────────────────────
+
+function buildFilterFields(settings) {
+  const groups = [
+    { group: "Sample", fields: [
+      { id: "technique",        label: "Technique",     type: "categorical", options: ["sputter", "pld"] },
+      { id: "substrate",        label: "Substrate",     type: "text" },
+      { id: "lot",              label: "Lot",           type: "text" },
+      { id: "material",         label: "Material",      type: "text" },
+    ]},
+    { group: "Growth", fields: [
+      { id: "growth_temp",      label: "Temperature",   type: "numeric", unit: "°C" },
+      { id: "growth_pressure",  label: "Pressure",      type: "numeric", unit: "mTorr" },
+      { id: "growth_o2_pct",    label: "O₂ %",          type: "numeric", unit: "%" },
+      { id: "growth_time_s",    label: "Dep. time",     type: "numeric", unit: "s" },
+      { id: "growth_power_w",   label: "Power",         type: "numeric", unit: "W" },
+      { id: "growth_energy_mj", label: "Laser energy",  type: "numeric", unit: "mJ" },
+      { id: "growth_freq_hz",   label: "Rep. rate",     type: "numeric", unit: "Hz" },
+      { id: "growth_pulses",    label: "Pulses",        type: "numeric", unit: "" },
+    ]},
+    { group: "Physical", fields: [
+      { id: "thickness_nm",     label: "Thickness",     type: "numeric", unit: "nm" },
+    ]},
+  ];
+  const customSputter = (settings?.custom_growth_params?.sputter || []).filter(p => p.name);
+  const customPld     = (settings?.custom_growth_params?.pld     || []).filter(p => p.name);
+  if (customSputter.length) groups.push({ group: "Custom — Sputter",
+    fields: customSputter.map(p => ({ id: `custom_${p.id}`, label: p.name, type: "numeric", unit: p.unit || "" })) });
+  if (customPld.length) groups.push({ group: "Custom — PLD",
+    fields: customPld.map(p => ({ id: `custom_${p.id}`, label: p.name, type: "numeric", unit: p.unit || "" })) });
+  return groups;
+}
+
+function FilterChip({ condition, onRemove }) {
+  let label;
+  const u = condition.unit ? ` ${condition.unit}` : "";
+  if (condition.type === "numeric") {
+    const symMap = { gt: ">", gte: "≥", lt: "<", lte: "≤", eq: "=" };
+    label = condition.op === "between"
+      ? `${condition.fieldLabel}: ${condition.min}–${condition.max}${u}`
+      : `${condition.fieldLabel} ${symMap[condition.op] || condition.op} ${condition.value}${u}`;
+  } else {
+    label = condition.op === "contains"
+      ? `${condition.fieldLabel} ∋ "${condition.value}"`
+      : `${condition.fieldLabel}: ${condition.value}`;
+  }
+  return (
+    <div style={{ display: "inline-flex", alignItems: "center", gap: 5, background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 4, padding: "3px 7px 3px 9px", fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textSecondary, whiteSpace: "nowrap" }}>
+      {label}
+      <button onClick={onRemove} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 15, lineHeight: 1, padding: 0, marginLeft: 2 }}>×</button>
+    </div>
+  );
+}
+
+function SampleFilter({ settings, samples = [], onFilterChange }) {
+  const [conditions,  setConditions]  = useState([]);
+  const [panelOpen,   setPanelOpen]   = useState(false);
+  const [newField,    setNewField]    = useState("");
+  const [newOp,       setNewOp]       = useState("between");
+  const [newVal,      setNewVal]      = useState("");
+  const [newMin,      setNewMin]      = useState("");
+  const [newMax,      setNewMax]      = useState("");
+
+  const groups = buildFilterFields(settings);
+  const allFields = groups.flatMap(g => g.fields.map(f => ({ ...f, group: g.group })));
+
+  // Derive distinct existing values for text fields from the loaded samples array.
+  const knownValues = useMemo(() => {
+    const substrate = [...new Set(samples.map(s => s.substrate).filter(Boolean))].sort();
+    const lot       = [...new Set(samples.map(s => s.lot).filter(Boolean))].sort();
+    const material  = [...new Set(
+      samples.flatMap(s => (s.layers || []).flatMap(l => (l.targets || []).map(t => t.material).filter(Boolean)))
+    )].sort();
+    // technique is always static
+    return { substrate, lot, material };
+  }, [samples]);
+
+  const resetNew = () => { setNewField(""); setNewOp("between"); setNewVal(""); setNewMin(""); setNewMax(""); };
+
+  const selectedField = allFields.find(f => f.id === newField) || null;
+
+  // When field changes, reset op + val
+  const handleFieldChange = (id) => {
+    setNewField(id);
+    const f = allFields.find(x => x.id === id);
+    setNewOp(f?.type === "numeric" ? "between" : "eq");
+    setNewVal(""); setNewMin(""); setNewMax("");
+  };
+
+  // For a text field, get the list of pickable values (static options or derived from samples)
+  const getPickList = (field) => {
+    if (!field || field.type === "numeric") return null;
+    if (field.options) return field.options; // e.g. technique
+    return knownValues[field.id] || null;
+  };
+
+  const isReady = () => {
+    if (!newField || !selectedField) return false;
+    if (selectedField.type === "numeric") {
+      if (newOp === "between") return newMin !== "" && newMax !== "";
+      return newVal !== "";
+    }
+    return newVal.trim() !== "";
+  };
+
+  const addCondition = () => {
+    if (!isReady()) return;
+    const cond = {
+      id: Math.random().toString(36).slice(2, 8),
+      fieldId: newField, fieldLabel: selectedField.label,
+      type: selectedField.type, unit: selectedField.unit || "",
+      op: newOp,
+      ...(selectedField.type === "numeric"
+        ? newOp === "between" ? { min: newMin, max: newMax } : { value: newVal }
+        : { value: newVal }),
+    };
+    const next = [...conditions, cond];
+    setConditions(next);
+    onFilterChange(next);
+    resetNew();
+    setPanelOpen(false);
+  };
+
+  const removeCondition = (id) => {
+    const next = conditions.filter(c => c.id !== id);
+    setConditions(next);
+    onFilterChange(next);
+  };
+
+  const clearAll = () => { setConditions([]); onFilterChange([]); };
+
+  const inputSm = { background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 7px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" };
+  const numericOps = [["between","range"],["gt",">"],["gte","≥"],["lt","<"],["lte","≤"],["eq","="]];
+
+  const pickList = getPickList(selectedField);
+
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+      {conditions.map(c => <FilterChip key={c.id} condition={c} onRemove={() => removeCondition(c.id)} />)}
+
+      <div style={{ position: "relative" }}>
+        {panelOpen && <div onClick={() => { setPanelOpen(false); resetNew(); }} style={{ position: "fixed", inset: 0, zIndex: 90 }} />}
+        <button
+          onClick={() => setPanelOpen(v => !v)}
+          style={{ background: "none", border: `1px dashed ${panelOpen ? T.amber : T.border}`, borderRadius: 4, color: panelOpen ? T.amber : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer", transition: "all .12s" }}>
+          ＋ Filter
+        </button>
+
+        {panelOpen && (
+          <div onClick={e => e.stopPropagation()}
+            style={{ position: "absolute", left: 0, top: "calc(100% + 6px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 200, boxShadow: "0 4px 20px rgba(0,0,0,.35)", minWidth: 280, display: "flex", flexDirection: "column", gap: 10 }}>
+
+            {/* Field selector */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Field</span>
+              <select value={newField} onChange={e => handleFieldChange(e.target.value)}
+                style={{ ...inputSm, width: "100%", cursor: "pointer" }}>
+                <option value="">— select —</option>
+                {groups.map(g => (
+                  <optgroup key={g.group} label={g.group}>
+                    {g.fields.map(f => <option key={f.id} value={f.id}>{f.label}{f.unit ? ` (${f.unit})` : ""}</option>)}
+                  </optgroup>
+                ))}
+              </select>
+            </div>
+
+            {/* Condition inputs */}
+            {selectedField && (
+              <>
+                {selectedField.type === "numeric" ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {/* Op toggle */}
+                    <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}`, alignSelf: "flex-start" }}>
+                      {numericOps.map(([op, lbl], idx, arr) => (
+                        <button key={op} onClick={() => setNewOp(op)}
+                          style={{ background: newOp === op ? T.bg3 : T.bg0, border: "none", borderRight: idx < arr.length - 1 ? `1px solid ${T.border}` : "none", color: newOp === op ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 8px", cursor: "pointer" }}>
+                          {lbl}
+                        </button>
+                      ))}
+                    </div>
+                    {/* Value inputs */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      {newOp === "between" ? (
+                        <>
+                          <input type="number" value={newMin} onChange={e => setNewMin(e.target.value)} placeholder="min" style={{ ...inputSm, width: 80 }} />
+                          <span style={{ color: T.textDim, fontFamily: "'DM Mono', monospace" }}>–</span>
+                          <input type="number" value={newMax} onChange={e => setNewMax(e.target.value)} placeholder="max" style={{ ...inputSm, width: 80 }} />
+                        </>
+                      ) : (
+                        <input type="number" value={newVal} onChange={e => setNewVal(e.target.value)} placeholder="value" style={{ ...inputSm, width: 110 }} />
+                      )}
+                      {selectedField.unit && <span style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{selectedField.unit}</span>}
+                    </div>
+                  </div>
+                ) : pickList ? (
+                  /* Pick-list mode: known values rendered as a <select>. Always exact match. */
+                  <select value={newVal} onChange={e => setNewVal(e.target.value)}
+                    style={{ ...inputSm, width: "100%", cursor: "pointer" }}>
+                    <option value="">— choose —</option>
+                    {pickList.map(v => <option key={v} value={v}>{v}</option>)}
+                  </select>
+                ) : (
+                  /* Free-text mode: fallback for fields with no known values yet */
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}`, alignSelf: "flex-start" }}>
+                      {[["eq","is"],["contains","contains"]].map(([op, lbl], idx, arr) => (
+                        <button key={op} onClick={() => setNewOp(op)}
+                          style={{ background: newOp === op ? T.bg3 : T.bg0, border: "none", borderRight: idx < arr.length - 1 ? `1px solid ${T.border}` : "none", color: newOp === op ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer" }}>
+                          {lbl}
+                        </button>
+                      ))}
+                    </div>
+                    <input type="text" value={newVal} onChange={e => setNewVal(e.target.value)} placeholder="value…"
+                      onKeyDown={e => e.key === "Enter" && addCondition()}
+                      style={{ ...inputSm, width: "100%" }} />
+                  </div>
+                )}
+                <Btn small onClick={addCondition} disabled={!isReady()}>Add</Btn>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      {conditions.length > 0 && (
+        <button onClick={clearAll}
+          style={{ background: "none", border: "none", color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, cursor: "pointer", padding: "3px 4px", textDecoration: "underline" }}>
+          Clear all
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -10431,6 +10931,8 @@ export default function App() {
   const [editingFolder, setEditingFolder] = useState(null); // folder object being edited — type inferred from its flags
   const [importModalType, setImportModalType] = useState(null); // "sample"|"book"|"module"|null
   const [importing,       setImporting]       = useState(false);
+  const [sampleFilterConds, setSampleFilterConds] = useState([]);
+  const [filteredSampleIds,  setFilteredSampleIds]  = useState(null); // null = no filter active
   const [addingBook,    setAddingBook]    = useState(false);
   const [editingBook,   setEditingBook]   = useState(null);
   const [loading,  setLoading]  = useState(true);
@@ -10474,6 +10976,25 @@ export default function App() {
       setLoading(false);
     }).catch(e => { setError(e.message); setLoading(false); });
   }, []);
+
+  // Debounced filter — call API whenever conditions change
+  useEffect(() => {
+    if (!sampleFilterConds.length) { setFilteredSampleIds(null); return; }
+    const timer = setTimeout(async () => {
+      try {
+        const conditions = sampleFilterConds.map(c => {
+          if (c.type === "numeric") {
+            if (c.op === "between") return { field: c.fieldId, op: "between", min: Number(c.min), max: Number(c.max) };
+            return { field: c.fieldId, op: c.op, value: Number(c.value) };
+          }
+          return { field: c.fieldId, op: c.op, value: c.value };
+        });
+        const res = await api("POST", "/samples/filter", { conditions });
+        setFilteredSampleIds(new Set(res.ids));
+      } catch { setFilteredSampleIds(null); }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [sampleFilterConds]);
 
   // ── Samples ──────────────────────────────────────────────────────────────
 
@@ -10861,7 +11382,8 @@ export default function App() {
   const sortedFolders = [...folders].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.name.localeCompare(b.name));
   const getSiblings = (parentId, isBook) => sortedFolders.filter(f => !!f.book_folder === isBook && !f.module_folder && (f.parent_id ?? null) === parentId);
   const allSampleFolders = folders.filter(f => !f.book_folder);
-  const ungrouped = samples.filter(s => !s.folder_id || !allSampleFolders.find(f => f.id === s.folder_id)).sort(byId);
+  const displaySamples = filteredSampleIds ? samples.filter(s => filteredSampleIds.has(s.id)) : samples;
+  const ungrouped = displaySamples.filter(s => !s.folder_id || !allSampleFolders.find(f => f.id === s.folder_id)).sort(byId);
   const [ungroupedDragOver,     setUngroupedDragOver]     = useState(false);
   const [bookUngroupedDragOver, setBookUngroupedDragOver] = useState(false);
 
@@ -10995,7 +11517,9 @@ export default function App() {
               <div style={{ marginBottom: 32 }}>
                 <div style={{ marginBottom: 18, display: "flex", alignItems: "baseline", gap: 12 }}>
                   <h1 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 26, color: T.textPrimary }}>Samples</h1>
-                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{samples.length} total</span>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>
+                    {filteredSampleIds ? `${filteredSampleIds.size} of ${samples.length}` : `${samples.length} total`}
+                  </span>
                   <div style={{ flex: 1 }} />
                   <Btn variant="ghost" small onClick={() => setAddingSampleFolder(true)}>+ Folder</Btn>
                   <Btn variant="ghost" small onClick={() => setImportModalType("sample")} disabled={importing}>
@@ -11006,12 +11530,17 @@ export default function App() {
                   <Btn variant="primary" small onClick={() => setAdding(true)}>+ New Sample</Btn>
                 </div>
 
+                {/* Filter bar */}
+                <div style={{ marginBottom: 14 }}>
+                  <SampleFilter settings={settings} samples={samples} onFilterChange={setSampleFilterConds} />
+                </div>
+
                 {/* Foldered groups — recursive tree */}
                 {(() => {
                   const renderSampleFolders = (parentId, depth = 0) =>
                     getSiblings(parentId, false).map(folder => (
                       <FolderTile key={folder.id} folder={folder} depth={depth}
-                        samples={samples.filter(s => s.folder_id === folder.id).sort(byId)}
+                        samples={displaySamples.filter(s => s.folder_id === folder.id).sort(byId)}
                         childContent={renderSampleFolders(folder.id, depth + 1)}
                         plotCache={plotCache}
                         onSelectSample={openSample} onDeleteSample={deleteSample}
