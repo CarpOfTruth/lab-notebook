@@ -1664,49 +1664,10 @@ function splitCsvLine(line) {
   return out;
 }
 
-function parse3PPCsv(text) {
-  const lines = text.trim().split('\n');
-  if (lines.length < 2) return null;
-  const hdrs = splitCsvLine(lines[0]).map(h => h.trim());
-  const gi = k => hdrs.indexOf(k);
-  const [iWPA, iPs, iVoff] = [gi('writePA'), gi('Ps'), gi('voff')];
-  if (iWPA < 0 || iPs < 0) return null;
-  const rows = lines.slice(1)
-    .map(l => { const c = splitCsvLine(l); return { wpa: parseFloat(c[iWPA]), ps: parseFloat(c[iPs]), voff: iVoff >= 0 ? parseFloat(c[iVoff]) : 0 }; })
-    .filter(r => isFinite(r.wpa) && isFinite(r.ps))
-    .sort((a, b) => a.wpa - b.wpa);
-  if (!rows.length) return null;
-  // Zero-correct: subtract Ps at the row closest to writePA = 0
-  const zeroRow = rows.reduce((best, r) => Math.abs(r.wpa) < Math.abs(best.wpa) ? r : best, rows[0]);
-  const psOffset = zeroRow.ps;
-  return { wpas: rows.map(r => r.wpa), ps: rows.map(r => r.ps - psOffset), voff: rows[0].voff ?? 0 };
-}
+// ── AddDataModal ──────────────────────────────────────────────────────────────
 
-function parsePrCsv(text) {
-  const lines = text.trim().split('\n');
-  if (lines.length < 2) return null;
-  const hdrs = splitCsvLine(lines[0]).map(h => h.trim());
-  const gi = k => hdrs.indexOf(k);
-  const [iWPD, iMW, iWPA, iTwin] = [gi('writePD'), gi('MW_pos_dPoff'), gi('writePA'), gi('twin')];
-  if (iWPD < 0 || iMW < 0) return null;
-  const rows = lines.slice(1)
-    .map(l => { const c = splitCsvLine(l); return { wpd: parseFloat(c[iWPD]), mw: parseFloat(c[iMW]), wpa: iWPA >= 0 ? parseFloat(c[iWPA]) : null, twin: iTwin >= 0 ? c[iTwin]?.trim() : null }; })
-    .filter(r => isFinite(r.wpd) && isFinite(r.mw))
-    .sort((a, b) => a.wpd - b.wpd);
-  if (!rows.length) return null;
-  const wpa   = rows[0].wpa  != null && isFinite(rows[0].wpa)  ? Math.round(rows[0].wpa * 100) / 100 : null;
-  const twin  = rows[0].twin || null;
-  return { wpds: rows.map(r => r.wpd), mw: rows.map(r => r.mw), wpa, twin };
-}
-
-// ── PulsedAddModal ────────────────────────────────────────────────────────────
-
-function PulsedAddModal({ onAdd, onClose, moduleOptions = [], sampleId, onModuleFileAdded }) {
+function AddDataModal({ onClose, moduleOptions = [], sampleId, onModuleFileAdded }) {
   const mono = { fontFamily: "'DM Mono', monospace" };
-  const pulsedOpts = [
-    { type: '3pp', label: '3PP Shmoo',    desc: 'ΔP vs write voltage — no offset + biased', color: T.teal },
-    { type: 'pr',  label: 'Pr Retention', desc: 'Switched polarization vs delay time',       color: T.blue },
-  ];
   const [uploadingFor, setUploadingFor] = useState(null); // module id being uploaded
   const [uploading,    setUploading]    = useState(false);
 
@@ -1730,160 +1691,31 @@ function PulsedAddModal({ onAdd, onClose, moduleOptions = [], sampleId, onModule
           <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>Add Data</span>
           <button onClick={onClose} style={{ background: 'none', border: 'none', color: T.textDim, cursor: 'pointer', fontSize: 16, lineHeight: 1 }}>✕</button>
         </div>
-        {moduleOptions.length > 0 && (
-          <>
-            <div style={{ padding: '7px 16px', borderBottom: `1px solid ${T.border}` }}>
-              <span style={{ ...mono, fontSize: 11, color: T.red }}>Module Data</span>
-            </div>
-            <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8, borderBottom: `1px solid ${T.border}` }}>
-              {moduleOptions.map(mod => (
-                <div key={mod.id}>
-                  {uploadingFor === mod.id ? (
-                    <label style={{ background: T.bg2, border: `1px solid ${T.teal}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ ...mono, fontSize: 12, color: T.teal }}>{uploading ? 'Uploading…' : `↑ Choose file for ${mod.name}`}</span>
-                      <input type="file" accept={mod.accepts?.join(",")} style={{ display: 'none' }}
-                        onChange={e => { if (e.target.files[0]) handleModuleFile(mod, e.target.files[0]); }} />
-                    </label>
-                  ) : (
-                    <button onClick={() => setUploadingFor(mod.id)}
-                      style={{ width: '100%', background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: 3, transition: 'border-color .15s' }}
-                      onMouseEnter={e => e.currentTarget.style.borderColor = T.red}
-                      onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
-                      <span style={{ ...mono, fontSize: 12, color: T.red, fontWeight: 600 }}>{mod.name}</span>
-                      <span style={{ ...mono, fontSize: 10, color: T.textDim }}>{mod.description}</span>
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
-          </>
-        )}
-        <div style={{ padding: '7px 16px', borderBottom: `1px solid ${T.border}` }}>
-          <span style={{ ...mono, fontSize: 11, color: T.teal }}>Pulsed Measurements</span>
-        </div>
-        <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {pulsedOpts.map(o => (
-            <button key={o.type} onClick={() => { onAdd(o.type); onClose(); }}
-              style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: 3, transition: 'border-color .15s' }}
-              onMouseEnter={e => e.currentTarget.style.borderColor = o.color}
-              onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
-              <span style={{ ...mono, fontSize: 12, color: o.color, fontWeight: 600 }}>{o.label}</span>
-              <span style={{ ...mono, fontSize: 10, color: T.textDim }}>{o.desc}</span>
-            </button>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ── ThreePPCard ───────────────────────────────────────────────────────────────
-
-function ThreePPCard({ data, onFileNo, onFileAt, onRemove }) {
-  const mono = { fontFamily: "'DM Mono', monospace" };
-  const hasNo  = !!(data?.no?.wpas?.length);
-  const hasAt  = !!(data?.at?.wpas?.length);
-  const hasAny = hasNo || hasAt;
-  const refNo  = useRef();
-  const refAt  = useRef();
-
-  const plotTraces = [
-    hasNo && { x: data.no.wpas, y: data.no.ps, name: 'No offset', line: { color: T.blue, width: 1.5 } },
-    hasAt && { x: data.at.wpas, y: data.at.ps, name: `@ ${data.at.voff?.toFixed(2)} V`, line: { color: T.amber, width: 1.5 } },
-  ].filter(Boolean).map(t => ({ ...t, type: 'scatter', mode: 'lines', showlegend: true, hovertemplate: '<extra></extra>' }));
-
-  const miniLayout = {
-    paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
-    margin: { l: 42, r: 6, t: 6, b: 32 }, height: 150,
-    xaxis: { title: { text: 'V_write (V)', font: { size: 10, color: T.textDim }, standoff: 4 }, tickfont: { size: 9, color: T.textDim }, gridcolor: T.border, zerolinecolor: T.border },
-    yaxis: { title: { text: 'Ps (µC/cm²)', font: { size: 10, color: T.textDim }, standoff: 4 }, tickfont: { size: 9, color: T.textDim }, gridcolor: T.border, zerolinecolor: T.border },
-    legend: { font: { size: 9, color: T.textDim }, bgcolor: 'transparent', x: 0, y: 1 },
-  };
-
-  const zones = [
-    { label: 'No Offset', has: hasNo, ref: refNo, onFile: onFileNo },
-    { label: '@ Offset',  has: hasAt, ref: refAt,  onFile: onFileAt },
-  ];
-
-  return (
-    <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: 'hidden' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: `1px solid ${T.border}` }}>
-        <span style={{ ...mono, fontSize: 12, color: T.teal, fontWeight: 600 }}>3PP Shmoo</span>
-        <button onClick={onRemove} style={{ background: 'none', border: 'none', color: T.textDim, cursor: 'pointer', fontSize: 13, lineHeight: 1 }}>✕</button>
-      </div>
-      <div style={{ padding: '10px 12px' }}>
-        {hasAny && <Plot data={plotTraces} layout={miniLayout} config={{ displayModeBar: false }} style={{ width: '100%' }} useResizeHandler />}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: hasAny ? 8 : 0 }}>
-          {zones.map(({ label, has, ref, onFile }) => (
-            <div key={label}>
-              <div style={{ ...mono, fontSize: 10, color: T.textDim, marginBottom: 4 }}>{label}</div>
-              <input ref={ref} type="file" accept=".csv" style={{ display: 'none' }} onChange={e => { if (e.target.files[0]) onFile(e.target.files[0]); e.target.value = ''; }} />
-              <div
-                onClick={() => ref.current.click()}
-                onDragOver={e => e.preventDefault()}
-                onDrop={e => { e.preventDefault(); if (e.dataTransfer.files[0]) onFile(e.dataTransfer.files[0]); }}
-                style={{ border: `1px dashed ${T.borderBright}`, borderRadius: 6, padding: '7px 6px', cursor: 'pointer', textAlign: 'center', ...mono, fontSize: 10, color: T.textDim }}>
-                {has ? '↑ replace' : 'drop / click'}
+        {moduleOptions.length > 0 ? (
+          <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {moduleOptions.map(mod => (
+              <div key={mod.id}>
+                {uploadingFor === mod.id ? (
+                  <label style={{ background: T.bg2, border: `1px solid ${T.teal}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ ...mono, fontSize: 12, color: T.teal }}>{uploading ? 'Uploading…' : `↑ Choose file for ${mod.name}`}</span>
+                    <input type="file" accept={mod.accepts?.join(",")} style={{ display: 'none' }}
+                      onChange={e => { if (e.target.files[0]) handleModuleFile(mod, e.target.files[0]); }} />
+                  </label>
+                ) : (
+                  <button onClick={() => setUploadingFor(mod.id)}
+                    style={{ width: '100%', background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: 3, transition: 'border-color .15s' }}
+                    onMouseEnter={e => e.currentTarget.style.borderColor = T.red}
+                    onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+                    <span style={{ ...mono, fontSize: 12, color: T.red, fontWeight: 600 }}>{mod.name}</span>
+                    <span style={{ ...mono, fontSize: 10, color: T.textDim }}>{mod.description}</span>
+                  </button>
+                )}
               </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ── PrCard ────────────────────────────────────────────────────────────────────
-
-const PR_CURVE_COLORS = [T.blue, T.amber, T.teal, T.red, '#a78bfa', '#f472b6'];
-
-function PrCard({ data, onFile, onRemove }) {
-  const mono = { fontFamily: "'DM Mono', monospace" };
-  const curves = data?.curves || [];
-  const fileRef = useRef();
-
-  const curveLabel = (c, i) => c.wpa != null ? `${c.wpa} V` : `file ${i + 1}`;
-  const plotTraces = curves.map((c, i) => ({
-    x: c.wpds, y: c.mw,
-    name: curveLabel(c, i),
-    type: 'scatter', mode: 'lines+markers',
-    line: { color: PR_CURVE_COLORS[i % PR_CURVE_COLORS.length], width: 1.5 },
-    marker: { size: 3, color: PR_CURVE_COLORS[i % PR_CURVE_COLORS.length] },
-    showlegend: true, hovertemplate: '<extra></extra>',
-  }));
-
-  const miniLayout = {
-    paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
-    margin: { l: 46, r: 6, t: 6, b: 32 }, height: 150,
-    xaxis: { type: 'log', title: { text: 'Delay (s)', font: { size: 10, color: T.textDim }, standoff: 4 }, tickfont: { size: 9, color: T.textDim }, gridcolor: T.border },
-    yaxis: { title: { text: '2Pr (µC/cm²)', font: { size: 10, color: T.textDim }, standoff: 4 }, tickfont: { size: 9, color: T.textDim }, gridcolor: T.border, zerolinecolor: T.border },
-    legend: { font: { size: 9, color: T.textDim }, bgcolor: 'transparent', x: 0, y: 1 },
-  };
-
-  return (
-    <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: 'hidden' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: `1px solid ${T.border}` }}>
-        <span style={{ ...mono, fontSize: 12, color: T.blue, fontWeight: 600 }}>Pr Retention</span>
-        <button onClick={onRemove} style={{ background: 'none', border: 'none', color: T.textDim, cursor: 'pointer', fontSize: 13, lineHeight: 1 }}>✕</button>
-      </div>
-      <div style={{ padding: '10px 12px' }}>
-        {curves.length > 0 && <Plot data={plotTraces} layout={miniLayout} config={{ displayModeBar: false }} style={{ width: '100%' }} useResizeHandler />}
-        <input ref={fileRef} type="file" accept=".csv" multiple style={{ display: 'none' }}
-          onChange={e => { [...e.target.files].forEach(onFile); e.target.value = ''; }} />
-        <div
-          onDragOver={e => e.preventDefault()}
-          onDrop={e => { e.preventDefault(); [...e.dataTransfer.files].forEach(onFile); }}
-          onClick={() => fileRef.current.click()}
-          style={{ border: `1px dashed ${T.borderBright}`, borderRadius: 6, padding: '8px 14px', cursor: 'pointer', textAlign: 'center', ...mono, fontSize: 10, color: T.textDim, marginTop: curves.length > 0 ? 8 : 0 }}>
-          {curves.length > 0 ? `↑ add more files  (${curves.length} loaded)` : 'drop one or more Pr .csv files'}
-        </div>
-        {curves.length > 0 && (
-          <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-            {curves.map((c, i) => (
-              <span key={i} style={{ ...mono, fontSize: 9, padding: '2px 6px', borderRadius: 4, background: PR_CURVE_COLORS[i % PR_CURVE_COLORS.length] + '22', color: PR_CURVE_COLORS[i % PR_CURVE_COLORS.length], border: `1px solid ${PR_CURVE_COLORS[i % PR_CURVE_COLORS.length]}44` }}>
-                {curveLabel(c, i)} · {c.wpds.length} pts
-              </span>
             ))}
+          </div>
+        ) : (
+          <div style={{ padding: '14px 16px' }}>
+            <span style={{ ...mono, fontSize: 11, color: T.textDim }}>No modules available for this section.</span>
           </div>
         )}
       </div>
@@ -1900,8 +1732,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
   const [overIdx, setOverIdx]           = useState(null);
   const [knownMaterials, setKnownMaterials] = useState([]);
   const [xrdAnalysisOpen, setXrdAnalysisOpen] = useState(false);
-  const [addPulsedOpen, setAddPulsedOpen]     = useState(false);
-  const [pulsedData, setPulsedData]           = useState({});
+  const [addDataOpen, setAddDataOpen]         = useState(false);
 
   useEffect(() => {
     api("GET", "/materials").then(setKnownMaterials).catch(() => {});
@@ -1957,45 +1788,6 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
       const parsed = csvToPlotData(text, measType, thick);
       if (!parsed || !hasPlotData(parsed)) return;
       onUploadFile(measType, file, parsed, null);
-    };
-    reader.readAsText(file);
-  };
-
-  const pulsedItems = sample.pulsed_items || [];
-
-  const addPulsedItem = type => {
-    const id = Math.random().toString(36).slice(2, 9);
-    onUpdate({ ...sample, pulsed_items: [...pulsedItems, { type, id }] });
-  };
-
-  const removePulsedItem = id => {
-    onUpdate({ ...sample, pulsed_items: pulsedItems.filter(i => i.id !== id) });
-    setPulsedData(p => { const c = { ...p }; delete c[id]; return c; });
-  };
-
-  const handlePulsedFile3PP = (itemId, slot, file) => {
-    const reader = new FileReader();
-    reader.onload = e => {
-      const parsed = parse3PPCsv(e.target.result);
-      if (!parsed) return;
-      setPulsedData(p => ({ ...p, [itemId]: { ...(p[itemId] || { type: '3pp' }), [slot]: parsed } }));
-    };
-    reader.readAsText(file);
-  };
-
-  const handlePulsedFilePr = (itemId, file) => {
-    const reader = new FileReader();
-    reader.onload = e => {
-      const parsed = parsePrCsv(e.target.result);
-      if (!parsed) return;
-      setPulsedData(p => {
-        const prev = p[itemId] || { type: 'pr', curves: [] };
-        const curves = [...(prev.curves || [])];
-        // Deduplicate by write voltage — replacing if same wpa dropped again
-        const existingIdx = parsed.wpa != null ? curves.findIndex(c => c.wpa === parsed.wpa) : -1;
-        if (existingIdx >= 0) curves[existingIdx] = parsed; else curves.push(parsed);
-        return { ...p, [itemId]: { ...prev, curves } };
-      });
     };
     reader.readAsText(file);
   };
@@ -2086,7 +1878,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
       <section>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
           <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2 }}>Electrical Characterization</span>
-          <Btn variant="teal" small onClick={() => setAddPulsedOpen(true)}>+ Add Data</Btn>
+          <Btn variant="teal" small onClick={() => setAddDataOpen(true)}>+ Add Data</Btn>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
           {["pe", "diel_b", "diel_f"].map(t => (
@@ -2103,27 +1895,9 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
           {modulesForSection("electrical").map(m => (
             <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} />
           ))}
-          {pulsedItems.map(item => {
-            const d = pulsedData[item.id] || {};
-            if (item.type === '3pp') return (
-              <ThreePPCard key={item.id}
-                data={{ no: d.no, at: d.at }}
-                onFileNo={file => handlePulsedFile3PP(item.id, 'no', file)}
-                onFileAt={file => handlePulsedFile3PP(item.id, 'at', file)}
-                onRemove={() => removePulsedItem(item.id)} />
-            );
-            if (item.type === 'pr') return (
-              <PrCard key={item.id}
-                data={{ curves: d.curves || [] }}
-                onFile={file => handlePulsedFilePr(item.id, file)}
-                onRemove={() => removePulsedItem(item.id)} />
-            );
-            return null;
-          })}
         </div>
-        {addPulsedOpen && <PulsedAddModal
-          onAdd={addPulsedItem}
-          onClose={() => setAddPulsedOpen(false)}
+        {addDataOpen && <AddDataModal
+          onClose={() => setAddDataOpen(false)}
           sampleId={sample.id}
           moduleOptions={modulesForSection("electrical").filter(m => !sample.filenames?.[m.id])}
           onModuleFileAdded={refreshSample}
@@ -3480,7 +3254,7 @@ function ViewDataModal({ sampleId, files, loading, onClose, onDeleteFile }) {
 
   const MEAS_LABELS = {
     pe: "PE Loop", diel_b: "Dielectric", diel_b_up: "Dielectric ↑", diel_b_down: "Dielectric ↓",
-    iv: "IV", pulsed: "Pulsed", xrd_ot: "XRD θ/2θ", xrr: "XRR", rsm: "RSM", afm: "AFM",
+    iv: "IV", xrd_ot: "XRD θ/2θ", xrr: "XRR", rsm: "RSM", afm: "AFM",
   };
 
   return (
