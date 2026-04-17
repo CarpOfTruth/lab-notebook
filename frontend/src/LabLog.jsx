@@ -321,6 +321,17 @@ const Btn = ({ children, onClick, variant = "primary", small, disabled }) => {
   return <button style={styles[variant]} onClick={onClick} disabled={disabled}>{children}</button>;
 };
 
+// File-picker button — identical to <Btn> but triggers a hidden <input type="file">
+const FileBtn = ({ children, accept, onChange, disabled, variant = "ghost", small = true }) => {
+  const ref = useRef();
+  return (
+    <>
+      <Btn variant={variant} small={small} disabled={disabled} onClick={() => ref.current?.click()}>{children}</Btn>
+      <input ref={ref} type="file" accept={accept} style={{ display: "none" }} onChange={e => { onChange(e); e.target.value = ""; }} disabled={disabled} />
+    </>
+  );
+};
+
 const Label = ({ children }) => (
   <label style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>{children}</label>
 );
@@ -411,6 +422,36 @@ const Sel = ({ label, value, onChange, options }) => (
     </select>
   </div>
 );
+
+// Recursively builds a flat ordered list of folder options with depth metadata.
+// Pass `filterFn` to restrict which folders are eligible (e.g. sample-only).
+function buildFolderOptions(folders, filterFn, parentId = null, depth = 0) {
+  return folders
+    .filter(f => filterFn(f) && (f.parent_id ?? null) === parentId)
+    .flatMap(f => [
+      { value: f.id, label: f.name, depth },
+      ...buildFolderOptions(folders, filterFn, f.id, depth + 1),
+    ]);
+}
+
+// Folder <select> with depth-indented options. Shares the same visual style as Sel.
+function FolderSelect({ label, value, onChange, folders, filterFn, emptyLabel = "— Ungrouped —" }) {
+  const opts = buildFolderOptions(folders, filterFn);
+  if (!opts.length) return null;
+  const INDENT = "\u00a0\u00a0\u00a0\u00a0";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      {label && <Label>{label}</Label>}
+      <select value={value} onChange={e => onChange(e.target.value)}
+        style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, color: T.textPrimary, padding: "8px 10px", fontFamily: "'DM Mono', monospace", fontSize: 13, outline: "none", cursor: "pointer" }}>
+        <option value="">{emptyLabel}</option>
+        {opts.map(o => (
+          <option key={o.value} value={o.value}>{INDENT.repeat(o.depth)}{o.label}</option>
+        ))}
+      </select>
+    </div>
+  );
+}
 
 // Renders a chemical-formula string with digit sequences as subscripts.
 // e.g. "BaTiO3" → BaTiO₃, "Ba0.5Sr0.5TiO3" → Ba₀.₅Sr₀.₅TiO₃ (via <sub>)
@@ -1366,6 +1407,7 @@ const DEFAULT_SETTINGS = {
   pld:        { temp: 600, pressure: 2,  frequency_hz: 10, energy_mJ: 60, pulses: 10000 },
   materials:  { sputter: [], pld: [] },
   structures: [],
+  custom_growth_params: { sputter: [], pld: [] },
 };
 
 function mergeSettings(parsed) {
@@ -1379,7 +1421,19 @@ function mergeSettings(parsed) {
       pld:     parsed.materials?.pld     ?? [],
     },
     structures: parsed.structures ?? [],
+    custom_growth_params: {
+      sputter: parsed.custom_growth_params?.sputter ?? [],
+      pld:     parsed.custom_growth_params?.pld     ?? [],
+    },
   };
+}
+
+// Generate a stable, readable ID for a custom growth param.
+// Slug from initial name + 4-char random suffix so it survives renames.
+function makeParamId(name) {
+  const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "param";
+  const suffix = Math.random().toString(36).slice(2, 6);
+  return `${slug}_${suffix}`;
 }
 
 // Parse a CIF file text and return { name, a, b, c, alpha, beta, gamma }
@@ -1447,12 +1501,19 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
         if (entry.oxygen_pct != null && entry.oxygen_pct !== "") layerDefaults.oxygen_pct = entry.oxygen_pct;
         if (entry.time_s     != null && entry.time_s     !== "") layerDefaults.time_s     = entry.time_s;
       } else {
-        if (entry.energy_mJ    != null && entry.energy_mJ    !== "") merged.energy_mJ           = entry.energy_mJ;
-        if (entry.pulses       != null && entry.pulses       !== "") merged.pulses               = entry.pulses;
-        if (entry.temp         != null && entry.temp         !== "") layerDefaults.temp           = entry.temp;
-        if (entry.pressure     != null && entry.pressure     !== "") layerDefaults.pressure       = entry.pressure;
-        if (entry.frequency_hz != null && entry.frequency_hz !== "") layerDefaults.frequency_hz  = entry.frequency_hz;
+        if (entry.energy_mJ    != null && entry.energy_mJ    !== "") merged.energy_mJ          = entry.energy_mJ;
+        if (entry.pulses       != null && entry.pulses       !== "") merged.pulses              = entry.pulses;
+        if (entry.temp         != null && entry.temp         !== "") layerDefaults.temp         = entry.temp;
+        if (entry.pressure     != null && entry.pressure     !== "") layerDefaults.pressure     = entry.pressure;
+        if (entry.frequency_hz != null && entry.frequency_hz !== "") layerDefaults.frequency_hz = entry.frequency_hz;
       }
+      // Autofill custom growth params from material library entry
+      const customParams = settings?.custom_growth_params?.[technique] || [];
+      const customFill = {};
+      for (const p of customParams) {
+        if (entry[p.id] != null && entry[p.id] !== "") customFill[p.id] = entry[p.id];
+      }
+      if (Object.keys(customFill).length) layerDefaults.custom = customFill;
       onChange(merged, Object.keys(layerDefaults).length ? layerDefaults : null);
     } else {
       onChange({ ...target, material: v });
@@ -1496,7 +1557,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
   const cancelEdit = (e) => { e.stopPropagation(); if (initialEditing) { onRemove(); } else { setEditing(false); } };
   const handleEditKeyDown = (e) => { if (e.key === "Enter") { e.preventDefault(); onUpdate(draft); setEditing(false); } };
   const setDraftField = (k, v) => setDraft(p => ({ ...p, [k]: v }));
-  const updateTarget = (i, t, layerDefaults)  => setDraft(p => { const ts = [...p.targets]; ts[i] = t; const patch = { ...p, targets: ts }; if (i === 0 && layerDefaults) Object.assign(patch, layerDefaults); return patch; });
+  const updateTarget = (i, t, layerDefaults)  => setDraft(p => { const ts = [...p.targets]; ts[i] = t; const patch = { ...p, targets: ts }; if (i === 0 && layerDefaults) { const { custom: newCustom, ...rest } = layerDefaults; Object.assign(patch, rest); if (newCustom) patch.custom = { ...(patch.custom || {}), ...newCustom }; } return patch; });
   const removeTarget = (i)     => setDraft(p => { const ts = p.targets.filter((_, j) => j !== i); return { ...p, targets: ts }; });
   const addTarget = () => {
     const cfg = settings?.[technique] || {};
@@ -1547,6 +1608,12 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
         {technique === "pld"
           ? <>{sharedField("frequency_hz", "Rep", "Hz")}</>
           : <>{sharedField("oxygen_pct", "O₂", "%")}{sharedField("time_s", "Time", "s")}</>}
+        {(settings?.custom_growth_params?.[technique] || []).filter(p => layer.custom?.[p.id] != null && layer.custom[p.id] !== "").map(p => (
+          <div key={p.id} style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", marginBottom: 1 }}>{p.name || p.id}</div>
+            <div style={{ fontSize: 12, color: T.textPrimary, fontFamily: "'DM Mono', monospace" }}>{layer.custom[p.id]}<span style={{ fontSize: 10, color: T.textDim }}>{p.unit ? ` ${p.unit}` : ""}</span></div>
+          </div>
+        ))}
         <button onClick={startEdit}   style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>✎</button>
         <button onClick={onDuplicate} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 15, padding: 0 }}>+</button>
         <button onClick={onRemove}    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, padding: 0 }}>×</button>
@@ -1614,6 +1681,19 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
             </div>
           </>
         )}
+        {(settings?.custom_growth_params?.[technique] || []).map(p => (
+          <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+              <input
+                value={draft.custom?.[p.id] ?? ""}
+                placeholder={p.default !== "" ? String(p.default) : "—"}
+                onChange={e => setDraft(prev => ({ ...prev, custom: { ...(prev.custom || {}), [p.id]: e.target.value } }))}
+                style={{ ...inputSm, width: 70 }} />
+              {p.unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{p.unit}</span>}
+            </div>
+          </div>
+        ))}
       </div>
       {/* targets */}
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -1653,49 +1733,10 @@ function splitCsvLine(line) {
   return out;
 }
 
-function parse3PPCsv(text) {
-  const lines = text.trim().split('\n');
-  if (lines.length < 2) return null;
-  const hdrs = splitCsvLine(lines[0]).map(h => h.trim());
-  const gi = k => hdrs.indexOf(k);
-  const [iWPA, iPs, iVoff] = [gi('writePA'), gi('Ps'), gi('voff')];
-  if (iWPA < 0 || iPs < 0) return null;
-  const rows = lines.slice(1)
-    .map(l => { const c = splitCsvLine(l); return { wpa: parseFloat(c[iWPA]), ps: parseFloat(c[iPs]), voff: iVoff >= 0 ? parseFloat(c[iVoff]) : 0 }; })
-    .filter(r => isFinite(r.wpa) && isFinite(r.ps))
-    .sort((a, b) => a.wpa - b.wpa);
-  if (!rows.length) return null;
-  // Zero-correct: subtract Ps at the row closest to writePA = 0
-  const zeroRow = rows.reduce((best, r) => Math.abs(r.wpa) < Math.abs(best.wpa) ? r : best, rows[0]);
-  const psOffset = zeroRow.ps;
-  return { wpas: rows.map(r => r.wpa), ps: rows.map(r => r.ps - psOffset), voff: rows[0].voff ?? 0 };
-}
+// ── AddDataModal ──────────────────────────────────────────────────────────────
 
-function parsePrCsv(text) {
-  const lines = text.trim().split('\n');
-  if (lines.length < 2) return null;
-  const hdrs = splitCsvLine(lines[0]).map(h => h.trim());
-  const gi = k => hdrs.indexOf(k);
-  const [iWPD, iMW, iWPA, iTwin] = [gi('writePD'), gi('MW_pos_dPoff'), gi('writePA'), gi('twin')];
-  if (iWPD < 0 || iMW < 0) return null;
-  const rows = lines.slice(1)
-    .map(l => { const c = splitCsvLine(l); return { wpd: parseFloat(c[iWPD]), mw: parseFloat(c[iMW]), wpa: iWPA >= 0 ? parseFloat(c[iWPA]) : null, twin: iTwin >= 0 ? c[iTwin]?.trim() : null }; })
-    .filter(r => isFinite(r.wpd) && isFinite(r.mw))
-    .sort((a, b) => a.wpd - b.wpd);
-  if (!rows.length) return null;
-  const wpa   = rows[0].wpa  != null && isFinite(rows[0].wpa)  ? Math.round(rows[0].wpa * 100) / 100 : null;
-  const twin  = rows[0].twin || null;
-  return { wpds: rows.map(r => r.wpd), mw: rows.map(r => r.mw), wpa, twin };
-}
-
-// ── PulsedAddModal ────────────────────────────────────────────────────────────
-
-function PulsedAddModal({ onAdd, onClose, moduleOptions = [], sampleId, onModuleFileAdded }) {
+function AddDataModal({ onClose, moduleOptions = [], sampleId, onModuleFileAdded }) {
   const mono = { fontFamily: "'DM Mono', monospace" };
-  const pulsedOpts = [
-    { type: '3pp', label: '3PP Shmoo',    desc: 'ΔP vs write voltage — no offset + biased', color: T.teal },
-    { type: 'pr',  label: 'Pr Retention', desc: 'Switched polarization vs delay time',       color: T.blue },
-  ];
   const [uploadingFor, setUploadingFor] = useState(null); // module id being uploaded
   const [uploading,    setUploading]    = useState(false);
 
@@ -1719,160 +1760,31 @@ function PulsedAddModal({ onAdd, onClose, moduleOptions = [], sampleId, onModule
           <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>Add Data</span>
           <button onClick={onClose} style={{ background: 'none', border: 'none', color: T.textDim, cursor: 'pointer', fontSize: 16, lineHeight: 1 }}>✕</button>
         </div>
-        {moduleOptions.length > 0 && (
-          <>
-            <div style={{ padding: '7px 16px', borderBottom: `1px solid ${T.border}` }}>
-              <span style={{ ...mono, fontSize: 11, color: T.red }}>Module Data</span>
-            </div>
-            <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8, borderBottom: `1px solid ${T.border}` }}>
-              {moduleOptions.map(mod => (
-                <div key={mod.id}>
-                  {uploadingFor === mod.id ? (
-                    <label style={{ background: T.bg2, border: `1px solid ${T.teal}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ ...mono, fontSize: 12, color: T.teal }}>{uploading ? 'Uploading…' : `↑ Choose file for ${mod.name}`}</span>
-                      <input type="file" accept={mod.accepts?.join(",")} style={{ display: 'none' }}
-                        onChange={e => { if (e.target.files[0]) handleModuleFile(mod, e.target.files[0]); }} />
-                    </label>
-                  ) : (
-                    <button onClick={() => setUploadingFor(mod.id)}
-                      style={{ width: '100%', background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: 3, transition: 'border-color .15s' }}
-                      onMouseEnter={e => e.currentTarget.style.borderColor = T.red}
-                      onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
-                      <span style={{ ...mono, fontSize: 12, color: T.red, fontWeight: 600 }}>{mod.name}</span>
-                      <span style={{ ...mono, fontSize: 10, color: T.textDim }}>{mod.description}</span>
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
-          </>
-        )}
-        <div style={{ padding: '7px 16px', borderBottom: `1px solid ${T.border}` }}>
-          <span style={{ ...mono, fontSize: 11, color: T.teal }}>Pulsed Measurements</span>
-        </div>
-        <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {pulsedOpts.map(o => (
-            <button key={o.type} onClick={() => { onAdd(o.type); onClose(); }}
-              style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: 3, transition: 'border-color .15s' }}
-              onMouseEnter={e => e.currentTarget.style.borderColor = o.color}
-              onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
-              <span style={{ ...mono, fontSize: 12, color: o.color, fontWeight: 600 }}>{o.label}</span>
-              <span style={{ ...mono, fontSize: 10, color: T.textDim }}>{o.desc}</span>
-            </button>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ── ThreePPCard ───────────────────────────────────────────────────────────────
-
-function ThreePPCard({ data, onFileNo, onFileAt, onRemove }) {
-  const mono = { fontFamily: "'DM Mono', monospace" };
-  const hasNo  = !!(data?.no?.wpas?.length);
-  const hasAt  = !!(data?.at?.wpas?.length);
-  const hasAny = hasNo || hasAt;
-  const refNo  = useRef();
-  const refAt  = useRef();
-
-  const plotTraces = [
-    hasNo && { x: data.no.wpas, y: data.no.ps, name: 'No offset', line: { color: T.blue, width: 1.5 } },
-    hasAt && { x: data.at.wpas, y: data.at.ps, name: `@ ${data.at.voff?.toFixed(2)} V`, line: { color: T.amber, width: 1.5 } },
-  ].filter(Boolean).map(t => ({ ...t, type: 'scatter', mode: 'lines', showlegend: true, hovertemplate: '<extra></extra>' }));
-
-  const miniLayout = {
-    paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
-    margin: { l: 42, r: 6, t: 6, b: 32 }, height: 150,
-    xaxis: { title: { text: 'V_write (V)', font: { size: 10, color: T.textDim }, standoff: 4 }, tickfont: { size: 9, color: T.textDim }, gridcolor: T.border, zerolinecolor: T.border },
-    yaxis: { title: { text: 'Ps (µC/cm²)', font: { size: 10, color: T.textDim }, standoff: 4 }, tickfont: { size: 9, color: T.textDim }, gridcolor: T.border, zerolinecolor: T.border },
-    legend: { font: { size: 9, color: T.textDim }, bgcolor: 'transparent', x: 0, y: 1 },
-  };
-
-  const zones = [
-    { label: 'No Offset', has: hasNo, ref: refNo, onFile: onFileNo },
-    { label: '@ Offset',  has: hasAt, ref: refAt,  onFile: onFileAt },
-  ];
-
-  return (
-    <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: 'hidden' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: `1px solid ${T.border}` }}>
-        <span style={{ ...mono, fontSize: 12, color: T.teal, fontWeight: 600 }}>3PP Shmoo</span>
-        <button onClick={onRemove} style={{ background: 'none', border: 'none', color: T.textDim, cursor: 'pointer', fontSize: 13, lineHeight: 1 }}>✕</button>
-      </div>
-      <div style={{ padding: '10px 12px' }}>
-        {hasAny && <Plot data={plotTraces} layout={miniLayout} config={{ displayModeBar: false }} style={{ width: '100%' }} useResizeHandler />}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: hasAny ? 8 : 0 }}>
-          {zones.map(({ label, has, ref, onFile }) => (
-            <div key={label}>
-              <div style={{ ...mono, fontSize: 10, color: T.textDim, marginBottom: 4 }}>{label}</div>
-              <input ref={ref} type="file" accept=".csv" style={{ display: 'none' }} onChange={e => { if (e.target.files[0]) onFile(e.target.files[0]); e.target.value = ''; }} />
-              <div
-                onClick={() => ref.current.click()}
-                onDragOver={e => e.preventDefault()}
-                onDrop={e => { e.preventDefault(); if (e.dataTransfer.files[0]) onFile(e.dataTransfer.files[0]); }}
-                style={{ border: `1px dashed ${T.borderBright}`, borderRadius: 6, padding: '7px 6px', cursor: 'pointer', textAlign: 'center', ...mono, fontSize: 10, color: T.textDim }}>
-                {has ? '↑ replace' : 'drop / click'}
+        {moduleOptions.length > 0 ? (
+          <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {moduleOptions.map(mod => (
+              <div key={mod.id}>
+                {uploadingFor === mod.id ? (
+                  <label style={{ background: T.bg2, border: `1px solid ${T.teal}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ ...mono, fontSize: 12, color: T.teal }}>{uploading ? 'Uploading…' : `↑ Choose file for ${mod.name}`}</span>
+                    <input type="file" accept={mod.accepts?.join(",")} style={{ display: 'none' }}
+                      onChange={e => { if (e.target.files[0]) handleModuleFile(mod, e.target.files[0]); }} />
+                  </label>
+                ) : (
+                  <button onClick={() => setUploadingFor(mod.id)}
+                    style={{ width: '100%', background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: 3, transition: 'border-color .15s' }}
+                    onMouseEnter={e => e.currentTarget.style.borderColor = T.red}
+                    onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+                    <span style={{ ...mono, fontSize: 12, color: T.red, fontWeight: 600 }}>{mod.name}</span>
+                    <span style={{ ...mono, fontSize: 10, color: T.textDim }}>{mod.description}</span>
+                  </button>
+                )}
               </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ── PrCard ────────────────────────────────────────────────────────────────────
-
-const PR_CURVE_COLORS = [T.blue, T.amber, T.teal, T.red, '#a78bfa', '#f472b6'];
-
-function PrCard({ data, onFile, onRemove }) {
-  const mono = { fontFamily: "'DM Mono', monospace" };
-  const curves = data?.curves || [];
-  const fileRef = useRef();
-
-  const curveLabel = (c, i) => c.wpa != null ? `${c.wpa} V` : `file ${i + 1}`;
-  const plotTraces = curves.map((c, i) => ({
-    x: c.wpds, y: c.mw,
-    name: curveLabel(c, i),
-    type: 'scatter', mode: 'lines+markers',
-    line: { color: PR_CURVE_COLORS[i % PR_CURVE_COLORS.length], width: 1.5 },
-    marker: { size: 3, color: PR_CURVE_COLORS[i % PR_CURVE_COLORS.length] },
-    showlegend: true, hovertemplate: '<extra></extra>',
-  }));
-
-  const miniLayout = {
-    paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
-    margin: { l: 46, r: 6, t: 6, b: 32 }, height: 150,
-    xaxis: { type: 'log', title: { text: 'Delay (s)', font: { size: 10, color: T.textDim }, standoff: 4 }, tickfont: { size: 9, color: T.textDim }, gridcolor: T.border },
-    yaxis: { title: { text: '2Pr (µC/cm²)', font: { size: 10, color: T.textDim }, standoff: 4 }, tickfont: { size: 9, color: T.textDim }, gridcolor: T.border, zerolinecolor: T.border },
-    legend: { font: { size: 9, color: T.textDim }, bgcolor: 'transparent', x: 0, y: 1 },
-  };
-
-  return (
-    <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: 'hidden' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: `1px solid ${T.border}` }}>
-        <span style={{ ...mono, fontSize: 12, color: T.blue, fontWeight: 600 }}>Pr Retention</span>
-        <button onClick={onRemove} style={{ background: 'none', border: 'none', color: T.textDim, cursor: 'pointer', fontSize: 13, lineHeight: 1 }}>✕</button>
-      </div>
-      <div style={{ padding: '10px 12px' }}>
-        {curves.length > 0 && <Plot data={plotTraces} layout={miniLayout} config={{ displayModeBar: false }} style={{ width: '100%' }} useResizeHandler />}
-        <input ref={fileRef} type="file" accept=".csv" multiple style={{ display: 'none' }}
-          onChange={e => { [...e.target.files].forEach(onFile); e.target.value = ''; }} />
-        <div
-          onDragOver={e => e.preventDefault()}
-          onDrop={e => { e.preventDefault(); [...e.dataTransfer.files].forEach(onFile); }}
-          onClick={() => fileRef.current.click()}
-          style={{ border: `1px dashed ${T.borderBright}`, borderRadius: 6, padding: '8px 14px', cursor: 'pointer', textAlign: 'center', ...mono, fontSize: 10, color: T.textDim, marginTop: curves.length > 0 ? 8 : 0 }}>
-          {curves.length > 0 ? `↑ add more files  (${curves.length} loaded)` : 'drop one or more Pr .csv files'}
-        </div>
-        {curves.length > 0 && (
-          <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-            {curves.map((c, i) => (
-              <span key={i} style={{ ...mono, fontSize: 9, padding: '2px 6px', borderRadius: 4, background: PR_CURVE_COLORS[i % PR_CURVE_COLORS.length] + '22', color: PR_CURVE_COLORS[i % PR_CURVE_COLORS.length], border: `1px solid ${PR_CURVE_COLORS[i % PR_CURVE_COLORS.length]}44` }}>
-                {curveLabel(c, i)} · {c.wpds.length} pts
-              </span>
             ))}
+          </div>
+        ) : (
+          <div style={{ padding: '14px 16px' }}>
+            <span style={{ ...mono, fontSize: 11, color: T.textDim }}>No modules available for this section.</span>
           </div>
         )}
       </div>
@@ -1889,8 +1801,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
   const [overIdx, setOverIdx]           = useState(null);
   const [knownMaterials, setKnownMaterials] = useState([]);
   const [xrdAnalysisOpen, setXrdAnalysisOpen] = useState(false);
-  const [addPulsedOpen, setAddPulsedOpen]     = useState(false);
-  const [pulsedData, setPulsedData]           = useState({});
+  const [addDataOpen, setAddDataOpen]         = useState(false);
 
   useEffect(() => {
     api("GET", "/materials").then(setKnownMaterials).catch(() => {});
@@ -1946,45 +1857,6 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
       const parsed = csvToPlotData(text, measType, thick);
       if (!parsed || !hasPlotData(parsed)) return;
       onUploadFile(measType, file, parsed, null);
-    };
-    reader.readAsText(file);
-  };
-
-  const pulsedItems = sample.pulsed_items || [];
-
-  const addPulsedItem = type => {
-    const id = Math.random().toString(36).slice(2, 9);
-    onUpdate({ ...sample, pulsed_items: [...pulsedItems, { type, id }] });
-  };
-
-  const removePulsedItem = id => {
-    onUpdate({ ...sample, pulsed_items: pulsedItems.filter(i => i.id !== id) });
-    setPulsedData(p => { const c = { ...p }; delete c[id]; return c; });
-  };
-
-  const handlePulsedFile3PP = (itemId, slot, file) => {
-    const reader = new FileReader();
-    reader.onload = e => {
-      const parsed = parse3PPCsv(e.target.result);
-      if (!parsed) return;
-      setPulsedData(p => ({ ...p, [itemId]: { ...(p[itemId] || { type: '3pp' }), [slot]: parsed } }));
-    };
-    reader.readAsText(file);
-  };
-
-  const handlePulsedFilePr = (itemId, file) => {
-    const reader = new FileReader();
-    reader.onload = e => {
-      const parsed = parsePrCsv(e.target.result);
-      if (!parsed) return;
-      setPulsedData(p => {
-        const prev = p[itemId] || { type: 'pr', curves: [] };
-        const curves = [...(prev.curves || [])];
-        // Deduplicate by write voltage — replacing if same wpa dropped again
-        const existingIdx = parsed.wpa != null ? curves.findIndex(c => c.wpa === parsed.wpa) : -1;
-        if (existingIdx >= 0) curves[existingIdx] = parsed; else curves.push(parsed);
-        return { ...p, [itemId]: { ...prev, curves } };
-      });
     };
     reader.readAsText(file);
   };
@@ -2075,7 +1947,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
       <section>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
           <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2 }}>Electrical Characterization</span>
-          <Btn variant="teal" small onClick={() => setAddPulsedOpen(true)}>+ Add Data</Btn>
+          <Btn variant="teal" small onClick={() => setAddDataOpen(true)}>+ Add Data</Btn>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
           {["pe", "diel_b", "diel_f"].map(t => (
@@ -2092,27 +1964,9 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
           {modulesForSection("electrical").map(m => (
             <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} />
           ))}
-          {pulsedItems.map(item => {
-            const d = pulsedData[item.id] || {};
-            if (item.type === '3pp') return (
-              <ThreePPCard key={item.id}
-                data={{ no: d.no, at: d.at }}
-                onFileNo={file => handlePulsedFile3PP(item.id, 'no', file)}
-                onFileAt={file => handlePulsedFile3PP(item.id, 'at', file)}
-                onRemove={() => removePulsedItem(item.id)} />
-            );
-            if (item.type === 'pr') return (
-              <PrCard key={item.id}
-                data={{ curves: d.curves || [] }}
-                onFile={file => handlePulsedFilePr(item.id, file)}
-                onRemove={() => removePulsedItem(item.id)} />
-            );
-            return null;
-          })}
         </div>
-        {addPulsedOpen && <PulsedAddModal
-          onAdd={addPulsedItem}
-          onClose={() => setAddPulsedOpen(false)}
+        {addDataOpen && <AddDataModal
+          onClose={() => setAddDataOpen(false)}
           sampleId={sample.id}
           moduleOptions={modulesForSection("electrical").filter(m => !sample.filenames?.[m.id])}
           onModuleFileAdded={refreshSample}
@@ -2257,10 +2111,14 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
           <Input label="Bin"  value={f.bin} onChange={set("bin")} placeholder="e.g. A3" />
         </div>
         <Input label="Notes"      value={f.notes}     onChange={set("notes")}     placeholder="Brief description…" />
-        {folders && folders.length > 0 && (
-          <Sel label="Folder (optional)" value={f.folder_id} onChange={set("folder_id")}
-            options={[{ value: "", label: "— Ungrouped —" }, ...folders.map(fo => ({ value: fo.id, label: fo.name }))]} />
-        )}
+        <FolderSelect
+          label="Folder (optional)"
+          value={f.folder_id}
+          onChange={set("folder_id")}
+          folders={folders || []}
+          filterFn={fo => !fo.book_folder && !fo.module_folder}
+          emptyLabel="— Ungrouped —"
+        />
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
           <Btn onClick={() => {
@@ -3469,7 +3327,7 @@ function ViewDataModal({ sampleId, files, loading, onClose, onDeleteFile }) {
 
   const MEAS_LABELS = {
     pe: "PE Loop", diel_b: "Dielectric", diel_b_up: "Dielectric ↑", diel_b_down: "Dielectric ↓",
-    iv: "IV", pulsed: "Pulsed", xrd_ot: "XRD θ/2θ", xrr: "XRR", rsm: "RSM", afm: "AFM",
+    iv: "IV", xrd_ot: "XRD θ/2θ", xrr: "XRR", rsm: "RSM", afm: "AFM",
   };
 
   return (
@@ -3728,7 +3586,7 @@ function ModuleSourceModal({ mod, onClose, onSave, existingIds = [] }) {
 // Full-page module editor — navigated to like SampleDetail / AnalysisBookDetail.
 // mod: { id, name, builtin, source, mode: "view"|"edit"|"create", version, accepts, description }
 
-function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModules = [] }) {
+function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModules = [], folders = [] }) {
   const [tab,        setTab]        = useState("visual");
   const [source,     setSource]     = useState(mod.source || "");
   const [saving,     setSaving]     = useState(false);
@@ -3739,11 +3597,12 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
   const isCreate  = mod.mode === "create";
 
   // ── Identity fields ──────────────────────────────────────────────────────
-  const [mName,   setMName]   = useState(mod.name        || "");
-  const [mId,     setMId]     = useState(mod.id          || "");
-  const [mDesc,   setMDesc]   = useState(mod.description || "");
-  const [mVer,    setMVer]    = useState(mod.version     || "1.0");
-  const [mAuthor, setMAuthor] = useState(mod.author      || "");
+  const [mName,     setMName]     = useState(mod.name        || "");
+  const [mId,       setMId]       = useState(mod.id          || "");
+  const [mDesc,     setMDesc]     = useState(mod.description || "");
+  const [mVer,      setMVer]      = useState(mod.version     || "1.0");
+  const [mAuthor,   setMAuthor]   = useState(mod.author      || "");
+  const [mFolderId, setMFolderId] = useState(mod.folder_id   || "");
   const [mAccepts, setMAccepts] = useState(mod.accepts   || []);
   const [mNotes,  setMNotes]  = useState(() => {
     const m = (mod.source || "").match(/"""([\s\S]*?)"""/);
@@ -3914,6 +3773,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       analysis_code: fullAnalysisCode(), // backward compat
       section: cardSection,
       card_controls: cardControls,
+      folder_id: mFolderId || null,
     };
     await api("PUT", `/modules/${id}/config`, cfg);
   };
@@ -4231,6 +4091,22 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
             )}
           </div>
         </div>
+        {!isBuiltin && folders.some(f => f.module_folder) && (() => {
+          const INDENT = "\u00a0\u00a0\u00a0\u00a0";
+          const modOpts = buildFolderOptions(folders, f => !!f.module_folder);
+          return (
+            <div>
+              <span style={label}>Folder</span>
+              <select value={mFolderId} onChange={e => setMFolderId(e.target.value)}
+                style={{ ...field(), cursor: "pointer" }}>
+                <option value="">— None —</option>
+                {modOpts.map(o => (
+                  <option key={o.value} value={o.value}>{INDENT.repeat(o.depth)}{o.label}</option>
+                ))}
+              </select>
+            </div>
+          );
+        })()}
         <div>
           <span style={label}>Usage notes</span>
           <textarea value={mNotes} onChange={e => !isBuiltin && setMNotes(e.target.value)} readOnly={isBuiltin}
@@ -5206,6 +5082,303 @@ function ExportModal({ samples, onClose }) {
   );
 }
 
+// ── ImportModal ───────────────────────────────────────────────────────────────
+// Unified import modal. Opens immediately; file is picked inside.
+// Props:
+//   type        "sample" | "book" | "module"
+//   onConfirm   (cfg, file) => void
+//   onClose     () => void
+
+function ImportModal({ type, onConfirm, onClose }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+
+  // ── File + preview state ──────────────────────────────────────────────────
+  const [file,       setFile]       = useState(null);
+  const [preview,    setPreview]    = useState(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewErr, setPreviewErr] = useState(null);
+  const [dragOver,   setDragOver]   = useState(false);
+  const fileRef = useRef();
+
+  const previewUrls = {
+    sample: `${API_BASE}/samples/import-preview`,
+    book:   `${API_BASE}/books/import-preview`,
+    module: `${API_BASE}/modules/import-preview`,
+  };
+
+  const loadPreview = async (f) => {
+    setFile(f);
+    setPreview(null);
+    setPreviewErr(null);
+    setPreviewing(true);
+    const form = new FormData();
+    form.append("file", f);
+    try {
+      const res  = await fetch(previewUrls[type], { method: "POST", body: form });
+      const data = await res.json();
+      if (!res.ok) { setPreviewErr(data.detail || "Could not read file"); setPreviewing(false); return; }
+      setPreview(data);
+      // Reset resolution state whenever a new file is loaded
+      if (data.sample?.exists)  { setSampleAction("rename"); setSampleNewId(data.sample.proposed_id ?? ""); }
+      else                       { setSampleAction("overwrite"); }
+      if (data.exists)           { setModuleAction("overwrite"); setModuleNewId(`${data.module_id}_copy`); }
+      if (type === "book") {
+        const anyConflicts = data.samples?.some(s => s.exists);
+        setCreateFolder(anyConflicts);
+        setFolderName(`${data.book?.name ?? ""} (imported)`);
+      }
+    } catch (e) { setPreviewErr(e.message); }
+    setPreviewing(false);
+  };
+
+  // ── Resolution state (reset by loadPreview) ───────────────────────────────
+  const [sampleAction, setSampleAction] = useState("overwrite");
+  const [sampleNewId,  setSampleNewId]  = useState("");
+  const [createFolder, setCreateFolder] = useState(false);
+  const [folderName,   setFolderName]   = useState("");
+  const [moduleAction, setModuleAction] = useState("overwrite");
+  const [moduleNewId,  setModuleNewId]  = useState("");
+  const [srcExpanded,  setSrcExpanded]  = useState(false);
+
+  // ── Shared ────────────────────────────────────────────────────────────────
+  const titles      = { sample: "Import Sample", book: "Import Book", module: "Import Module" };
+  const accepts     = { sample: ".zip", book: ".zip", module: ".zip" };
+  const accentColors = { sample: T.amber, book: T.blue, module: T.red };
+  const accent = accentColors[type];
+  const inputStyle = { ...mono, fontSize: 12, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, padding: "5px 10px", color: T.textPrimary, outline: "none", width: "100%", boxSizing: "border-box" };
+
+  const buildConfig = () => {
+    if (type === "sample") return { action: sampleAction, new_id: sampleAction === "rename" ? sampleNewId : undefined };
+    if (type === "module") return { action: moduleAction, new_id: moduleAction === "rename" ? moduleNewId : undefined };
+    if (type === "book") {
+      const renames = Object.fromEntries((preview?.samples ?? []).map(s => [s.original_id, s.proposed_id]));
+      return { sample_renames: renames, create_folder: createFolder, folder_name: folderName };
+    }
+  };
+
+  const canConfirm = preview && !previewing && (() => {
+    if (type === "sample" && sampleAction === "rename") return sampleNewId.trim().length > 0;
+    if (type === "module" && moduleAction === "rename") return moduleNewId.trim().length > 0;
+    return true;
+  })();
+
+  return (
+    <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, width: type === "module" ? 540 : 480, display: "flex", flexDirection: "column", maxHeight: "85vh", overflow: "hidden" }}>
+
+        {/* Header */}
+        <div style={{ padding: "16px 22px", borderBottom: `1px solid ${T.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+          <span style={{ ...mono, fontSize: 14, color: accent, fontWeight: 600 }}>{titles[type]}</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1 }}>✕</button>
+        </div>
+
+        {/* Body */}
+        <div style={{ padding: "18px 22px", display: "flex", flexDirection: "column", gap: 14, overflowY: "auto" }}>
+
+          {/* File pick zone — always shown at top */}
+          <div>
+            <input ref={fileRef} type="file" accept={accepts[type]} style={{ display: "none" }}
+              onChange={e => { const f = e.target.files?.[0]; e.target.value = ""; if (f) loadPreview(f); }} />
+            {!file ? (
+              <div
+                onClick={() => fileRef.current?.click()}
+                onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={e => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files?.[0]; if (f) loadPreview(f); }}
+                style={{ border: `1px dashed ${dragOver ? accent : T.borderBright}`, borderRadius: 8, padding: "22px 18px", cursor: "pointer", textAlign: "center", display: "flex", flexDirection: "column", gap: 6, alignItems: "center", transition: "border-color .15s", background: dragOver ? accent + "0a" : "transparent" }}>
+                <span style={{ ...mono, fontSize: 22, color: T.textDim, lineHeight: 1 }}>↑</span>
+                <span style={{ ...mono, fontSize: 12, color: T.textSecondary }}>Drop a .zip here</span>
+                <span style={{ ...mono, fontSize: 10, color: T.textDim }}>or click to browse</span>
+              </div>
+            ) : (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, background: T.bg2, borderRadius: 7, padding: "8px 12px" }}>
+                <span style={{ ...mono, fontSize: 11, color: T.textSecondary, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{file.name}</span>
+                <button onClick={() => fileRef.current?.click()}
+                  style={{ ...mono, fontSize: 10, color: T.textDim, background: "none", border: "none", cursor: "pointer", flexShrink: 0, padding: "2px 6px" }}>change</button>
+              </div>
+            )}
+            {previewErr && <div style={{ ...mono, fontSize: 11, color: T.red, marginTop: 8 }}>{previewErr}</div>}
+            {previewing && <div style={{ ...mono, fontSize: 11, color: T.textDim, marginTop: 8 }}>Reading file…</div>}
+          </div>
+
+          {/* Preview content — shown once file is loaded */}
+          {preview && <>
+
+            {/* ── SAMPLE ─────────────────────────────────────────────── */}
+            {type === "sample" && (() => {
+              const s = preview.sample;
+              return (
+                <>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>{s.id}</span>
+                    <span style={{ ...mono, fontSize: 11, color: T.textDim }}>
+                      {s.technique}{s.date ? ` · ${s.date}` : ""}{s.substrate ? ` · ${s.substrate}` : ""}
+                      {s.has_files && " · includes data files"}
+                    </span>
+                  </div>
+                  {s.exists ? (
+                    <div style={{ background: T.bg2, border: `1px solid ${T.amber}33`, borderRadius: 7, padding: "10px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ color: T.amber }}>⚠</span>
+                        <span style={{ ...mono, fontSize: 11, color: T.amber }}>Sample ID already exists</span>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        {[["overwrite", "Overwrite — replace existing metadata, restore missing files"],
+                          ["rename",    "Import as new ID"],
+                          ["skip",      "Skip — do nothing"]].map(([val, label]) => (
+                          <label key={val} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                            <input type="radio" name="sampleAction" value={val} checked={sampleAction === val} onChange={() => setSampleAction(val)} />
+                            <span style={{ ...mono, fontSize: 11, color: T.textSecondary }}>{label}</span>
+                          </label>
+                        ))}
+                      </div>
+                      {sampleAction === "rename" && (
+                        <input value={sampleNewId} onChange={e => setSampleNewId(e.target.value)}
+                          placeholder="New sample ID" style={inputStyle} />
+                      )}
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ color: T.teal }}>✓</span>
+                      <span style={{ ...mono, fontSize: 11, color: T.textDim }}>No conflict — will be created</span>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
+
+            {/* ── BOOK ─────────────────────────────────────────────────── */}
+            {type === "book" && (() => {
+              const b = preview;
+              return (
+                <>
+                  <div style={{ ...mono, fontSize: 12, color: T.textSecondary }}>
+                    <span style={{ color: T.textPrimary, fontWeight: 600 }}>{b.book.name}</span>
+                    {" "}&mdash; {b.samples.length} sample{b.samples.length !== 1 ? "s" : ""}
+                    {b.modules.length > 0 && `, ${b.modules.length} module${b.modules.length !== 1 ? "s" : ""}`}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    <span style={{ ...mono, fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>Samples</span>
+                    {b.samples.map(s => (
+                      <div key={s.original_id} style={{ display: "flex", alignItems: "center", gap: 8, ...mono, fontSize: 11, padding: "4px 8px", borderRadius: 5, background: T.bg2 }}>
+                        {s.exists ? (
+                          <>
+                            <span style={{ color: T.amber }}>⚠</span>
+                            <span style={{ color: T.textDim, textDecoration: "line-through" }}>{s.original_id}</span>
+                            <span style={{ color: T.textDim }}>→</span>
+                            <span style={{ color: T.textPrimary }}>{s.proposed_id}</span>
+                            <span style={{ color: T.amber, fontSize: 9 }}>renamed</span>
+                          </>
+                        ) : (
+                          <>
+                            <span style={{ color: T.teal }}>✓</span>
+                            <span style={{ color: T.textPrimary }}>{s.original_id}</span>
+                            <span style={{ color: T.textDim, fontSize: 9 }}>new</span>
+                          </>
+                        )}
+                        {s.has_files && <span style={{ color: T.textDim, fontSize: 9, marginLeft: "auto" }}>+ files</span>}
+                      </div>
+                    ))}
+                  </div>
+                  <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                    <input type="checkbox" checked={createFolder} onChange={e => setCreateFolder(e.target.checked)} />
+                    <span style={{ ...mono, fontSize: 11, color: T.textSecondary }}>Create a sample folder for new imports</span>
+                  </label>
+                  {createFolder && (
+                    <input value={folderName} onChange={e => setFolderName(e.target.value)} style={inputStyle} />
+                  )}
+                </>
+              );
+            })()}
+
+            {/* ── MODULE ───────────────────────────────────────────────── */}
+            {type === "module" && (() => {
+              const m = preview;
+              return (
+                <>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                    <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>{m.name || m.module_id}</span>
+                    <span style={{ ...mono, fontSize: 11, color: T.textDim }}>
+                      {m.version ? `v${m.version}` : ""}
+                      {m.author  ? ` · ${m.author}` : ""}
+                      {m.accepts?.length ? ` · ${m.accepts.join(", ")}` : ""}
+                    </span>
+                    {m.description && <span style={{ ...mono, fontSize: 11, color: T.textSecondary, marginTop: 2 }}>{m.description}</span>}
+                    {m.dependencies?.length > 0 && (
+                      <div style={{ marginTop: 4, display: "flex", flexWrap: "wrap", gap: 4 }}>
+                        <span style={{ ...mono, fontSize: 9, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>deps:</span>
+                        {m.dependencies.map(d => (
+                          <span key={d} style={{ ...mono, fontSize: 10, padding: "1px 6px", borderRadius: 4, background: T.bg2, color: T.teal, border: `1px solid ${T.teal}33` }}>{d}</span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                      <span style={{ ...mono, fontSize: 10, color: T.red, textTransform: "uppercase", letterSpacing: 1 }}>Source code</span>
+                      <button onClick={() => setSrcExpanded(p => !p)}
+                        style={{ ...mono, fontSize: 10, color: T.textDim, background: "none", border: "none", cursor: "pointer", padding: "2px 6px" }}>
+                        {srcExpanded ? "collapse" : "expand"}
+                      </button>
+                    </div>
+                    <div style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 10px", maxHeight: srcExpanded ? 400 : 120, overflow: "auto", transition: "max-height .2s" }}>
+                      {m.source_code ? (
+                        <pre style={{ ...mono, fontSize: 10, color: T.textSecondary, margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{m.source_code}</pre>
+                      ) : (
+                        <span style={{ ...mono, fontSize: 10, color: T.textDim }}>No source code in archive.</span>
+                      )}
+                    </div>
+                    <span style={{ ...mono, fontSize: 9, color: T.textDim }}>
+                      ⚠ Module source executes as Python on your local server. Only import from sources you trust.
+                    </span>
+                  </div>
+                  {m.exists && (
+                    <div style={{ background: T.bg2, border: `1px solid ${T.amber}33`, borderRadius: 7, padding: "10px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ color: T.amber }}>⚠</span>
+                        <span style={{ ...mono, fontSize: 11, color: T.amber }}>
+                          Module ID already exists{m.builtin ? " (built-in)" : ""}
+                        </span>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        {[["overwrite", m.builtin ? "Overwrite built-in (not recommended)" : "Overwrite existing"],
+                          ["rename",    "Install as new ID"],
+                          ["skip",      "Skip — cancel import"]].map(([val, label]) => (
+                          <label key={val} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                            <input type="radio" name="moduleAction" value={val} checked={moduleAction === val} onChange={() => setModuleAction(val)} />
+                            <span style={{ ...mono, fontSize: 11, color: val === "overwrite" && m.builtin ? T.amber : T.textSecondary }}>{label}</span>
+                          </label>
+                        ))}
+                      </div>
+                      {moduleAction === "rename" && (
+                        <input value={moduleNewId} onChange={e => setModuleNewId(e.target.value)}
+                          placeholder="New module ID" style={inputStyle} />
+                      )}
+                    </div>
+                  )}
+                </>
+              );
+            })()}
+
+          </>}
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding: "14px 22px", borderTop: `1px solid ${T.border}`, display: "flex", gap: 8, justifyContent: "flex-end", flexShrink: 0 }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          {preview && (
+            <Btn disabled={!canConfirm} onClick={() => onConfirm(buildConfig(), file)}>
+              {type === "sample" && sampleAction === "skip" ? "Skip" : "Import"}
+            </Btn>
+          )}
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
 // ── SettingsModal ─────────────────────────────────────────────────────────────
 
 function SettingsModal({ settings, onSave, onClose }) {
@@ -5236,6 +5409,66 @@ function SettingsModal({ settings, onSave, onClose }) {
       </div>
     </div>
   );
+
+  // Custom growth param helpers
+  const addCustomParam = (tech) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.custom_growth_params[tech].push({ id: makeParamId("param"), name: "", unit: "", default: "" });
+    return d;
+  });
+  const removeCustomParam = (tech, i) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.custom_growth_params[tech].splice(i, 1);
+    return d;
+  });
+  const setCustomParam = (tech, i, k, v) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    // If this is the first time the name is being set and the param still has a generic id, regenerate it
+    if (k === "name" && d.custom_growth_params[tech][i].id.startsWith("param_")) {
+      d.custom_growth_params[tech][i].id = makeParamId(v);
+    }
+    d.custom_growth_params[tech][i][k] = v;
+    return d;
+  });
+
+  const renderCustomParams = (tech) => {
+    const params = draft.custom_growth_params?.[tech] || [];
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+        {params.map((p, i) => (
+          <div key={p.id} style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: 2, minWidth: 120 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Name</span>
+              <input value={p.name}
+                onChange={e => setCustomParam(tech, i, "name", e.target.value)}
+                placeholder="e.g. Ar flow"
+                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2, width: 72 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Unit</span>
+              <input value={p.unit}
+                onChange={e => setCustomParam(tech, i, "unit", e.target.value)}
+                placeholder="sccm"
+                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2, width: 72 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Default</span>
+              <input value={p.default}
+                onChange={e => setCustomParam(tech, i, "default", e.target.value)}
+                placeholder="—"
+                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+            </div>
+            <button onClick={() => removeCustomParam(tech, i)}
+              style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 2px", marginBottom: 3 }}>×</button>
+          </div>
+        ))}
+        <button onClick={() => addCustomParam(tech)}
+          style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
+          + Add param
+        </button>
+      </div>
+    );
+  };
 
   // Material library helpers
   const addMat = (tech) => setDraft(p => {
@@ -5380,6 +5613,9 @@ function SettingsModal({ settings, onSave, onClose }) {
             {matInput(tech, i, "pressure",    "Press",  "mT",   52)}
             {matInput(tech, i, "frequency_hz","Rep",    "Hz",   48)}
           </>)}
+          {(draft.custom_growth_params?.[tech] || []).filter(p => p.name).map(p =>
+            matInput(tech, i, p.id, p.name, p.unit || "", 60)
+          )}
           <button onClick={() => removeMat(tech, i)}
             style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 2px", alignSelf: "flex-end", marginBottom: 1 }}>×</button>
         </div>
@@ -5428,6 +5664,8 @@ function SettingsModal({ settings, onSave, onClose }) {
           {fieldSm("sputter.time_s",     "Time",    "s",  72)}
           {fieldSm("sputter.power_W",    "Power",   "W",  60)}
         </div>
+        <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1.5, marginTop: 6, marginBottom: 2 }}>Custom Sputter Params</div>
+        {renderCustomParams("sputter")}
 
         {/* PLD defaults */}
         {sectionHdr("PLD Defaults")}
@@ -5438,6 +5676,8 @@ function SettingsModal({ settings, onSave, onClose }) {
           {fieldSm("pld.energy_mJ",    "Energy",   "mJ",  60)}
           {fieldSm("pld.pulses",       "Pulses",   "",    72)}
         </div>
+        <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1.5, marginTop: 6, marginBottom: 2 }}>Custom PLD Params</div>
+        {renderCustomParams("pld")}
 
         {/* Material library — Sputter (collapsible) */}
         <button onClick={() => setLibOpen(s => ({ ...s, matSputter: !s.matSputter }))}
@@ -5643,46 +5883,26 @@ function FolderTile({ folder, samples, childContent = null, plotCache, depth = 0
   );
 }
 
-function AddFolderModal({ onSave, onClose, existing, allFolders = [], defaultForBooks = false }) {
+// ── Folder modals — one per context, no shared type toggle ────────────────
+function AddSampleFolderModal({ onSave, onClose, existing, allFolders = [] }) {
   const [name,     setName]     = useState(existing?.name || "");
   const [color,    setColor]    = useState(existing?.color || COLOR_OPTIONS[0]);
-  const [forBooks, setForBooks] = useState(existing?.book_folder ?? defaultForBooks);
   const [parentId, setParentId] = useState(existing?.parent_id || "");
-
-  // Prevent nesting a folder into itself or its descendants
-  const getDescendantIds = (id, set = new Set()) => {
-    set.add(id);
-    allFolders.filter(f => f.parent_id === id).forEach(c => getDescendantIds(c.id, set));
-    return set;
-  };
+  const sampleFolders = allFolders.filter(f => !f.book_folder && !f.module_folder);
+  const getDescendantIds = (id, set = new Set()) => { set.add(id); sampleFolders.filter(f => f.parent_id === id).forEach(c => getDescendantIds(c.id, set)); return set; };
   const excludeIds = existing ? getDescendantIds(existing.id) : new Set();
-  const parentOptions = allFolders.filter(f => !!f.book_folder === forBooks && !excludeIds.has(f.id));
-
+  const parentOptions = sampleFolders.filter(f => !excludeIds.has(f.id));
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
-      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 360, display: "flex", flexDirection: "column", gap: 16 }}>
-        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 20 }}>{existing ? "Edit Folder" : "New Folder"}</h2>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 20 }}>{existing ? "Edit Folder" : "New Sample Folder"}</h2>
         <Input label="Name" value={name} onChange={setName} placeholder="e.g. BTO Series" />
-        {/* Samples / Analysis Books segmented toggle */}
-        <div style={{ display: "flex", background: T.bg2, borderRadius: 8, padding: 3, gap: 2 }}>
-          {[{ label: "Samples", value: false }, { label: "Analysis Books", value: true }].map(opt => (
-            <button key={String(opt.value)} onClick={() => { setForBooks(opt.value); setParentId(""); }}
-              style={{ flex: 1, padding: "6px 0", border: "none", borderRadius: 6, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 11, letterSpacing: 0.3, transition: "background .15s, color .15s",
-                background: forBooks === opt.value ? T.bg0 : "transparent",
-                color: forBooks === opt.value ? (opt.value ? T.blue : T.amber) : T.textDim,
-                fontWeight: forBooks === opt.value ? 600 : 400,
-                boxShadow: forBooks === opt.value ? "0 1px 3px rgba(0,0,0,.25)" : "none" }}>
-              {opt.label}
-            </button>
-          ))}
-        </div>
-        {/* Parent folder selector */}
         {parentOptions.length > 0 && (
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <Label>Parent Folder</Label>
             <select value={parentId} onChange={e => setParentId(e.target.value)}
               style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "7px 10px", outline: "none" }}>
-              <option value="">— None (root level) —</option>
+              <option value="">— None —</option>
               {parentOptions.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
             </select>
           </div>
@@ -5690,17 +5910,58 @@ function AddFolderModal({ onSave, onClose, existing, allFolders = [], defaultFor
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           <Label>Color</Label>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            {COLOR_OPTIONS.map(c => (
-              <div key={c} onClick={() => setColor(c)}
-                style={{ width: 24, height: 24, borderRadius: "50%", background: c, cursor: "pointer", border: color === c ? `3px solid ${T.textPrimary}` : `2px solid transparent`, transition: "border .1s", boxSizing: "border-box" }} />
-            ))}
+            {COLOR_OPTIONS.map(c => <div key={c} onClick={() => setColor(c)} style={{ width: 24, height: 24, borderRadius: "50%", background: c, cursor: "pointer", border: color === c ? `3px solid ${T.textPrimary}` : "2px solid transparent", boxSizing: "border-box" }} />)}
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn onClick={() => { if (name.trim()) onSave({ name: name.trim(), color, book_folder: forBooks, parent_id: parentId || null }); }} disabled={!name.trim()}>
-            {existing ? "Save" : "Create"}
-          </Btn>
+          <Btn onClick={() => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: false, parent_id: parentId || null })} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AddBookFolderModal({ onSave, onClose, existing, allFolders = [] }) {
+  const [name,  setName]  = useState(existing?.name || "");
+  const [color, setColor] = useState(existing?.color || COLOR_OPTIONS[0]);
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.blue, fontSize: 20 }}>{existing ? "Edit Folder" : "New Book Folder"}</h2>
+        <Input label="Name" value={name} onChange={setName} placeholder="e.g. Thickness Study" />
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <Label>Color</Label>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {COLOR_OPTIONS.map(c => <div key={c} onClick={() => setColor(c)} style={{ width: 24, height: 24, borderRadius: "50%", background: c, cursor: "pointer", border: color === c ? `3px solid ${T.textPrimary}` : "2px solid transparent", boxSizing: "border-box" }} />)}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn onClick={() => name.trim() && onSave({ name: name.trim(), color, book_folder: true, module_folder: false, parent_id: null })} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AddModuleFolderModal({ onSave, onClose, existing }) {
+  const [name,  setName]  = useState(existing?.name || "");
+  const [color, setColor] = useState(existing?.color || COLOR_OPTIONS[0]);
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.teal, fontSize: 20 }}>{existing ? "Edit Folder" : "New Module Folder"}</h2>
+        <Input label="Name" value={name} onChange={setName} placeholder="e.g. Electrical" />
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <Label>Color</Label>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {COLOR_OPTIONS.map(c => <div key={c} onClick={() => setColor(c)} style={{ width: 24, height: 24, borderRadius: "50%", background: c, cursor: "pointer", border: color === c ? `3px solid ${T.textPrimary}` : "2px solid transparent", boxSizing: "border-box" }} />)}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn onClick={() => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: true, parent_id: null })} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
         </div>
       </div>
     </div>
@@ -6201,10 +6462,14 @@ function calcTwoTheta(structure, hklStr) {
   return 2 * Math.asin(sinTheta) / deg;
 }
 
-// Calculate (Qx, Qz) for a reflection hkl, assuming [001] surface normal.
-// q2pi=false (default): Q = h/a in nm⁻¹  (factor=10 since a is in Å → 10/a_Å = 1/a_nm)
-// q2pi=true:            Q = 2π·h/a in Å⁻¹ (standard physics convention)
-function calcQxQz(structure, hklStr, q2pi = false) {
+// Calculate (Qx, Qz) for a reflection hkl.
+// q2pi=false (default): Q = 1/d in nm⁻¹  (factor=10 since a is in Å → 10/a_Å = 1/a_nm)
+// q2pi=true:            Q = 2π/d in Å⁻¹  (standard physics convention)
+// orientation: optional { qz_along: [u,v,w], qx_along: [p,q,r] } — reciprocal-space
+//   directions aligned with Qz (surface normal) and Qx (in-plane diffraction axis).
+//   Valid for orthogonal lattices (cubic / tetragonal / orthorhombic).
+//   Defaults to qz=[0,0,1], qx=[1,0,0] when not provided (c-axis normal, a-axis in-plane).
+function calcQxQz(structure, hklStr, q2pi = false, orientation = null) {
   const hkl = parseHKL(hklStr);
   if (!hkl) return null;
   const { h, k, l } = hkl;
@@ -6213,6 +6478,32 @@ function calcQxQz(structure, hklStr, q2pi = false) {
   const c = parseFloat(structure.c);
   if (!a || !c) return null;
   const factor = q2pi ? 2 * Math.PI : 10; // 10/a_Å = 1/a_nm
+
+  if (orientation) {
+    const nDir = orientation.qz_along || [0, 0, 1];
+    const xDir = orientation.qx_along || [1, 0, 0];
+    // Cartesian reciprocal-space vector for this reflection (orthogonal lattice)
+    const gx = h / a, gy = k / b, gz = l / c;
+    // Convert orientation directions to Cartesian reciprocal space
+    let nx = nDir[0] / a, ny = nDir[1] / b, nz = nDir[2] / c;
+    let xx = xDir[0] / a, xy = xDir[1] / b, xz = xDir[2] / c;
+    // Normalise n̂
+    const nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
+    if (nLen < 1e-10) return null;
+    nx /= nLen; ny /= nLen; nz /= nLen;
+    // Gram-Schmidt: remove n̂ component from x̂, then normalise
+    const xdotn = xx*nx + xy*ny + xz*nz;
+    xx -= xdotn*nx; xy -= xdotn*ny; xz -= xdotn*nz;
+    const xLen = Math.sqrt(xx*xx + xy*xy + xz*xz);
+    if (xLen < 1e-10) return null;
+    xx /= xLen; xy /= xLen; xz /= xLen;
+    return {
+      qx: factor * (gx*xx + gy*xy + gz*xz),
+      qz: factor * (gx*nx + gy*ny + gz*nz),
+    };
+  }
+
+  // Default (backward-compatible): c∥z, a∥x
   const qx = h !== 0 ? factor * h / a : factor * k / b;
   const qz = factor * l / c;
   return { qx, qz };
@@ -6288,9 +6579,9 @@ function makeHeatmapColorscale(scaleName, bgFade = 0) {
 
 // Bin raw RSM points into an nx×ny grid using average intensity per cell.
 // bgMethod: null | "percentile" | "median" | "plane"
-//   percentile — subtract bgPct-th percentile of occupied cells
-//   median     — subtract median (bgPct ignored)
-//   plane      — subtract a least-squares linear plane fit
+//   Linear mode  — additive subtraction in intensity space
+//   Log mode     — operates in log10 space: percentile/median mask cells below the
+//                  log-floor; plane fits and subtracts a multiplicative trend (log-plane)
 // Returns { x, y, z, zmin, zmax, xDomain, yDomain } where zmin/zmax are
 // robust 2nd–99.5th percentile bounds for colorscale clipping.
 function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true, bgMethod = null, bgPct = 5) {
@@ -6321,50 +6612,89 @@ function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true,
   const grid = new Float64Array(nx * ny);
   for (let i = 0; i < nx * ny; i++) grid[i] = cntG[i] > 0 ? sumG[i] / cntG[i] : 0;
 
-  // Background subtraction
-  if (bgMethod === "percentile" || bgMethod === "median") {
-    const pct = bgMethod === "median" ? 50 : bgPct;
-    const occ = [];
-    for (let i = 0; i < grid.length; i++) { if (cntG[i] > 0) occ.push(grid[i]); }
-    if (occ.length) {
-      occ.sort((a, b) => a - b);
-      const bg = occ[Math.min(Math.floor(occ.length * pct / 100), occ.length - 1)];
-      for (let i = 0; i < grid.length; i++) { if (cntG[i] > 0) grid[i] = Math.max(0, grid[i] - bg); }
-    }
-  } else if (bgMethod === "plane") {
-    // Least-squares linear plane fit on occupied cells (normalized coords 0..1)
+  // Helper: least-squares plane fit + subtract (reused for both linear and log modes)
+  const fitAndSubtractPlane = (vals, mask) => {
+    // vals[i] is the value to fit; mask[i] truthy = cell participates
     let sx = 0, sy = 0, sz = 0, sxx = 0, sxy = 0, syy = 0, sxz = 0, syz = 0, n = 0;
     for (let i = 0; i < nx * ny; i++) {
-      if (!cntG[i]) continue;
-      const xn = (i % nx) / nx, yn = Math.floor(i / nx) / ny, z = grid[i];
+      if (!mask[i]) continue;
+      const xn = (i % nx) / nx, yn = Math.floor(i / nx) / ny, z = vals[i];
       sx += xn; sy += yn; sz += z; sxx += xn*xn; sxy += xn*yn; syy += yn*yn;
       sxz += xn*z; syz += yn*z; n++;
     }
-    if (n >= 3) {
-      // Solve [n,sx,sy; sx,sxx,sxy; sy,sxy,syy] * [a,b,c] = [sz,sxz,syz]
-      const A = [[n,sx,sy],[sx,sxx,sxy],[sy,sxy,syy]];
-      const B = [sz, sxz, syz];
-      for (let c = 0; c < 3; c++) {
-        let maxR = c;
-        for (let r = c+1; r < 3; r++) if (Math.abs(A[r][c]) > Math.abs(A[maxR][c])) maxR = r;
-        [A[c], A[maxR]] = [A[maxR], A[c]]; [B[c], B[maxR]] = [B[maxR], B[c]];
-        for (let r = c+1; r < 3; r++) {
-          const f = A[r][c] / (A[c][c] || 1e-30);
-          B[r] -= f * B[c];
-          for (let k = c; k < 3; k++) A[r][k] -= f * A[c][k];
+    if (n < 3) return vals;
+    const A = [[n,sx,sy],[sx,sxx,sxy],[sy,sxy,syy]];
+    const B = [sz, sxz, syz];
+    for (let c = 0; c < 3; c++) {
+      let maxR = c;
+      for (let r = c+1; r < 3; r++) if (Math.abs(A[r][c]) > Math.abs(A[maxR][c])) maxR = r;
+      [A[c], A[maxR]] = [A[maxR], A[c]]; [B[c], B[maxR]] = [B[maxR], B[c]];
+      for (let r = c+1; r < 3; r++) {
+        const f = A[r][c] / (A[c][c] || 1e-30);
+        B[r] -= f * B[c];
+        for (let k = c; k < 3; k++) A[r][k] -= f * A[c][k];
+      }
+    }
+    const coef = [0, 0, 0];
+    for (let i = 2; i >= 0; i--) {
+      coef[i] = B[i];
+      for (let j = i+1; j < 3; j++) coef[i] -= A[i][j] * coef[j];
+      coef[i] /= A[i][i] || 1e-30;
+    }
+    const [a, b, cv] = coef;
+    const out = vals.slice();
+    for (let i = 0; i < nx * ny; i++) {
+      if (!mask[i]) continue;
+      out[i] = vals[i] - (a + b * (i % nx) / nx + cv * Math.floor(i / nx) / ny);
+    }
+    return out;
+  };
+
+  // Background subtraction — branches on logIntensity
+  if (bgMethod) {
+    if (!logIntensity) {
+      // ── Linear mode: additive subtraction in intensity space ──────────────
+      if (bgMethod === "percentile" || bgMethod === "median") {
+        const pct = bgMethod === "median" ? 50 : bgPct;
+        const occ = [];
+        for (let i = 0; i < grid.length; i++) { if (cntG[i] > 0) occ.push(grid[i]); }
+        if (occ.length) {
+          occ.sort((a, b) => a - b);
+          const bg = occ[Math.min(Math.floor(occ.length * pct / 100), occ.length - 1)];
+          for (let i = 0; i < grid.length; i++) { if (cntG[i] > 0) grid[i] = Math.max(0, grid[i] - bg); }
         }
+      } else if (bgMethod === "plane") {
+        const result = fitAndSubtractPlane(grid, cntG);
+        for (let i = 0; i < nx * ny; i++) { if (cntG[i] > 0) grid[i] = Math.max(0, result[i]); }
       }
-      const coef = [0,0,0];
-      for (let i = 2; i >= 0; i--) {
-        coef[i] = B[i];
-        for (let j = i+1; j < 3; j++) coef[i] -= A[i][j] * coef[j];
-        coef[i] /= A[i][i] || 1e-30;
-      }
-      const [a, b, c] = coef;
+    } else {
+      // ── Log mode: operate entirely in log10 space ─────────────────────────
+      // Build log10 grid (only for occupied positive cells)
+      const logGrid = new Float64Array(nx * ny);
+      const logMask = new Uint8Array(nx * ny);
       for (let i = 0; i < nx * ny; i++) {
-        if (!cntG[i]) continue;
-        const bg = a + b * (i % nx) / nx + c * Math.floor(i / nx) / ny;
-        grid[i] = Math.max(0, grid[i] - bg);
+        if (cntG[i] > 0 && grid[i] > 0) { logGrid[i] = Math.log10(grid[i]); logMask[i] = 1; }
+      }
+      if (bgMethod === "percentile" || bgMethod === "median") {
+        // Find percentile in log space; mask cells at or below the log floor
+        const pct = bgMethod === "median" ? 50 : bgPct;
+        const logOcc = [];
+        for (let i = 0; i < nx * ny; i++) { if (logMask[i]) logOcc.push(logGrid[i]); }
+        if (logOcc.length) {
+          logOcc.sort((a, b) => a - b);
+          const logFloor = logOcc[Math.min(Math.floor(logOcc.length * pct / 100), logOcc.length - 1)];
+          for (let i = 0; i < nx * ny; i++) {
+            if (logMask[i] && logGrid[i] <= logFloor) cntG[i] = 0; // treat as empty
+          }
+        }
+      } else if (bgMethod === "plane") {
+        // Fit and subtract a plane in log10 space (removes multiplicative gradient)
+        const result = fitAndSubtractPlane(logGrid, logMask);
+        for (let i = 0; i < nx * ny; i++) {
+          if (!logMask[i]) continue;
+          if (result[i] <= 0) { cntG[i] = 0; } // mask cells that went negative
+          else { grid[i] = Math.pow(10, result[i]); } // convert residual back to linear
+        }
       }
     }
   }
@@ -6985,7 +7315,8 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
       const qx = parseFloat(pt.manual_qx), qz = parseFloat(pt.manual_qz);
       pos = (!isNaN(qx) && !isNaN(qz)) ? { qx, qz } : null;
     } else {
-      pos = pointEffStructs[i] ? calcQxQz(pointEffStructs[i], pt.hkl, q2pi) : null;
+      const ori = (pt.qz_along || pt.qx_along) ? { qz_along: pt.qz_along || [0,0,1], qx_along: pt.qx_along || [1,0,0] } : null;
+      pos = pointEffStructs[i] ? calcQxQz(pointEffStructs[i], pt.hkl, q2pi, ori) : null;
     }
     const label = pt.material === "__arbitrary__" ? "Arbitrary" : (pt.material && pt.hkl ? `${pt.material} ${pt.hkl}` : "");
     return pos ? { id: pt.id, qx: pos.qx, qz: pos.qz, color: pt.color, symbol: pt.symbol || "cross", markerSize: pt.markerSize ?? 9, label } : null;
@@ -7010,9 +7341,10 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
         {points.map((pt, i) => {
           const effStruct   = pointEffStructs[i];
           const isArbitrary = pt.material === "__arbitrary__";
+          const ptOri       = (pt.qz_along || pt.qx_along) ? { qz_along: pt.qz_along || [0,0,1], qx_along: pt.qx_along || [1,0,0] } : null;
           const pos         = isArbitrary
             ? (() => { const qx = parseFloat(pt.manual_qx), qz = parseFloat(pt.manual_qz); return (!isNaN(qx) && !isNaN(qz)) ? { qx, qz } : null; })()
-            : (effStruct ? calcQxQz(effStruct, pt.hkl, q2pi) : null);
+            : (effStruct ? calcQxQz(effStruct, pt.hkl, q2pi, ptOri) : null);
           const colorOpen   = openPicker?.id === pt.id && openPicker?.type === "color";
           const cfgOpen     = openPicker?.id === pt.id && openPicker?.type === "strainCfg";
           const shapeOpen   = openPicker?.id === pt.id && openPicker?.type === "shape";
@@ -7064,6 +7396,25 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
                 {cfgOpen && (
                   <div onClick={e => e.stopPropagation()}
                     style={{ position: "absolute", left: 0, top: "calc(100% + 4px)", background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 200, boxShadow: "0 4px 20px rgba(0,0,0,.3), 0 1px 4px rgba(0,0,0,.15)", minWidth: 280, display: "flex", flexDirection: "column", gap: 12 }}>
+                    {/* Crystal orientation */}
+                    <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                      {[["qz_along", "Qz ∥", [0,0,1]], ["qx_along", "Qx ∥", [1,0,0]]].map(([key, label, def]) => {
+                        const vec = pt[key] || def;
+                        return (
+                          <div key={key} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, minWidth: 36 }}>{label}</span>
+                            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>[</span>
+                            {vec.map((v, idx) => (
+                              <DeferredInput key={idx} type="number" value={v} step={1}
+                                onChange={s => { const cur = pt[key] || def; const next = [...cur]; next[idx] = parseInt(s) || 0; updatePoint(pt.id, { [key]: next }); }}
+                                style={{ ...rc, width: 36, background: T.bg0, border: `1px solid ${T.border}`, color: T.textPrimary, textAlign: "center", cursor: "text", padding: "4px 2px" }} />
+                            ))}
+                            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>]</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div style={{ height: 1, background: T.border, margin: "0 -14px" }} />
                     {/* Mode toggle: BULK / STRAINED */}
                     <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}`, alignSelf: "flex-start" }}>
                       {[["bulk", "BULK"], ["strained", "STRAINED"]].map(([m, label], idx, arr) => (
@@ -8153,7 +8504,7 @@ function MetaMarkerPicker({ prefix, config, onUpdate, defaultSymbol = "circle" }
   );
 }
 
-function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {}, config = {}, plotStyle, activeMaterial, structures = [], modules = [], onUpdate }) {
+function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {}, config = {}, plotStyle, activeMaterial, structures = [], modules = [], settings = {}, onUpdate }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const xParamId  = config.x_param  || "";
   const yParamId  = config.y_param  || "";
@@ -8215,7 +8566,33 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
       .filter(Boolean);
   }, [modules, modResults, sampleOrder, sampleMap]);
 
-  const allParamGroups = useMemo(() => [...META_PARAM_GROUPS, ...moduleGroups], [moduleGroups]);
+  const allParamGroups = useMemo(() => {
+    // Inject custom growth params from settings into the Growth group
+    const customSputter = (settings?.custom_growth_params?.sputter || []).filter(p => p.name);
+    const customPld     = (settings?.custom_growth_params?.pld     || []).filter(p => p.name);
+    const customParams  = [...customSputter, ...customPld].map(p => ({
+      id: `custom_growth_${p.id}`,
+      label: p.name,
+      unit: p.unit || "",
+      needsLayer: true,
+      extract: (s, _pc, am) => {
+        if (!s?.layers || !am) return null;
+        for (const layer of s.layers) {
+          if (layer.targets?.length === 1 && layer.targets[0].material === am) {
+            const v = layer.custom?.[p.id];
+            return v != null && v !== "" ? Number(v) : null;
+          }
+        }
+        return null;
+      },
+    }));
+    const baseGroups = META_PARAM_GROUPS.map(g =>
+      g.group === "Growth" && customParams.length
+        ? { ...g, params: [...g.params, ...customParams] }
+        : g
+    );
+    return [...baseGroups, ...moduleGroups];
+  }, [moduleGroups, settings?.custom_growth_params]);
   const allParamsFlat  = useMemo(() => allParamGroups.flatMap(g => g.params.map(p => ({ ...p, group: g.group }))), [allParamGroups]);
 
   const xParam  = allParamsFlat.find(p => p.id === xParamId)  || null;
@@ -8278,7 +8655,8 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
     const hasPE    = sampleOrder.some(sid => plotCache[sid]?.pe?.length > 0);
     const hasDielF = sampleOrder.some(sid => plotCache[sid]?.diel_f?.length > 0);
     const hasDielB = sampleOrder.some(sid => (plotCache[sid]?.diel_b_up?.length || 0) + (plotCache[sid]?.diel_b_down?.length || 0) > 0);
-    const builtinFiltered = META_PARAM_GROUPS.map(g => {
+    // Use allParamGroups so custom growth params are included
+    const builtinFiltered = allParamGroups.filter(g => !moduleGroups.includes(g)).map(g => {
       let params;
       if (g.group === "Growth" || g.group === "Sample") {
         params = g.params.filter(p =>
@@ -8307,7 +8685,7 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
     // Module groups are already pre-filtered to params with ≥1 non-null value
     return [...builtinFiltered, ...moduleGroups];
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sampleOrder, sampleMap, plotCache, activeMaterial, structures, moduleGroups]);
+  }, [sampleOrder, sampleMap, plotCache, activeMaterial, structures, allParamGroups, moduleGroups]);
 
   const addY2BtnStyle = { background: "transparent", border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 8px", cursor: "pointer", letterSpacing: 0.5, textTransform: "uppercase" };
 
@@ -9184,7 +9562,7 @@ function StatisticalAnalysisPanel({ sampleOrder, samples, plotCache, colors, lab
   );
 }
 
-function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, labels = {}, colorScale: bookColorScale = "viridis", structures = [], activeMaterial = null, modules = [], onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver }) {
+function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, labels = {}, colorScale: bookColorScale = "viridis", structures = [], activeMaterial = null, modules = [], settings = {}, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver }) {
   const { type, config } = panel;
   const [cogOpen, setCogOpen] = useState(false);
   const [savedFlash, setSavedFlash] = useState(false);
@@ -9681,7 +10059,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
       {type === "afm"  && <AfmComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
       {type === "de"   && <DEComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
       {type === "df"   && <DfComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} />}
-      {type === "meta" && <MetaAnalysisPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} modules={modules} onUpdate={onUpdate} />}
+      {type === "meta" && <MetaAnalysisPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} modules={modules} settings={settings} onUpdate={onUpdate} />}
       {type === "xrd_pos" && <XRDPeakPositionPanel sampleOrder={sampleOrder} samples={samples} colors={colors} labels={labels} config={config} plotStyle={ps} structures={structures} onUpdate={onUpdate} />}
       {type === "stats"      && <StatisticalAnalysisPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
       {type === "parcoords"  && <ParallelCoordsPanel       sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
@@ -9989,6 +10367,7 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, 
           structures={settings?.structures || []}
           activeMaterial={activeMaterial}
           modules={modules}
+          settings={settings}
           isDragOver={panelDragOverIdx === i && panelDragIdx !== i}
           onDragStart={() => setPanelDragIdx(i)}
           onDragOver={() => setPanelDragOverIdx(i)}
@@ -10110,6 +10489,73 @@ function BookFolderTile({ folder, books, childContent = null, depth = 0,
   );
 }
 
+function ModCard({ m, onOpen, onDelete, onDragStart }) {
+  return (
+    <div
+      draggable={!!onDragStart}
+      onDragStart={onDragStart ? e => { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/x-module", m.id); onDragStart(m.id); } : undefined}
+      onClick={() => onOpen?.(m.id)}
+      style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "12px 14px", cursor: "pointer", transition: "border-color .12s", display: "flex", flexDirection: "column", gap: 6 }}
+      onMouseEnter={e => e.currentTarget.style.borderColor = T.borderBright}
+      onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 15, color: T.textPrimary, flex: 1 }}>{m.name}</span>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: m.builtin ? T.amber : T.teal, background: (m.builtin ? T.amber : T.teal) + "18", border: `1px solid ${(m.builtin ? T.amber : T.teal)}33`, borderRadius: 3, padding: "1px 5px" }}>
+          {m.builtin ? "built-in" : "user"}
+        </span>
+        {m.builtin && (
+          <button onClick={e => { e.stopPropagation(); onOpen?.(m.id, { mode: "create", id: `copy_of_${m.id}`, builtin: false }); }}
+            style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.teal, background: "none", border: `1px solid ${T.teal}44`, borderRadius: 3, padding: "1px 6px", cursor: "pointer" }}>copy</button>
+        )}
+        {!m.builtin && (
+          <button onClick={e => { e.stopPropagation(); onDelete?.(m); }}
+            style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.red, background: "none", border: "none", padding: "0 2px", cursor: "pointer", lineHeight: 1, opacity: 0.7 }}>✕</button>
+        )}
+      </div>
+      {m.description && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, lineHeight: 1.4 }}>{m.description}</div>}
+      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>
+        v{m.version || "1.0"}{m.accepts?.length ? " · " + m.accepts.map(a => `.${a}`).join(", ") : ""}
+      </div>
+    </div>
+  );
+}
+
+function ModuleFolderTile({ folder, mods, onOpenModule, onDeleteModule, onEdit, onDelete, onDropModule, onDragStartModule }) {
+  const lsKey = `modfolder-open-${folder.id}`;
+  const [open, setOpen] = useState(() => { try { const v = localStorage.getItem(lsKey); return v === null ? true : v === "1"; } catch { return true; } });
+  const toggleOpen = () => setOpen(v => { const next = !v; try { localStorage.setItem(lsKey, next ? "1" : "0"); } catch {} return next; });
+  const [dragOver, setDragOver] = useState(false);
+  const color = folder.color || T.borderBright;
+  return (
+    <div style={{ marginBottom: 8 }}
+      onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setDragOver(true); }}
+      onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false); }}
+      onDrop={e => { e.preventDefault(); const mid = e.dataTransfer.getData("text/x-module"); if (mid) onDropModule?.(mid, folder.id); setDragOver(false); }}>
+      <div style={{ border: `2px solid ${dragOver ? T.amber : color}`, borderRadius: 10, overflow: "hidden", boxShadow: dragOver ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
+        <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: dragOver ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
+          onClick={toggleOpen}>
+          <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
+          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: T.textPrimary, flex: 1 }}>{folder.name}</span>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>{mods.length}</span>
+          <span style={{ color: T.textDim, fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+          <button onClick={e => { e.stopPropagation(); onEdit?.(); }} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: "0 3px" }}>✎</button>
+          <button onClick={e => { e.stopPropagation(); if (window.confirm(`Delete folder "${folder.name}"? Modules will become ungrouped.`)) onDelete?.(); }} style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, padding: "0 3px" }}>×</button>
+        </div>
+        {open && (
+          <div style={{ padding: 12, background: T.bg0 }}>
+            {mods.length > 0
+              ? <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
+                  {mods.map(m => <ModCard key={m.id} m={m} onOpen={onOpenModule} onDelete={onDeleteModule} onDragStart={onDragStartModule} />)}
+                </div>
+              : <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: dragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>{dragOver ? "Drop here" : "Empty folder"}</div>
+            }
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function AnalysisBookTile({ book, onDelete, onEdit, onDuplicate, onClick, onDragStart }) {
   const orderedIds = book.config?.sample_order?.length ? book.config.sample_order : (book.sample_ids || []);
   const n = orderedIds.length;
@@ -10180,10 +10626,14 @@ function AddBookModal({ onSave, onClose, existing, samples, folders = [], bookFo
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 480, display: "flex", flexDirection: "column", gap: 16, maxHeight: "80vh" }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.blue, fontSize: 20 }}>{existing ? "Edit Book" : "New Analysis Book"}</h2>
         <Input label="Name" value={name} onChange={setName} placeholder="e.g. Thickness Study" />
-        {bookFolders.length > 0 && (
-          <Sel label="Folder (optional)" value={folderId} onChange={setFolderId}
-            options={[{ value: "", label: "— No folder —" }, ...bookFolders.map(f => ({ value: f.id, label: f.name }))]} />
-        )}
+        <FolderSelect
+          label="Folder (optional)"
+          value={folderId}
+          onChange={setFolderId}
+          folders={folders}
+          filterFn={f => !!f.book_folder && !f.module_folder}
+          emptyLabel="— No folder —"
+        />
         <div style={{ display: "flex", flexDirection: "column", gap: 6, overflow: "hidden" }}>
           <Label>Samples</Label>
           <div style={{ overflowY: "auto", maxHeight: 300, border: `1px solid ${T.border}`, borderRadius: 6, overflow: "hidden auto" }}>
@@ -10218,6 +10668,240 @@ function AddBookModal({ onSave, onClose, existing, samples, folders = [], bookFo
   );
 }
 
+// ── Sample filter ─────────────────────────────────────────────────────────────
+
+function buildFilterFields(settings) {
+  const groups = [
+    { group: "Sample", fields: [
+      { id: "technique",        label: "Technique",     type: "categorical", options: ["sputter", "pld"] },
+      { id: "substrate",        label: "Substrate",     type: "text" },
+      { id: "lot",              label: "Lot",           type: "text" },
+      { id: "material",         label: "Material",      type: "text" },
+    ]},
+    { group: "Growth", fields: [
+      { id: "growth_temp",      label: "Temperature",   type: "numeric", unit: "°C" },
+      { id: "growth_pressure",  label: "Pressure",      type: "numeric", unit: "mTorr" },
+      { id: "growth_o2_pct",    label: "O₂ %",          type: "numeric", unit: "%" },
+      { id: "growth_time_s",    label: "Dep. time",     type: "numeric", unit: "s" },
+      { id: "growth_power_w",   label: "Power",         type: "numeric", unit: "W" },
+      { id: "growth_energy_mj", label: "Laser energy",  type: "numeric", unit: "mJ" },
+      { id: "growth_freq_hz",   label: "Rep. rate",     type: "numeric", unit: "Hz" },
+      { id: "growth_pulses",    label: "Pulses",        type: "numeric", unit: "" },
+    ]},
+    { group: "Physical", fields: [
+      { id: "thickness_nm",     label: "Thickness",     type: "numeric", unit: "nm" },
+    ]},
+  ];
+  const customSputter = (settings?.custom_growth_params?.sputter || []).filter(p => p.name);
+  const customPld     = (settings?.custom_growth_params?.pld     || []).filter(p => p.name);
+  if (customSputter.length) groups.push({ group: "Custom — Sputter",
+    fields: customSputter.map(p => ({ id: `custom_${p.id}`, label: p.name, type: "numeric", unit: p.unit || "" })) });
+  if (customPld.length) groups.push({ group: "Custom — PLD",
+    fields: customPld.map(p => ({ id: `custom_${p.id}`, label: p.name, type: "numeric", unit: p.unit || "" })) });
+  return groups;
+}
+
+function FilterChip({ condition, onRemove }) {
+  let label;
+  const u = condition.unit ? ` ${condition.unit}` : "";
+  if (condition.type === "numeric") {
+    const symMap = { gt: ">", gte: "≥", lt: "<", lte: "≤", eq: "=" };
+    label = condition.op === "between"
+      ? `${condition.fieldLabel}: ${condition.min}–${condition.max}${u}`
+      : `${condition.fieldLabel} ${symMap[condition.op] || condition.op} ${condition.value}${u}`;
+  } else {
+    label = condition.op === "contains"
+      ? `${condition.fieldLabel} ∋ "${condition.value}"`
+      : `${condition.fieldLabel}: ${condition.value}`;
+  }
+  return (
+    <div style={{ display: "inline-flex", alignItems: "center", gap: 5, background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 4, padding: "3px 7px 3px 9px", fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textSecondary, whiteSpace: "nowrap" }}>
+      {label}
+      <button onClick={onRemove} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 15, lineHeight: 1, padding: 0, marginLeft: 2 }}>×</button>
+    </div>
+  );
+}
+
+function SampleFilter({ settings, samples = [], onFilterChange }) {
+  const [conditions,  setConditions]  = useState([]);
+  const [panelOpen,   setPanelOpen]   = useState(false);
+  const [newField,    setNewField]    = useState("");
+  const [newOp,       setNewOp]       = useState("between");
+  const [newVal,      setNewVal]      = useState("");
+  const [newMin,      setNewMin]      = useState("");
+  const [newMax,      setNewMax]      = useState("");
+
+  const groups = buildFilterFields(settings);
+  const allFields = groups.flatMap(g => g.fields.map(f => ({ ...f, group: g.group })));
+
+  // Derive distinct existing values for text fields from the loaded samples array.
+  const knownValues = useMemo(() => {
+    const substrate = [...new Set(samples.map(s => s.substrate).filter(Boolean))].sort();
+    const lot       = [...new Set(samples.map(s => s.lot).filter(Boolean))].sort();
+    const material  = [...new Set(
+      samples.flatMap(s => (s.layers || []).flatMap(l => (l.targets || []).map(t => t.material).filter(Boolean)))
+    )].sort();
+    // technique is always static
+    return { substrate, lot, material };
+  }, [samples]);
+
+  const resetNew = () => { setNewField(""); setNewOp("between"); setNewVal(""); setNewMin(""); setNewMax(""); };
+
+  const selectedField = allFields.find(f => f.id === newField) || null;
+
+  // When field changes, reset op + val
+  const handleFieldChange = (id) => {
+    setNewField(id);
+    const f = allFields.find(x => x.id === id);
+    setNewOp(f?.type === "numeric" ? "between" : "eq");
+    setNewVal(""); setNewMin(""); setNewMax("");
+  };
+
+  // For a text field, get the list of pickable values (static options or derived from samples)
+  const getPickList = (field) => {
+    if (!field || field.type === "numeric") return null;
+    if (field.options) return field.options; // e.g. technique
+    return knownValues[field.id] || null;
+  };
+
+  const isReady = () => {
+    if (!newField || !selectedField) return false;
+    if (selectedField.type === "numeric") {
+      if (newOp === "between") return newMin !== "" && newMax !== "";
+      return newVal !== "";
+    }
+    return newVal.trim() !== "";
+  };
+
+  const addCondition = () => {
+    if (!isReady()) return;
+    const cond = {
+      id: Math.random().toString(36).slice(2, 8),
+      fieldId: newField, fieldLabel: selectedField.label,
+      type: selectedField.type, unit: selectedField.unit || "",
+      op: newOp,
+      ...(selectedField.type === "numeric"
+        ? newOp === "between" ? { min: newMin, max: newMax } : { value: newVal }
+        : { value: newVal }),
+    };
+    const next = [...conditions, cond];
+    setConditions(next);
+    onFilterChange(next);
+    resetNew();
+    setPanelOpen(false);
+  };
+
+  const removeCondition = (id) => {
+    const next = conditions.filter(c => c.id !== id);
+    setConditions(next);
+    onFilterChange(next);
+  };
+
+  const clearAll = () => { setConditions([]); onFilterChange([]); };
+
+  const inputSm = { background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 7px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" };
+  const numericOps = [["between","range"],["gt",">"],["gte","≥"],["lt","<"],["lte","≤"],["eq","="]];
+
+  const pickList = getPickList(selectedField);
+
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+      {conditions.map(c => <FilterChip key={c.id} condition={c} onRemove={() => removeCondition(c.id)} />)}
+
+      <div style={{ position: "relative" }}>
+        {panelOpen && <div onClick={() => { setPanelOpen(false); resetNew(); }} style={{ position: "fixed", inset: 0, zIndex: 90 }} />}
+        <button
+          onClick={() => setPanelOpen(v => !v)}
+          style={{ background: "none", border: `1px dashed ${panelOpen ? T.amber : T.border}`, borderRadius: 4, color: panelOpen ? T.amber : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer", transition: "all .12s" }}>
+          ＋ Filter
+        </button>
+
+        {panelOpen && (
+          <div onClick={e => e.stopPropagation()}
+            style={{ position: "absolute", left: 0, top: "calc(100% + 6px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "12px 14px", zIndex: 200, boxShadow: "0 4px 20px rgba(0,0,0,.35)", minWidth: 280, display: "flex", flexDirection: "column", gap: 10 }}>
+
+            {/* Field selector */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Field</span>
+              <select value={newField} onChange={e => handleFieldChange(e.target.value)}
+                style={{ ...inputSm, width: "100%", cursor: "pointer" }}>
+                <option value="">— select —</option>
+                {groups.map(g => (
+                  <optgroup key={g.group} label={g.group}>
+                    {g.fields.map(f => <option key={f.id} value={f.id}>{f.label}{f.unit ? ` (${f.unit})` : ""}</option>)}
+                  </optgroup>
+                ))}
+              </select>
+            </div>
+
+            {/* Condition inputs */}
+            {selectedField && (
+              <>
+                {selectedField.type === "numeric" ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {/* Op toggle */}
+                    <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}`, alignSelf: "flex-start" }}>
+                      {numericOps.map(([op, lbl], idx, arr) => (
+                        <button key={op} onClick={() => setNewOp(op)}
+                          style={{ background: newOp === op ? T.bg3 : T.bg0, border: "none", borderRight: idx < arr.length - 1 ? `1px solid ${T.border}` : "none", color: newOp === op ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 8px", cursor: "pointer" }}>
+                          {lbl}
+                        </button>
+                      ))}
+                    </div>
+                    {/* Value inputs */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      {newOp === "between" ? (
+                        <>
+                          <input type="number" value={newMin} onChange={e => setNewMin(e.target.value)} placeholder="min" style={{ ...inputSm, width: 80 }} />
+                          <span style={{ color: T.textDim, fontFamily: "'DM Mono', monospace" }}>–</span>
+                          <input type="number" value={newMax} onChange={e => setNewMax(e.target.value)} placeholder="max" style={{ ...inputSm, width: 80 }} />
+                        </>
+                      ) : (
+                        <input type="number" value={newVal} onChange={e => setNewVal(e.target.value)} placeholder="value" style={{ ...inputSm, width: 110 }} />
+                      )}
+                      {selectedField.unit && <span style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{selectedField.unit}</span>}
+                    </div>
+                  </div>
+                ) : pickList ? (
+                  /* Pick-list mode: known values rendered as a <select>. Always exact match. */
+                  <select value={newVal} onChange={e => setNewVal(e.target.value)}
+                    style={{ ...inputSm, width: "100%", cursor: "pointer" }}>
+                    <option value="">— choose —</option>
+                    {pickList.map(v => <option key={v} value={v}>{v}</option>)}
+                  </select>
+                ) : (
+                  /* Free-text mode: fallback for fields with no known values yet */
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}`, alignSelf: "flex-start" }}>
+                      {[["eq","is"],["contains","contains"]].map(([op, lbl], idx, arr) => (
+                        <button key={op} onClick={() => setNewOp(op)}
+                          style={{ background: newOp === op ? T.bg3 : T.bg0, border: "none", borderRight: idx < arr.length - 1 ? `1px solid ${T.border}` : "none", color: newOp === op ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer" }}>
+                          {lbl}
+                        </button>
+                      ))}
+                    </div>
+                    <input type="text" value={newVal} onChange={e => setNewVal(e.target.value)} placeholder="value…"
+                      onKeyDown={e => e.key === "Enter" && addCondition()}
+                      style={{ ...inputSm, width: "100%" }} />
+                  </div>
+                )}
+                <Btn small onClick={addCondition} disabled={!isReady()}>Add</Btn>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      {conditions.length > 0 && (
+        <button onClick={clearAll}
+          style={{ background: "none", border: "none", color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 11, cursor: "pointer", padding: "3px 4px", textDecoration: "underline" }}>
+          Clear all
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -10240,9 +10924,15 @@ export default function App() {
   const [draggingSampleId, setDraggingSampleId] = useState(null);
   const [draggingBookId,   setDraggingBookId]   = useState(null);
   const [draggingFolderId, setDraggingFolderId] = useState(null);
-  const [addingFolder,        setAddingFolder]        = useState(false);
-  const [folderDefaultForBooks, setFolderDefaultForBooks] = useState(false);
-  const [editingFolder, setEditingFolder] = useState(null); // folder object
+  const [draggingModuleId, setDraggingModuleId] = useState(null);
+  const [addingSampleFolder, setAddingSampleFolder] = useState(false);
+  const [addingBookFolder,   setAddingBookFolder]   = useState(false);
+  const [addingModuleFolder, setAddingModuleFolder] = useState(false);
+  const [editingFolder, setEditingFolder] = useState(null); // folder object being edited — type inferred from its flags
+  const [importModalType, setImportModalType] = useState(null); // "sample"|"book"|"module"|null
+  const [importing,       setImporting]       = useState(false);
+  const [sampleFilterConds, setSampleFilterConds] = useState([]);
+  const [filteredSampleIds,  setFilteredSampleIds]  = useState(null); // null = no filter active
   const [addingBook,    setAddingBook]    = useState(false);
   const [editingBook,   setEditingBook]   = useState(null);
   const [loading,  setLoading]  = useState(true);
@@ -10252,8 +10942,6 @@ export default function App() {
   const [exportOpen,    setExportOpen]    = useState(false);
   const [modules,       setModules]       = useState([]);
   const [activeModule,  setActiveModule]  = useState(null); // full module editor state: { id, name, builtin, source, mode, ... }
-  const [importError,   setImportError]   = useState(null);
-  const [importing,     setImporting]     = useState(false);
   const [viewDataOpen,  setViewDataOpen]  = useState(false);  // View Data modal
   const [viewDataFiles, setViewDataFiles] = useState([]);
   const [viewDataLoading, setViewDataLoading] = useState(false);
@@ -10288,6 +10976,25 @@ export default function App() {
       setLoading(false);
     }).catch(e => { setError(e.message); setLoading(false); });
   }, []);
+
+  // Debounced filter — call API whenever conditions change
+  useEffect(() => {
+    if (!sampleFilterConds.length) { setFilteredSampleIds(null); return; }
+    const timer = setTimeout(async () => {
+      try {
+        const conditions = sampleFilterConds.map(c => {
+          if (c.type === "numeric") {
+            if (c.op === "between") return { field: c.fieldId, op: "between", min: Number(c.min), max: Number(c.max) };
+            return { field: c.fieldId, op: c.op, value: Number(c.value) };
+          }
+          return { field: c.fieldId, op: c.op, value: c.value };
+        });
+        const res = await api("POST", "/samples/filter", { conditions });
+        setFilteredSampleIds(new Set(res.ids));
+      } catch { setFilteredSampleIds(null); }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [sampleFilterConds]);
 
   // ── Samples ──────────────────────────────────────────────────────────────
 
@@ -10398,48 +11105,50 @@ export default function App() {
     a.click();
   };
 
-  const handleImportSample = async (e) => {
-    const file = e.target.files?.[0];
-    e.target.value = "";          // reset so same file can be re-selected
-    if (!file) return;
-    setImporting(true);
-    setImportError(null);
-    try {
-      await doImport(file, false);
-    } catch (err) {
-      setImportError(err.message);
-    }
-    setImporting(false);
-  };
+  // ── Unified import confirm ────────────────────────────────────────────────
+  // Called by ImportModal with (cfg, file) after user resolves conflicts.
 
-  const doImport = async (file, merge) => {
-    const form = new FormData();
-    form.append("file", file);
-    const url = `${API_BASE}/samples/import${merge ? "?merge=true" : ""}`;
-    const res = await fetch(url, { method: "POST", body: form });
-    const json = await res.json();
-    if (res.status === 409) {
-      const sampleId = json.detail?.match(/'([^']+)'/)?.[1] ?? "this sample";
-      const ok = window.confirm(
-        `'${sampleId}' already exists.\n\n` +
-        `Merge? Metadata will be overwritten. Existing data files will be kept; missing ones restored.`
-      );
-      if (!ok) return;
-      // re-read the file bytes since FormData body was already consumed
-      const mergeForm = new FormData();
-      mergeForm.append("file", file);
-      const mergeRes = await fetch(`${API_BASE}/samples/import?merge=true`, { method: "POST", body: mergeForm });
-      const mergeJson = await mergeRes.json();
-      if (!mergeRes.ok) throw new Error(mergeJson.detail || "Merge failed");
-      const updated = await api("GET", "/samples");
-      setSamples(updated);
-      setActive(mergeJson.id);
-      return;
-    }
-    if (!res.ok) throw new Error(json.detail || "Import failed");
-    const updated = await api("GET", "/samples");
-    setSamples(updated);
-    setActive(json.id);
+  const handleImportConfirm = async (cfg, file) => {
+    const type = importModalType;
+    setImportModalType(null);
+    setImporting(true);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("config", JSON.stringify(cfg));
+
+      if (type === "sample") {
+        const res  = await fetch(`${API_BASE}/samples/import`, { method: "POST", body: form });
+        const data = await res.json();
+        if (!res.ok) { alert(data.detail || "Import failed"); return; }
+        if (!data.skipped) {
+          setSamples(await api("GET", "/samples"));
+          setActive(data.id);
+        }
+
+      } else if (type === "book") {
+        const res  = await fetch(`${API_BASE}/books/import`, { method: "POST", body: form });
+        const data = await res.json();
+        if (!res.ok) { alert(data.detail || "Import failed"); return; }
+        const [updatedSamples, updatedBooks] = await Promise.all([api("GET", "/samples"), api("GET", "/analysis-books")]);
+        setSamples(updatedSamples);
+        setBooks(updatedBooks);
+        setFolders(await api("GET", "/folders"));
+
+      } else if (type === "module") {
+        const res  = await fetch(`${API_BASE}/modules/import`, { method: "POST", body: form });
+        const data = await res.json();
+        if (!res.ok) { alert(data.detail || "Import failed"); return; }
+        if (!data.skipped) {
+          const mods = await api("GET", "/modules");
+          setModules(mods);
+          const modMeta = mods.find(m => m.id === data.module_id) || {};
+          const srcRes  = await api("GET", `/modules/${data.module_id}/source`);
+          setActiveModule({ ...modMeta, source: srcRes.source, builtin: srcRes.builtin, mode: srcRes.builtin ? "view" : "edit" });
+        }
+      }
+    } catch (e) { alert(`Import failed: ${e.message}`); }
+    setImporting(false);
   };
 
   const handleReparseFiles = async () => {
@@ -10500,12 +11209,18 @@ export default function App() {
 
   const createFolder = async (data) => {
     const id = String(Date.now());
-    const siblings = folders.filter(f => !!f.book_folder === !!data.book_folder && (f.parent_id ?? null) === (data.parent_id ?? null));
+    const siblings = folders.filter(f =>
+      !!f.book_folder === !!data.book_folder &&
+      !!f.module_folder === !!data.module_folder &&
+      (f.parent_id ?? null) === (data.parent_id ?? null)
+    );
     const sort_order = siblings.length;
     const folder = { id, sort_order, ...data };
     await api("POST", "/folders", folder);
     setFolders(p => [...p, folder]);
-    setAddingFolder(false);
+    setAddingSampleFolder(false);
+    setAddingBookFolder(false);
+    setAddingModuleFolder(false);
   };
 
   const saveFolder = async (data) => {
@@ -10515,7 +11230,10 @@ export default function App() {
     } else {
       await createFolder(data);
     }
-    setEditingFolder(null); setAddingFolder(false);
+    setEditingFolder(null);
+    setAddingSampleFolder(false);
+    setAddingBookFolder(false);
+    setAddingModuleFolder(false);
   };
 
   const deleteFolder = async (id) => {
@@ -10662,9 +11380,10 @@ export default function App() {
 
   const byId = (a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" });
   const sortedFolders = [...folders].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.name.localeCompare(b.name));
-  const getSiblings = (parentId, isBook) => sortedFolders.filter(f => !!f.book_folder === isBook && (f.parent_id ?? null) === parentId);
+  const getSiblings = (parentId, isBook) => sortedFolders.filter(f => !!f.book_folder === isBook && !f.module_folder && (f.parent_id ?? null) === parentId);
   const allSampleFolders = folders.filter(f => !f.book_folder);
-  const ungrouped = samples.filter(s => !s.folder_id || !allSampleFolders.find(f => f.id === s.folder_id)).sort(byId);
+  const displaySamples = filteredSampleIds ? samples.filter(s => filteredSampleIds.has(s.id)) : samples;
+  const ungrouped = displaySamples.filter(s => !s.folder_id || !allSampleFolders.find(f => f.id === s.folder_id)).sort(byId);
   const [ungroupedDragOver,     setUngroupedDragOver]     = useState(false);
   const [bookUngroupedDragOver, setBookUngroupedDragOver] = useState(false);
 
@@ -10701,6 +11420,14 @@ export default function App() {
                 <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.blue }}>{activeBookObj.name}</span>
                 <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 8px" }}>Analysis Book</span>
                 <div style={{ flex: 1 }} />
+                <Btn variant="ghost" small onClick={async () => {
+                  const incFiles = window.confirm("Include sample data files in the export?\n\nOK = yes (larger file)\nCancel = metadata only");
+                  const resp = await fetch(`${API_BASE}/books/${activeBook}/export?include_files=${incFiles}`);
+                  const blob = await resp.blob();
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a"); a.href = url; a.download = `${activeBookObj.name}.labbook.zip`; a.click();
+                  URL.revokeObjectURL(url);
+                }}>Export Book</Btn>
                 <Btn variant="ghost" small onClick={() => setEditingBook(activeBookObj)}>Edit</Btn>
                 <Btn variant="danger" small onClick={() => { if (window.confirm(`Delete book "${activeBookObj.name}"?`)) { deleteBook(activeBookObj.id); } }}>Delete</Btn>
               </>
@@ -10780,6 +11507,7 @@ export default function App() {
               mod={activeModule}
               onBack={() => setActiveModule(null)}
               allModules={modules}
+              folders={folders}
               onSave={async () => { const mods = await api("GET", "/modules"); setModules(mods); }}
               onDuplicate={(source, defaultId) => setActiveModule({ ...activeModule, id: defaultId, mode: "create", source, builtin: false })}
             />
@@ -10789,16 +11517,22 @@ export default function App() {
               <div style={{ marginBottom: 32 }}>
                 <div style={{ marginBottom: 18, display: "flex", alignItems: "baseline", gap: 12 }}>
                   <h1 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 26, color: T.textPrimary }}>Samples</h1>
-                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{samples.length} total</span>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>
+                    {filteredSampleIds ? `${filteredSampleIds.size} of ${samples.length}` : `${samples.length} total`}
+                  </span>
                   <div style={{ flex: 1 }} />
-                  <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", borderRadius: 6, border: `1px solid ${T.border}`, background: "transparent", color: importing ? T.textDim : T.textSecondary, cursor: importing ? "wait" : "pointer", userSelect: "none", marginRight: 4 }}>
+                  <Btn variant="ghost" small onClick={() => setAddingSampleFolder(true)}>+ Folder</Btn>
+                  <Btn variant="ghost" small onClick={() => setImportModalType("sample")} disabled={importing}>
                     {importing ? "Importing…" : "Import"}
-                    <input type="file" accept=".zip" style={{ display: "none" }} onChange={handleImportSample} disabled={importing} />
-                  </label>
-                  {importError && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, marginRight: 6, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={importError}>{importError}</span>}
-                  <Btn variant="ghost" small onClick={() => setExportOpen(true)}>Export</Btn>
-                  <Btn variant="ghost" small onClick={() => { setFolderDefaultForBooks(false); setAddingFolder(true); }}>+ Folder</Btn>
+                  </Btn>
+                  {/* Export hidden for now — keep for future reintroduction */}
+                  {false && <Btn variant="ghost" small onClick={() => setExportOpen(true)}>Export</Btn>}
                   <Btn variant="primary" small onClick={() => setAdding(true)}>+ New Sample</Btn>
+                </div>
+
+                {/* Filter bar */}
+                <div style={{ marginBottom: 14 }}>
+                  <SampleFilter settings={settings} samples={samples} onFilterChange={setSampleFilterConds} />
                 </div>
 
                 {/* Foldered groups — recursive tree */}
@@ -10806,7 +11540,7 @@ export default function App() {
                   const renderSampleFolders = (parentId, depth = 0) =>
                     getSiblings(parentId, false).map(folder => (
                       <FolderTile key={folder.id} folder={folder} depth={depth}
-                        samples={samples.filter(s => s.folder_id === folder.id).sort(byId)}
+                        samples={displaySamples.filter(s => s.folder_id === folder.id).sort(byId)}
                         childContent={renderSampleFolders(folder.id, depth + 1)}
                         plotCache={plotCache}
                         onSelectSample={openSample} onDeleteSample={deleteSample}
@@ -10850,7 +11584,8 @@ export default function App() {
                   <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.textPrimary }}>Analysis Books</h2>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{books.length}</span>
                   <div style={{ flex: 1 }} />
-                  <Btn variant="ghost" small onClick={() => { setFolderDefaultForBooks(true); setAddingFolder(true); }}>+ Folder</Btn>
+                  <Btn variant="ghost" small onClick={() => setAddingBookFolder(true)}>+ Folder</Btn>
+                  <Btn variant="ghost" small onClick={() => setImportModalType("book")}>Import</Btn>
                   <Btn variant="primary" small onClick={() => setAddingBook(true)}>+ New Book</Btn>
                 </div>
                 {(() => {
@@ -10910,78 +11645,55 @@ export default function App() {
                   <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 22, color: T.textPrimary }}>Modules</h2>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textDim }}>{modules.length}</span>
                   <div style={{ flex: 1 }} />
-                  {/* Import module zip */}
-                  <label style={{ marginRight: 6, cursor: "pointer" }}>
-                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 500, padding: "4px 10px", borderRadius: 6, border: `1px solid ${T.border}`, background: "transparent", color: T.textSecondary, cursor: "pointer", userSelect: "none" }}>Import</span>
-                    <input type="file" accept=".zip" style={{ display: "none" }} onChange={async e => {
-                      const f = e.target.files?.[0];
-                      if (!f) return;
-                      e.target.value = "";
-                      const form = new FormData();
-                      form.append("file", f);
-                      const res = await fetch(`${API_BASE}/modules/import`, { method: "POST", body: form });
-                      const data = await res.json();
-                      if (!res.ok) { alert(data.detail || "Import failed"); return; }
-                      // Refresh module list, then open — use fresh list to avoid stale state
-                      const mods = await api("GET", "/modules");
-                      setModules(mods);
-                      const modMeta = mods.find(m => m.id === data.module_id) || {};
-                      const srcRes  = await api("GET", `/modules/${data.module_id}/source`);
-                      setActiveModule({ ...modMeta, source: srcRes.source, builtin: srcRes.builtin, mode: srcRes.builtin ? "view" : "edit" });
-                    }} />
-                  </label>
+                  <Btn variant="ghost" small onClick={() => setAddingModuleFolder(true)}>+ Folder</Btn>
+                  <Btn variant="ghost" small onClick={() => setImportModalType("module")}>Import</Btn>
                   <Btn variant="primary" small onClick={() => openModule(null)}>+ New Module</Btn>
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
-                  {modules.map(m => (
-                    <div key={m.id}
-                      onClick={() => openModule(m.id)}
-                      style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "12px 14px", cursor: "pointer", transition: "border-color .12s", display: "flex", flexDirection: "column", gap: 6 }}
-                      onMouseEnter={e => e.currentTarget.style.borderColor = T.borderBright}
-                      onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 15, color: T.textPrimary, flex: 1 }}>{m.name}</span>
-                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: m.builtin ? T.amber : T.teal, background: (m.builtin ? T.amber : T.teal) + "18", border: `1px solid ${(m.builtin ? T.amber : T.teal)}33`, borderRadius: 3, padding: "1px 5px" }}>
-                          {m.builtin ? "built-in" : "user"}
-                        </span>
-                        {/* Copy button for built-in modules */}
-                        {m.builtin && (
-                          <button
-                            onClick={async e => {
-                              e.stopPropagation();
-                              await openModule(m.id, { mode: "create", id: `copy_of_${m.id}`, builtin: false });
-                            }}
-                            style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.teal, background: "none", border: `1px solid ${T.teal}44`, borderRadius: 3, padding: "1px 6px", cursor: "pointer" }}>
-                            copy
-                          </button>
-                        )}
-                        {/* Delete button for user modules */}
-                        {!m.builtin && (
-                          <button
-                            onClick={async e => {
-                              e.stopPropagation();
-                              if (!window.confirm(`Delete module "${m.name}"? This cannot be undone.`)) return;
-                              await api("DELETE", `/modules/${m.id}`);
-                              const mods = await api("GET", "/modules");
-                              setModules(mods);
-                            }}
-                            style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.red, background: "none", border: "none", padding: "0 2px", cursor: "pointer", lineHeight: 1, opacity: 0.7 }}>
-                            ✕
-                          </button>
-                        )}
-                      </div>
-                      <p style={{ margin: 0, fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textSecondary, lineHeight: 1.5 }}>{m.description}</p>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
-                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>v{m.version}</span>
-                        <span style={{ color: T.border }}>·</span>
-                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{m.accepts?.join(", ")}</span>
-                      </div>
-                    </div>
-                  ))}
-                  {modules.length === 0 && (
-                    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>No modules loaded.</div>
-                  )}
-                </div>
+                {(() => {
+                  const modFolders = folders.filter(f => f.module_folder);
+                  const ungroupedMods = modules.filter(m => !m.folder_id || !modFolders.find(f => f.id === m.folder_id));
+                  const handleDropModule = async (moduleId, folderId) => {
+                    await api("PATCH", `/modules/${moduleId}/folder`, { folder_id: folderId || null });
+                    setModules(await api("GET", "/modules"));
+                    setDraggingModuleId(null);
+                  };
+                  const handleDeleteModule = async m => {
+                    if (!window.confirm(`Delete module "${m.name}"?`)) return;
+                    await api("DELETE", `/modules/${m.id}`);
+                    setModules(await api("GET", "/modules"));
+                  };
+                  const [ungroupedDragOver, setUngroupedDragOver] = [false, () => {}]; // placeholder; use state in parent
+                  return (
+                    <>
+                      {modFolders.map(folder => (
+                        <ModuleFolderTile key={folder.id}
+                          folder={folder}
+                          mods={modules.filter(m => m.folder_id === folder.id)}
+                          onOpenModule={(id, overrides) => openModule(id, overrides)}
+                          onDeleteModule={handleDeleteModule}
+                          onEdit={() => setEditingFolder(folder)}
+                          onDelete={() => deleteFolder(folder.id)}
+                          onDropModule={handleDropModule}
+                          onDragStartModule={setDraggingModuleId} />
+                      ))}
+                      {(ungroupedMods.length > 0 || draggingModuleId) && (
+                        <div
+                          onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
+                          onDrop={e => { e.preventDefault(); const mid = e.dataTransfer.getData("text/x-module"); if (mid) handleDropModule(mid, null); }}>
+                          {modFolders.length > 0 && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>Ungrouped</div>}
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
+                            {ungroupedMods.map(m => (
+                              <ModCard key={m.id} m={m}
+                                onOpen={(id, overrides) => openModule(id, overrides)}
+                                onDelete={handleDeleteModule}
+                                onDragStart={modFolders.length > 0 ? setDraggingModuleId : null} />
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
             </>
           )}
@@ -11000,8 +11712,21 @@ export default function App() {
           setSamples(p => p.map(s => s.id === active ? updated : s));
         }} />}
       {settingsOpen && <SettingsModal settings={settings} onSave={handleSaveSettings} onClose={() => setSettingsOpen(false)} />}
-      {(addingFolder || editingFolder) && (
-        <AddFolderModal onSave={saveFolder} onClose={() => { setAddingFolder(false); setEditingFolder(null); }} existing={editingFolder} allFolders={folders} defaultForBooks={folderDefaultForBooks} />
+      {(addingSampleFolder || (editingFolder && !editingFolder.book_folder && !editingFolder.module_folder)) && (
+        <AddSampleFolderModal onSave={saveFolder} onClose={() => { setAddingSampleFolder(false); setEditingFolder(null); }} existing={editingFolder && !editingFolder.book_folder && !editingFolder.module_folder ? editingFolder : null} allFolders={folders} />
+      )}
+      {(addingBookFolder || (editingFolder?.book_folder)) && (
+        <AddBookFolderModal onSave={saveFolder} onClose={() => { setAddingBookFolder(false); setEditingFolder(null); }} existing={editingFolder?.book_folder ? editingFolder : null} allFolders={folders} />
+      )}
+      {(addingModuleFolder || (editingFolder?.module_folder)) && (
+        <AddModuleFolderModal onSave={saveFolder} onClose={() => { setAddingModuleFolder(false); setEditingFolder(null); }} existing={editingFolder?.module_folder ? editingFolder : null} />
+      )}
+      {importModalType && (
+        <ImportModal
+          type={importModalType}
+          onClose={() => setImportModalType(null)}
+          onConfirm={handleImportConfirm}
+        />
       )}
       {(addingBook || editingBook) && (
         <AddBookModal onSave={saveBook} onClose={() => { setAddingBook(false); setEditingBook(null); }} existing={editingBook} samples={samples} folders={folders} bookFolders={folders.filter(f => f.book_folder)} />
