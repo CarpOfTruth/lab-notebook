@@ -1,19 +1,12 @@
 # LabLog
 
-**A local lab notebook for ferroelectric oxide thin film growth and characterization.**
-
-LabLog is a self-hosted web app that keeps deposition recipes, raw measurement files, and publication-ready plots in one place. No cloud, no accounts — just a SQLite database and a dev server running on your own machine.
+A self-hosted lab notebook for materials science researchers. Tracks samples, measurement files, and analysis routines in one place. No cloud, no accounts — SQLite database and a dev server on your local machine.
 
 ---
 
 ## Installation
 
-### Requirements
-
-- Python 3.9+
-- Node.js 18+
-
-### 1. Clone and set up
+**Requirements:** Python 3.9+, Node.js 18+
 
 ```bash
 git clone https://github.com/CarpOfTruth/lab-notebook.git
@@ -23,113 +16,62 @@ npm run setup
 
 This creates the Python virtual environment, installs all dependencies, and copies the default config.
 
-### 2. Load demo data (optional)
+### Demo data (optional)
 
-The repo ships with measurement files for four BaTiO₃ / SrRuO₃ / Si:STO samples (SP022 – SP025) from a sputter pressure series (3 – 5 mTorr), plus a pre-configured Analysis Book comparing them across all panel types.
+Loads four BaTiO₃/SrRuO₃/Si:STO samples (SP022–SP025) from a sputter pressure series, plus a pre-configured Analysis Book.
 
 ```bash
 npm run seed
 ```
 
-Re-run with `--overwrite` to reset to a clean demo state:
+Re-run with `--overwrite` to reset to a clean demo state.
 
-```bash
-npm run seed -- --overwrite
-```
-
-Your own data lives in `backend/data/` and is gitignored.
-
-### 3. Start
+### Start
 
 ```bash
 npm start
 ```
 
-Open **http://localhost:5173**.
+Open **http://localhost:5173**. Backend runs on port 8000, frontend on port 5173.
+
+All user data lives in `backend/data/` and is gitignored.
 
 ---
 
-## Features
+## Overview
 
-### Dashboard
+The home page has three sections.
 
-Samples are organized into named, color-coded **folders** (growth series). Each card shows the deposition technique, substrate, layer material chips (SrRuO₃, BaTiO₃, etc.), notes, and a count of attached datasets. **Analysis Books** appear below for cross-sample comparisons and can themselves be grouped into book folders.
+### Samples
 
-A **dark / light mode** toggle is always visible in the top bar and persists across sessions.
+Physical samples (thin films, etc.), each with an ID (SP###), name, deposition technique (PLD or Sputter), substrate, notes, and metadata. Samples are organized into color-coded folders. Clicking a sample opens its detail page.
 
-![Dashboard — samples and analysis books](docs/screenshots/samples-dark.png)
-
-### Creating a sample
-
-Click **+ New Sample** to open the creation dialog. Choose sputter or PLD technique, enter an ID, date, substrate, thickness, notes, and optionally assign the sample to a folder.
-
-![New Sample dialog](docs/screenshots/new-sample-modal.png)
-
-### Settings & material library
-
-The gear icon opens **Settings**, where you configure global deposition defaults (temperature, pressure, O₂ %, time, power/energy) for both sputter and PLD. The **Material Library** stores per-material target defaults — when you add a layer and type a known material, parameters auto-fill.
-
-![Settings — global defaults and material library](docs/screenshots/settings.png)
-
-### Deposition recipe editor
-
-Multi-layer recipes are stored per sample. Both **sputter** and **PLD** techniques are supported with their own parameter sets. Layers are drag-reorderable. Click **+ Add Layer** to open the inline layer form, which pulls defaults from the material library.
-
-| Sputter | PLD |
-|---------|-----|
-| Temperature (°C) | Temperature (°C) |
-| Pressure (mTorr) | Pressure (mTorr) |
-| O₂ % | Rep rate (Hz) |
-| Power (W) | Energy (mJ) |
-| Time (s) | Pulse count |
-
-![Sample detail — layers and add-layer form](docs/screenshots/sample-layers.png)
-
-### X-ray characterization
-
-Three X-ray panels per sample: **XRD ω-2θ** (log-scale intensity vs 2θ), **XRR** (reflectivity curve for thickness extraction), and **RSM** (false-color Qₓ–Qz heatmap for epitaxial strain analysis).
-
-![X-ray characterization row — XRD, XRR, RSM](docs/screenshots/sample-detail-xray.png)
-
-### Electrical characterization
-
-Three electrical panels per sample:
-
-- **P-E Hysteresis** — polarization (µC/cm²) vs field (kV/cm). A loop toggle switches between full double loop and isolated 2nd loop.
-- **εᵣ vs E** — butterfly permittivity curve from a bipolar voltage sweep, with tan δ on the right axis.
-- **εᵣ vs frequency** — frequency dispersion from 1 kHz – 3 MHz on a log axis, with tan δ on the right axis.
-
-The capacitor area is entered per sample and the correction factor is shown inline.
-
-![Electrical characterization row — P-E, εᵣ vs E, εᵣ vs f](docs/screenshots/sample-detail-electrical.png)
+The sample page has a tab per module added to the sample, plus a metadata tab. The metadata tab holds editable fields and file attachments. Each module tab shows the processed data plot, a file upload zone, and plot controls (color, axis variables, log/linear scale, fit overlay). Tab bar actions include Reparse, View Data, Export Sample, Edit, and Delete.
 
 ### Analysis Books
 
-Collect any set of samples into an **Analysis Book** for synchronized, side-by-side comparisons. Samples are assigned colors from a continuous scale (Viridis, Plasma, Inferno, Magma, or Coolwarm) with a configurable trim to avoid washed-out endpoints.
+Books group samples for cross-sample comparison and meta-analysis. The book view is panel-based — add comparison panels for any module, plus a meta-analysis panel that plots any extracted parameter against any other across all samples in the book. Books can be organized into folders and exported/imported as `.labbook.zip` files (optionally including sample data).
 
-![Analysis Book — sample roster with color scale](docs/screenshots/book-roster.png)
+### Modules
 
-Comparison panels (each independently added/removed via **+ Add Panel**):
+Modules define how measurement data is processed and how results are aggregated across samples in a book. They are independent of specific measurement types — any file format can be supported by writing the appropriate module.
 
-| Panel | What it shows |
-|-------|---------------|
-| **XRD ω-2θ** | Waterfall with configurable inter-sample offset (decades) |
-| **RSM** | Per-sample heatmap gallery |
-| **P-E Hysteresis** | Overlaid loops, all-loop or 2nd-loop toggle |
-| **εᵣ vs E** | Overlaid butterfly curves |
-| **εᵣ vs frequency** | Overlaid frequency dispersion |
-| **Meta-Analysis** | Scatter plot of any extracted parameter vs any other |
+**Built-in modules:** P-E Loop (ferroelectric hysteresis; accepts `.csv`, `.dat`, `.txt`, `.pe`)
 
-![Analysis Book — XRD waterfall](docs/screenshots/book-xrd.png)
-![Analysis Book — RSM gallery](docs/screenshots/book-rsm.png)
-![Analysis Book — P-E overlay](docs/screenshots/book-pe.png)
-![Analysis Book — εᵣ vs E overlay](docs/screenshots/book-de.png)
-![Analysis Book — εᵣ vs f overlay](docs/screenshots/book-df.png)
+**Custom modules:** The module editor provides a three-block Python editor: Block 1 auto-generates column imports (locked), Block 2 is user processing code, Block 3 returns the output dict. Modules have a name, version, description, author, accepted file types, and section/category. They can be tested against example data in the editor, then saved, exported as `.labmodule.zip`, and shared or imported elsewhere.
 
-### Meta-Analysis
+Modules are organized into folders with drag-drop assignment.
 
-The **Meta-Analysis** panel plots any extracted parameter against any other across all samples in a book. X and Y axes are chosen from a dropdown of all available quantities — growth conditions (pressure, temperature, O₂ %, time, power/energy) and fitted measurement parameters (remnant polarization Pᵣ, coercive field Eᶜ, saturation polarization Pₛ, permittivity εᵣ, and loss tan δ at any field or frequency).
+---
 
-A second Y axis can be added for direct overlay of two different parameters. Marker color and style are configurable per axis.
+## Security
 
-![Analysis Book — Meta-Analysis scatter](docs/screenshots/book-meta.png)
+Module `proc_code` and `analysis_code` execute as Python on the backend server. Only import modules from sources you trust. The import flow displays full module source before any code is executed.
+
+---
+
+## Documentation
+
+- `docs/user-manual.md` — full application usage guide
+- `docs/module-authoring-guide.md` — writing custom analysis modules
+- `docs/lab-guide.md` — lab-specific conventions and workflows
