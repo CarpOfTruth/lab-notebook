@@ -1,6 +1,8 @@
 # LabLog User Manual
 
-LabLog is a self-hosted web application for recording and analyzing thin film growth experiments. It runs entirely on your machine — no cloud account, no internet dependency. Data is stored locally in a SQLite database.
+LabLog is a self-hosted web application for recording and analyzing measurement-driven research. It runs entirely on your machine — no cloud account, no internet dependency. Data is stored locally in a SQLite database. While the built-in modules and demo data are drawn from thin film characterization, the module system is general-purpose and can be adapted to any measurement workflow.
+
+Feedback and suggestions are welcome — if something doesn't work the way you expect or you have ideas for improvement, please reach out.
 
 ---
 
@@ -61,17 +63,17 @@ A dark/light mode toggle is always visible in the top bar. The setting persists 
 
 ### What a sample represents
 
-A sample record corresponds to one physical sample: a thin film on a substrate, for example. It stores growth metadata, deposition recipe layers, attached measurement files, and processed data.
+A sample record corresponds to one physical specimen — a thin film on a substrate, a batch synthesis product, a device under test, or whatever unit your workflow tracks. It stores metadata, attached measurement files, and processed data.
 
 ### Creating a sample
 
 Click **+ New Sample** in the Samples section. Fill in:
 
-- **ID** — a short identifier you choose, e.g. `SP026`. Must be unique. This is used throughout the application to refer to the sample.
-- **Date** — growth date.
+- **ID** — a short identifier you choose (e.g. `SP026`, `BTO-001`, or whatever convention your lab uses). Must be unique. This is used throughout the application to refer to the sample. Any format is accepted — spaces and special characters are the only things to avoid since the ID is used in file paths.
+- **Date** — growth or preparation date.
 - **Technique** — PLD, Sputter, or other.
 - **Substrate** — e.g. `Si:STO`, `STO`, `LAO`.
-- **Thickness (nm)** — active layer thickness. Used by modules to convert voltage to electric field.
+- **Thickness (nm)** — active layer thickness. Used by modules that need to convert voltage to electric field.
 - **Notes** — free text. Growth conditions, observations, anything relevant.
 - **Folder** — optional. Assign the sample to a folder on creation, or move it later.
 
@@ -102,7 +104,7 @@ Each module you attach to the sample gets its own tab.
 
 ### Metadata tab
 
-Displays all growth parameters: technique, substrate, thickness, electrode area, area correction factor, notes, and layers. Fields are editable in place or via the **Edit** button. You can also attach arbitrary files here (PDFs, images, supplementary data) by dragging onto the upload zone or clicking to browse.
+Displays all growth parameters: technique, substrate, thickness, notes, and layers. Fields are editable in place or via the **Edit** button. You can also attach arbitrary files here (PDFs, images, supplementary data) by dragging onto the upload zone or clicking to browse.
 
 ### Deposition layers
 
@@ -124,7 +126,7 @@ Layers are drag-reorderable. If you have a material library configured in Settin
 
 ### What a module does
 
-A module is an analysis routine that knows how to ingest one or more raw instrument files for a given measurement type, process them, and return plottable data. The built-in **P-E Loop** module, for example, parses polarization–electric-field hysteresis files from Radiant, aixACCT, or generic CSV instruments, converts units, and splits the trace into first and second loops.
+A module is an analysis routine that knows how to ingest one or more raw instrument files for a given measurement type, process them, and return plottable data. The built-in **P-E Loop** module, for example, parses polarization–electric-field hysteresis files from Radiant, aixACCT, or generic CSV instruments, converts units, and splits the trace into first and second loops. Modules for other measurement types work similarly — the specifics depend on what each module is designed to do.
 
 ### Adding a module tab to a sample
 
@@ -150,13 +152,13 @@ If you update sample metadata that affects unit conversion (e.g., you forgot to 
 
 ### The module card
 
-Each module tab shows a card with the processed data plot and a set of controls. The exact controls depend on the module.
+Each module tab shows a card with the processed data plot and a set of controls. The exact controls depend on the module — not all modules use the same inputs.
 
 For **P-E Loop**, the card shows:
 
 - **Plot** — polarization (µC/cm²) vs. electric field (kV/cm), or vs. voltage (V) if no thickness is set
 - **Loop toggle** — switches between the full double loop ("All") and the isolated second loop ("2nd"). The second loop is cleaner and used for Pᵣ/Eᶜ extraction.
-- **Electrode area** — shows the area detected from the file header, if any. A correction factor field lets you scale the area (e.g., if the instrument area differs from the actual electrode). The correction is saved to the sample record on blur and applied immediately.
+- **Electrode area** — an example of a card control modifier. The P-E Loop module shows the area detected from the file header, if any, and a correction factor field that lets you scale the area (e.g., if the instrument area differs from the actual electrode). The correction is saved to the sample record on blur and applied immediately. Other modules may expose different controls, or none at all — card controls are defined per module.
 
 ### Plot config panel
 
@@ -211,7 +213,7 @@ Click the folder tile to collapse or expand it. Collapsed folders show a count o
 
 ### What a book is
 
-An Analysis Book groups a set of samples for side-by-side comparison. You can overlay P-E loops from multiple samples, inspect XRD waterfalls, and run meta-analysis scatter plots across growth parameters and extracted metrics.
+An Analysis Book groups a set of samples for side-by-side comparison. You can overlay traces from multiple samples, inspect data waterfalls, and run meta-analysis scatter plots across growth parameters and extracted metrics.
 
 ### Creating a book
 
@@ -242,7 +244,7 @@ Each sample in the book is assigned a color from a continuous colorscale. In the
 The Meta-Analysis panel plots any scalar parameter against any other across all samples in the book. X and Y axes are each chosen from a dropdown of all available quantities:
 
 - Growth conditions: pressure, temperature, O₂ %, time, power/energy
-- Fitted measurement parameters: Pᵣ, Eᶜ, Pₛ, εᵣ, tan δ (at specified field or frequency)
+- Fitted measurement parameters: Pᵣ, Eᶜ, Pₛ, εᵣ, tan δ (at specified field or frequency), or any scalar your modules return
 
 A second Y axis can be added for direct overlay of two different parameters. Marker color and style are configurable per axis.
 
@@ -265,7 +267,7 @@ Click **Import** in the Analysis Books section header and select a `.labbook.zip
 
 ### Built-in modules
 
-LabLog ships with built-in modules for common ferroelectric characterization measurements. The **P-E Loop** module (ID: `pe`) handles polarization–electric-field hysteresis. Additional built-in modules cover XRD, XRR, dielectric (C-f, C-V), and RSM.
+LabLog ships with built-in modules for common characterization measurements. The **P-E Loop** module (ID: `pe`) handles polarization–electric-field hysteresis. Additional built-in modules cover XRD, XRR, dielectric (C-f, C-V), and RSM.
 
 Built-in modules appear in the Modules section and can be used on any sample but cannot be edited directly. To customize one, duplicate it first.
 
@@ -278,7 +280,7 @@ The Modules section on the home page shows all available modules as cards. Each 
 Click **+ New Module** to open the module editor. The editor is divided into sections:
 
 1. **Identity** — ID (unique, snake_case, e.g. `cv_sweep`), name, description, accepted file extensions, version
-2. **Card** — section assignment, file slots (name and label for each upload zone), card controls (toggles, area input)
+2. **Card** — section assignment, file slots (name and label for each upload zone), card controls (toggles, numeric inputs, or other per-module controls)
 3. **Data** — upload an example file per slot; configure delimiter and skip rows; assign which columns map to which variables
 4. **Processing** — write the Python transform logic:
    - Block 1 (auto-generated, locked): column extraction from your example file configuration
@@ -286,7 +288,7 @@ Click **+ New Module** to open the module editor. The editor is divided into sec
    - Block 3 (scaffolded): return dict with `x` and `y` keys required; optional keys like `x_label`, `y_label`, `x_fit`, `y_fit`, `area_m2`
    - Click **Run** to preview the plot against your example file
 5. **Plot** — configure x/y variable selectors, extra traces, default color
-6. **Analysis** — declare output metrics; write analysis code that extracts scalar values (Pᵣ, Eᶜ, etc.) from the processed result; click **Compute** to test
+6. **Analysis** — declare output metrics; write analysis code that extracts scalar values from the processed result; click **Compute** to test
 7. **Save** — the module becomes available in the module picker on sample pages and in book comparison panels
 
 The `x` and `y` keys are required return values from processing code. All other keys are optional. Use Unicode in axis labels (µ, ε, Ω) for compatibility with card rendering.
@@ -342,15 +344,15 @@ The gear icon in the top bar opens **Settings**. Here you configure:
 
 ## 11. Tips and Conventions
 
-**Sample IDs**: use a consistent scheme from the start. `SP026` (technique prefix + sequential number) is readable in plot legends and filenames. Avoid spaces and special characters — the ID is used in file paths.
+**Sample IDs**: any identifier works — `SP026`, `BTO-001`, `run_42`, or whatever convention your lab uses. The only constraint is uniqueness and avoiding spaces and special characters, since the ID is used in file paths. Pick something readable in plot legends and stick with it.
 
-**Thickness first**: enter film thickness before uploading P-E or dielectric files. The P-E module converts voltage to kV/cm at parse time; if thickness is missing, x-axis will be in volts. Use Reparse after updating thickness.
+**Thickness first**: if you are using a module that converts voltage to a field quantity (like the P-E Loop module), enter film thickness before uploading files. The P-E module converts voltage to kV/cm at parse time; if thickness is missing, the x-axis will be in volts. Use Reparse after updating thickness.
 
-**Electrode area**: the P-E module attempts to read electrode area from instrument file headers (recognizes cm², µm², and m² with various spellings). If detected, it auto-populates. The correction factor on the card lets you override or scale this without re-uploading.
+**Electrode area and card controls**: some modules expose additional controls on the card to modify how data is processed or displayed. The P-E Loop module, for example, includes an electrode area field and a correction factor — it attempts to read area from the instrument file header and lets you scale it without re-uploading. Other modules may have different controls, or none. Card controls are defined per module and will vary.
 
 **Second loop vs. all loops**: for ferroelectric hysteresis, the second loop is recommended for Pᵣ and Eᶜ extraction — it is cleaner because the ferroelectric is already pre-polarized. Use "All" only if you need to inspect the first cycle (e.g., for imprint or fatigue analysis).
 
-**Analysis Books for series**: create one book per growth series (e.g., a pressure series, a temperature series). Assign all samples in the series to the book. Use the Meta-Analysis panel to plot Pᵣ vs. pressure, εᵣ vs. temperature, or any other parameter pair across the series.
+**Analysis Books for series**: create one book per measurement series (e.g., a pressure series, a temperature series). Assign all samples in the series to the book. Use the Meta-Analysis panel to plot any extracted parameter against any growth condition across the series.
 
 **Module proc_code scope**: the processing code runs in a sandboxed Python environment. Standard library modules are available. NumPy is available as `np`. You cannot import arbitrary third-party packages — write self-contained transform logic.
 

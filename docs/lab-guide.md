@@ -1,7 +1,9 @@
 # LabLog Operations Guide
 ## Ferroelectric Thin Film Lab
 
-This guide covers how we use LabLog in this lab. It assumes you have read the user manual and know the basics of navigating the app. What follows is **lab policy** — conventions we follow so that the notebook stays useful as a shared, long-term record.
+This guide covers how **we use LabLog in this lab specifically**. It assumes you have read the user manual and know the basics of navigating the app. What follows is lab policy — conventions we follow so that the notebook stays useful as a shared, long-term record.
+
+> **Note on conventions vs. software rules:** The application itself is flexible — naming conventions, folder structure, ID formats, and workflows are entirely up to you. Nothing described here is enforced by the software. This guide documents the choices we've made for our lab. If you're from a different group or field, you can adapt these conventions freely to fit your own work; the underlying application is general-purpose.
 
 ---
 
@@ -9,13 +11,13 @@ This guide covers how we use LabLog in this lab. It assumes you have read the us
 
 ### ID Format
 
-Every sample grown in this lab gets a unique ID: **SP### — three digits, zero-padded, sequential.**
+Every sample grown in this lab gets a unique ID using our lab's convention: **SP### — three digits, zero-padded, sequential.**
 
 ```
 SP024, SP025, SP026, SP027 ...
 ```
 
-IDs are assigned in order of growth date. Before you start a deposition, check the most recent entry in the notebook and take the next number. Do not skip numbers. Do not recycle numbers.
+The application accepts any ID format — this is our choice, not a software requirement. We use SP### because it's short, unambiguous, and sorts cleanly. IDs are assigned in order of growth date. Before you start a deposition, check the most recent entry in the notebook and take the next number. Do not skip numbers. Do not recycle numbers.
 
 **IDs are never reused.** If a deposition failed, the target cracked, or the sample was destroyed, it still gets an entry. Mark it failed in the name or notes. The record of what went wrong is part of the scientific record.
 
@@ -109,13 +111,15 @@ SP031_PE_10kHz_-60to60V.dat
 
 Include: sample ID, measurement type, key condition (frequency, voltage range, temperature if not room temperature), and device number if measuring multiple capacitors on the same sample.
 
-### Setting the Device Area — Critical
+### Setting the Device Area
 
-**The device area input is mandatory and must be set correctly.** All polarization values (µC/cm²) are calculated from this number. A wrong area means wrong polarization values in every output and every analysis book that uses this data.
+**The device area input must be set correctly.** All polarization values (µC/cm²) are calculated from this number. A wrong area means wrong polarization values in every output and every analysis book that uses this data.
 
 Measure the capacitor area before or immediately after the measurement. For circular contacts, calculate area from the diameter. For square/rectangular contacts, measure both sides. Record the method (optical microscope, profilometer, nominal mask dimensions) in the module notes if there's any ambiguity.
 
 If you're unsure of the area, record the raw charge data and note the uncertainty — do not guess.
+
+Note: device area is relevant to electrical characterization measurements like P-E loops and dielectric sweeps, where converting from charge or capacitance to physical units requires knowing the electrode geometry. It is not a universal concept — other measurement types (XRD, AFM, optical) don't use it.
 
 ### Checking the Fit Overlay
 
@@ -152,7 +156,7 @@ The processed loop, P_r, P_s, and E_c values from the module are available when 
 
 ## 4. XRD Data — Current Practice
 
-There is no dedicated XRD module yet. Until one is available, attach raw XRD files directly to the sample metadata as file attachments and record observations in the notes field.
+There is no dedicated XRD module yet. For now, attach raw XRD files directly to the sample metadata as file attachments and record observations in the notes field. This is the current state of the workflow — a proper XRD module is planned and will replace this approach when it's available.
 
 ### File Attachment
 
@@ -251,7 +255,7 @@ If you upload a file and later realize it was incorrect (wrong sample ID on the 
 
 ## 7. Dielectric and Other Electrical Measurements
 
-There is no dedicated module for dielectric measurements yet. Until one is available, follow the same approach as XRD: attach raw files, record conditions in notes.
+There is no dedicated dielectric module yet. For now, follow the same approach as XRD: attach raw files, record conditions in notes. A proper dielectric module is on the roadmap and will provide structured analysis when it's available.
 
 ### File Attachment
 
@@ -270,13 +274,13 @@ For every dielectric measurement, note:
 - **Bias range**: e.g., –10 V to +10 V, or ±MV/cm if converted
 - **AC signal amplitude**
 - **Temperature**: room temperature, or specific temperature if variable-temperature
-- **Device area** (same as P-E loop — required for calculating permittivity)
+- **Device area** (needed for calculating permittivity from capacitance — same reason as P-E loops)
 - **Key results**: peak permittivity, tunability at 10 kHz, loss tangent at 100 kHz — whatever is relevant to the measurement goal
 
 Example note:
 > Dielectric frequency sweep, 0 V DC bias, 1 kHz–1 MHz, RT. Device area 7.07×10⁻⁵ cm² (300 µm diameter). ε_r(10 kHz) ≈ 380, tan δ(10 kHz) ≈ 0.02. No obvious dispersion. Raw file: SP026_dielectric_freqsweep_0V_RT.csv
 
-For **AFM and scanning probe** measurements, attach the image files and note the scan size, mode (contact, tapping, PFM), tip type, and what the image shows. PFM measurements should note the AC voltage amplitude and frequency, and whether you observed switching.
+For **AFM and scanning probe** measurements, there is likewise no dedicated module at present — attach image files and note the scan size, mode (contact, tapping, PFM), tip type, and what the image shows. PFM measurements should note the AC voltage amplitude and frequency, and whether you observed switching. These will become structured modules over time.
 
 ---
 
@@ -304,6 +308,14 @@ Notes are not just for your own reference. Future you, your PI, and your labmate
 - Concerns (why you think the data might be unreliable)
 
 Vague notes like "looks good" or "measured XRD" are not useful. The notebook is where the science lives. Treat it accordingly.
+
+---
+
+## Feedback
+
+This guide and the application itself are both works in progress. If something here is unclear, out of date, or conflicts with how you actually work — say something. If you find a workflow that works better than what's described here, it should be in the guide. If the application is missing something you need, or behaves in a way that doesn't fit the work, that's worth knowing too.
+
+Suggestions about the guide or the application are welcome. The goal is a tool that fits how the lab actually operates.
 
 ---
 

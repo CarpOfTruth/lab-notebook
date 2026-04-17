@@ -2,12 +2,18 @@
 
 ## What a module is
 
-A module teaches LabLog how to process a specific type of measurement file. Once written, it appears as a card on every sample page, accepts file uploads of the types you specify, runs your processing code, and produces a plot. If the module includes analysis code, it also contributes computed values (coercive field, resistance, peak position, etc.) to analysis books.
+A module teaches LabLog how to process a specific type of measurement file. Once written, it appears as a card on every sample page, accepts file uploads of the types you specify, runs your processing code, and produces a plot. If the module includes analysis code, it also contributes computed values (coercive field, resistance, peak position, fit parameter, etc.) to analysis books.
 
 You need to write a module when:
 - You have a new instrument or file format not covered by any existing module.
 - You want custom processing logic for an existing format (different normalization, unit conversions, derived quantities).
 - You want to expose new scalar values for cross-sample analysis.
+
+Modules can be written for any measurement type — electrical transport, spectroscopy, diffraction, imaging, mechanical testing, or anything else that produces data files. The system is not domain-specific.
+
+---
+
+> **Security notice:** Modules execute arbitrary Python code on the backend server. When importing a module someone else wrote, only import from sources you trust. When sharing your own modules, be aware that recipients will be running your code on their machines.
 
 ---
 
@@ -62,6 +68,8 @@ Block A regenerates whenever you change the file type, delimiter, column mapping
 
 This is where you write code. You receive the variables from Block A and produce whatever intermediate values you need. All the variables Block A declares are in scope here — column arrays, header metadata, `meta`, and any card control values.
 
+`proc_code` is plain Python. You can import `numpy`, `scipy`, `lmfit`, or any other library installed on the server. The system does not constrain what you compute or how.
+
 ### Block C — The return block
 
 Block C contains the `return` statement. Click **Reset scaffold** to restore a clean template. You populate it with the keys your module produces. See the contracts below for what is required and what is optional.
@@ -92,24 +100,24 @@ The exact names depend on your column mappings in the schema. For header metadat
 
 ### The meta dict
 
-`meta` is passed in from the sample record and the active card controls:
+`meta` is passed in from the sample record and the active card controls. It may include fields from the sample record such as film thickness or electrode area, and any values contributed by card controls defined in the module schema:
 
 ```python
 meta = {
-    "thickness_nm":    float | None,   # film thickness from the sample record
-    "area_m2":         float | None,   # electrode area from the sample record
-    "area_correction": float,          # multiplier from the area card control (default 1.0)
-    # any additional fields from the sample record
+    "thickness_nm":    float | None,   # film thickness from the sample record, if set
+    "area_m2":         float | None,   # electrode area from the sample record, if set
+    # additional fields from the sample record...
+    # values from any card controls defined in this module's schema
 }
 ```
 
-Access it in Block B with `meta.get("thickness_nm")` etc.
+Which fields are present in `meta` depends on the sample record and which card controls your module defines. Always use `meta.get(...)` with a sensible default rather than assuming a key exists.
 
-### Card control values
+### Card controls
 
-If you define card controls in the schema (toggle or area), their current values are injected into Block A as variables and available in Block B.
+Card controls are optional UI elements you can define in the module schema. They let users adjust module behavior per-measurement from the card, without editing code. There are two types:
 
-A **toggle** control lets users switch between named modes (e.g. "linear" vs "log", "raw" vs "normalized"). Its current value is a string matching one of the defined choices. In `proc_code`, you can branch on it or use it to select which data to return:
+A **toggle** control lets users switch between named modes (e.g. "linear" vs "log", "raw" vs "normalized"). Its current value is a string matching one of the defined choices. In `proc_code`, you can branch on it:
 
 ```python
 # if you defined a toggle named "scale" with choices ["raw", "normalized"]
@@ -117,7 +125,7 @@ if scale == "normalized":
     ys = [v / max(ys) for v in ys]
 ```
 
-An **area** control provides a correction factor. Its value flows in through `meta["area_correction"]` (a float, default 1.0). Apply it to normalize by area.
+An **area** control provides a correction multiplier. If you define one, its value flows in through `meta["area_correction"]` (a float, default 1.0). This is useful when users need to adjust for electrode geometry without reprocessing — but it is optional and module-specific. Not every module needs or uses an area control.
 
 ---
 
@@ -132,14 +140,16 @@ return {
 }
 ```
 
-The `x` and `y` keys are what the card plots by default. If you define a toggle that switches the plot between two data series, you expose multiple named arrays and map them in the card controls config:
+The `x` and `y` keys are what the card plots by default. Beyond that, the return dict is flexible — return whatever your module needs. Additional arrays, scalar values, intermediate computed quantities, and axis labels are all fair game.
+
+If you define a toggle that switches the plot between two data series, you expose multiple named arrays and map them in the card controls config:
 
 ```python
 return {
-    "x":     e_field,        # electric field (kV/cm)
-    "y":     polarization,   # second loop
-    "x_all": e_field_full,   # full loop
-    "y_all": pol_full,
+    "x":     wavelength,      # nm
+    "y":     absorbance,      # main series
+    "x_ref": wavelength,
+    "y_ref": baseline,        # reference or background trace
 }
 ```
 
@@ -170,7 +180,7 @@ Iterate here before saving. Common things to check:
 
 - The plot looks right (correct units, reasonable scale).
 - `x_label` and `y_label` are populated.
-- Any optional keys you intend to expose (fit curves, area, intermediate values) are present.
+- Any optional keys you intend to expose (fit curves, intermediate values, scalars for analysis) are present.
 - The return dict contains no numpy dtypes — convert arrays to lists if you see serialization errors.
 
 ---
@@ -218,11 +228,13 @@ Any key in the return dict that you also declare in `analysis_metrics` in the sc
 
 Send this file to a collaborator. They import it from their own Modules section. The module ID must not conflict with an existing module on their instance — if it does, they can rename it during import.
 
+> **Reminder:** imported modules execute code on the recipient's server. Share modules responsibly, and recipients should only import modules from sources they trust.
+
 ---
 
 ## Worked example: I-V curve module
 
-This walks through writing a module for a simple current-voltage sweep from a two-column CSV file:
+This walks through writing a module for a simple current-voltage sweep from a two-column CSV file. The P-E Loop module (included with LabLog) follows the same structure and can serve as another reference; this I-V example is intentionally generic to illustrate the pattern for any measurement type.
 
 ```
 # I-V measurement
@@ -242,7 +254,7 @@ Voltage (V),Current (A)
 
 ### Block A (generated)
 
-After configuring the schema — tab delimiter, skip 1 header row, column 0 = `voltage_v`, column 1 = `current_a` — Block A generates something like:
+After configuring the schema — comma delimiter, skip 1 header row, column 0 = `voltage_v`, column 1 = `current_a` — Block A generates something like:
 
 ```python
 DELIMITER = ","
@@ -268,28 +280,25 @@ You do not write this. You configure it in the schema and it appears locked in B
 ```python
 import numpy as np
 
-area_cm2 = meta.get("area_m2", None)
-if area_cm2 is not None:
-    area_cm2 = area_cm2 * 1e4   # m² → cm²
-
-# Current density if area is known, otherwise raw current
-if area_cm2 and area_cm2 > 0:
+# Normalize by area if available — this module optionally uses area,
+# but many modules don't need it at all.
+area_m2 = meta.get("area_m2", None)
+if area_m2 is not None:
+    area_cm2 = area_m2 * 1e4   # m² → cm²
     j = [i / area_cm2 for i in current_a]
     y_label = "Current Density (A/cm²)"
 else:
     j = list(current_a)
     y_label = "Current (A)"
 
-# Log-scale absolute values for Fowler-Nordheim or diode analysis
+# Log-scale absolute values for diode or leakage analysis
 j_abs = [abs(v) for v in j]
 
 # Simple series resistance estimate from slope near V=0
-# Find points closest to zero voltage
 mid = sorted(range(len(voltage_v)), key=lambda i: abs(voltage_v[i]))[:10]
 dv = [voltage_v[i] for i in mid]
 di = [j[i] for i in mid]
 if len(dv) > 1 and (max(dv) - min(dv)) > 0:
-    # linear fit: dV/dI
     slope = (max(dv) - min(dv)) / (max(di) - min(di)) if (max(di) - min(di)) != 0 else None
 else:
     slope = None
@@ -299,12 +308,12 @@ else:
 
 ```python
 return {
-    "x":       list(voltage_v),
-    "y":       j,
-    "y_abs":   j_abs,
-    "x_label": "Voltage (V)",
-    "y_label": y_label,
-    "r_series": slope,   # rough Ω·cm² if area-normalized, Ω otherwise
+    "x":        list(voltage_v),
+    "y":        j,
+    "y_abs":    j_abs,
+    "x_label":  "Voltage (V)",
+    "y_label":  y_label,
+    "r_series": slope,   # Ω·cm² if area-normalized, Ω otherwise
 }
 ```
 
@@ -314,7 +323,7 @@ return {
 x = result["x"]
 y = result["y"]
 
-# Find open-circuit voltage (where current changes sign)
+# Find zero-crossing (open-circuit voltage equivalent)
 v_oc = None
 for i in range(len(x) - 1):
     if y[i] * y[i+1] <= 0 and x[i+1] != x[i]:
@@ -342,7 +351,7 @@ return {
 
 **Forgetting that Block A regenerates.** If you change the column assignments or file type in the schema, Block A is rewritten. Variable names you relied on in Block B may change. Always check Block A after a schema change.
 
-**Assuming area is always set.** `meta["area_m2"]` is `None` if the user hasn't set it on the sample record. Guard against it: `area = meta.get("area_m2") or 1.0`.
+**Assuming meta fields are always set.** `meta.get("area_m2")` is `None` if the user hasn't set it on the sample record, and a key may not exist at all if the corresponding card control isn't defined for this module. Always use `meta.get(key)` with a sensible default.
 
 **Returning arrays of different lengths.** `x` and `y` must have the same length. Mismatched lengths will produce a broken plot. If you derive `x_fit`/`y_fit`, they can have a different length from `x`/`y` — the fit is plotted as a separate trace.
 
@@ -352,4 +361,8 @@ return {
 
 **Module ID conflicts on import.** If you share a `.labmodule.zip` and the recipient already has a module with the same ID, the import may overwrite or be rejected depending on the version. Use a distinctive ID (e.g. `smith_lab_iv_curve` rather than `iv`) if your module is intended for wide distribution.
 
-**Area correction double-application.** If your data file contains an area value and you return it as `area_m2`, LabLog uses that to display the area on the card. If you also manually divide by area in Block B, and the user additionally sets an area correction in the card control, the correction may be applied twice. Either extract area from the file and return it as `area_m2` (letting LabLog handle the correction), or apply `meta["area_correction"]` yourself but don't also return `area_m2`.
+**Area correction double-application.** If your data file contains an area value and you return it as `area_m2`, LabLog uses that to display the area on the card. If you also manually divide by area in Block B, and the user additionally sets an area correction in the card control, the correction may be applied twice. Either extract area from the file and return it as `area_m2` (letting LabLog handle the correction), or apply `meta["area_correction"]` yourself but don't also return `area_m2`. Note: this only applies to modules that explicitly use the area card control — most modules won't encounter this at all.
+
+---
+
+*Have feedback or suggestions for this guide? Share them — module authoring is an evolving part of LabLog and your input helps improve the experience for everyone.*
