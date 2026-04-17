@@ -8,51 +8,43 @@ All work happens on **dev**. Nothing merges to main without explicit approval.
 
 ## Priority Tiers
 
-### Tier 1 — Foundation
-Infrastructure that other features depend on or that makes the system significantly more usable.
-
+### Tier 1 — True Foundation
+No dependencies. Everything downstream builds on these.
 1. Universal import framework
 2. Growth parameters in settings
-3. Search and filter
+3. Materials library — must be scoped correctly from the start (lab-specific properties + crystallographic/physical data). Modules will be written against it; retrofitting the scope later is costly.
+4. Search and filter (depends on #2)
 
-### Tier 1.5 — Rolling: hardcoded panel → module conversion
-Convert remaining hardcoded characterization panels to proper modules. Done incrementally as supporting infrastructure becomes available. Simple conversions can happen alongside Tier 2 work; complex ones are blocked on deeper infrastructure.
+### Tier 2 — Module Infrastructure
+Unlocks large classes of features. Should be in place before the module system grows significantly.
+5. Module configuration schema + system resource API — must precede derived module implementation, or fit-type modules get built without proper configuration support
+6. Collection file mode + metafile handling — unblocks switching, RSM, scanning probe, and other complex measurement types
+7. 2D/image plot type — discrete work item needed before RSM and scanning probe modules can be built
+8. Custom package dependencies — unblocks serious custom module authoring
 
-- **Convertible now (single-file capable):** XRD ω-2θ, XRR, dielectric (εᵣ vs E, εᵣ vs f)
-- **Blocked on collection file mode (Tier 3):** switching current
-- **Blocked on 2D/image plot type:** RSM (Qx/Qz heatmap), scanning probe / AFM (topography, phase, amplitude maps)
+### Tier 3 — Module System Depth
+Builds on Tier 2. Derived module framework moved up from Tier 4 — needed sooner than originally placed.
+9. Derived/hybrid module type + Identity block UI
+10. Invisible modules + auto-fire + tunable panel
+11. Run chain button + stale flag system
+↳ Rolling alongside Tier 3: simple hardcoded panel conversions (XRD ω-2θ, XRR, dielectric) — single-file capable, done incrementally
 
-RSM and scanning probe share a 2D plot infrastructure need — design them together when that work begins. Scanning probe also involves proprietary file formats (.ibw Igor binary via igor2, .sxm Nanonis, .gwy Gwyddion) and multi-channel per-scan data not reducible to an x/y curve. Expect each measurement type to surface unique requirements as it is converted.
-
-### Tier 2 — User-facing, low architectural risk
-Features with real user value and limited downstream complexity.
-
-4. Materials and growth conditions library
-5. Custom package dependencies for modules
-6. Full config/settings export
-
-### Tier 3 — Module system depth
-These require a design walkthrough before implementation. The concepts are clear enough to describe but interact in ways that need to be worked through before writing code.
-
-7. Collection file mode
-8. Invisible modules + auto-fire + tunable panel
-9. Run chain button + stale flag system
-10. Module configuration schema
-
-### Tier 4 — Derived modules
-The most architecturally complex tier. Introduces a DAG execution model and inter-module data contracts.
-
-11. Derived/hybrid module types + Identity block UI
+### Tier 4 — Full Pipeline
+Requires Tier 3 to be solid before touching.
 12. Multi-source DAG execution + cache layer
-13. Inter-module namespace + analysis_code for derived modules
+13. analysis_code interface for derived modules + exports mechanism
+14. Fit-type module design session → first fit module implementation
+15. Config/settings export
 
 ### Tier 5 — Deferred
-Design these against concrete use cases when real modules drive the requirements. Building them speculatively risks getting the design wrong.
-
-14. Primary flag richness and multi-condition collection analysis
-15. Multi-point meta returns per sample from analysis_code
-16. Derivative module plot/analysis boundary
-17. Fit-type module interface
+Blocked on specific infrastructure, or needs concrete use cases to design against.
+16. Primary flag richness and multi-condition collection analysis
+17. Multi-point meta returns per sample
+18. Derivative module plot/analysis boundary details
+- RSM module (after 2D plot type; may also need collection mode)
+- Scanning probe module (after 2D plot type)
+- Switching module (after collection mode + derived modules)
+- XRD fitting migration (after full fit-type framework — one of the last conversions)
 
 ---
 
