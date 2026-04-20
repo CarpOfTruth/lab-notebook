@@ -454,6 +454,15 @@ function FolderSelect({ label, value, onChange, folders, filterFn, emptyLabel = 
 }
 
 // Renders a chemical-formula string with digit sequences as subscripts.
+// Look up a material name in the library and return its formula string (from composition).
+// Falls back to the raw name if not found or composition is empty.
+function matDisplayName(name, materialsLib) {
+  if (!name) return name;
+  const entry = (materialsLib || []).find(m => m.name === name);
+  if (!entry || !Object.keys(entry.composition || {}).length) return name;
+  return compToFormula(entry.composition);
+}
+
 // Generate a formula string from composition rows [{el, amt}] or a composition dict {El: amount}.
 // Uses entry order; omits subscript for amount === 1.
 function compToFormula(comp) {
@@ -1735,7 +1744,7 @@ function LayerEditor({ layer, technique: sampleTechnique, onRemove, onDuplicate,
             }).filter(Boolean).join(" · ") || null;
             return (
               <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 700, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 8px" }}>
-                <ChemName name={t.material || "?"} />
+                <ChemName name={matDisplayName(t.material || "?", materialsLib)} />
                 {detail && <span style={{ fontWeight: 400, opacity: 0.7, fontSize: 11 }}>· {detail}</span>}
               </span>
             );
@@ -5976,7 +5985,7 @@ function SettingsModal({ settings, onSave, onClose }) {
 
 // ── SampleCard ────────────────────────────────────────────────────────────────
 
-function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, onDragStart }) {
+function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, onDragStart, materialsLib = [] }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const wasDragged = useRef(false);
   const materials = [...new Set((sample.layers || []).flatMap(l => (l.targets || []).map(t => t.material).filter(Boolean)))];
@@ -6022,7 +6031,7 @@ function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, 
       {materials.length > 0 && (
         <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
           {materials.map(m => { const s = getMaterialStyle(m); return (
-            <span key={m} style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 7px" }}><ChemName name={m} /></span>
+            <span key={m} style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 7px" }} title={m}><ChemName name={matDisplayName(m, materialsLib)} /></span>
           );})}
           {(sample.layers || []).some(l => l.role === "buffer") && (
             <span style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", fontWeight: 600, color: T.teal, background: `${T.teal}22`, border: `1px solid ${T.teal}66`, borderRadius: 3, padding: "1px 5px", letterSpacing: 0.5 }}>BUF</span>
@@ -6043,7 +6052,7 @@ const COLOR_OPTIONS = ["#4a5568", "#3182ce", "#38a169", "#d69e2e", "#9f7aea", "#
 
 function FolderTile({ folder, samples, childContent = null, plotCache, depth = 0,
   onSelectSample, onDeleteSample, onDuplicateTemplate, onEdit, onDelete,
-  onDropSample, onDragStartSample, onDragStartFolder, onDropFolder }) {
+  onDropSample, onDragStartSample, onDragStartFolder, onDropFolder, materialsLib = [] }) {
   const lsKey = `folder-open-${folder.id}`;
   const [open, setOpen] = useState(() => { try { const v = localStorage.getItem(lsKey); return v === null ? false : v === "1"; } catch { return false; } });
   const toggleOpen = () => setOpen(v => { const next = !v; try { localStorage.setItem(lsKey, next ? "1" : "0"); } catch {} return next; });
@@ -6121,7 +6130,7 @@ function FolderTile({ folder, samples, childContent = null, plotCache, depth = 0
           <div style={{ padding: 12, background: T.bg0 }}>
             {childContent}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(310px,1fr))", gap: 12, marginTop: childContent ? 8 : 0 }}>
-              {samples.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => onSelectSample(s.id)} onDelete={onDeleteSample} onDuplicateTemplate={onDuplicateTemplate} onDragStart={onDragStartSample} />)}
+              {samples.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => onSelectSample(s.id)} onDelete={onDeleteSample} onDuplicateTemplate={onDuplicateTemplate} onDragStart={onDragStartSample} materialsLib={materialsLib} />)}
               {!samples.length && !childContent && (
                 <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: sampleDragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>
                   {sampleDragOver ? "Drop to add to this folder" : "Empty folder"}
@@ -12050,7 +12059,8 @@ export default function App() {
                         onDropSample={() => handleDropToFolder(folder.id)}
                         onDragStartSample={setDraggingSampleId}
                         onDragStartFolder={setDraggingFolderId}
-                        onDropFolder={handleFolderReorder} />
+                        onDropFolder={handleFolderReorder}
+                        materialsLib={materialsLib} />
                     ));
                   return renderSampleFolders(null);
                 })()}
@@ -12068,7 +12078,7 @@ export default function App() {
                       </div>
                     )}
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(310px,1fr))", gap: 12 }}>
-                      {ungrouped.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => openSample(s.id)} onDelete={deleteSample} onDuplicateTemplate={setTemplateSample} onDragStart={setDraggingSampleId} />)}
+                      {ungrouped.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => openSample(s.id)} onDelete={deleteSample} onDuplicateTemplate={setTemplateSample} onDragStart={setDraggingSampleId} materialsLib={materialsLib} />)}
                     </div>
                   </div>
                 )}

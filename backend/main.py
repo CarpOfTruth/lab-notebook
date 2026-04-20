@@ -597,14 +597,44 @@ def create_material_library_entry(body: dict = Body(...)):
 @app.put("/api/materials-library/{mat_id}")
 def update_material_library_entry(mat_id: str, body: dict = Body(...)):
     with get_db() as conn:
+        # Get old name before updating so we can cascade renames
+        old_row = conn.execute("SELECT name FROM materials_library WHERE id=?", (mat_id,)).fetchone()
+        old_name = old_row["name"] if old_row else None
+        new_name = body.get("name", "")
+
         conn.execute(
             "UPDATE materials_library SET name=?,formula=?,composition=?,parent=?,notes=?,crystal=?,properties=?,growth_defaults=? WHERE id=?",
-            (body.get("name",""), body.get("formula",""),
+            (new_name, body.get("formula",""),
              json.dumps(body.get("composition",{})), body.get("parent",""),
              body.get("notes",""), json.dumps(body.get("crystal",{})),
              json.dumps(body.get("properties",{})), json.dumps(body.get("growth_defaults",{})),
              mat_id)
         )
+
+        # Cascade name change to sample layers and substrates
+        if old_name and new_name and old_name != new_name:
+            rows = conn.execute("SELECT id, layers, substrate FROM samples").fetchall()
+            for row in rows:
+                changed = False
+                # Update layer target material references
+                layers = json.loads(row["layers"] or "[]")
+                for layer in layers:
+                    for target in layer.get("targets", []):
+                        if target.get("material") == old_name:
+                            target["material"] = new_name
+                            changed = True
+                # Update substrate reference
+                substrate = row["substrate"] or ""
+                new_substrate = substrate
+                if substrate == old_name:
+                    new_substrate = new_name
+                    changed = True
+                if changed:
+                    conn.execute(
+                        "UPDATE samples SET layers=?, substrate=? WHERE id=?",
+                        (json.dumps(layers), new_substrate, row["id"])
+                    )
+
         row = conn.execute("SELECT * FROM materials_library WHERE id=?", (mat_id,)).fetchone()
     if not row:
         raise HTTPException(404)
