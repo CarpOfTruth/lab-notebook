@@ -1399,32 +1399,84 @@ function AfmCard({ afmData, filename, onFile }) {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
+// Shipped technique definitions — used for new installs and as migration base.
+const SHIPPED_TECHNIQUES = [
+  {
+    id: "sputter", name: "Sputter",
+    params: [
+      { id: "temp",       name: "Temperature", unit: "°C",    default: 600,  scope: "layer",  type: "number" },
+      { id: "pressure",   name: "Pressure",    unit: "mTorr", default: 3,    scope: "layer",  type: "number" },
+      { id: "oxygen_pct", name: "O₂",          unit: "%",     default: 10,   scope: "layer",  type: "number" },
+      { id: "time_s",     name: "Time",        unit: "s",     default: 2000, scope: "layer",  type: "number" },
+      { id: "power_type", name: "Power type",  unit: "",      default: "RF", scope: "target", type: "select", options: ["RF", "DC", "Pulsed DC"] },
+      { id: "power_W",    name: "Power",       unit: "W",     default: 150,  scope: "target", type: "number" },
+    ],
+  },
+  {
+    id: "pld", name: "PLD",
+    params: [
+      { id: "temp",         name: "Temperature", unit: "°C",   default: 670,  scope: "layer",  type: "number" },
+      { id: "pressure",     name: "Pressure",    unit: "mTorr",default: 100,  scope: "layer",  type: "number" },
+      { id: "frequency_hz", name: "Rep rate",    unit: "Hz",   default: 10,   scope: "layer",  type: "number" },
+      { id: "energy_mJ",    name: "Energy",      unit: "mJ",   default: 100,  scope: "target", type: "number" },
+      { id: "pulses",       name: "Pulses",      unit: "",     default: 1000, scope: "target", type: "number" },
+    ],
+  },
+];
+
 const DEFAULT_SETTINGS = {
   defaultSubstrate: "STO (001)",
   defaultLot: "",
   defaultAreaCm2: "",
-  sputter:    { temp: 600, pressure: 10, oxygen_pct: 20, time_s: 2000, power_W: 150 },
-  pld:        { temp: 600, pressure: 2,  frequency_hz: 10, energy_mJ: 60, pulses: 10000 },
+  techniques: SHIPPED_TECHNIQUES,
+  // Legacy fields kept for material library autofill (Phase 2 will migrate these out)
   materials:  { sputter: [], pld: [] },
   structures: [],
-  custom_growth_params: { sputter: [], pld: [] },
 };
 
-function mergeSettings(parsed) {
+function mergeSettings(raw) {
+  if (!raw) raw = {};
+
+  // ── Migration: old settings (no techniques key) → new format ──────────────
+  if (!raw.techniques) {
+    const oldS = raw.sputter || {};
+    const oldP = raw.pld     || {};
+    const sCustom = (raw.custom_growth_params?.sputter || []);
+    const pCustom = (raw.custom_growth_params?.pld     || []);
+
+    const sputterTech = {
+      id: "sputter", name: "Sputter",
+      params: [
+        { id: "temp",       name: "Temperature", unit: "°C",    default: oldS.temp       ?? 600,  scope: "layer",  type: "number" },
+        { id: "pressure",   name: "Pressure",    unit: "mTorr", default: oldS.pressure   ?? 3,    scope: "layer",  type: "number" },
+        { id: "oxygen_pct", name: "O₂",          unit: "%",     default: oldS.oxygen_pct ?? 10,   scope: "layer",  type: "number" },
+        { id: "time_s",     name: "Time",        unit: "s",     default: oldS.time_s     ?? 2000, scope: "layer",  type: "number" },
+        { id: "power_type", name: "Power type",  unit: "",      default: "RF", scope: "target", type: "select", options: ["RF", "DC", "Pulsed DC"] },
+        { id: "power_W",    name: "Power",       unit: "W",     default: oldS.power_W    ?? 150,  scope: "target", type: "number" },
+        ...sCustom.map(p => ({ ...p, scope: p.scope || "layer", type: p.type || "number" })),
+      ],
+    };
+    const pldTech = {
+      id: "pld", name: "PLD",
+      params: [
+        { id: "temp",         name: "Temperature", unit: "°C",   default: oldP.temp         ?? 670,  scope: "layer",  type: "number" },
+        { id: "pressure",     name: "Pressure",    unit: "mTorr",default: oldP.pressure     ?? 100,  scope: "layer",  type: "number" },
+        { id: "frequency_hz", name: "Rep rate",    unit: "Hz",   default: oldP.frequency_hz ?? 10,   scope: "layer",  type: "number" },
+        { id: "energy_mJ",    name: "Energy",      unit: "mJ",   default: oldP.energy_mJ    ?? 100,  scope: "target", type: "number" },
+        { id: "pulses",       name: "Pulses",      unit: "",     default: oldP.pulses       ?? 1000, scope: "target", type: "number" },
+        ...pCustom.map(p => ({ ...p, scope: p.scope || "layer", type: p.type || "number" })),
+      ],
+    };
+    raw = { ...raw, techniques: [sputterTech, pldTech] };
+  }
+
   return {
-    ...DEFAULT_SETTINGS,
-    ...parsed,
-    sputter:    { ...DEFAULT_SETTINGS.sputter, ...parsed.sputter },
-    pld:        { ...DEFAULT_SETTINGS.pld,     ...parsed.pld },
-    materials: {
-      sputter: parsed.materials?.sputter ?? [],
-      pld:     parsed.materials?.pld     ?? [],
-    },
-    structures: parsed.structures ?? [],
-    custom_growth_params: {
-      sputter: parsed.custom_growth_params?.sputter ?? [],
-      pld:     parsed.custom_growth_params?.pld     ?? [],
-    },
+    defaultSubstrate: raw.defaultSubstrate ?? "STO (001)",
+    defaultLot:       raw.defaultLot       ?? "",
+    defaultAreaCm2:   raw.defaultAreaCm2   ?? "",
+    techniques:       raw.techniques,
+    materials:  { sputter: raw.materials?.sputter ?? [], pld: raw.materials?.pld ?? [] },
+    structures: raw.structures ?? [],
   };
 }
 
@@ -1434,6 +1486,40 @@ function makeParamId(name) {
   const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "param";
   const suffix = Math.random().toString(36).slice(2, 6);
   return `${slug}_${suffix}`;
+}
+
+// Param IDs that are stored directly on layer/target objects (backward compat).
+// User-added params use layer.custom[id] / target.custom[id].
+const BUILTIN_LAYER_PARAM_IDS  = new Set(["temp","pressure","oxygen_pct","time_s","frequency_hz"]);
+const BUILTIN_TARGET_PARAM_IDS = new Set(["power_W","energy_mJ","pulses","power_type","material"]);
+
+// Get the technique definition object from settings.
+function getTechDef(settings, techniqueId) {
+  return (settings?.techniques || []).find(t => t.id === techniqueId) || null;
+}
+
+// Get all params for a technique.
+function getTechParams(settings, techniqueId) {
+  return getTechDef(settings, techniqueId)?.params || [];
+}
+
+// Get user-added (non-builtin) layer params for a technique.
+// These are stored in layer.custom[id], not layer[id].
+function getUserLayerParams(settings, techniqueId) {
+  return getTechParams(settings, techniqueId)
+    .filter(p => p.scope === "layer" && !BUILTIN_LAYER_PARAM_IDS.has(p.id));
+}
+
+// Read a layer param value (checks custom first for user params, falls back to direct field).
+function readLayerParam(layer, paramId) {
+  if (BUILTIN_LAYER_PARAM_IDS.has(paramId)) return layer[paramId] ?? "";
+  return layer.custom?.[paramId] ?? layer[paramId] ?? "";
+}
+
+// Read a target param value.
+function readTargetParam(target, paramId) {
+  if (BUILTIN_TARGET_PARAM_IDS.has(paramId)) return target[paramId] ?? "";
+  return target.custom?.[paramId] ?? target[paramId] ?? "";
 }
 
 // Parse a CIF file text and return { name, a, b, c, alpha, beta, gamma }
@@ -1458,59 +1544,55 @@ function saveSettings(s) {
   api("PUT", "/settings", s).catch(() => {});
 }
 
-const SPUTTER_DEFAULTS = { material: "", power_W: 150 };
-const PLD_DEFAULTS     = { material: "", energy_mJ: 60, pulses: 10000 };
-
-function newLayer(technique, settings) {
-  const cfg = settings?.[technique] || {};
-  return {
+function newLayer(techniqueId, settings) {
+  const params  = getTechParams(settings, techniqueId);
+  const layer = {
     id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
-    temp:     cfg.temp     ?? (technique === "pld" ? 600 : 600),
-    pressure: cfg.pressure ?? (technique === "pld" ? 2   : 10),
-    ...(technique === "pld"
-      ? { frequency_hz: cfg.frequency_hz ?? 10, focal_position: "" }
-      : { oxygen_pct:   cfg.oxygen_pct   ?? 20, time_s: cfg.time_s ?? 2000 }),
-    targets: [technique === "pld"
-      ? { material: "", energy_mJ: cfg.energy_mJ ?? 60, pulses: cfg.pulses ?? 10000 }
-      : { material: "", power_W:   cfg.power_W   ?? 150 }],
   };
+  // Layer-scoped params
+  for (const p of params.filter(pp => pp.scope === "layer")) {
+    const val = p.default !== "" && p.default != null ? p.default : "";
+    if (BUILTIN_LAYER_PARAM_IDS.has(p.id)) {
+      layer[p.id] = val;
+    } else {
+      if (!layer.custom) layer.custom = {};
+      layer.custom[p.id] = val;
+    }
+  }
+  // First target (target-scoped params)
+  const target = { material: "" };
+  for (const p of params.filter(pp => pp.scope === "target")) {
+    target[p.id] = p.default !== "" && p.default != null ? p.default : (p.type === "select" ? (p.options?.[0] || "") : "");
+  }
+  layer.targets = [target];
+  return layer;
 }
 
 function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMaterials, settings }) {
   const s = getMaterialStyle(target.material);
-  const tField = (k, label, unit, w = 70) => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{label}</span>
-      <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-        <input value={target[k] ?? ""} onChange={e => onChange({ ...target, [k]: e.target.value })}
-          style={{ width: w, background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
-        {unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", whiteSpace: "nowrap" }}>{unit}</span>}
-      </div>
-    </div>
-  );
+  const techParams = getTechParams(settings, technique);
+  const targetParams = techParams.filter(p => p.scope === "target" && p.id !== "material");
+
   const handleMaterialChange = (v) => {
     const lib   = settings?.materials?.[technique] || [];
     const entry = lib.find(m => m.name === v);
     if (entry) {
       const merged = { ...target, material: v };
       const layerDefaults = {};
-      if (technique === "sputter") {
-        if (entry.power_W    != null && entry.power_W    !== "") merged.power_W          = entry.power_W;
-        if (entry.temp       != null && entry.temp       !== "") layerDefaults.temp       = entry.temp;
-        if (entry.pressure   != null && entry.pressure   !== "") layerDefaults.pressure   = entry.pressure;
-        if (entry.oxygen_pct != null && entry.oxygen_pct !== "") layerDefaults.oxygen_pct = entry.oxygen_pct;
-        if (entry.time_s     != null && entry.time_s     !== "") layerDefaults.time_s     = entry.time_s;
-      } else {
-        if (entry.energy_mJ    != null && entry.energy_mJ    !== "") merged.energy_mJ          = entry.energy_mJ;
-        if (entry.pulses       != null && entry.pulses       !== "") merged.pulses              = entry.pulses;
-        if (entry.temp         != null && entry.temp         !== "") layerDefaults.temp         = entry.temp;
-        if (entry.pressure     != null && entry.pressure     !== "") layerDefaults.pressure     = entry.pressure;
-        if (entry.frequency_hz != null && entry.frequency_hz !== "") layerDefaults.frequency_hz = entry.frequency_hz;
+      // Autofill builtin target params
+      for (const p of targetParams) {
+        if (BUILTIN_TARGET_PARAM_IDS.has(p.id) && entry[p.id] != null && entry[p.id] !== "") {
+          merged[p.id] = entry[p.id];
+        }
       }
-      // Autofill custom growth params from material library entry
-      const customParams = settings?.custom_growth_params?.[technique] || [];
+      // Autofill builtin layer params
+      for (const [entryKey, layerKey] of [["temp","temp"],["pressure","pressure"],["oxygen_pct","oxygen_pct"],["time_s","time_s"],["frequency_hz","frequency_hz"]]) {
+        if (entry[entryKey] != null && entry[entryKey] !== "") layerDefaults[layerKey] = entry[entryKey];
+      }
+      // Autofill user-added layer params from material entry
+      const userLayerParams = getUserLayerParams(settings, technique);
       const customFill = {};
-      for (const p of customParams) {
+      for (const p of userLayerParams) {
         if (entry[p.id] != null && entry[p.id] !== "") customFill[p.id] = entry[p.id];
       }
       if (Object.keys(customFill).length) layerDefaults.custom = customFill;
@@ -1519,6 +1601,7 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
       onChange({ ...target, material: v });
     }
   };
+
   return (
     <div style={{ display: "flex", alignItems: "flex-end", gap: 8, flexWrap: "wrap" }}>
       <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -1527,16 +1610,30 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
           <MaterialCombobox value={target.material} onChange={handleMaterialChange} knownMaterials={knownMaterials} small />
         </div>
       </div>
-      {technique === "sputter" ? (
-        <>
-          {tField("power_W", "Power", "W", 56)}
-        </>
-      ) : (
-        <>
-          {tField("energy_mJ", "Energy", "mJ", 60)}
-          {tField("pulses",    "Pulses",  "",  72)}
-        </>
-      )}
+      {targetParams.map(p => {
+        const val = readTargetParam(target, p.id);
+        if (p.type === "select") {
+          return (
+            <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
+              <select value={val} onChange={e => onChange({ ...target, [p.id]: e.target.value })}
+                style={{ background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", cursor: "pointer" }}>
+                {(p.options || []).map(o => <option key={o} value={o}>{o}</option>)}
+              </select>
+            </div>
+          );
+        }
+        return (
+          <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+              <input value={val} onChange={e => onChange({ ...target, [p.id]: e.target.value })}
+                style={{ width: p.id === "pulses" ? 72 : 56, background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+              {p.unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", whiteSpace: "nowrap" }}>{p.unit}</span>}
+            </div>
+          </div>
+        );
+      })}
       {canRemove && (
         <button onClick={onRemove} style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px", alignSelf: "flex-end", marginBottom: 1 }}>×</button>
       )}
@@ -1560,11 +1657,12 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
   const updateTarget = (i, t, layerDefaults)  => setDraft(p => { const ts = [...p.targets]; ts[i] = t; const patch = { ...p, targets: ts }; if (i === 0 && layerDefaults) { const { custom: newCustom, ...rest } = layerDefaults; Object.assign(patch, rest); if (newCustom) patch.custom = { ...(patch.custom || {}), ...newCustom }; } return patch; });
   const removeTarget = (i)     => setDraft(p => { const ts = p.targets.filter((_, j) => j !== i); return { ...p, targets: ts }; });
   const addTarget = () => {
-    const cfg = settings?.[technique] || {};
-    const newTarget = technique === "pld"
-      ? { material: "", energy_mJ: cfg.energy_mJ ?? 60, pulses: cfg.pulses ?? 10000 }
-      : { material: "", power_W: cfg.power_W ?? 150 };
-    setDraft(p => ({ ...p, targets: [...p.targets, newTarget] }));
+    const params = getTechParams(settings, technique);
+    const target = { material: "" };
+    for (const p of params.filter(pp => pp.scope === "target")) {
+      target[p.id] = p.default !== "" && p.default != null ? p.default : (p.type === "select" ? (p.options?.[0] || "") : "");
+    }
+    setDraft(p => ({ ...p, targets: [...p.targets, target] }));
   };
 
   const materials = layer.targets.map(t => t.material).filter(Boolean);
@@ -1583,9 +1681,13 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
         <div style={{ display: "flex", gap: 5, flex: 1, flexWrap: "wrap", alignItems: "center" }}>
           {layer.targets.length && layer.targets.some(t => t.material) ? layer.targets.map((t, i) => {
             const s = getMaterialStyle(t.material || "?");
-            const detail = technique === "pld"
-              ? [t.energy_mJ != null ? `${t.energy_mJ} mJ` : null, t.pulses != null ? `${Number(t.pulses).toLocaleString()} pulses` : null].filter(Boolean).join(" · ")
-              : t.power_W != null ? `${t.power_W} W` : null;
+            const techParams = getTechParams(settings, technique);
+            const targetNumParams = techParams.filter(p => p.scope === "target" && p.type === "number" && p.id !== "material");
+            const detail = targetNumParams.map(p => {
+              const v = readTargetParam(t, p.id);
+              if (v == null || v === "") return null;
+              return `${v}${p.unit ? ` ${p.unit}` : ""}`;
+            }).filter(Boolean).join(" · ") || null;
             return (
               <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 700, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 8px" }}>
                 <ChemName name={t.material || "?"} />
@@ -1603,17 +1705,16 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
             <div style={{ fontSize: 12, color: T.textPrimary, fontFamily: "'DM Mono', monospace" }}>{layer.thickness_nm}<span style={{ fontSize: 10, color: T.textDim }}> nm</span></div>
           </div>
         )}
-        {sharedField("temp", "Temp", "°C")}
-        {sharedField("pressure", "Press", "mTorr")}
-        {technique === "pld"
-          ? <>{sharedField("frequency_hz", "Rep", "Hz")}</>
-          : <>{sharedField("oxygen_pct", "O₂", "%")}{sharedField("time_s", "Time", "s")}</>}
-        {(settings?.custom_growth_params?.[technique] || []).filter(p => layer.custom?.[p.id] != null && layer.custom[p.id] !== "").map(p => (
-          <div key={p.id} style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", marginBottom: 1 }}>{p.name || p.id}</div>
-            <div style={{ fontSize: 12, color: T.textPrimary, fontFamily: "'DM Mono', monospace" }}>{layer.custom[p.id]}<span style={{ fontSize: 10, color: T.textDim }}>{p.unit ? ` ${p.unit}` : ""}</span></div>
-          </div>
-        ))}
+        {getTechParams(settings, technique).filter(p => p.scope === "layer").map(p => {
+          const v = readLayerParam(layer, p.id);
+          if (v == null || v === "") return null;
+          return (
+            <div key={p.id} style={{ textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", marginBottom: 1 }}>{p.name || p.id}</div>
+              <div style={{ fontSize: 12, color: T.textPrimary, fontFamily: "'DM Mono', monospace" }}>{v}<span style={{ fontSize: 10, color: T.textDim }}>{p.unit ? ` ${p.unit}` : ""}</span></div>
+            </div>
+          );
+        })}
         <button onClick={startEdit}   style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>✎</button>
         <button onClick={onDuplicate} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 15, padding: 0 }}>+</button>
         <button onClick={onRemove}    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, padding: 0 }}>×</button>
@@ -1625,7 +1726,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
 
   return (
     <div onKeyDown={handleEditKeyDown} style={{ background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 7, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 12 }}>
-      {/* shared layer fields */}
+      {/* Layer params — rendered dynamically from technique definition */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
           <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Thickness</span>
@@ -1634,66 +1735,36 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
             <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>nm</span>
           </div>
         </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-          <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Temp</span>
-          <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-            <input value={draft.temp ?? ""} onChange={e => setDraftField("temp", e.target.value)} style={{ ...inputSm, width: 60 }} />
-            <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>°C</span>
-          </div>
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-          <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Pressure</span>
-          <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-            <input value={draft.pressure ?? ""} onChange={e => setDraftField("pressure", e.target.value)} style={{ ...inputSm, width: 60 }} />
-            <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>mTorr</span>
-          </div>
-        </div>
-        {technique === "sputter" && (
-          <>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>O₂</span>
+        {getTechParams(settings, technique).filter(p => p.scope === "layer").map(p => {
+          const isBuiltin = BUILTIN_LAYER_PARAM_IDS.has(p.id);
+          const val = isBuiltin ? (draft[p.id] ?? "") : (draft.custom?.[p.id] ?? "");
+          const setVal = v => {
+            if (isBuiltin) setDraftField(p.id, v);
+            else setDraft(prev => ({ ...prev, custom: { ...(prev.custom || {}), [p.id]: v } }));
+          };
+          const placeholder = p.default !== "" && p.default != null ? String(p.default) : "—";
+          if (p.type === "select") {
+            return (
+              <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
+                <select value={val} onChange={e => setVal(e.target.value)}
+                  style={{ ...inputSm, cursor: "pointer", textAlign: "left" }}>
+                  {(p.options || []).map(o => <option key={o} value={o}>{o}</option>)}
+                </select>
+              </div>
+            );
+          }
+          return (
+            <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
               <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-                <input value={draft.oxygen_pct ?? ""} onChange={e => setDraftField("oxygen_pct", e.target.value)} style={{ ...inputSm, width: 50 }} />
-                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>%</span>
+                <input value={val} placeholder={placeholder} onChange={e => setVal(e.target.value)}
+                  style={{ ...inputSm, width: p.unit === "°C" || p.unit === "mTorr" || p.unit === "s" ? 60 : p.unit === "%" || p.unit === "Hz" ? 50 : 70 }} />
+                {p.unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{p.unit}</span>}
               </div>
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Time</span>
-              <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-                <input value={draft.time_s ?? ""} onChange={e => setDraftField("time_s", e.target.value)} style={{ ...inputSm, width: 60 }} />
-                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>s</span>
-              </div>
-            </div>
-          </>
-        )}
-        {technique === "pld" && (
-          <>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Rep rate</span>
-              <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-                <input value={draft.frequency_hz ?? ""} onChange={e => setDraftField("frequency_hz", e.target.value)} style={{ ...inputSm, width: 56 }} />
-                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>Hz</span>
-              </div>
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Focal pos.</span>
-              <input value={draft.focal_position ?? ""} onChange={e => setDraftField("focal_position", e.target.value)} style={{ ...inputSm, width: 80 }} />
-            </div>
-          </>
-        )}
-        {(settings?.custom_growth_params?.[technique] || []).map(p => (
-          <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
-            <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-              <input
-                value={draft.custom?.[p.id] ?? ""}
-                placeholder={p.default !== "" ? String(p.default) : "—"}
-                onChange={e => setDraft(prev => ({ ...prev, custom: { ...(prev.custom || {}), [p.id]: e.target.value } }))}
-                style={{ ...inputSm, width: 70 }} />
-              {p.unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{p.unit}</span>}
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
       {/* targets */}
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -2080,12 +2151,6 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
   });
   const set = k => v => setF(p => ({ ...p, [k]: v }));
 
-  const techniqueBtn = (v, label) => (
-    <button onClick={() => set("technique")(v)}
-      style={{ flex: 1, padding: "8px 0", fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 600, cursor: "pointer", borderRadius: 5, border: `1px solid ${f.technique === v ? T.amber : T.border}`, background: f.technique === v ? T.amberGlow : "transparent", color: f.technique === v ? T.amber : T.textSecondary, transition: "all .15s" }}>
-      {label}
-    </button>
-  );
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
@@ -2095,9 +2160,13 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
           {template && <div style={{ marginTop: 4, fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>From {template.id} — layers copied, data not included</div>}
         </div>
 
-        <div style={{ display: "flex", gap: 6 }}>
-          {techniqueBtn("sputter", "Sputter")}
-          {techniqueBtn("pld",     "PLD")}
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {(settings?.techniques || [{ id: "sputter", name: "Sputter" }, { id: "pld", name: "PLD" }]).map(t => (
+            <button key={t.id} onClick={() => set("technique")(t.id)}
+              style={{ flex: 1, minWidth: 80, padding: "8px 0", fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 600, cursor: "pointer", borderRadius: 5, border: `1px solid ${f.technique === t.id ? T.amber : T.border}`, background: f.technique === t.id ? T.amberGlow : "transparent", color: f.technique === t.id ? T.amber : T.textSecondary, transition: "all .15s" }}>
+              {t.name || t.id}
+            </button>
+          ))}
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
@@ -5385,6 +5454,7 @@ function SettingsModal({ settings, onSave, onClose }) {
   const [draft, setDraft] = useState(() => JSON.parse(JSON.stringify(settings)));
   const [knownMaterials, setKnownMaterials] = useState([]);
   const [libOpen, setLibOpen] = useState({ matSputter: false, matPld: false, struct: false });
+  const [techOpen, setTechOpen] = useState({});
   useEffect(() => { api("GET", "/materials").then(setKnownMaterials).catch(() => {}); }, []);
   const set = (path, v) => setDraft(p => {
     const d = JSON.parse(JSON.stringify(p));
@@ -5410,61 +5480,151 @@ function SettingsModal({ settings, onSave, onClose }) {
     </div>
   );
 
-  // Custom growth param helpers
-  const addCustomParam = (tech) => setDraft(p => {
+  // Technique library helpers
+  const addTechnique = () => setDraft(p => {
     const d = JSON.parse(JSON.stringify(p));
-    d.custom_growth_params[tech].push({ id: makeParamId("param"), name: "", unit: "", default: "" });
+    d.techniques = [...(d.techniques || []), { id: makeParamId("tech"), name: "", params: [] }];
     return d;
   });
-  const removeCustomParam = (tech, i) => setDraft(p => {
+  const removeTechnique = (ti) => setDraft(p => {
     const d = JSON.parse(JSON.stringify(p));
-    d.custom_growth_params[tech].splice(i, 1);
+    d.techniques = d.techniques.filter((_, i) => i !== ti);
     return d;
   });
-  const setCustomParam = (tech, i, k, v) => setDraft(p => {
+  const setTechniqueName = (ti, v) => setDraft(p => {
     const d = JSON.parse(JSON.stringify(p));
-    // If this is the first time the name is being set and the param still has a generic id, regenerate it
-    if (k === "name" && d.custom_growth_params[tech][i].id.startsWith("param_")) {
-      d.custom_growth_params[tech][i].id = makeParamId(v);
+    d.techniques[ti].name = v;
+    return d;
+  });
+  const addTechParam = (ti) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.techniques[ti].params.push({ id: makeParamId("param"), name: "", unit: "", default: "", scope: "layer", type: "number" });
+    return d;
+  });
+  const removeTechParam = (ti, pi) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.techniques[ti].params.splice(pi, 1);
+    return d;
+  });
+  const setTechParam = (ti, pi, k, v) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    if (k === "name" && d.techniques[ti].params[pi].id.startsWith("param_")) {
+      d.techniques[ti].params[pi].id = makeParamId(v);
     }
-    d.custom_growth_params[tech][i][k] = v;
+    d.techniques[ti].params[pi][k] = v;
+    return d;
+  });
+  const moveTechParam = (ti, pi, dir) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    const params = d.techniques[ti].params;
+    const ni = pi + dir;
+    if (ni < 0 || ni >= params.length) return d;
+    [params[pi], params[ni]] = [params[ni], params[pi]];
     return d;
   });
 
-  const renderCustomParams = (tech) => {
-    const params = draft.custom_growth_params?.[tech] || [];
+  const renderTechniqueLibrary = () => {
+    const techniques = draft.techniques || [];
+    const IS = { background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" };
+    const scopeBtn = (ti, pi, s) => (
+      <button onClick={() => setTechParam(ti, pi, "scope", s)}
+        style={{ background: draft.techniques[ti].params[pi].scope === s ? T.bg3 : T.bg0, border: "none", color: draft.techniques[ti].params[pi].scope === s ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 5px", cursor: "pointer" }}>
+        {s === "layer" ? "L" : "T"}
+      </button>
+    );
+    const typeBtn = (ti, pi, t, label) => (
+      <button onClick={() => setTechParam(ti, pi, "type", t)}
+        style={{ background: draft.techniques[ti].params[pi].type === t ? T.bg3 : T.bg0, border: "none", color: draft.techniques[ti].params[pi].type === t ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 5px", cursor: "pointer" }}>
+        {label}
+      </button>
+    );
     return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
-        {params.map((p, i) => (
-          <div key={p.id} style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: 2, minWidth: 120 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Name</span>
-              <input value={p.name}
-                onChange={e => setCustomParam(tech, i, "name", e.target.value)}
-                placeholder="e.g. Ar flow"
-                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {techniques.map((tech, ti) => (
+          <div key={tech.id || ti} style={{ border: `1px solid ${T.border}`, borderRadius: 6, overflow: "hidden" }}>
+            {/* Technique header */}
+            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", background: T.bg2, cursor: "pointer" }}
+              onClick={() => setTechOpen(s => ({ ...s, [ti]: !s[ti] }))}>
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>{techOpen[ti] ? "▾" : "▸"}</span>
+              <input value={tech.name} onClick={e => e.stopPropagation()}
+                onChange={e => setTechniqueName(ti, e.target.value)}
+                placeholder="Technique name"
+                style={{ ...IS, flex: 1, background: "transparent", border: "none", fontSize: 13, fontWeight: 600, color: T.textPrimary, padding: "0" }} />
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{tech.params.length} param{tech.params.length !== 1 ? "s" : ""}</span>
+              <button onClick={e => { e.stopPropagation(); removeTechnique(ti); }}
+                style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 14, padding: "0 2px" }}>×</button>
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2, width: 72 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Unit</span>
-              <input value={p.unit}
-                onChange={e => setCustomParam(tech, i, "unit", e.target.value)}
-                placeholder="sccm"
-                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2, width: 72 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Default</span>
-              <input value={p.default}
-                onChange={e => setCustomParam(tech, i, "default", e.target.value)}
-                placeholder="—"
-                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
-            </div>
-            <button onClick={() => removeCustomParam(tech, i)}
-              style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 2px", marginBottom: 3 }}>×</button>
+            {/* Params list */}
+            {techOpen[ti] && (
+              <div style={{ padding: "8px 10px", display: "flex", flexDirection: "column", gap: 5 }}>
+                {/* Header row */}
+                {tech.params.length > 0 && (
+                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <span style={{ flex: 2, minWidth: 100, fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Name</span>
+                    <span style={{ width: 52, fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Unit</span>
+                    <span style={{ width: 64, fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Default</span>
+                    <span style={{ width: 38, fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", textAlign: "center" }}>Scope</span>
+                    <span style={{ width: 52, fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", textAlign: "center" }}>Type</span>
+                    <span style={{ width: 28 }} />
+                    <span style={{ width: 18 }} />
+                  </div>
+                )}
+                {tech.params.map((p, pi) => (
+                  <div key={p.id || pi} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                    <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                      <input value={p.name} onChange={e => setTechParam(ti, pi, "name", e.target.value)}
+                        placeholder="Param name"
+                        style={{ ...IS, flex: 2, minWidth: 100 }} />
+                      <input value={p.unit} onChange={e => setTechParam(ti, pi, "unit", e.target.value)}
+                        placeholder="unit"
+                        style={{ ...IS, width: 52 }} />
+                      <input value={String(p.default ?? "")} onChange={e => setTechParam(ti, pi, "default", e.target.value)}
+                        placeholder="—"
+                        style={{ ...IS, width: 64, textAlign: "center" }} />
+                      {/* Scope toggle: L / T */}
+                      <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 4, overflow: "hidden", width: 38 }}>
+                        {scopeBtn(ti, pi, "layer")}
+                        {scopeBtn(ti, pi, "target")}
+                      </div>
+                      {/* Type toggle: # / Aa / ▾ */}
+                      <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 4, overflow: "hidden", width: 52 }}>
+                        {typeBtn(ti, pi, "number", "#")}
+                        {typeBtn(ti, pi, "text",   "Aa")}
+                        {typeBtn(ti, pi, "select",  "▾")}
+                      </div>
+                      {/* Move up/down */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: 1, width: 14 }}>
+                        <button onClick={() => moveTechParam(ti, pi, -1)} disabled={pi === 0}
+                          style={{ background: "none", border: "none", color: pi === 0 ? T.textDim : T.textSecondary, cursor: pi === 0 ? "default" : "pointer", fontSize: 9, padding: 0, lineHeight: 1 }}>▲</button>
+                        <button onClick={() => moveTechParam(ti, pi, 1)} disabled={pi === tech.params.length - 1}
+                          style={{ background: "none", border: "none", color: pi === tech.params.length - 1 ? T.textDim : T.textSecondary, cursor: pi === tech.params.length - 1 ? "default" : "pointer", fontSize: 9, padding: 0, lineHeight: 1 }}>▼</button>
+                      </div>
+                      <button onClick={() => removeTechParam(ti, pi)}
+                        style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px" }}>×</button>
+                    </div>
+                    {/* Options row for select type */}
+                    {p.type === "select" && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 4 }}>
+                        <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>OPTIONS</span>
+                        <input value={(p.options || []).join(", ")}
+                          onChange={e => setTechParam(ti, pi, "options", e.target.value.split(",").map(s => s.trim()).filter(Boolean))}
+                          placeholder="e.g. RF, DC, Pulsed DC"
+                          style={{ ...IS, flex: 1, fontSize: 11 }} />
+                      </div>
+                    )}
+                  </div>
+                ))}
+                <button onClick={() => addTechParam(ti)}
+                  style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start", marginTop: 2 }}>
+                  + Add param
+                </button>
+              </div>
+            )}
           </div>
         ))}
-        <button onClick={() => addCustomParam(tech)}
-          style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
-          + Add param
+        <button onClick={addTechnique}
+          style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.amber, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
+          + Add technique
         </button>
       </div>
     );
@@ -5613,9 +5773,9 @@ function SettingsModal({ settings, onSave, onClose }) {
             {matInput(tech, i, "pressure",    "Press",  "mT",   52)}
             {matInput(tech, i, "frequency_hz","Rep",    "Hz",   48)}
           </>)}
-          {(draft.custom_growth_params?.[tech] || []).filter(p => p.name).map(p =>
-            matInput(tech, i, p.id, p.name, p.unit || "", 60)
-          )}
+          {(draft.techniques?.find(t => t.id === tech)?.params || []).filter(p =>
+            p.scope === "layer" && !BUILTIN_LAYER_PARAM_IDS.has(p.id) && p.name
+          ).map(p => matInput(tech, i, p.id, p.name, p.unit || "", 60))}
           <button onClick={() => removeMat(tech, i)}
             style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 2px", alignSelf: "flex-end", marginBottom: 1 }}>×</button>
         </div>
@@ -5655,29 +5815,9 @@ function SettingsModal({ settings, onSave, onClose }) {
           </div>
         </div>
 
-        {/* Sputter defaults */}
-        {sectionHdr("Sputter Defaults")}
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          {fieldSm("sputter.temp",       "Temp",    "°C")}
-          {fieldSm("sputter.pressure",   "Pressure","mTorr")}
-          {fieldSm("sputter.oxygen_pct", "O₂",      "%",  52)}
-          {fieldSm("sputter.time_s",     "Time",    "s",  72)}
-          {fieldSm("sputter.power_W",    "Power",   "W",  60)}
-        </div>
-        <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1.5, marginTop: 6, marginBottom: 2 }}>Custom Sputter Params</div>
-        {renderCustomParams("sputter")}
-
-        {/* PLD defaults */}
-        {sectionHdr("PLD Defaults")}
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          {fieldSm("pld.temp",         "Temp",     "°C")}
-          {fieldSm("pld.pressure",     "Pressure", "mTorr")}
-          {fieldSm("pld.frequency_hz", "Rep rate", "Hz",  60)}
-          {fieldSm("pld.energy_mJ",    "Energy",   "mJ",  60)}
-          {fieldSm("pld.pulses",       "Pulses",   "",    72)}
-        </div>
-        <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1.5, marginTop: 6, marginBottom: 2 }}>Custom PLD Params</div>
-        {renderCustomParams("pld")}
+        {/* Technique Library */}
+        {sectionHdr("Technique Library")}
+        {renderTechniqueLibrary()}
 
         {/* Material library — Sputter (collapsible) */}
         <button onClick={() => setLibOpen(s => ({ ...s, matSputter: !s.matSputter }))}
@@ -8568,9 +8708,9 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
   const allParamGroups = useMemo(() => {
     // Inject custom growth params from settings into the Growth group
-    const customSputter = (settings?.custom_growth_params?.sputter || []).filter(p => p.name);
-    const customPld     = (settings?.custom_growth_params?.pld     || []).filter(p => p.name);
-    const customParams  = [...customSputter, ...customPld].map(p => ({
+    const customParams = (settings?.techniques || []).flatMap(tech =>
+      (tech.params || []).filter(p => p.scope === "layer" && !BUILTIN_LAYER_PARAM_IDS.has(p.id) && p.name && p.type !== "select")
+    ).map(p => ({
       id: `custom_growth_${p.id}`,
       label: p.name,
       unit: p.unit || "",
@@ -8592,7 +8732,7 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
         : g
     );
     return [...baseGroups, ...moduleGroups];
-  }, [moduleGroups, settings?.custom_growth_params]);
+  }, [moduleGroups, settings?.techniques]);
   const allParamsFlat  = useMemo(() => allParamGroups.flatMap(g => g.params.map(p => ({ ...p, group: g.group }))), [allParamGroups]);
 
   const xParam  = allParamsFlat.find(p => p.id === xParamId)  || null;
@@ -10692,12 +10832,18 @@ function buildFilterFields(settings) {
       { id: "thickness_nm",     label: "Thickness",     type: "numeric", unit: "nm" },
     ]},
   ];
-  const customSputter = (settings?.custom_growth_params?.sputter || []).filter(p => p.name);
-  const customPld     = (settings?.custom_growth_params?.pld     || []).filter(p => p.name);
-  if (customSputter.length) groups.push({ group: "Custom — Sputter",
-    fields: customSputter.map(p => ({ id: `custom_${p.id}`, label: p.name, type: "numeric", unit: p.unit || "" })) });
-  if (customPld.length) groups.push({ group: "Custom — PLD",
-    fields: customPld.map(p => ({ id: `custom_${p.id}`, label: p.name, type: "numeric", unit: p.unit || "" })) });
+  // User-added layer params from technique definitions (non-builtin)
+  for (const tech of (settings?.techniques || [])) {
+    const userParams = (tech.params || []).filter(p =>
+      p.scope === "layer" && !BUILTIN_LAYER_PARAM_IDS.has(p.id) && p.name && p.type !== "select"
+    );
+    if (userParams.length) {
+      groups.push({
+        group: `Custom — ${tech.name || tech.id}`,
+        fields: userParams.map(p => ({ id: `custom_${p.id}`, label: p.name, type: "numeric", unit: p.unit || "" })),
+      });
+    }
+  }
   return groups;
 }
 

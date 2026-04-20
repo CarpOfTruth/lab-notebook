@@ -226,6 +226,9 @@ def _index_sample(conn, sample_id, layers_json, technique, substrate, lot):
                 n = _num(target.get(t_key))
                 if n is not None:
                     _add(idx_field, num=n)
+            pt = (target.get("power_type") or "").strip()
+            if pt:
+                _add("growth_power_type", text=pt)
 
     if rows:
         conn.executemany(
