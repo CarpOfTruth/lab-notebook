@@ -11144,8 +11144,124 @@ function SampleFilter({ settings, samples = [], onFilterChange }) {
 
 // ── MaterialsLibrarySection ───────────────────────────────────────────────────
 
-function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete }) {
+function MatImportModal({ onClose, onImported }) {
+  const [preview, setPreview]       = useState(null); // {to_add, conflicts}
+  const [resolutions, setResolutions] = useState({}); // {name: "skip"|"overwrite"|"merge"}
+  const [importing, setImporting]   = useState(false);
+  const [rawMaterials, setRawMaterials] = useState([]);
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      setRawMaterials(arr);
+      const prev = await api("POST", "/materials-library/import-preview", arr);
+      const defaultRes = {};
+      for (const c of prev.conflicts) defaultRes[c.name] = "skip";
+      setResolutions(defaultRes);
+      setPreview(prev);
+    } catch (err) {
+      alert("Could not parse file: " + err.message);
+    }
+    e.target.value = "";
+  };
+
+  const handleImport = async () => {
+    setImporting(true);
+    try {
+      const result = await api("POST", "/materials-library/import", { materials: rawMaterials, resolutions });
+      onImported(result.materials);
+      onClose();
+    } catch (err) {
+      alert("Import failed: " + err.message);
+    }
+    setImporting(false);
+  };
+
+  const resBtn = (name, val, label) => (
+    <button onClick={() => setResolutions(r => ({ ...r, [name]: val }))}
+      style={{ padding: "2px 8px", fontFamily: "'DM Mono', monospace", fontSize: 10, cursor: "pointer", borderRadius: 3,
+        border: `1px solid ${resolutions[name] === val ? T.amber : T.border}`,
+        background: resolutions[name] === val ? T.amberGlow : "transparent",
+        color: resolutions[name] === val ? T.amber : T.textDim }}>
+      {label}
+    </button>
+  );
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 110 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: "20px 24px", width: 520, display: "flex", flexDirection: "column", gap: 14 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 20 }}>Import Materials</h2>
+
+        {!preview ? (
+          <>
+            <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>
+              Select a <code>.json</code> file previously exported from this app.
+            </div>
+            <label style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, background: T.bg0, border: `1px dashed ${T.border}`, borderRadius: 8, padding: "18px 0", cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary }}>
+              ↑ Choose materials-library.json
+              <input type="file" accept=".json" style={{ display: "none" }} onChange={handleFile} />
+            </label>
+          </>
+        ) : (
+          <>
+            {preview.to_add.length > 0 && (
+              <div>
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>
+                  New — {preview.to_add.length} material{preview.to_add.length !== 1 ? "s" : ""}
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {preview.to_add.map(m => (
+                    <span key={m.name} style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.teal, background: `${T.teal}18`, border: `1px solid ${T.teal}44`, borderRadius: 4, padding: "2px 8px" }}>{m.name}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+            {preview.conflicts.length > 0 && (
+              <div>
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>
+                  Conflicts — already in library
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {preview.conflicts.map(c => (
+                    <div key={c.name} style={{ display: "flex", alignItems: "center", gap: 10, background: T.bg2, borderRadius: 6, padding: "6px 10px" }}>
+                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textPrimary, flex: 1 }}>{c.name}</span>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        {resBtn(c.name, "skip",      "Skip")}
+                        {resBtn(c.name, "overwrite",  "Overwrite")}
+                        {resBtn(c.name, "merge",      "Merge")}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, marginTop: 6 }}>
+                  Merge keeps existing values and fills any blanks from the incoming entry.
+                </div>
+              </div>
+            )}
+            {preview.to_add.length === 0 && preview.conflicts.length === 0 && (
+              <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>Nothing to import — file appears empty.</div>
+            )}
+          </>
+        )}
+
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          {preview && (preview.to_add.length > 0 || preview.conflicts.some(c => resolutions[c.name] !== "skip")) && (
+            <Btn onClick={handleImport} disabled={importing}>{importing ? "Importing…" : "Import"}</Btn>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete, onReplaceAll }) {
   const [editorMat, setEditorMat] = useState(null); // null=closed, false=new, or material entry
+  const [importOpen, setImportOpen] = useState(false);
   const [open, setOpen] = useState(true);
 
   const handleSave = (result) => {
@@ -11157,6 +11273,13 @@ function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete })
     setEditorMat(null);
   };
 
+  const handleExport = () => {
+    const a = document.createElement("a");
+    a.href = `${API_BASE}/materials-library/export`;
+    a.download = "materials-library.json";
+    a.click();
+  };
+
   return (
     <div style={{ marginBottom: 32 }}>
       {/* Section header */}
@@ -11166,6 +11289,8 @@ function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete })
         </h2>
         <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{open ? "▴" : "▾"}</span>
         <div style={{ flex: 1 }} />
+        <Btn small variant="ghost" onClick={() => setImportOpen(true)}>Import</Btn>
+        <Btn small variant="ghost" onClick={handleExport} disabled={materialsLib.length === 0}>Export</Btn>
         <Btn small onClick={() => setEditorMat(false)}>+ New Material</Btn>
       </div>
 
@@ -11204,6 +11329,11 @@ function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete })
           onSave={handleSave}
           onDelete={handleDelete}
           onClose={() => setEditorMat(null)} />
+      )}
+      {importOpen && (
+        <MatImportModal
+          onClose={() => setImportOpen(false)}
+          onImported={mats => { onReplaceAll(mats); setImportOpen(false); }} />
       )}
     </div>
   );
@@ -11995,7 +12125,8 @@ export default function App() {
                     const idx = prev.findIndex(m => m.id === mat.id);
                     return idx >= 0 ? prev.map(m => m.id === mat.id ? mat : m) : [...prev, mat];
                   })}
-                  onDelete={id => setMaterialsLib(prev => prev.filter(m => m.id !== id))} />
+                  onDelete={id => setMaterialsLib(prev => prev.filter(m => m.id !== id))}
+                  onReplaceAll={mats => setMaterialsLib(mats)} />
               </div>
 
               {/* Modules section */}

@@ -616,6 +616,90 @@ def delete_material_library_entry(mat_id: str):
         conn.execute("DELETE FROM materials_library WHERE id=?", (mat_id,))
     return {"ok": True}
 
+@app.get("/api/materials-library/export")
+def export_materials_library():
+    from fastapi.responses import Response
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM materials_library ORDER BY name").fetchall()
+    data = json.dumps([_mat_row_to_dict(r) for r in rows], indent=2)
+    return Response(
+        content=data,
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=materials-library.json"},
+    )
+
+@app.post("/api/materials-library/import-preview")
+def import_materials_preview(body: list = Body(...)):
+    with get_db() as conn:
+        existing = {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM materials_library").fetchall()}
+    to_add = []
+    conflicts = []
+    for mat in body:
+        name = (mat.get("name") or "").strip()
+        if not name:
+            continue
+        if name in existing:
+            conflicts.append({"name": name, "incoming": mat})
+        else:
+            to_add.append(mat)
+    return {"to_add": to_add, "conflicts": conflicts}
+
+@app.post("/api/materials-library/import")
+def import_materials(body: dict = Body(...)):
+    materials   = body.get("materials", [])
+    resolutions = body.get("resolutions", {})  # {name: "skip"|"overwrite"|"merge"}
+    with get_db() as conn:
+        existing     = {r["name"]: _mat_row_to_dict(r) for r in conn.execute("SELECT * FROM materials_library").fetchall()}
+        existing_ids = {r["id"] for r in conn.execute("SELECT id FROM materials_library").fetchall()}
+        imported = skipped = 0
+        for mat in materials:
+            name = (mat.get("name") or "").strip()
+            if not name:
+                continue
+            if name in existing:
+                res = resolutions.get(name, "skip")
+                if res == "skip":
+                    skipped += 1
+                    continue
+                elif res == "overwrite":
+                    conn.execute(
+                        "UPDATE materials_library SET formula=?,composition=?,parent=?,notes=?,crystal=?,properties=?,growth_defaults=? WHERE name=?",
+                        (mat.get("formula",""), json.dumps(mat.get("composition",{})),
+                         mat.get("parent",""), mat.get("notes",""),
+                         json.dumps(mat.get("crystal",{})), json.dumps(mat.get("properties",{})),
+                         json.dumps(mat.get("growth_defaults",{})), name)
+                    )
+                    imported += 1
+                elif res == "merge":
+                    ex = existing[name]
+                    merged_crystal  = {**ex["crystal"],  **{k: v for k, v in mat.get("crystal",  {}).items() if v not in ("", None)}}
+                    merged_props    = {**ex["properties"],**mat.get("properties", {})}
+                    merged_defaults = {**ex["growth_defaults"], **mat.get("growth_defaults", {})}
+                    conn.execute(
+                        "UPDATE materials_library SET formula=?,composition=?,parent=?,notes=?,crystal=?,properties=?,growth_defaults=? WHERE name=?",
+                        (mat.get("formula","") or ex["formula"],
+                         json.dumps(mat.get("composition","{}") or ex["composition"]),
+                         mat.get("parent","") or ex["parent"],
+                         mat.get("notes","") or ex["notes"],
+                         json.dumps(merged_crystal), json.dumps(merged_props),
+                         json.dumps(merged_defaults), name)
+                    )
+                    imported += 1
+            else:
+                mat_id = mat.get("id") or _make_mat_id(name, existing_ids)
+                if mat_id in existing_ids:
+                    mat_id = _make_mat_id(mat_id, existing_ids)
+                existing_ids.add(mat_id)
+                conn.execute(
+                    "INSERT INTO materials_library (id,name,formula,composition,parent,notes,crystal,properties,growth_defaults) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (mat_id, name, mat.get("formula",""), json.dumps(mat.get("composition",{})),
+                     mat.get("parent",""), mat.get("notes",""), json.dumps(mat.get("crystal",{})),
+                     json.dumps(mat.get("properties",{})), json.dumps(mat.get("growth_defaults",{})))
+                )
+                imported += 1
+        rows = conn.execute("SELECT * FROM materials_library ORDER BY name").fetchall()
+    return {"imported": imported, "skipped": skipped, "materials": [_mat_row_to_dict(r) for r in rows]}
+
 
 # ── File upload / retrieval ───────────────────────────────────────────────────
 
