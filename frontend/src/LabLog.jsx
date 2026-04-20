@@ -454,6 +454,24 @@ function FolderSelect({ label, value, onChange, folders, filterFn, emptyLabel = 
 }
 
 // Renders a chemical-formula string with digit sequences as subscripts.
+// Generate a formula string from composition rows [{el, amt}] or a composition dict {El: amount}.
+// Uses entry order; omits subscript for amount === 1.
+function compToFormula(comp) {
+  const entries = Array.isArray(comp)
+    ? comp
+    : Object.entries(comp).map(([el, amt]) => ({ el, amt }));
+  return entries
+    .filter(({ el }) => el.trim())
+    .map(({ el, amt }) => {
+      const n = parseFloat(amt);
+      if (isNaN(n) || n === 0) return el.trim();
+      if (n === 1) return el.trim();
+      const s = Number.isInteger(n) ? String(n) : String(parseFloat(n.toFixed(4)));
+      return el.trim() + s;
+    })
+    .join("");
+}
+
 // e.g. "BaTiO3" → BaTiO₃, "Ba0.5Sr0.5TiO3" → Ba₀.₅Sr₀.₅TiO₃ (via <sub>)
 function ChemName({ name }) {
   if (!name) return null;
@@ -5613,13 +5631,7 @@ function MaterialEditorModal({ material, settings, onSave, onDelete, onClose }) 
           <div style={{ flex: 2, minWidth: 160 }}>
             <div style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", marginBottom: 3 }}>Name</div>
             <input value={draft.name} onChange={e => setDraft(p => ({ ...p, name: e.target.value }))}
-              placeholder="e.g. BaTiO₃"
-              style={{ ...IS, width: "100%" }} />
-          </div>
-          <div style={{ flex: 1, minWidth: 100 }}>
-            <div style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", marginBottom: 3 }}>Formula</div>
-            <input value={draft.formula} onChange={e => setDraft(p => ({ ...p, formula: e.target.value }))}
-              placeholder="e.g. BaTiO3"
+              placeholder="e.g. SRO"
               style={{ ...IS, width: "100%" }} />
           </div>
           <div style={{ flex: 1, minWidth: 100 }}>
@@ -5652,10 +5664,17 @@ function MaterialEditorModal({ material, settings, onSave, onDelete, onClose }) 
                 style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 0 }}>×</button>
             </div>
           ))}
-          <button onClick={() => setCompRows(rs => [...rs, { el: "", amt: "" }])}
-            style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
-            + Add element
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 2 }}>
+            <button onClick={() => setCompRows(rs => [...rs, { el: "", amt: "" }])}
+              style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+              + Add element
+            </button>
+            {compRows.some(r => r.el.trim()) && (
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textSecondary }}>
+                → <ChemName name={compToFormula(compRows)} />
+              </span>
+            )}
+          </div>
         </div>
 
         {/* Crystal */}
@@ -11307,7 +11326,11 @@ function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete, o
                 onMouseEnter={e => e.currentTarget.style.borderColor = T.amber}
                 onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
                 <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, fontWeight: 700, color: T.textPrimary }}>{m.name}</div>
-                {m.formula && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>{m.formula}</div>}
+                {Object.keys(m.composition || {}).length > 0 && (
+                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>
+                    <ChemName name={compToFormula(m.composition)} />
+                  </div>
+                )}
                 {m.parent && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.teal }}>▸ {m.parent}</div>}
                 {Object.keys(m.growth_defaults || {}).length > 0 && (
                   <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 2 }}>
