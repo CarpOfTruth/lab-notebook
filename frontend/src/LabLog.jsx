@@ -1544,6 +1544,7 @@ function newLayer(techniqueId, settings) {
   const params  = getTechParams(settings, techniqueId);
   const layer = {
     id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
+    technique: techniqueId,
   };
   // Layer-scoped params
   for (const p of params.filter(pp => pp.scope === "layer")) {
@@ -1637,9 +1638,36 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
   );
 }
 
-function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials, settings, materialsLib = [], initialEditing = false }) {
+function LayerEditor({ layer, technique: sampleTechnique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials, settings, materialsLib = [], initialEditing = false }) {
   const [editing, setEditing] = useState(initialEditing);
   const [draft, setDraft]     = useState(initialEditing ? JSON.parse(JSON.stringify(layer)) : null);
+
+  // Effective technique: layer carries its own if set, otherwise falls back to sample's technique
+  const viewTechnique = layer.technique || sampleTechnique;
+  const editTechnique = draft?.technique || sampleTechnique;
+
+  // Change technique in edit mode — rebuilds params, preserves overlapping values and materials
+  const changeTechnique = (newTechId) => {
+    const newParams = getTechParams(settings, newTechId);
+    const newDraft = { ...draft, technique: newTechId };
+    for (const p of newParams.filter(pp => pp.scope === "layer")) {
+      const def = p.default !== "" && p.default != null ? p.default : "";
+      if (BUILTIN_LAYER_PARAM_IDS.has(p.id)) {
+        newDraft[p.id] = draft[p.id] ?? def;
+      } else {
+        newDraft.custom = { ...(newDraft.custom || {}) };
+        newDraft.custom[p.id] = draft.custom?.[p.id] ?? def;
+      }
+    }
+    newDraft.targets = draft.targets.map(t => {
+      const nt = { material: t.material };
+      for (const p of newParams.filter(pp => pp.scope === "target")) {
+        nt[p.id] = t[p.id] ?? (p.default !== "" && p.default != null ? p.default : (p.type === "select" ? (p.options?.[0] || "") : ""));
+      }
+      return nt;
+    });
+    setDraft(newDraft);
+  };
 
   const startEdit = (e) => {
     e.stopPropagation();
@@ -1653,7 +1681,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
   const updateTarget = (i, t, layerDefaults)  => setDraft(p => { const ts = [...p.targets]; ts[i] = t; const patch = { ...p, targets: ts }; if (i === 0 && layerDefaults) { const { custom: newCustom, ...rest } = layerDefaults; Object.assign(patch, rest); if (newCustom) patch.custom = { ...(patch.custom || {}), ...newCustom }; } return patch; });
   const removeTarget = (i)     => setDraft(p => { const ts = p.targets.filter((_, j) => j !== i); return { ...p, targets: ts }; });
   const addTarget = () => {
-    const params = getTechParams(settings, technique);
+    const params = getTechParams(settings, editTechnique);
     const target = { material: "" };
     for (const p of params.filter(pp => pp.scope === "target")) {
       target[p.id] = p.default !== "" && p.default != null ? p.default : (p.type === "select" ? (p.options?.[0] || "") : "");
@@ -1674,10 +1702,13 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
       <div draggable onDragStart={onDragStart} onDragOver={e => { e.preventDefault(); onDragOver(); }} onDrop={onDrop} onDragEnd={onDragEnd}
         style={{ background: T.bg3, border: `1px solid ${isDragOver ? T.amber : T.border}`, borderRadius: 7, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10, cursor: "grab", transition: "border-color .12s", flexWrap: "wrap" }}>
         <span style={{ color: T.textDim, fontSize: 14, cursor: "grab", userSelect: "none", letterSpacing: "-1px" }}>⠿</span>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 3, padding: "1px 5px", textTransform: "uppercase", letterSpacing: 0.5, flexShrink: 0 }}>
+          {getTechDef(settings, viewTechnique)?.name || viewTechnique}
+        </span>
         <div style={{ display: "flex", gap: 5, flex: 1, flexWrap: "wrap", alignItems: "center" }}>
           {layer.targets.length && layer.targets.some(t => t.material) ? layer.targets.map((t, i) => {
             const s = getMaterialStyle(t.material || "?");
-            const techParams = getTechParams(settings, technique);
+            const techParams = getTechParams(settings, viewTechnique);
             const targetNumParams = techParams.filter(p => p.scope === "target" && p.type === "number" && p.id !== "material");
             const detail = targetNumParams.map(p => {
               const v = readTargetParam(t, p.id);
@@ -1701,7 +1732,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
             <div style={{ fontSize: 12, color: T.textPrimary, fontFamily: "'DM Mono', monospace" }}>{layer.thickness_nm}<span style={{ fontSize: 10, color: T.textDim }}> nm</span></div>
           </div>
         )}
-        {getTechParams(settings, technique).filter(p => p.scope === "layer").map(p => {
+        {getTechParams(settings, viewTechnique).filter(p => p.scope === "layer").map(p => {
           const v = readLayerParam(layer, p.id);
           if (v == null || v === "") return null;
           return (
@@ -1722,6 +1753,15 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
 
   return (
     <div onKeyDown={handleEditKeyDown} style={{ background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 7, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 12 }}>
+      {/* Technique selector */}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {(settings?.techniques || []).map(t => (
+          <button key={t.id} onClick={() => changeTechnique(t.id)}
+            style={{ padding: "3px 10px", fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 600, cursor: "pointer", borderRadius: 4, border: `1px solid ${editTechnique === t.id ? T.amber : T.border}`, background: editTechnique === t.id ? T.amberGlow : "transparent", color: editTechnique === t.id ? T.amber : T.textSecondary, transition: "all .15s" }}>
+            {t.name || t.id}
+          </button>
+        ))}
+      </div>
       {/* Layer params — rendered dynamically from technique definition */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -1731,7 +1771,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
             <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>nm</span>
           </div>
         </div>
-        {getTechParams(settings, technique).filter(p => p.scope === "layer").map(p => {
+        {getTechParams(settings, editTechnique).filter(p => p.scope === "layer").map(p => {
           const isBuiltin = BUILTIN_LAYER_PARAM_IDS.has(p.id);
           const val = isBuiltin ? (draft[p.id] ?? "") : (draft.custom?.[p.id] ?? "");
           const setVal = v => {
@@ -1766,7 +1806,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Targets</span>
         {draft.targets.map((t, i) => (
-          <TargetRow key={i} target={t} technique={technique} knownMaterials={knownMaterials} settings={settings} materialsLib={materialsLib}
+          <TargetRow key={i} target={t} technique={editTechnique} knownMaterials={knownMaterials} settings={settings} materialsLib={materialsLib}
             onChange={(t2, ld) => updateTarget(i, t2, ld)}
             onRemove={() => removeTarget(i)}
             canRemove={draft.targets.length > 1} />
@@ -2072,52 +2112,91 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 
 // ── AddLayerModal ─────────────────────────────────────────────────────────────
 
-function AddLayerModal({ technique, knownMaterials, settings, materialsLib = [], onAdd, onClose }) {
-  const [draft, setDraft] = useState(() => newLayer(technique, settings));
+function AddLayerModal({ technique: sampleTechnique, knownMaterials, settings, materialsLib = [], onAdd, onClose }) {
+  const [layerTech, setLayerTech] = useState(sampleTechnique);
+  const [draft, setDraft] = useState(() => newLayer(sampleTechnique, settings));
+
+  const switchTech = (newTechId) => {
+    setLayerTech(newTechId);
+    setDraft(newLayer(newTechId, settings));
+  };
+
   const setDraftField = (k, v) => setDraft(p => ({ ...p, [k]: v }));
-  const updateTarget  = (i, t, layerDefaults) => setDraft(p => { const ts = [...p.targets]; ts[i] = t; const patch = { ...p, targets: ts }; if (i === 0 && layerDefaults) Object.assign(patch, layerDefaults); return patch; });
-  const removeTarget  = (i)    => setDraft(p => ({ ...p, targets: p.targets.filter((_, j) => j !== i) }));
+  const updateTarget  = (i, t, layerDefaults) => setDraft(p => {
+    const ts = [...p.targets]; ts[i] = t;
+    const patch = { ...p, targets: ts };
+    if (i === 0 && layerDefaults) { const { custom: nc, ...rest } = layerDefaults; Object.assign(patch, rest); if (nc) patch.custom = { ...(patch.custom || {}), ...nc }; }
+    return patch;
+  });
+  const removeTarget  = (i) => setDraft(p => ({ ...p, targets: p.targets.filter((_, j) => j !== i) }));
   const addTarget = () => {
-    const cfg = settings?.[technique] || {};
-    const t = technique === "pld"
-      ? { material: "", energy_mJ: cfg.energy_mJ ?? 60, pulses: cfg.pulses ?? 10000 }
-      : { material: "", power_W: cfg.power_W ?? 150 };
+    const params = getTechParams(settings, layerTech);
+    const t = { material: "" };
+    for (const p of params.filter(pp => pp.scope === "target")) {
+      t[p.id] = p.default !== "" && p.default != null ? p.default : (p.type === "select" ? (p.options?.[0] || "") : "");
+    }
     setDraft(p => ({ ...p, targets: [...p.targets, t] }));
   };
 
   const inputSm = { background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" };
-  const field = (k, label, unit, w) => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{label}</span>
-      <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-        <input value={draft[k] ?? ""} onChange={e => setDraftField(k, e.target.value)} style={{ ...inputSm, width: w }} />
-        {unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{unit}</span>}
-      </div>
-    </div>
-  );
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 500, display: "flex", flexDirection: "column", gap: 16 }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 22 }}>New Layer</h2>
 
-        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
-          {field("temp",     "Temp",     "°C",    60)}
-          {field("pressure", "Pressure", "mTorr", 60)}
-          {technique === "sputter" && <>
-            {field("oxygen_pct", "O₂",  "%", 50)}
-            {field("time_s",     "Time", "s", 60)}
-          </>}
-          {technique === "pld" && <>
-            {field("frequency_hz",   "Rep rate",  "Hz", 56)}
-            {field("focal_position", "Focal pos.", "",   80)}
-          </>}
+        {/* Technique selector */}
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {(settings?.techniques || []).map(t => (
+            <button key={t.id} onClick={() => switchTech(t.id)}
+              style={{ flex: 1, padding: "6px 0", fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 600, cursor: "pointer", borderRadius: 5, border: `1px solid ${layerTech === t.id ? T.amber : T.border}`, background: layerTech === t.id ? T.amberGlow : "transparent", color: layerTech === t.id ? T.amber : T.textSecondary, transition: "all .15s" }}>
+              {t.name || t.id}
+            </button>
+          ))}
         </div>
 
+        {/* Layer-scoped params */}
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Thickness</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+              <input type="number" value={draft.thickness_nm ?? ""} onChange={e => setDraftField("thickness_nm", e.target.value === "" ? null : Number(e.target.value))} placeholder="—" style={{ ...inputSm, width: 60 }} />
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>nm</span>
+            </div>
+          </div>
+          {getTechParams(settings, layerTech).filter(p => p.scope === "layer").map(p => {
+            const isBuiltin = BUILTIN_LAYER_PARAM_IDS.has(p.id);
+            const val = isBuiltin ? (draft[p.id] ?? "") : (draft.custom?.[p.id] ?? "");
+            const setVal = v => {
+              if (isBuiltin) setDraftField(p.id, v);
+              else setDraft(prev => ({ ...prev, custom: { ...(prev.custom || {}), [p.id]: v } }));
+            };
+            if (p.type === "select") return (
+              <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
+                <select value={val} onChange={e => setVal(e.target.value)} style={{ ...inputSm, cursor: "pointer", textAlign: "left" }}>
+                  {(p.options || []).map(o => <option key={o} value={o}>{o}</option>)}
+                </select>
+              </div>
+            );
+            return (
+              <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                  <input value={val} placeholder={p.default != null && p.default !== "" ? String(p.default) : "—"} onChange={e => setVal(e.target.value)}
+                    style={{ ...inputSm, width: p.unit === "°C" || p.unit === "mTorr" || p.unit === "s" ? 60 : p.unit === "%" || p.unit === "Hz" ? 50 : 70 }} />
+                  {p.unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{p.unit}</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Targets */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Targets</span>
           {draft.targets.map((t, i) => (
-            <TargetRow key={i} target={t} technique={technique} knownMaterials={knownMaterials} settings={settings} materialsLib={materialsLib}
+            <TargetRow key={i} target={t} technique={layerTech} knownMaterials={knownMaterials} settings={settings} materialsLib={materialsLib}
               onChange={(t2, ld) => updateTarget(i, t2, ld)}
               onRemove={() => removeTarget(i)}
               canRemove={draft.targets.length > 1} />
@@ -5473,7 +5552,7 @@ function MaterialEditorModal({ material, settings, onSave, onDelete, onClose }) 
 
   const crystalField = (k, label, unit, w = 60) => (
     <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", textAlign: "center" }}>{label}</span>
+      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textAlign: "center" }}>{label}</span>
       <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
         <input value={draft.crystal?.[k] ?? ""} onChange={e => setDraft(p => ({ ...p, crystal: { ...(p.crystal || {}), [k]: e.target.value } }))}
           placeholder="—"
