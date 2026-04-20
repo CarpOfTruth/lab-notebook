@@ -1429,9 +1429,6 @@ const DEFAULT_SETTINGS = {
   defaultLot: "",
   defaultAreaCm2: "",
   techniques: SHIPPED_TECHNIQUES,
-  // Legacy fields kept for material library autofill (Phase 2 will migrate these out)
-  materials:  { sputter: [], pld: [] },
-  structures: [],
 };
 
 function mergeSettings(raw) {
@@ -1475,8 +1472,7 @@ function mergeSettings(raw) {
     defaultLot:       raw.defaultLot       ?? "",
     defaultAreaCm2:   raw.defaultAreaCm2   ?? "",
     techniques:       raw.techniques,
-    materials:  { sputter: raw.materials?.sputter ?? [], pld: raw.materials?.pld ?? [] },
-    structures: raw.structures ?? [],
+    xrd_configs:      raw.xrd_configs      ?? [],
   };
 }
 
@@ -1568,35 +1564,35 @@ function newLayer(techniqueId, settings) {
   return layer;
 }
 
-function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMaterials, settings }) {
+function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMaterials, settings, materialsLib = [] }) {
   const s = getMaterialStyle(target.material);
   const techParams = getTechParams(settings, technique);
   const targetParams = techParams.filter(p => p.scope === "target" && p.id !== "material");
 
   const handleMaterialChange = (v) => {
-    const lib   = settings?.materials?.[technique] || [];
-    const entry = lib.find(m => m.name === v);
+    const entry = (materialsLib || []).find(m => m.name === v);
     if (entry) {
+      const defaults = entry.growth_defaults?.[technique] || {};
       const merged = { ...target, material: v };
       const layerDefaults = {};
-      // Autofill builtin target params
+      // Autofill target-scoped params
       for (const p of targetParams) {
-        if (BUILTIN_TARGET_PARAM_IDS.has(p.id) && entry[p.id] != null && entry[p.id] !== "") {
-          merged[p.id] = entry[p.id];
+        if (defaults[p.id] != null && defaults[p.id] !== "") {
+          merged[p.id] = defaults[p.id];
         }
       }
-      // Autofill builtin layer params
-      for (const [entryKey, layerKey] of [["temp","temp"],["pressure","pressure"],["oxygen_pct","oxygen_pct"],["time_s","time_s"],["frequency_hz","frequency_hz"]]) {
-        if (entry[entryKey] != null && entry[entryKey] !== "") layerDefaults[layerKey] = entry[entryKey];
+      // Autofill layer-scoped params
+      for (const p of getTechParams(settings, technique).filter(pp => pp.scope === "layer")) {
+        if (defaults[p.id] != null && defaults[p.id] !== "") {
+          if (BUILTIN_LAYER_PARAM_IDS.has(p.id)) {
+            layerDefaults[p.id] = defaults[p.id];
+          } else {
+            if (!layerDefaults.custom) layerDefaults.custom = {};
+            layerDefaults.custom[p.id] = defaults[p.id];
+          }
+        }
       }
-      // Autofill user-added layer params from material entry
-      const userLayerParams = getUserLayerParams(settings, technique);
-      const customFill = {};
-      for (const p of userLayerParams) {
-        if (entry[p.id] != null && entry[p.id] !== "") customFill[p.id] = entry[p.id];
-      }
-      if (Object.keys(customFill).length) layerDefaults.custom = customFill;
-      onChange(merged, Object.keys(layerDefaults).length ? layerDefaults : null);
+      onChange(merged, Object.keys(layerDefaults).length ? layerDefaults : undefined);
     } else {
       onChange({ ...target, material: v });
     }
@@ -1641,7 +1637,7 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
   );
 }
 
-function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials, settings, initialEditing = false }) {
+function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials, settings, materialsLib = [], initialEditing = false }) {
   const [editing, setEditing] = useState(initialEditing);
   const [draft, setDraft]     = useState(initialEditing ? JSON.parse(JSON.stringify(layer)) : null);
 
@@ -1770,7 +1766,7 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Targets</span>
         {draft.targets.map((t, i) => (
-          <TargetRow key={i} target={t} technique={technique} knownMaterials={knownMaterials} settings={settings}
+          <TargetRow key={i} target={t} technique={technique} knownMaterials={knownMaterials} settings={settings} materialsLib={materialsLib}
             onChange={(t2, ld) => updateTarget(i, t2, ld)}
             onRemove={() => removeTarget(i)}
             canRemove={draft.targets.length > 1} />
@@ -1865,7 +1861,7 @@ function AddDataModal({ onClose, moduleOptions = [], sampleId, onModuleFileAdded
 
 // ── SampleDetail ──────────────────────────────────────────────────────────────
 
-function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [] }) {
+function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [], materialsLib = [] }) {
   const [addingLayer, setAddingLayer]   = useState(false);
   const [meta, setMeta]                 = useState({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
   const [dragIdx, setDragIdx]           = useState(null);
@@ -1873,6 +1869,12 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
   const [knownMaterials, setKnownMaterials] = useState([]);
   const [xrdAnalysisOpen, setXrdAnalysisOpen] = useState(false);
   const [addDataOpen, setAddDataOpen]         = useState(false);
+
+  // Flatten materialsLib crystal data into the shape XRD panels expect: {name, a, b, c, ...}
+  const structuresCompat = useMemo(
+    () => materialsLib.map(m => ({ name: m.name, ...(m.crystal || {}) })),
+    [materialsLib]
+  );
 
   useEffect(() => {
     api("GET", "/materials").then(setKnownMaterials).catch(() => {});
@@ -1963,7 +1965,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {sample.layers.map((l, i) => (
-            <LayerEditor key={l.id} layer={l} technique={sample.technique || "sputter"} knownMaterials={knownMaterials} settings={settings}
+            <LayerEditor key={l.id} layer={l} technique={sample.technique || "sputter"} knownMaterials={knownMaterials} settings={settings} materialsLib={materialsLib}
               onRemove={() => removeLayer(l.id)} onDuplicate={() => duplicateLayer(l.id)} onUpdate={updateLayer}
               isDragOver={overIdx === i && dragIdx !== i}
               onDragStart={() => setDragIdx(i)} onDragOver={() => setOverIdx(i)}
@@ -1976,6 +1978,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
             technique={sample.technique || "sputter"}
             knownMaterials={knownMaterials}
             settings={settings}
+            materialsLib={materialsLib}
             onAdd={addLayer}
             onClose={() => setAddingLayer(false)} />
         )}
@@ -1996,7 +1999,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
             <XRDAnalysisModal
               sample={sample}
               xrdData={pd?.xrd_ot || []}
-              structures={settings?.structures || []}
+              structures={structuresCompat}
               xrdConfigs={settings?.xrd_configs || []}
               onSaveXrdConfigs={configs => onSaveSettings?.({ ...settings, xrd_configs: configs })}
               onSave={peaks => onUpdate({ ...sample, xrd_peaks: peaks })}
@@ -2069,7 +2072,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 
 // ── AddLayerModal ─────────────────────────────────────────────────────────────
 
-function AddLayerModal({ technique, knownMaterials, settings, onAdd, onClose }) {
+function AddLayerModal({ technique, knownMaterials, settings, materialsLib = [], onAdd, onClose }) {
   const [draft, setDraft] = useState(() => newLayer(technique, settings));
   const setDraftField = (k, v) => setDraft(p => ({ ...p, [k]: v }));
   const updateTarget  = (i, t, layerDefaults) => setDraft(p => { const ts = [...p.targets]; ts[i] = t; const patch = { ...p, targets: ts }; if (i === 0 && layerDefaults) Object.assign(patch, layerDefaults); return patch; });
@@ -2114,7 +2117,7 @@ function AddLayerModal({ technique, knownMaterials, settings, onAdd, onClose }) 
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Targets</span>
           {draft.targets.map((t, i) => (
-            <TargetRow key={i} target={t} technique={technique} knownMaterials={knownMaterials} settings={settings}
+            <TargetRow key={i} target={t} technique={technique} knownMaterials={knownMaterials} settings={settings} materialsLib={materialsLib}
               onChange={(t2, ld) => updateTarget(i, t2, ld)}
               onRemove={() => removeTarget(i)}
               canRemove={draft.targets.length > 1} />
@@ -5450,12 +5453,214 @@ function ImportModal({ type, onConfirm, onClose }) {
 
 // ── SettingsModal ─────────────────────────────────────────────────────────────
 
+function MaterialEditorModal({ material, settings, onSave, onDelete, onClose }) {
+  // material is null for new entries, or an existing entry for editing
+  const isNew = !material?.id;
+  const blank = { id: "", name: "", formula: "", composition: {}, parent: "", notes: "", crystal: {}, properties: {}, growth_defaults: {} };
+  const [draft, setDraft] = useState(() => material ? JSON.parse(JSON.stringify(material)) : blank);
+  const [saving, setSaving] = useState(false);
+
+  // Composition as editable rows: [{el, amount}]
+  const [compRows, setCompRows] = useState(() => Object.entries(draft.composition || {}).map(([el, amt]) => ({ el, amt: String(amt) })));
+
+  const compositionDict = useMemo(() => {
+    const d = {};
+    for (const { el, amt } of compRows) {
+      if (el.trim()) d[el.trim()] = parseFloat(amt) || 0;
+    }
+    return d;
+  }, [compRows]);
+
+  const crystalField = (k, label, unit, w = 60) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", textAlign: "center" }}>{label}</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+        <input value={draft.crystal?.[k] ?? ""} onChange={e => setDraft(p => ({ ...p, crystal: { ...(p.crystal || {}), [k]: e.target.value } }))}
+          placeholder="—"
+          style={{ width: w, background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+        {unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{unit}</span>}
+      </div>
+    </div>
+  );
+
+  const IS = { background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "5px 8px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" };
+
+  const handleCIF = (file) => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      const parsed = parseCIF(e.target.result);
+      setDraft(p => ({
+        ...p,
+        name: p.name || parsed.name || "",
+        crystal: { ...(p.crystal || {}), a: parsed.a, b: parsed.b, c: parsed.c, alpha: parsed.alpha, beta: parsed.beta, gamma: parsed.gamma, cif_filename: file.name },
+      }));
+    };
+    reader.readAsText(file);
+  };
+
+  const handleSave = async () => {
+    if (!draft.name.trim()) return;
+    setSaving(true);
+    const payload = { ...draft, composition: compositionDict };
+    try {
+      const result = isNew
+        ? await api("POST", "/materials-library", payload)
+        : await api("PUT", `/materials-library/${draft.id}`, payload);
+      onSave(result);
+    } catch (e) { console.error(e); }
+    setSaving(false);
+  };
+
+  const handleDelete = async () => {
+    if (!window.confirm(`Delete "${draft.name}"? This cannot be undone.`)) return;
+    await api("DELETE", `/materials-library/${draft.id}`);
+    onDelete(draft.id);
+  };
+
+  const sHdr = (label) => (
+    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2, borderBottom: `1px solid ${T.border}`, paddingBottom: 4, marginTop: 8 }}>{label}</div>
+  );
+
+  const techniques = settings?.techniques || [];
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "flex-start", justifyContent: "center", zIndex: 110, overflowY: "auto", padding: "60px 20px 40px" }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: "20px 24px", width: 580, display: "flex", flexDirection: "column", gap: 10, marginBottom: 40 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 20 }}>{isNew ? "New Material" : "Edit Material"}</h2>
+
+        {/* Identity */}
+        {sHdr("Identity")}
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <div style={{ flex: 2, minWidth: 160 }}>
+            <div style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", marginBottom: 3 }}>Name</div>
+            <input value={draft.name} onChange={e => setDraft(p => ({ ...p, name: e.target.value }))}
+              placeholder="e.g. BaTiO₃"
+              style={{ ...IS, width: "100%" }} />
+          </div>
+          <div style={{ flex: 1, minWidth: 100 }}>
+            <div style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", marginBottom: 3 }}>Formula</div>
+            <input value={draft.formula} onChange={e => setDraft(p => ({ ...p, formula: e.target.value }))}
+              placeholder="e.g. BaTiO3"
+              style={{ ...IS, width: "100%" }} />
+          </div>
+          <div style={{ flex: 1, minWidth: 100 }}>
+            <div style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", marginBottom: 3 }}>Family/Parent</div>
+            <input value={draft.parent} onChange={e => setDraft(p => ({ ...p, parent: e.target.value }))}
+              placeholder="e.g. BZTO"
+              style={{ ...IS, width: "100%" }} />
+          </div>
+        </div>
+        <div>
+          <div style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", marginBottom: 3 }}>Notes</div>
+          <textarea value={draft.notes} onChange={e => setDraft(p => ({ ...p, notes: e.target.value }))}
+            rows={2} placeholder="Optional notes"
+            style={{ ...IS, width: "100%", resize: "vertical" }} />
+        </div>
+
+        {/* Composition */}
+        {sHdr("Composition")}
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          {compRows.map((row, i) => (
+            <div key={i} style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input value={row.el} onChange={e => setCompRows(rs => rs.map((r, j) => j === i ? { ...r, el: e.target.value } : r))}
+                placeholder="El"
+                style={{ ...IS, width: 52, textAlign: "center" }} />
+              <span style={{ color: T.textDim, fontFamily: "'DM Mono', monospace" }}>:</span>
+              <input value={row.amt} onChange={e => setCompRows(rs => rs.map((r, j) => j === i ? { ...r, amt: e.target.value } : r))}
+                placeholder="1.0"
+                style={{ ...IS, width: 64, textAlign: "center" }} />
+              <button onClick={() => setCompRows(rs => rs.filter((_, j) => j !== i))}
+                style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 0 }}>×</button>
+            </div>
+          ))}
+          <button onClick={() => setCompRows(rs => [...rs, { el: "", amt: "" }])}
+            style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
+            + Add element
+          </button>
+        </div>
+
+        {/* Crystal */}
+        {sHdr("Crystallographic")}
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: 2, minWidth: 120 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Space group</span>
+            <input value={draft.crystal?.space_group ?? ""} onChange={e => setDraft(p => ({ ...p, crystal: { ...(p.crystal || {}), space_group: e.target.value } }))}
+              placeholder="e.g. P4mm"
+              style={{ ...IS }} />
+          </div>
+          <label onDragOver={e => e.preventDefault()}
+            onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) handleCIF(f); }}
+            style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 1, background: T.bg0, border: `1px dashed ${draft.crystal?.cif_filename ? T.teal : T.border}`, borderRadius: 4, color: draft.crystal?.cif_filename ? T.teal : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "5px 10px", cursor: "pointer", whiteSpace: "nowrap", alignSelf: "flex-end" }}>
+            {draft.crystal?.cif_filename ? `↑ ${draft.crystal.cif_filename}` : "drop .cif or click"}
+            <input type="file" accept=".cif" style={{ display: "none" }} onChange={e => { if (e.target.files[0]) handleCIF(e.target.files[0]); e.target.value = ""; }} />
+          </label>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+          {crystalField("a", "a", "Å", 54)}
+          {crystalField("b", "b", "Å", 54)}
+          {crystalField("c", "c", "Å", 54)}
+          <div style={{ width: 1, alignSelf: "stretch", background: T.border, margin: "0 2px" }} />
+          {crystalField("alpha", "α", "°", 50)}
+          {crystalField("beta",  "β", "°", 50)}
+          {crystalField("gamma", "γ", "°", 50)}
+          <div style={{ width: 1, alignSelf: "stretch", background: T.border, margin: "0 2px" }} />
+          {crystalField("poisson", "ν", "", 50)}
+        </div>
+
+        {/* Growth defaults */}
+        {techniques.length > 0 && sHdr("Growth Defaults")}
+        {techniques.map(tech => {
+          const defaults = draft.growth_defaults?.[tech.id] || {};
+          const setDefault = (paramId, v) => setDraft(p => ({
+            ...p,
+            growth_defaults: { ...(p.growth_defaults || {}), [tech.id]: { ...(p.growth_defaults?.[tech.id] || {}), [paramId]: v } }
+          }));
+          return (
+            <div key={tech.id} style={{ border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6 }}>
+              <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 600, color: T.textSecondary }}>{tech.name || tech.id}</div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+                {tech.params.filter(p => p.name).map(p => (
+                  <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                    <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name}</span>
+                    <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                      {p.type === "select" ? (
+                        <select value={defaults[p.id] ?? ""} onChange={e => setDefault(p.id, e.target.value)}
+                          style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "3px 5px", fontFamily: "'DM Mono', monospace", fontSize: 11, outline: "none" }}>
+                          <option value="">—</option>
+                          {(p.options || []).map(o => <option key={o} value={o}>{o}</option>)}
+                        </select>
+                      ) : (
+                        <input value={defaults[p.id] ?? ""} onChange={e => setDefault(p.id, e.target.value)}
+                          placeholder="—"
+                          style={{ width: 60, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "3px 5px", fontFamily: "'DM Mono', monospace", fontSize: 11, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+                      )}
+                      {p.unit && <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{p.unit}</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+
+        {/* Actions */}
+        <div style={{ display: "flex", gap: 8, justifyContent: "space-between", marginTop: 6 }}>
+          <div>
+            {!isNew && <Btn variant="danger" small onClick={handleDelete}>Delete</Btn>}
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+            <Btn onClick={handleSave} disabled={saving || !draft.name.trim()}>{saving ? "Saving…" : "Save"}</Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SettingsModal({ settings, onSave, onClose }) {
   const [draft, setDraft] = useState(() => JSON.parse(JSON.stringify(settings)));
-  const [knownMaterials, setKnownMaterials] = useState([]);
-  const [libOpen, setLibOpen] = useState({ matSputter: false, matPld: false, struct: false });
   const [techOpen, setTechOpen] = useState({});
-  useEffect(() => { api("GET", "/materials").then(setKnownMaterials).catch(() => {}); }, []);
   const set = (path, v) => setDraft(p => {
     const d = JSON.parse(JSON.stringify(p));
     const keys = path.split(".");
@@ -5630,163 +5835,6 @@ function SettingsModal({ settings, onSave, onClose }) {
     );
   };
 
-  // Material library helpers
-  const addMat = (tech) => setDraft(p => {
-    const d = JSON.parse(JSON.stringify(p));
-    d.materials[tech].push(tech === "sputter"
-      ? { name: "", power_W: "", temp: "", pressure: "", oxygen_pct: "", time_s: "" }
-      : { name: "", energy_mJ: "", pulses: "", temp: "", pressure: "", frequency_hz: "" });
-    return d;
-  });
-  const removeMat = (tech, i) => setDraft(p => {
-    const d = JSON.parse(JSON.stringify(p));
-    d.materials[tech].splice(i, 1);
-    return d;
-  });
-  const setMat = (tech, i, k, v) => setDraft(p => {
-    const d = JSON.parse(JSON.stringify(p));
-    d.materials[tech][i][k] = v;
-    return d;
-  });
-
-  const matInput = (tech, i, k, label, unit, w = 52) => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{label}</span>
-      <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-        <input value={draft.materials[tech][i][k] ?? ""}
-          onChange={e => setMat(tech, i, k, e.target.value)}
-          placeholder="—"
-          style={{ width: w, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "3px 5px", fontFamily: "'DM Mono', monospace", fontSize: 11, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
-        {unit && <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{unit}</span>}
-      </div>
-    </div>
-  );
-
-  // Structure library helpers
-  const [cifDragIdx, setCifDragIdx] = useState(null);
-  const addStruct = () => setDraft(p => ({
-    ...p, structures: [...(p.structures || []), { name: "", a: "", b: "", c: "", alpha: "", beta: "", gamma: "", poisson: "", cif_filename: "", cif_text: "" }]
-  }));
-  const removeStruct = (i) => setDraft(p => ({ ...p, structures: p.structures.filter((_, j) => j !== i) }));
-  const setStruct = (i, k, v) => setDraft(p => {
-    const structs = [...p.structures];
-    structs[i] = { ...structs[i], [k]: v };
-    return { ...p, structures: structs };
-  });
-  const importCIF = (i, file) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const text = e.target.result;
-      const parsed = parseCIF(text);
-      setDraft(p => {
-        const structs = [...p.structures];
-        structs[i] = { ...structs[i], ...parsed, name: structs[i].name || parsed.name, cif_filename: file.name, cif_text: text };
-        return { ...p, structures: structs };
-      });
-    };
-    reader.readAsText(file);
-  };
-
-  const structInput = (i, k, label, unit, w = 62) => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-      <span style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", textAlign: "center" }}>{label}</span>
-      <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-        <input type="number" className="no-spin" value={draft.structures[i][k] ?? ""}
-          onChange={e => setStruct(i, k, e.target.value)}
-          placeholder="—"
-          style={{ width: w, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "3px 5px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
-        {unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{unit}</span>}
-      </div>
-    </div>
-  );
-
-  const renderStructLib = () => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      {(draft.structures || []).map((s, i) => (
-        <div key={i} style={{ background: T.bg3, border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 10px", display: "flex", flexDirection: "column", gap: 8 }}>
-          {/* Row 1: name + CIF drop zone + delete */}
-          <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: 1 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Name</span>
-              <input value={s.name ?? ""}
-                onChange={e => setStruct(i, "name", e.target.value)}
-                placeholder="e.g. BaTiO3"
-                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "3px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>CIF</span>
-              <label
-                onDragOver={e => { e.preventDefault(); setCifDragIdx(i); }}
-                onDragLeave={() => setCifDragIdx(null)}
-                onDrop={e => { e.preventDefault(); setCifDragIdx(null); const f = e.dataTransfer.files[0]; if (f) importCIF(i, f); }}
-                style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, background: cifDragIdx === i ? T.amberGlow : T.bg0, border: `1px dashed ${cifDragIdx === i ? T.amber : s.cif_filename ? T.teal : T.border}`, borderRadius: 4, color: cifDragIdx === i ? T.amber : s.cif_filename ? T.teal : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 10px", cursor: "pointer", whiteSpace: "nowrap", transition: "all .15s", textAlign: "center" }}>
-                {s.cif_filename
-                  ? <span style={{ maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>↑ {s.cif_filename}</span>
-                  : "drop .cif or click"}
-                <input type="file" accept=".cif" style={{ display: "none" }} onChange={e => { if (e.target.files[0]) importCIF(i, e.target.files[0]); e.target.value = ""; }} />
-              </label>
-            </div>
-            <button onClick={() => removeStruct(i)}
-              style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 2px", marginBottom: 1 }}>×</button>
-          </div>
-          {/* Row 2: lattice params + Poisson */}
-          <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
-            {structInput(i, "a",       "a",  "Å", 54)}
-            {structInput(i, "b",       "b",  "Å", 54)}
-            {structInput(i, "c",       "c",  "Å", 54)}
-            <div style={{ width: 1, alignSelf: "stretch", background: T.border, margin: "0 2px" }} />
-            {structInput(i, "alpha",   "α",  "°", 50)}
-            {structInput(i, "beta",    "β",  "°", 50)}
-            {structInput(i, "gamma",   "γ",  "°", 50)}
-            <div style={{ width: 1, alignSelf: "stretch", background: T.border, margin: "0 2px" }} />
-            {structInput(i, "poisson", "ν",  "",  50)}
-          </div>
-        </div>
-      ))}
-      <button onClick={addStruct}
-        style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
-        + Add structure
-      </button>
-    </div>
-  );
-
-  const renderMatLib = (tech) => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      {draft.materials[tech].map((m, i) => (
-        <div key={i} style={{ background: T.bg3, border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 10px", display: "flex", alignItems: "flex-end", gap: 8, flexWrap: "wrap" }}>
-          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Material</span>
-            <div style={{ width: 100 }}>
-              <MaterialCombobox value={m.name} onChange={v => setMat(tech, i, "name", v)} knownMaterials={knownMaterials} small />
-            </div>
-          </div>
-          {tech === "sputter" ? (<>
-            {matInput(tech, i, "power_W",    "Power",  "W",    52)}
-            {matInput(tech, i, "temp",       "Temp",   "°C",   52)}
-            {matInput(tech, i, "pressure",   "Press",  "mT",   52)}
-            {matInput(tech, i, "oxygen_pct", "O₂",     "%",    44)}
-            {matInput(tech, i, "time_s",     "Time",   "s",    52)}
-          </>) : (<>
-            {matInput(tech, i, "energy_mJ",   "Energy", "mJ",   52)}
-            {matInput(tech, i, "pulses",      "Pulses", "",     64)}
-            {matInput(tech, i, "temp",        "Temp",   "°C",   52)}
-            {matInput(tech, i, "pressure",    "Press",  "mT",   52)}
-            {matInput(tech, i, "frequency_hz","Rep",    "Hz",   48)}
-          </>)}
-          {(draft.techniques?.find(t => t.id === tech)?.params || []).filter(p =>
-            p.scope === "layer" && !BUILTIN_LAYER_PARAM_IDS.has(p.id) && p.name
-          ).map(p => matInput(tech, i, p.id, p.name, p.unit || "", 60))}
-          <button onClick={() => removeMat(tech, i)}
-            style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 2px", alignSelf: "flex-end", marginBottom: 1 }}>×</button>
-        </div>
-      ))}
-      <button onClick={() => addMat(tech)}
-        style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
-        + Add material
-      </button>
-    </div>
-  );
-
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "flex-start", justifyContent: "center", zIndex: 100, overflowY: "auto", padding: "80px 20px 40px" }}>
       <style>{`.no-spin::-webkit-inner-spin-button,.no-spin::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}.no-spin{-moz-appearance:textfield}`}</style>
@@ -5818,39 +5866,6 @@ function SettingsModal({ settings, onSave, onClose }) {
         {/* Technique Library */}
         {sectionHdr("Technique Library")}
         {renderTechniqueLibrary()}
-
-        {/* Material library — Sputter (collapsible) */}
-        <button onClick={() => setLibOpen(s => ({ ...s, matSputter: !s.matSputter }))}
-          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "none", border: "none", borderBottom: `1px solid ${T.border}`, paddingBottom: 4, marginBottom: 0, marginTop: 6, cursor: "pointer", width: "100%", textAlign: "left" }}>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2 }}>Material Library — Sputter</span>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, lineHeight: 1 }}>{libOpen.matSputter ? "▴" : "▾"}</span>
-        </button>
-        {libOpen.matSputter && <>
-          <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -2, marginBottom: 2 }}>Leave fields blank to use global sputter defaults for that material.</div>
-          {renderMatLib("sputter")}
-        </>}
-
-        {/* Material library — PLD (collapsible) */}
-        <button onClick={() => setLibOpen(s => ({ ...s, matPld: !s.matPld }))}
-          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "none", border: "none", borderBottom: `1px solid ${T.border}`, paddingBottom: 4, marginBottom: 0, marginTop: 6, cursor: "pointer", width: "100%", textAlign: "left" }}>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2 }}>Material Library — PLD</span>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, lineHeight: 1 }}>{libOpen.matPld ? "▴" : "▾"}</span>
-        </button>
-        {libOpen.matPld && <>
-          <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -2, marginBottom: 2 }}>Leave fields blank to use global PLD defaults for that material.</div>
-          {renderMatLib("pld")}
-        </>}
-
-        {/* Structure library (collapsible) */}
-        <button onClick={() => setLibOpen(s => ({ ...s, struct: !s.struct }))}
-          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "none", border: "none", borderBottom: `1px solid ${T.border}`, paddingBottom: 4, marginBottom: 0, marginTop: 6, cursor: "pointer", width: "100%", textAlign: "left" }}>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2 }}>Structure Library</span>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, lineHeight: 1 }}>{libOpen.struct ? "▴" : "▾"}</span>
-        </button>
-        {libOpen.struct && <>
-          <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -2, marginBottom: 2 }}>Lattice parameters for peak prediction and strain calculations. Drop a .cif onto an entry to auto-fill.</div>
-          {renderStructLib()}
-        </>}
 
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 4 }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
@@ -10439,7 +10454,7 @@ function AddPanelRow({ onAdd, modules = [] }) {
   );
 }
 
-function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, modules = [] }) {
+function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, modules = [], structuresCompat = [] }) {
   const cfg            = book.config || {};
   const sampleOrder    = cfg.sample_order?.length ? cfg.sample_order : (book.sample_ids || []);
   const colorScale     = cfg.color_scale    || "viridis";
@@ -10504,7 +10519,7 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, 
           colors={colors}
           labels={labels}
           colorScale={colorScale}
-          structures={settings?.structures || []}
+          structures={structuresCompat}
           activeMaterial={activeMaterial}
           modules={modules}
           settings={settings}
@@ -11048,6 +11063,73 @@ function SampleFilter({ settings, samples = [], onFilterChange }) {
   );
 }
 
+// ── MaterialsLibrarySection ───────────────────────────────────────────────────
+
+function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete }) {
+  const [editorMat, setEditorMat] = useState(null); // null=closed, false=new, or material entry
+  const [open, setOpen] = useState(true);
+
+  const handleSave = (result) => {
+    onUpdate(result);
+    setEditorMat(null);
+  };
+  const handleDelete = (id) => {
+    onDelete(id);
+    setEditorMat(null);
+  };
+
+  return (
+    <div style={{ marginBottom: 32 }}>
+      {/* Section header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 20, color: T.textPrimary, cursor: "pointer" }} onClick={() => setOpen(o => !o)}>
+          Materials Library
+        </h2>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{open ? "▴" : "▾"}</span>
+        <div style={{ flex: 1 }} />
+        <Btn small onClick={() => setEditorMat(false)}>+ New Material</Btn>
+      </div>
+
+      {open && (
+        materialsLib.length === 0 ? (
+          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "12px 0" }}>
+            No materials yet. Add your first material to start building the library.
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+            {materialsLib.map(m => (
+              <div key={m.id} onClick={() => setEditorMat(m)}
+                style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 8, padding: "10px 14px", cursor: "pointer", minWidth: 160, maxWidth: 220, display: "flex", flexDirection: "column", gap: 4, transition: "border-color .15s" }}
+                onMouseEnter={e => e.currentTarget.style.borderColor = T.amber}
+                onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, fontWeight: 700, color: T.textPrimary }}>{m.name}</div>
+                {m.formula && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>{m.formula}</div>}
+                {m.parent && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.teal }}>▸ {m.parent}</div>}
+                {Object.keys(m.growth_defaults || {}).length > 0 && (
+                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 2 }}>
+                    {Object.keys(m.growth_defaults).map(tid => (
+                      <span key={tid} style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.amber, background: T.amberGlow, border: `1px solid ${T.amber}`, borderRadius: 3, padding: "1px 5px", textTransform: "uppercase" }}>{tid}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )
+      )}
+
+      {editorMat !== null && (
+        <MaterialEditorModal
+          material={editorMat || null}
+          settings={settings}
+          onSave={handleSave}
+          onDelete={handleDelete}
+          onClose={() => setEditorMat(null)} />
+      )}
+    </div>
+  );
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -11087,6 +11169,7 @@ export default function App() {
   const [settingsOpen,  setSettingsOpen]  = useState(false);
   const [exportOpen,    setExportOpen]    = useState(false);
   const [modules,       setModules]       = useState([]);
+  const [materialsLib,  setMaterialsLib]  = useState([]);
   const [activeModule,  setActiveModule]  = useState(null); // full module editor state: { id, name, builtin, source, mode, ... }
   const [viewDataOpen,  setViewDataOpen]  = useState(false);  // View Data modal
   const [viewDataFiles, setViewDataFiles] = useState([]);
@@ -11094,11 +11177,16 @@ export default function App() {
 
   const handleSaveSettings = (s) => {
     // Always deep-merge with current settings so partial updates (e.g. xrd_configs)
-    // never silently wipe other fields (structures, materials, etc.)
+    // never silently wipe other fields (techniques, etc.)
     const merged = mergeSettings({ ...settings, ...s });
     saveSettings(merged);
     setSettings(merged);
   };
+
+  const structuresCompat = useMemo(
+    () => materialsLib.map(m => ({ name: m.name, ...(m.crystal || {}) })),
+    [materialsLib]
+  );
 
   // Persist theme choice + sync body background
   useEffect(() => {
@@ -11115,11 +11203,43 @@ export default function App() {
       api("GET", "/analysis-books"),
       api("GET", "/settings"),
       api("GET", "/modules").catch(() => []),
-    ]).then(([s, f, b, cfg, mods]) => {
+      api("GET", "/materials-library").catch(() => []),
+    ]).then(([s, f, b, cfg, mods, mats]) => {
       setSamples(s); setFolders(f); setBooks(b);
       setSettings(mergeSettings(cfg || {}));
       setModules(mods || []);
+      setMaterialsLib(mats || []);
       setLoading(false);
+
+      // Auto-migrate old settings materials/structures into the library (runs once if library is empty)
+      const oldMats = mats || [];
+      const oldSMats = (cfg?.materials?.sputter || []).filter(m => m.name);
+      const oldPMats = (cfg?.materials?.pld     || []).filter(m => m.name);
+      const oldStructs = (cfg?.structures || []).filter(s => s.name);
+
+      if (oldMats.length === 0 && (oldSMats.length || oldPMats.length || oldStructs.length)) {
+        // Merge sputter and pld entries by name
+        const byName = {};
+        for (const m of oldSMats) {
+          byName[m.name] = byName[m.name] || { name: m.name, formula: "", composition: {}, parent: "", notes: "", crystal: {}, properties: {}, growth_defaults: {} };
+          const { name: _n, ...vals } = m;
+          byName[m.name].growth_defaults.sputter = vals;
+        }
+        for (const m of oldPMats) {
+          byName[m.name] = byName[m.name] || { name: m.name, formula: "", composition: {}, parent: "", notes: "", crystal: {}, properties: {}, growth_defaults: {} };
+          const { name: _n, ...vals } = m;
+          byName[m.name].growth_defaults.pld = vals;
+        }
+        for (const s of oldStructs) {
+          byName[s.name] = byName[s.name] || { name: s.name, formula: "", composition: {}, parent: "", notes: "", crystal: {}, properties: {}, growth_defaults: {} };
+          const { name: _n, cif_filename: _cf, cif_text: _ct, ...crystalFields } = s;
+          byName[s.name].crystal = crystalFields;
+        }
+        const toMigrate = Object.values(byName);
+        Promise.all(toMigrate.map(m => api("POST", "/materials-library", m)))
+          .then(results => setMaterialsLib(results))
+          .catch(() => {});
+      }
     }).catch(e => { setError(e.message); setLoading(false); });
   }, []);
 
@@ -11639,7 +11759,8 @@ export default function App() {
               setEditingMeta={setEditingMeta}
               settings={settings}
               onSaveSettings={handleSaveSettings}
-              modules={modules} />
+              modules={modules}
+              materialsLib={materialsLib} />
           ) : activeBook && activeBookObj ? (
             <AnalysisBookDetail
               book={activeBookObj}
@@ -11647,6 +11768,7 @@ export default function App() {
               plotCache={plotCache}
               settings={settings}
               modules={modules}
+              structuresCompat={structuresCompat}
               onUpdateBook={(updates) => updateBookInPlace(activeBook, updates)} />
           ) : activeModule ? (
             <ModuleEditorPage
@@ -11783,6 +11905,18 @@ export default function App() {
                     </>
                   );
                 })()}
+              </div>
+
+              {/* Materials Library section */}
+              <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 28, marginTop: 20 }}>
+                <MaterialsLibrarySection
+                  materialsLib={materialsLib}
+                  settings={settings}
+                  onUpdate={mat => setMaterialsLib(prev => {
+                    const idx = prev.findIndex(m => m.id === mat.id);
+                    return idx >= 0 ? prev.map(m => m.id === mat.id ? mat : m) : [...prev, mat];
+                  })}
+                  onDelete={id => setMaterialsLib(prev => prev.filter(m => m.id !== id))} />
               </div>
 
               {/* Modules section */}

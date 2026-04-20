@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 import sqlite3, json, os, shutil
@@ -152,6 +152,20 @@ def init_db():
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS materials_library (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                formula TEXT NOT NULL DEFAULT '',
+                composition TEXT NOT NULL DEFAULT '{}',
+                parent TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                crystal TEXT NOT NULL DEFAULT '{}',
+                properties TEXT NOT NULL DEFAULT '{}',
+                growth_defaults TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS sample_filter_index (
                 sample_id  TEXT NOT NULL,
                 field      TEXT NOT NULL,
@@ -166,6 +180,29 @@ init_db()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _mat_row_to_dict(row):
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "formula": row["formula"],
+        "composition": json.loads(row["composition"] or "{}"),
+        "parent": row["parent"],
+        "notes": row["notes"],
+        "crystal": json.loads(row["crystal"] or "{}"),
+        "properties": json.loads(row["properties"] or "{}"),
+        "growth_defaults": json.loads(row["growth_defaults"] or "{}"),
+    }
+
+def _make_mat_id(name: str, existing_ids: set) -> str:
+    import re
+    slug = re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or "material"
+    if slug not in existing_ids:
+        return slug
+    i = 2
+    while f"{slug}_{i}" in existing_ids:
+        i += 1
+    return f"{slug}_{i}"
 
 def row_to_dict(row):
     return dict(row)
@@ -518,6 +555,7 @@ def put_settings(body: dict):
 def list_materials():
     with get_db() as conn:
         rows = conn.execute("SELECT layers FROM samples").fetchall()
+        lib_rows = conn.execute("SELECT name FROM materials_library WHERE name != ''").fetchall()
     materials = set()
     for row in rows:
         layers = json.loads(row["layers"] or "[]")
@@ -526,7 +564,57 @@ def list_materials():
                 m = target.get("material", "").strip()
                 if m:
                     materials.add(m)
+    for r in lib_rows:
+        materials.add(r["name"])
     return sorted(materials)
+
+
+# ── Materials Library ─────────────────────────────────────────────────────────
+
+@app.get("/api/materials-library")
+def list_materials_library():
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM materials_library ORDER BY name").fetchall()
+    return [_mat_row_to_dict(r) for r in rows]
+
+@app.post("/api/materials-library")
+def create_material_library_entry(body: dict = Body(...)):
+    with get_db() as conn:
+        existing = {r["id"] for r in conn.execute("SELECT id FROM materials_library").fetchall()}
+        mat_id = body.get("id") or _make_mat_id(body.get("name", "material"), existing)
+        if mat_id in existing:
+            mat_id = _make_mat_id(mat_id, existing)
+        conn.execute(
+            "INSERT INTO materials_library (id,name,formula,composition,parent,notes,crystal,properties,growth_defaults) VALUES (?,?,?,?,?,?,?,?,?)",
+            (mat_id, body.get("name",""), body.get("formula",""),
+             json.dumps(body.get("composition",{})), body.get("parent",""),
+             body.get("notes",""), json.dumps(body.get("crystal",{})),
+             json.dumps(body.get("properties",{})), json.dumps(body.get("growth_defaults",{})))
+        )
+        row = conn.execute("SELECT * FROM materials_library WHERE id=?", (mat_id,)).fetchone()
+    return _mat_row_to_dict(row)
+
+@app.put("/api/materials-library/{mat_id}")
+def update_material_library_entry(mat_id: str, body: dict = Body(...)):
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE materials_library SET name=?,formula=?,composition=?,parent=?,notes=?,crystal=?,properties=?,growth_defaults=? WHERE id=?",
+            (body.get("name",""), body.get("formula",""),
+             json.dumps(body.get("composition",{})), body.get("parent",""),
+             body.get("notes",""), json.dumps(body.get("crystal",{})),
+             json.dumps(body.get("properties",{})), json.dumps(body.get("growth_defaults",{})),
+             mat_id)
+        )
+        row = conn.execute("SELECT * FROM materials_library WHERE id=?", (mat_id,)).fetchone()
+    if not row:
+        raise HTTPException(404)
+    return _mat_row_to_dict(row)
+
+@app.delete("/api/materials-library/{mat_id}")
+def delete_material_library_entry(mat_id: str):
+    with get_db() as conn:
+        conn.execute("DELETE FROM materials_library WHERE id=?", (mat_id,))
+    return {"ok": True}
 
 
 # ── File upload / retrieval ───────────────────────────────────────────────────
