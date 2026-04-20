@@ -1744,7 +1744,7 @@ function LayerEditor({ layer, technique: sampleTechnique, onRemove, onDuplicate,
             }).filter(Boolean).join(" · ") || null;
             return (
               <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 700, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 8px" }}>
-                <ChemName name={matDisplayName(t.material || "?", materialsLib)} />
+                <ChemName name={t.material || "?"} />
                 {detail && <span style={{ fontWeight: 400, opacity: 0.7, fontSize: 11 }}>· {detail}</span>}
               </span>
             );
@@ -6031,7 +6031,7 @@ function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, 
       {materials.length > 0 && (
         <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
           {materials.map(m => { const s = getMaterialStyle(m); return (
-            <span key={m} style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 7px" }} title={m}><ChemName name={matDisplayName(m, materialsLib)} /></span>
+            <span key={m} style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 7px" }} title={matDisplayName(m, materialsLib)}><ChemName name={m} /></span>
           );})}
           {(sample.layers || []).some(l => l.role === "buffer") && (
             <span style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", fontWeight: 600, color: T.teal, background: `${T.teal}22`, border: `1px solid ${T.teal}66`, borderRadius: 3, padding: "1px 5px", letterSpacing: 0.5 }}>BUF</span>
