@@ -11069,13 +11069,9 @@ function FilterChip({ condition, onRemove }) {
   );
 }
 
-const SampleFilter = React.forwardRef(function SampleFilter({ settings, samples = [], onFilterChange }, ref) {
+function SampleFilter({ settings, samples = [], onFilterChange }) {
   const [conditions,  setConditions]  = useState([]);
   const [panelOpen,   setPanelOpen]   = useState(false);
-  const fieldSelectRef = useRef(null);
-  React.useImperativeHandle(ref, () => ({ open() { setPanelOpen(true); } }));
-  // Auto-focus the field select when panel opens
-  useEffect(() => { if (panelOpen) setTimeout(() => fieldSelectRef.current?.focus(), 30); }, [panelOpen]);
   const [newField,    setNewField]    = useState("");
   const [newOp,       setNewOp]       = useState("between");
   const [newVal,      setNewVal]      = useState("");
@@ -11174,7 +11170,7 @@ const SampleFilter = React.forwardRef(function SampleFilter({ settings, samples 
             {/* Field selector */}
             <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
               <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Field</span>
-              <select ref={fieldSelectRef} value={newField} onChange={e => handleFieldChange(e.target.value)}
+              <select value={newField} onChange={e => handleFieldChange(e.target.value)}
                 style={{ ...inputSm, width: "100%", cursor: "pointer" }}>
                 <option value="">— select —</option>
                 {groups.map(g => (
@@ -11251,7 +11247,162 @@ const SampleFilter = React.forwardRef(function SampleFilter({ settings, samples 
       )}
     </div>
   );
-});
+}
+
+// ── GlobalSearch ──────────────────────────────────────────────────────────────
+
+function GlobalSearch({ samples = [], materialsLib = [], books = [], modules = [], onClose, onOpenSample, onOpenBook, onOpenModule, onOpenMaterial }) {
+  useEscClose(onClose);
+  const [query, setQuery] = useState("");
+  const [cursor, setCursor] = useState(0);
+  const inputRef = useRef(null);
+  const listRef  = useRef(null);
+
+  useEffect(() => { inputRef.current?.focus(); }, []);
+
+  const q = query.trim().toLowerCase();
+
+  // ── Build result set ──────────────────────────────────────────────────────
+  const results = useMemo(() => {
+    if (!q) return [];
+    const out = [];
+
+    // Samples — search id, substrate, notes, lot, bin, material names
+    for (const s of samples) {
+      const mats = (s.layers || []).flatMap(l => (l.targets || []).map(t => t.material).filter(Boolean));
+      const haystack = [s.id, s.substrate, s.notes, s.lot, s.bin, ...mats].filter(Boolean).join(" ").toLowerCase();
+      if (haystack.includes(q)) {
+        const matStr = [...new Set(mats)].join(", ");
+        out.push({
+          id: `s-${s.id}`, kind: "sample", label: s.id,
+          sub: [s.substrate, matStr].filter(Boolean).join(" · "),
+          location: "Samples", action: () => onOpenSample(s.id),
+        });
+      }
+    }
+
+    // Materials Library — search name, formula from composition, parent
+    for (const m of materialsLib) {
+      const formula = Object.keys(m.composition || {}).length ? compToFormula(m.composition) : "";
+      const haystack = [m.name, formula, m.parent, m.notes].filter(Boolean).join(" ").toLowerCase();
+      if (haystack.includes(q)) {
+        out.push({
+          id: `m-${m.id}`, kind: "material", label: m.name,
+          sub: formula && formula !== m.name ? formula : (m.parent ? `▸ ${m.parent}` : ""),
+          location: "Materials", action: () => onOpenMaterial(m),
+        });
+      }
+    }
+
+    // Analysis Books — search name
+    for (const b of books) {
+      if (!b.name) continue;
+      if (b.name.toLowerCase().includes(q)) {
+        const n = (b.sample_ids || []).length;
+        out.push({
+          id: `b-${b.id}`, kind: "book", label: b.name,
+          sub: `${n} sample${n !== 1 ? "s" : ""}`,
+          location: "Analysis Books", action: () => onOpenBook(b.id),
+        });
+      }
+    }
+
+    // Modules — search name, description
+    for (const m of modules) {
+      const haystack = [m.name, m.description].filter(Boolean).join(" ").toLowerCase();
+      if (haystack.includes(q)) {
+        out.push({
+          id: `mod-${m.id}`, kind: "module", label: m.name,
+          sub: m.description || "",
+          location: "Modules", action: () => onOpenModule(m.id),
+        });
+      }
+    }
+
+    return out;
+  }, [q, samples, materialsLib, books, modules]);
+
+  // Reset cursor when results change
+  useEffect(() => { setCursor(0); }, [results.length]);
+
+  // Scroll highlighted row into view
+  useEffect(() => {
+    const el = listRef.current?.querySelector(`[data-idx="${cursor}"]`);
+    el?.scrollIntoView({ block: "nearest" });
+  }, [cursor]);
+
+  const handleKey = (e) => {
+    if (e.key === "ArrowDown") { e.preventDefault(); setCursor(c => Math.min(c + 1, results.length - 1)); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); setCursor(c => Math.max(c - 1, 0)); }
+    else if (e.key === "Enter" && results[cursor]) { results[cursor].action(); onClose(); }
+  };
+
+  const kindIcon = { sample: "◈", material: "◇", book: "▤", module: "⊞" };
+  const kindColor = { sample: T.amber, material: T.teal, book: T.blue, module: T.textSecondary };
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.65)", zIndex: 400, display: "flex", alignItems: "flex-start", justifyContent: "center", paddingTop: "12vh" }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: 580, maxWidth: "calc(100vw - 32px)", background: T.bg1, borderRadius: 12, border: `1px solid ${T.borderBright}`, boxShadow: "0 24px 64px rgba(0,0,0,.6)", overflow: "hidden", display: "flex", flexDirection: "column" }}>
+
+        {/* Input */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: `1px solid ${T.border}` }}>
+          <span style={{ color: T.textDim, fontSize: 18, lineHeight: 1 }}>⌕</span>
+          <input
+            ref={inputRef}
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            onKeyDown={handleKey}
+            placeholder="Search samples, materials, books, modules…"
+            style={{ flex: 1, background: "none", border: "none", outline: "none", color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 15 }}
+          />
+          {query && (
+            <button onClick={() => setQuery("")} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }}>×</button>
+          )}
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, background: T.bg3, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 6px" }}>esc</span>
+        </div>
+
+        {/* Results */}
+        <div ref={listRef} style={{ maxHeight: 420, overflowY: "auto", padding: q ? "6px 0" : "0" }}>
+          {!q && (
+            <div style={{ padding: "28px 18px", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, textAlign: "center" }}>
+              Type to search across samples, materials, books, and modules
+            </div>
+          )}
+          {q && results.length === 0 && (
+            <div style={{ padding: "28px 18px", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, textAlign: "center" }}>
+              No results for <span style={{ color: T.textSecondary }}>"{query}"</span>
+            </div>
+          )}
+          {results.map((r, i) => (
+            <div key={r.id} data-idx={i}
+              onClick={() => { r.action(); onClose(); }}
+              onMouseEnter={() => setCursor(i)}
+              style={{ display: "flex", alignItems: "center", gap: 12, padding: "9px 18px", cursor: "pointer", background: i === cursor ? T.bg3 : "transparent", transition: "background .08s" }}>
+              {/* Kind icon */}
+              <span style={{ fontSize: 14, color: kindColor[r.kind], flexShrink: 0, width: 18, textAlign: "center" }}>{kindIcon[r.kind]}</span>
+              {/* Label + sub */}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, fontWeight: 700, color: T.textPrimary }}>{r.label}</span>
+                {r.sub && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, marginLeft: 8 }}>{r.sub}</span>}
+              </div>
+              {/* Location badge */}
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, flexShrink: 0 }}>{r.location}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* Footer hint */}
+        {results.length > 0 && (
+          <div style={{ borderTop: `1px solid ${T.border}`, padding: "7px 18px", display: "flex", gap: 16, fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>
+            <span>↑↓ navigate</span>
+            <span>↵ open</span>
+            <span>esc close</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 // ── MatFolderTile ─────────────────────────────────────────────────────────────
 
@@ -11430,11 +11581,16 @@ function MatImportModal({ onClose, onImported }) {
   );
 }
 
-function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete, onReplaceAll, matFolders = [], onCreateMatFolder, onDeleteMatFolder, onEditMatFolder, onAssignMatFolder }) {
+function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete, onReplaceAll, matFolders = [], onCreateMatFolder, onDeleteMatFolder, onEditMatFolder, onAssignMatFolder, openTarget = null, onClearTarget }) {
   const [editorMat, setEditorMat] = useState(null); // null=closed, false=new, or material entry
   const [importOpen, setImportOpen] = useState(false);
   const [open, setOpen] = useState(true);
   const [draggingMatId, setDraggingMatId] = useState(null);
+
+  // Open a material from an external trigger (e.g. global search)
+  useEffect(() => {
+    if (openTarget) { setOpen(true); setEditorMat(openTarget); onClearTarget?.(); }
+  }, [openTarget]);
 
   const handleSave = (result) => {
     onUpdate(result);
@@ -11574,7 +11730,8 @@ export default function App() {
   const [addingBookFolder,   setAddingBookFolder]   = useState(false);
   const [addingModuleFolder, setAddingModuleFolder] = useState(false);
   const [addingMatFolder,    setAddingMatFolder]    = useState(false);
-  const filterRef = useRef(null);
+  const [searchOpen,         setSearchOpen]         = useState(false);
+  const [matEditorTarget,    setMatEditorTarget]    = useState(null);
   const [editingFolder, setEditingFolder] = useState(null); // folder object being edited — type inferred from its flags
   const [importModalType, setImportModalType] = useState(null); // "sample"|"book"|"module"|null
   const [importing,       setImporting]       = useState(false);
@@ -12066,10 +12223,10 @@ export default function App() {
       if (e.key === "Escape") {
         if (_escStack.length > 0) { _escStack[_escStack.length - 1](); return; }
       }
-      // Cmd/Ctrl+K — open sample filter panel (home page only)
+      // Cmd/Ctrl+K — open global search
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
-        filterRef.current?.open();
+        setSearchOpen(true);
         return;
       }
       // Back navigation (← or Backspace) when not typing
@@ -12245,7 +12402,7 @@ export default function App() {
 
                 {/* Filter bar */}
                 <div style={{ marginBottom: 14 }}>
-                  <SampleFilter ref={filterRef} settings={settings} samples={samples} onFilterChange={setSampleFilterConds} />
+                  <SampleFilter settings={settings} samples={samples} onFilterChange={setSampleFilterConds} />
                 </div>
 
                 {/* Foldered groups — recursive tree */}
@@ -12359,6 +12516,8 @@ export default function App() {
                   materialsLib={materialsLib}
                   settings={settings}
                   matFolders={folders.filter(f => f.mat_folder)}
+                  openTarget={matEditorTarget}
+                  onClearTarget={() => setMatEditorTarget(null)}
                   onUpdate={mat => setMaterialsLib(prev => {
                     const idx = prev.findIndex(m => m.id === mat.id);
                     return idx >= 0 ? prev.map(m => m.id === mat.id ? mat : m) : [...prev, mat];
@@ -12435,6 +12594,16 @@ export default function App() {
         </div>
       </div>
 
+      {searchOpen && (
+        <GlobalSearch
+          samples={samples} materialsLib={materialsLib} books={books} modules={modules}
+          onClose={() => setSearchOpen(false)}
+          onOpenSample={id => { setSearchOpen(false); openSample(id); }}
+          onOpenBook={id => { setSearchOpen(false); setActiveBook(id); }}
+          onOpenModule={id => { setSearchOpen(false); openModule(id); }}
+          onOpenMaterial={mat => { setSearchOpen(false); setMatEditorTarget(mat); }}
+        />
+      )}
       {adding && <AddSampleModal onAdd={addSample} onClose={() => setAdding(false)} folders={folders} settings={settings} />}
       {templateSample && <AddSampleModal onAdd={s => { addSample(s); setTemplateSample(null); }} onClose={() => setTemplateSample(null)} folders={folders} template={templateSample} settings={settings} />}
       {exportOpen   && <ExportModal samples={samples} onClose={() => setExportOpen(false)} />}
