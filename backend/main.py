@@ -1,9 +1,32 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
-import sqlite3, json, os, shutil
+import sqlite3, json, os, shutil, re, importlib.util, subprocess, sys
 from pathlib import Path
 import modules as mod_registry
+
+# ── Dependency blacklist ───────────────────────────────────────────────────────
+# Packages that are never permitted to be pip-installed by user modules.
+# Covers system access, network access, privilege escalation, and unsafe
+# serialisation. The set is lowercase; package names are lowercased before
+# comparison. Stdlib modules like os/sys can't be pip-installed anyway, but
+# listing them here makes the policy explicit and auditable.
+_DEP_BLACKLIST = {
+    # System access / code execution
+    "os", "sys", "subprocess", "shutil", "ctypes", "pty", "signal", "multiprocessing",
+    "threading", "concurrent",
+    # Network access
+    "socket", "requests", "httpx", "aiohttp", "urllib3", "paramiko", "ftplib",
+    "smtplib", "http", "urllib",
+    # Privilege escalation / package management
+    "pip", "setuptools", "distutils", "pkg_resources", "wheel",
+    # Unsafe serialisation / code loading
+    "pickle", "marshal", "shelve", "dill", "cloudpickle",
+    # Filesystem / system introspection
+    "pathlib", "glob", "fnmatch", "tempfile", "io",
+    # Crypto / auth
+    "cryptography", "paramiko", "pyotp",
+}
 
 app = FastAPI(title="LabLog API")
 
@@ -153,6 +176,10 @@ def init_db():
             conn.execute("ALTER TABLE samples ADD COLUMN bin TEXT")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute("ALTER TABLE samples ADD COLUMN module_config TEXT DEFAULT '{}'")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
@@ -284,9 +311,10 @@ def _index_sample(conn, sample_id, layers_json, technique, substrate, lot):
 
 def row_to_sample(row):
     d = dict(row)
-    d["layers"]    = json.loads(d.get("layers")    or "[]")
-    d["filenames"] = json.loads(d.get("filenames") or "{}")
-    d["xrd_peaks"] = json.loads(d.get("xrd_peaks") or "[]")
+    d["layers"]        = json.loads(d.get("layers")        or "[]")
+    d["filenames"]     = json.loads(d.get("filenames")     or "{}")
+    d["xrd_peaks"]     = json.loads(d.get("xrd_peaks")     or "[]")
+    d["module_config"] = json.loads(d.get("module_config") or "{}")
     return d
 
 def row_to_book(row):
@@ -1398,6 +1426,11 @@ async def import_module_preview(file: UploadFile = File(...)):
     builtin_path = BASE_DIR / "modules" / f"{module_id}.py"
     exists = user_path.exists() or builtin_path.exists()
 
+    raw_deps = schema.get("dependencies", [])
+    dep_status = [_check_dep(d) for d in raw_deps]
+    any_blocked = any(s["blocked"] for s in dep_status)
+    any_missing = any(not s["installed"] and not s["blocked"] for s in dep_status)
+
     return {
         "module_id":    module_id,
         "name":         schema.get("name", module_id),
@@ -1405,7 +1438,9 @@ async def import_module_preview(file: UploadFile = File(...)):
         "author":       schema.get("author", ""),
         "description":  schema.get("description", ""),
         "accepts":      schema.get("accepts", []),
-        "dependencies": schema.get("dependencies", []),
+        "dependencies": dep_status,
+        "has_blocked_deps": any_blocked,
+        "has_missing_deps": any_missing,
         "exists":       exists,
         "builtin":      builtin_path.exists(),
         "source_code":  source_code,
@@ -1447,6 +1482,32 @@ async def import_module(file: UploadFile = File(...), config: str = "{}"):
     if action == "skip":
         return {"ok": True, "module_id": module_id, "skipped": True}
 
+    # Read schema early to check/install dependencies before writing files
+    schema = {}
+    if "schema.json" in names:
+        schema = json.loads(zf.read("schema.json"))
+    raw_deps = schema.get("dependencies", [])
+
+    # Install dependencies (skip blocked ones — caller saw them in preview)
+    dep_results = []
+    dep_errors  = []
+    for dep in raw_deps:
+        status = _check_dep(dep)
+        if status["blocked"]:
+            dep_errors.append(f"Blocked dep: {dep}")
+        elif not status["installed"]:
+            r = _install_dep(dep)
+            dep_results.append(r)
+            if not r["ok"]:
+                dep_errors.append(f"Failed to install {dep}: {r.get('error','')}")
+        else:
+            dep_results.append({**status, "ok": True, "skipped": True})
+
+    if dep_errors:
+        return {"ok": False, "module_id": module_id,
+                "error": "Dependency installation failed",
+                "dep_errors": dep_errors, "dep_results": dep_results}
+
     installed = []
 
     # Install Python source
@@ -1459,8 +1520,7 @@ async def import_module(file: UploadFile = File(...), config: str = "{}"):
             raise HTTPException(422, f"Invalid module source: {e}")
 
     # Install schema / config (update module_id in schema if renamed)
-    if "schema.json" in names:
-        schema = json.loads(zf.read("schema.json"))
+    if schema:
         if action == "rename" and new_id:
             schema["id"] = new_id
         schema_path = SCHEMAS_DIR / f"{module_id}.json"
@@ -1478,7 +1538,8 @@ async def import_module(file: UploadFile = File(...), config: str = "{}"):
         dest.write_bytes(zf.read(entry))
         installed.append("example")
 
-    return {"ok": True, "module_id": module_id, "installed": installed}
+    return {"ok": True, "module_id": module_id, "installed": installed,
+            "dep_results": dep_results}
 
 
 @app.get("/api/books/{book_id}/export")
@@ -1949,6 +2010,136 @@ def save_module_config(module_id: str, body: dict):
     return {"ok": True}
 
 
+@app.get("/api/modules/{module_id}/dependencies")
+def get_module_dependencies(module_id: str):
+    """Return dependency status for a module's declared dependencies."""
+    schema = _load_schema(module_id) or {}
+    deps = schema.get("dependencies", [])
+    return {"dependencies": [_check_dep(d) for d in deps]}
+
+
+@app.post("/api/modules/{module_id}/install-dependencies")
+def install_module_dependencies(module_id: str):
+    """Install any missing (non-blocked) dependencies for a module."""
+    schema = _load_schema(module_id) or {}
+    deps = schema.get("dependencies", [])
+    results = []
+    for d in deps:
+        status = _check_dep(d)
+        if status["blocked"]:
+            results.append({**status, "ok": False})
+        elif status["installed"]:
+            results.append({**status, "ok": True, "skipped": True})
+        else:
+            results.append(_install_dep(d))
+    all_ok = all(r.get("ok") or r.get("skipped") for r in results)
+    return {"ok": all_ok, "results": results}
+
+
+@app.patch("/api/samples/{sample_id}/module-config/{module_id}")
+async def update_sample_module_config(sample_id: str, module_id: str, request: Request):
+    """Persist per-sample, per-module configuration values.
+    Body: dict of { field_id: value } for this module only.
+    Merges into the existing module_config JSON stored on the sample."""
+    body = await request.json()
+    with get_db() as conn:
+        row = conn.execute("SELECT module_config FROM samples WHERE id=?", (sample_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"Sample '{sample_id}' not found")
+        mc = json.loads(row["module_config"] or "{}")
+        mc[module_id] = {**(mc.get(module_id) or {}), **body}
+        conn.execute("UPDATE samples SET module_config=? WHERE id=?", (json.dumps(mc), sample_id))
+    return {"ok": True}
+
+
+@app.post("/api/settings/install-packages")
+async def install_global_packages(request: Request):
+    """Install all packages listed in settings.extra_packages."""
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key='main'").fetchone()
+    settings = json.loads(row["value"] if row else "{}" or "{}")
+    packages = settings.get("extra_packages", [])
+    results = []
+    for p in packages:
+        status = _check_dep(p)
+        if status["blocked"]:
+            results.append({**status, "ok": False})
+        elif status["installed"]:
+            results.append({**status, "ok": True, "skipped": True})
+        else:
+            results.append(_install_dep(p))
+    return {"ok": all(r.get("ok") or r.get("skipped") for r in results), "results": results}
+
+
+def _build_resource_api() -> dict:
+    """Return a namespace dict of read-only resource functions for injection into proc_code.
+    Each function opens its own short-lived DB connection so this can be called from
+    endpoints that don't already hold one."""
+    def get_material(mat_id):
+        with get_db() as conn:
+            row = conn.execute("SELECT * FROM materials_library WHERE id=?", (mat_id,)).fetchone()
+        return _mat_row_to_dict(row) if row else None
+
+    def list_materials():
+        with get_db() as conn:
+            rows = conn.execute("SELECT id FROM materials_library ORDER BY name").fetchall()
+        return [r["id"] for r in rows]
+
+    def get_technique(tech_id):
+        with get_db() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key='main'").fetchone()
+        if not row:
+            return None
+        s = json.loads(row["value"] or "{}")
+        return s.get("techniques", {}).get(tech_id)
+
+    def list_techniques():
+        with get_db() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key='main'").fetchone()
+        if not row:
+            return []
+        s = json.loads(row["value"] or "{}")
+        return list(s.get("techniques", {}).keys())
+
+    return dict(
+        get_material=get_material,
+        list_materials=list_materials,
+        get_technique=get_technique,
+        list_techniques=list_techniques,
+    )
+
+
+def _check_dep(dep_str: str) -> dict:
+    """Check whether a pip dependency is installed and not blacklisted."""
+    pkg_name = re.split(r"[>=<!;\[]", dep_str)[0].strip().replace("-", "_").lower()
+    if pkg_name in _DEP_BLACKLIST:
+        return {"dep": dep_str, "pkg": pkg_name, "installed": False, "blocked": True,
+                "reason": f"Package '{pkg_name}' is not permitted"}
+    installed = importlib.util.find_spec(pkg_name) is not None
+    return {"dep": dep_str, "pkg": pkg_name, "installed": installed, "blocked": False}
+
+
+def _install_dep(dep_str: str) -> dict:
+    """Install a pip dependency. Returns status dict."""
+    pkg_name = re.split(r"[>=<!;\[]", dep_str)[0].strip().replace("-", "_").lower()
+    if pkg_name in _DEP_BLACKLIST:
+        return {"dep": dep_str, "ok": False, "blocked": True,
+                "error": f"Package '{pkg_name}' is not permitted"}
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", dep_str],
+            capture_output=True, text=True, timeout=120,
+        )
+        success = result.returncode == 0
+        return {"dep": dep_str, "ok": success, "blocked": False,
+                "output": result.stdout[-2000:] if result.stdout else "",
+                "error":  result.stderr[-1000:] if not success else ""}
+    except subprocess.TimeoutExpired:
+        return {"dep": dep_str, "ok": False, "blocked": False, "error": "Install timed out"}
+    except Exception as exc:
+        return {"dep": dep_str, "ok": False, "blocked": False, "error": str(exc)}
+
+
 def _json_safe(obj):
     """Recursively convert obj to a JSON-serialisable form."""
     if obj is None or isinstance(obj, (bool, int, float, str)):
@@ -1982,10 +2173,12 @@ def run_module_processing(module_id: str, body: dict):
     # Wrap user code (which uses `return`) in a function
     indented = "\n".join(f"    {line}" for line in code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
-    namespace: dict = {"file_bytes": file_bytes, "filename": filename, "meta": {}}
+    _meta: dict = {"config": {}}
+    namespace: dict = {"file_bytes": file_bytes, "filename": filename, "meta": _meta,
+                       **_build_resource_api()}
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
-        result = namespace["_proc"](file_bytes, filename, {})
+        result = namespace["_proc"](file_bytes, filename, _meta)
         return {"ok": True, "result": _json_safe(result)}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "traceback": tb.format_exc()}
@@ -2015,10 +2208,12 @@ def preview_module_plot(module_id: str, body: dict):
     # Run processing code
     indented = "\n".join(f"    {line}" for line in code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
-    namespace: dict = {"file_bytes": file_bytes, "filename": filename, "meta": {}}
+    _meta: dict = {"config": {}}
+    namespace: dict = {"file_bytes": file_bytes, "filename": filename, "meta": _meta,
+                       **_build_resource_api()}
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
-        data = namespace["_proc"](file_bytes, filename, {})
+        data = namespace["_proc"](file_bytes, filename, _meta)
     except Exception as exc:
         return {"ok": False, "stage": "processing", "error": str(exc), "traceback": tb.format_exc()}
     if not isinstance(data, dict):
@@ -2104,7 +2299,10 @@ def render_for_sample(module_id: str, body: dict):
 
     # Look for a file matching the module_id key in filenames
     with get_db() as conn:
-        row = conn.execute("SELECT filenames, thickness_nm, area_m2 FROM samples WHERE id=?", (sample_id,)).fetchone()
+        row = conn.execute(
+            "SELECT filenames, thickness_nm, area_m2, module_config FROM samples WHERE id=?",
+            (sample_id,),
+        ).fetchone()
     if not row:
         raise HTTPException(404, f"Sample '{sample_id}' not found")
     filenames   = json.loads(row["filenames"] or "{}")
@@ -2118,12 +2316,19 @@ def render_for_sample(module_id: str, body: dict):
         return {"ok": False, "error": f"File not found: {filename}"}
     file_bytes = file_path.read_bytes()
     area_correction = float((body.get("options") or {}).get("area_correction", 1.0) or 1.0)
-    meta = {"thickness_nm": thickness, "area_m2": area, "area_correction": area_correction}
+
+    # Build meta — include per-sample module config with schema defaults applied
+    schema = _load_schema(module_id) or {}
+    mod_config = json.loads(row["module_config"] or "{}").get(module_id, {})
+    for field in schema.get("config_schema", []):
+        mod_config.setdefault(field["id"], field.get("default"))
+    meta = {"thickness_nm": thickness, "area_m2": area, "area_correction": area_correction,
+            "config": mod_config}
 
     # Run processing code
     indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
-    namespace: dict = {}
+    namespace: dict = {**_build_resource_api()}
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
         data = namespace["_proc"](file_bytes, filename, meta)
@@ -2161,7 +2366,10 @@ def compute_module_analysis_for_sample(module_id: str, body: dict):
     analysis_code = body.get("analysis_code", "")
 
     with get_db() as conn:
-        row = conn.execute("SELECT filenames, thickness_nm, area_m2, area_correction FROM samples WHERE id=?", (sample_id,)).fetchone()
+        row = conn.execute(
+            "SELECT filenames, thickness_nm, area_m2, area_correction, module_config FROM samples WHERE id=?",
+            (sample_id,),
+        ).fetchone()
     if not row:
         raise HTTPException(404, f"Sample '{sample_id}' not found")
     filenames    = json.loads(row["filenames"] or "{}")
@@ -2175,11 +2383,18 @@ def compute_module_analysis_for_sample(module_id: str, body: dict):
     if not file_path.exists():
         return {"ok": False, "error": f"File not found: {filename}"}
     file_bytes = file_path.read_bytes()
-    meta = {"thickness_nm": thickness, "area_m2": area, "area_correction": area_corr}
 
+    schema = _load_schema(module_id) or {}
+    mod_config = json.loads(row["module_config"] or "{}").get(module_id, {})
+    for field in schema.get("config_schema", []):
+        mod_config.setdefault(field["id"], field.get("default"))
+    meta = {"thickness_nm": thickness, "area_m2": area, "area_correction": area_corr,
+            "config": mod_config}
+
+    resource_api = _build_resource_api()
     indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
-    namespace: dict = {}
+    namespace: dict = {**resource_api}
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
         result = namespace["_proc"](file_bytes, filename, meta)
@@ -2190,7 +2405,7 @@ def compute_module_analysis_for_sample(module_id: str, body: dict):
 
     indented2 = "\n".join(f"    {line}" for line in analysis_code.splitlines())
     wrapped2  = f"def _analysis(result):\n{indented2}\n"
-    namespace2: dict = {}
+    namespace2: dict = {**resource_api}
     try:
         exec(compile(wrapped2, "<analysis>", "exec"), namespace2)   # noqa: S102
         metrics = namespace2["_analysis"](result)
@@ -2216,12 +2431,14 @@ def compute_module_analysis(module_id: str, body: dict):
     filename   = f.name
 
     # Run processing code
+    _meta: dict = {"config": {}}
+    resource_api = _build_resource_api()
     indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
-    namespace: dict = {}
+    namespace: dict = {**resource_api}
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
-        result = namespace["_proc"](file_bytes, filename, {})
+        result = namespace["_proc"](file_bytes, filename, _meta)
     except Exception as exc:
         return {"ok": False, "stage": "processing", "error": str(exc), "traceback": tb.format_exc()}
     if not isinstance(result, dict):
@@ -2230,7 +2447,7 @@ def compute_module_analysis(module_id: str, body: dict):
     # Run analysis code — wrap in a function that receives `result` and must return a dict
     indented2 = "\n".join(f"    {line}" for line in analysis_code.splitlines())
     wrapped2  = f"def _analysis(result):\n{indented2}\n"
-    namespace2: dict = {}
+    namespace2: dict = {**resource_api}
     try:
         exec(compile(wrapped2, "<analysis>", "exec"), namespace2)   # noqa: S102
         metrics = namespace2["_analysis"](result)

@@ -1020,9 +1020,92 @@ function fmtAreaMicron(m2) {
 }
 
 // ── ModuleCard ────────────────────────────────────────────────────────────────
+// ── ModuleConfigModal ─────────────────────────────────────────────────────────
+
+function ModuleConfigModal({ mod, sample, onClose, onSaved }) {
+  const mono = "'DM Mono', monospace";
+  const schema = mod.config_schema || [];
+  const existing = (sample.module_config || {})[mod.id] || {};
+
+  // initialise form values: use saved value if present, else field default
+  const initValues = () => {
+    const v = {};
+    for (const f of schema) v[f.id] = existing[f.id] !== undefined ? existing[f.id] : (f.default ?? "");
+    return v;
+  };
+  const [values, setValues] = useState(initValues);
+  const [saving, setSaving] = useState(false);
+
+  useEscClose(onClose);
+
+  const doSave = async () => {
+    setSaving(true);
+    try {
+      await api("PATCH", `/samples/${sample.id}/module-config/${mod.id}`, values);
+      onSaved?.();
+      onClose();
+    } catch (e) { /* silently ignore */ }
+    setSaving(false);
+  };
+
+  const set = (id, val) => setValues(prev => ({ ...prev, [id]: val }));
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 900, display: "flex", alignItems: "center", justifyContent: "center" }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div onKeyDown={useModalEnter(doSave)} style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 12, padding: "24px 28px", width: 480, maxWidth: "95vw", maxHeight: "80vh", overflow: "auto" }}>
+        <div style={{ display: "flex", alignItems: "center", marginBottom: 18 }}>
+          <span style={{ fontFamily: mono, fontSize: 13, color: T.textPrimary, fontWeight: 600, flex: 1 }}>{mod.name} — Config</span>
+          <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>{sample.id}</span>
+        </div>
+        {schema.length === 0 ? (
+          <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>No configuration fields defined for this module.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            {schema.map(field => (
+              <div key={field.id}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: T.textSecondary, marginBottom: 5, display: "flex", gap: 8, alignItems: "baseline" }}>
+                  <span>{field.label || field.id}</span>
+                  {field.unit && <span style={{ color: T.textDim }}>({field.unit})</span>}
+                  <span style={{ color: T.textDim, marginLeft: "auto" }}>{field.id}</span>
+                </div>
+                {field.type === "boolean" ? (
+                  <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                    <input type="checkbox" checked={!!values[field.id]}
+                      onChange={e => set(field.id, e.target.checked)}
+                      style={{ accentColor: T.teal, width: 14, height: 14 }} />
+                    <span style={{ fontFamily: mono, fontSize: 12, color: T.textPrimary }}>{values[field.id] ? "true" : "false"}</span>
+                  </label>
+                ) : field.type === "select" ? (
+                  <select value={values[field.id] ?? ""}
+                    onChange={e => set(field.id, e.target.value)}
+                    style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "6px 10px", outline: "none" }}>
+                    {(field.choices || []).map(ch => <option key={ch} value={ch}>{ch}</option>)}
+                  </select>
+                ) : (
+                  <input
+                    type={field.type === "number" ? "number" : "text"}
+                    value={values[field.id] ?? ""}
+                    onChange={e => set(field.id, field.type === "number" ? (e.target.value === "" ? "" : Number(e.target.value)) : e.target.value)}
+                    style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "6px 10px", outline: "none", boxSizing: "border-box" }}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 22 }}>
+          <Btn variant="ghost" small onClick={onClose}>Cancel</Btn>
+          <Btn variant="primary" small onClick={doSave} disabled={saving}>{saving ? "Saving…" : "Save"}</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Generic card for user/built-in modules on the sample detail page.
 
-function ModuleCard({ mod, sample, onRemoved }) {
+function ModuleCard({ mod, sample, onRemoved, onSampleUpdate }) {
   const mono = "'DM Mono', monospace";
 
   const filename = sample.filenames?.[mod.id];
@@ -1034,12 +1117,14 @@ function ModuleCard({ mod, sample, onRemoved }) {
     return s;
   };
   const areaCtrl = (mod.card_controls || []).find(c => c.type === "area");
+  const hasConfig = (mod.config_schema || []).length > 0;
   const [controlState, setControlState] = useState(initControls);
   const [plotData,     setPlotData]     = useState(null); // {points, xLabel, yLabel, color}
   const [loading,      setLoading]      = useState(false);
   const [fetchError,   setFetchError]   = useState(null);
   const [areaM2,       setAreaM2]       = useState(sample.area_m2 ?? null);
   const [corrExpr,     setCorrExpr]     = useState(String(sample.area_correction ?? areaCtrl?.default ?? 1.0));
+  const [configOpen,   setConfigOpen]   = useState(false);
 
   const fetchPlot = async (overrides = {}) => {
     setLoading(true); setFetchError(null);
@@ -1111,6 +1196,10 @@ function ModuleCard({ mod, sample, onRemoved }) {
               ))}
             </div>
           ))}
+          {hasConfig && (
+            <button onClick={() => setConfigOpen(true)} title="Module configuration"
+              style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, lineHeight: 1, padding: "0 2px" }}>⚙</button>
+          )}
           <span style={{ fontSize: 10, color: T.textDim, fontFamily: mono, maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filename}</span>
           <button onClick={handleDelete} title="Remove data" style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 14, lineHeight: 1, padding: 0 }}>✕</button>
         </div>
@@ -1159,6 +1248,14 @@ function ModuleCard({ mod, sample, onRemoved }) {
           </div>
         )}
       </div>
+      {configOpen && (
+        <ModuleConfigModal
+          mod={mod}
+          sample={sample}
+          onClose={() => setConfigOpen(false)}
+          onSaved={() => { onSampleUpdate?.(); fetchPlot(); }}
+        />
+      )}
     </div>
   );
 }
@@ -2091,7 +2188,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               onAnalyze={t === "xrd_ot" ? () => setXrdAnalysisOpen(true) : undefined} />
           ))}
           {modulesForSection("structural").map(m => (
-            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} />
+            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
           ))}
           {xrdAnalysisOpen && (
             <XRDAnalysisModal
@@ -2111,7 +2208,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
           <AfmCard afmData={pd.afm} filename={sample.filenames?.afm} onFile={file => handleFile("afm", file)} />
           {modulesForSection("scanning_probe").map(m => (
-            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} />
+            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
           ))}
         </div>
       </section>
@@ -2134,7 +2231,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               onAreaChange={handleAreaChange} />
           ))}
           {modulesForSection("electrical").map(m => (
-            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} />
+            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
           ))}
         </div>
         {addDataOpen && <AddDataModal
@@ -2150,7 +2247,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         <section>
           <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Optical</div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
-            {modulesForSection("optical").map(m => <ModuleCard key={m.id} mod={m} sample={sample} />)}
+            {modulesForSection("optical").map(m => <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} onSampleUpdate={refreshSample} />)}
           </div>
         </section>
       )}
@@ -2160,7 +2257,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         <section>
           <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Other</div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
-            {modulesForSection("other").map(m => <ModuleCard key={m.id} mod={m} sample={sample} />)}
+            {modulesForSection("other").map(m => <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} onSampleUpdate={refreshSample} />)}
           </div>
         </section>
       )}
@@ -3859,6 +3956,10 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
   // ── Card section state ────────────────────────────────────────────────────
   const [cardSection,   setCardSection]   = useState("");          // "electrical"|"structural"|...
   const [cardControls,  setCardControls]  = useState([]);          // [{name,type,choices,default,plot_overrides}]
+  const [configSchema,  setConfigSchema]  = useState([]);          // [{id,label,type,default,unit?,choices?}]
+  const [moduleDeps,    setModuleDeps]    = useState([]);          // ["lmfit>=1.0", ...]
+  const [depStatus,     setDepStatus]     = useState([]);          // [{dep,pkg,installed,blocked}]
+  const [depLoading,    setDepLoading]    = useState(false);
 
   const defaultProcBlock2 = () =>
     `# Transform the imported variables into your desired output.\n# Variables from Block 1 are numpy arrays and in scope.\n# Example:\n# xs = voltage * 1000\n# ys = charge / area_m2`;
@@ -3917,6 +4018,8 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       }
       if (cfg.section)          setCardSection(cfg.section);
       if (cfg.card_controls)    setCardControls(cfg.card_controls);
+      if (cfg.config_schema)    setConfigSchema(cfg.config_schema);
+      if (cfg.dependencies)     { setModuleDeps(cfg.dependencies); }
       if (cfg.delimiter)  setExDelim(cfg.delimiter);
       if (cfg.skip_rows != null) setExSkip(String(cfg.skip_rows));
     }).catch(() => {});
@@ -3925,6 +4028,11 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       if (info.delimiter && info.delimiter !== "auto") setExDelim(info.delimiter);
       if (info.skip_rows != null) setExSkip(String(info.skip_rows));
     }).catch(() => {});
+    if (!isCreate) {
+      api("GET", `/modules/${mod.id}/dependencies`).then(r => {
+        if (r?.dependencies) setDepStatus(r.dependencies);
+      }).catch(() => {});
+    }
   }, [mod.id, isCreate]);
 
   const handleExampleUpload = async (file) => {
@@ -3987,6 +4095,8 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       analysis_code: fullAnalysisCode(), // backward compat
       section: cardSection,
       card_controls: cardControls,
+      config_schema: configSchema,
+      dependencies: moduleDeps,
       folder_id: mFolderId || null,
     };
     await api("PUT", `/modules/${id}/config`, cfg);
@@ -4071,12 +4181,14 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       lines.push(``);
     }
 
-    // Footer comment listing available names
+    // Footer comment listing available names + resource API
     const available = ["file_bytes", "filename", "meta",
       ...namedCols.map(([, v]) => v),
       ...namedMeta.map(([, v]) => v),
     ].join(", ");
     lines.push(`# Available: ${available}`);
+    lines.push(`# meta["config"] holds per-sample config values declared in the Configuration section`);
+    lines.push(`# Resources: get_material(id), list_materials(), get_technique(id), list_techniques()`);
     lines.push(`# ─────────────────────────────────────────────────────────────────────`);
     return lines.join("\n");
   };
@@ -4442,6 +4554,154 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
             </div>
           ))}
         </div>
+
+        {/* ── Dependencies ── */}
+        <div style={{ marginTop: 20 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Dependencies</span>
+            <button
+              disabled={depLoading || depStatus.every(d => d.installed || d.blocked)}
+              onClick={async () => {
+                setDepLoading(true);
+                const r = await api("POST", `/modules/${mod.id}/install-dependencies`).catch(() => null);
+                if (r?.results) setDepStatus(prev => {
+                  const map = Object.fromEntries(r.results.map(x => [x.dep, x]));
+                  return prev.map(d => map[d.dep] ? { ...d, installed: map[d.dep].ok || d.installed } : d);
+                });
+                setDepLoading(false);
+              }}
+              style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: depLoading ? T.textDim : T.teal, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: depLoading ? "default" : "pointer" }}>
+              {depLoading ? "Installing…" : "Install missing"}
+            </button>
+          </div>
+          <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 8 }}>
+            pip packages required by this module (e.g. <span style={{ color: T.textPrimary }}>lmfit&gt;=1.0</span>). One per line.
+          </div>
+          <textarea
+            value={moduleDeps.join("\n")}
+            onChange={e => {
+              const deps = e.target.value.split("\n").map(s => s.trim()).filter(Boolean);
+              setModuleDeps(deps);
+              setDepStatus([]);
+            }}
+            rows={Math.max(2, moduleDeps.length + 1)}
+            spellCheck={false}
+            style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "8px 10px", outline: "none", resize: "vertical", boxSizing: "border-box" }}
+          />
+          {depStatus.length > 0 && (
+            <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {depStatus.map((d, i) => (
+                <span key={i} style={{
+                  fontFamily: mono, fontSize: 10, padding: "2px 8px", borderRadius: 10,
+                  border: `1px solid ${d.blocked ? T.red + "55" : d.installed ? T.teal + "55" : T.amber + "55"}`,
+                  background: d.blocked ? T.red + "12" : d.installed ? T.teal + "12" : T.amber + "12",
+                  color: d.blocked ? T.red : d.installed ? T.teal : T.amber,
+                }}>
+                  {d.dep} {d.blocked ? "⊘ blocked" : d.installed ? "✓" : "⚠ missing"}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Configuration Schema section ── */}
+      <div style={section}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <h3 style={{ ...sh, margin: 0 }}>Configuration</h3>
+          <button
+            onClick={() => setConfigSchema(prev => [...prev, { id: "", label: "", type: "text", default: "" }])}
+            style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: T.textSecondary, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+            + Add field
+          </button>
+        </div>
+        <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 12 }}>
+          Per-sample configuration fields. Values are stored per sample and available as <span style={{ color: T.textPrimary }}>meta["config"]["field_id"]</span> in proc_code.
+        </div>
+        {configSchema.length === 0 && (
+          <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>No config fields — module uses only card controls and default meta values.</div>
+        )}
+        {configSchema.map((field, i) => (
+          <div key={i} style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "12px 14px", marginBottom: 8 }}>
+            <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>ID (key)</div>
+                <input value={field.id}
+                  onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, id: e.target.value } : f))}
+                  placeholder="field_id"
+                  style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.teal, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+              </div>
+              <div style={{ flex: 1.5 }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Label</div>
+                <input value={field.label}
+                  onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, label: e.target.value } : f))}
+                  placeholder="Displayed label"
+                  style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+              </div>
+              <div>
+                <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Type</div>
+                <select value={field.type}
+                  onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, type: e.target.value, choices: e.target.value === "select" ? (f.choices || ["a", "b"]) : undefined } : f))}
+                  style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 11, padding: "4px 6px", outline: "none" }}>
+                  <option value="text">text</option>
+                  <option value="number">number</option>
+                  <option value="boolean">boolean</option>
+                  <option value="select">select</option>
+                </select>
+              </div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>{field.type === "boolean" ? "Default (true/false)" : "Default"}</div>
+                {field.type === "boolean" ? (
+                  <select value={field.default === true || field.default === "true" ? "true" : "false"}
+                    onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, default: e.target.value === "true" } : f))}
+                    style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "4px 6px", outline: "none" }}>
+                    <option value="false">false</option>
+                    <option value="true">true</option>
+                  </select>
+                ) : (
+                  <input value={field.default ?? ""}
+                    onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, default: field.type === "number" ? (e.target.value === "" ? "" : Number(e.target.value)) : e.target.value } : f))}
+                    type={field.type === "number" ? "number" : "text"}
+                    style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+                )}
+              </div>
+              {field.type === "number" && (
+                <div style={{ width: 80 }}>
+                  <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Unit</div>
+                  <input value={field.unit || ""}
+                    onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, unit: e.target.value } : f))}
+                    placeholder="Hz"
+                    style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+                </div>
+              )}
+              <button onClick={() => setConfigSchema(prev => prev.filter((_, j) => j !== i))}
+                style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, padding: "0 4px", alignSelf: "flex-end", marginBottom: 2 }}>×</button>
+            </div>
+            {field.type === "select" && (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 6 }}>Choices</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+                  {(field.choices || []).map((ch, ci) => (
+                    <div key={ci} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <input value={ch}
+                        onChange={e => setConfigSchema(prev => prev.map((f, j) => {
+                          if (j !== i) return f;
+                          const c2 = [...(f.choices || [])]; c2[ci] = e.target.value; return { ...f, choices: c2 };
+                        }))}
+                        style={{ width: 80, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.teal, fontFamily: mono, fontSize: 12, padding: "3px 6px", outline: "none" }} />
+                      <button onClick={() => setConfigSchema(prev => prev.map((f, j) => j !== i ? f : { ...f, choices: (f.choices || []).filter((_, k) => k !== ci) }))}
+                        style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>×</button>
+                    </div>
+                  ))}
+                  <button onClick={() => setConfigSchema(prev => prev.map((f, j) => j !== i ? f : { ...f, choices: [...(f.choices || []), ""] }))}
+                    style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 10, padding: "2px 8px", cursor: "pointer" }}>
+                    + choice
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
       </div>
 
       {/* ── Data section ── */}
@@ -5374,7 +5634,10 @@ function ImportModal({ type, onConfirm, onClose }) {
 
   const canConfirm = preview && !previewing && (() => {
     if (type === "sample" && sampleAction === "rename") return sampleNewId.trim().length > 0;
-    if (type === "module" && moduleAction === "rename") return moduleNewId.trim().length > 0;
+    if (type === "module") {
+      if (preview.has_blocked_deps) return false;
+      if (moduleAction === "rename") return moduleNewId.trim().length > 0;
+    }
     return true;
   })();
 
@@ -5522,11 +5785,28 @@ function ImportModal({ type, onConfirm, onClose }) {
                     </span>
                     {m.description && <span style={{ ...mono, fontSize: 11, color: T.textSecondary, marginTop: 2 }}>{m.description}</span>}
                     {m.dependencies?.length > 0 && (
-                      <div style={{ marginTop: 4, display: "flex", flexWrap: "wrap", gap: 4 }}>
-                        <span style={{ ...mono, fontSize: 9, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>deps:</span>
-                        {m.dependencies.map(d => (
-                          <span key={d} style={{ ...mono, fontSize: 10, padding: "1px 6px", borderRadius: 4, background: T.bg2, color: T.teal, border: `1px solid ${T.teal}33` }}>{d}</span>
-                        ))}
+                      <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                        <span style={{ ...mono, fontSize: 9, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>
+                          Dependencies {m.has_blocked_deps ? "— ⊘ blocked" : m.has_missing_deps ? "— will install" : "— all installed ✓"}
+                        </span>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                          {m.dependencies.map(d => (
+                            <span key={d.dep} style={{
+                              ...mono, fontSize: 10, padding: "2px 8px", borderRadius: 10,
+                              border: `1px solid ${d.blocked ? T.red + "55" : d.installed ? T.teal + "55" : T.amber + "55"}`,
+                              background: d.blocked ? T.red + "12" : d.installed ? T.teal + "12" : T.amber + "12",
+                              color: d.blocked ? T.red : d.installed ? T.teal : T.amber,
+                            }}>
+                              {d.dep} {d.blocked ? "⊘" : d.installed ? "✓" : "⚠"}
+                            </span>
+                          ))}
+                        </div>
+                        {m.has_blocked_deps && (
+                          <span style={{ ...mono, fontSize: 10, color: T.red }}>⊘ Import blocked — archive requires a restricted package.</span>
+                        )}
+                        {!m.has_blocked_deps && m.has_missing_deps && (
+                          <span style={{ ...mono, fontSize: 10, color: T.amber }}>Missing packages will be installed automatically on import.</span>
+                        )}
                       </div>
                     )}
                   </div>
@@ -5814,6 +6094,8 @@ function SettingsModal({ settings, onSave, onClose }) {
   useEscClose(onClose);
   const [draft, setDraft] = useState(() => JSON.parse(JSON.stringify(settings)));
   const [techOpen, setTechOpen] = useState({});
+  const [pkgInstalling, setPkgInstalling] = useState(false);
+  const [pkgResults,    setPkgResults]    = useState(null);
   const set = (path, v) => setDraft(p => {
     const d = JSON.parse(JSON.stringify(p));
     const keys = path.split(".");
@@ -6019,6 +6301,52 @@ function SettingsModal({ settings, onSave, onClose }) {
         {/* Technique Library */}
         {sectionHdr("Technique Library")}
         {renderTechniqueLibrary()}
+
+        {/* Global Packages */}
+        {sectionHdr("Global Packages")}
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>
+            Extra pip packages available to all modules. One per line (e.g. <span style={{ color: T.textPrimary }}>lmfit&gt;=1.0</span>).
+          </div>
+          <textarea
+            value={(draft.extra_packages || []).join("\n")}
+            onChange={e => {
+              const pkgs = e.target.value.split("\n").map(s => s.trim()).filter(Boolean);
+              set("extra_packages", pkgs);
+              setPkgResults(null);
+            }}
+            rows={Math.max(2, (draft.extra_packages || []).length + 1)}
+            spellCheck={false}
+            style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 6, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "8px 10px", outline: "none", resize: "vertical", boxSizing: "border-box" }}
+          />
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <button
+              disabled={pkgInstalling || !(draft.extra_packages || []).length}
+              onClick={async () => {
+                setPkgInstalling(true); setPkgResults(null);
+                // Save settings first so backend picks up the latest package list
+                await api("PUT", "/settings", draft).catch(() => {});
+                const r = await api("POST", "/settings/install-packages").catch(() => null);
+                setPkgResults(r?.results || null);
+                setPkgInstalling(false);
+              }}
+              style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 14px", borderRadius: 6, border: `1px solid ${T.teal}55`, background: "none", color: pkgInstalling ? T.textDim : T.teal, cursor: pkgInstalling ? "default" : "pointer" }}>
+              {pkgInstalling ? "Installing…" : "Install now"}
+            </button>
+            {pkgResults && (
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: pkgResults.every(r => r.ok || r.skipped) ? T.teal : T.red }}>
+                {pkgResults.every(r => r.ok || r.skipped) ? "✓ All installed" : "⚠ Some failed — check console"}
+              </span>
+            )}
+          </div>
+          {pkgResults && pkgResults.some(r => !r.ok && !r.skipped) && (
+            <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, background: T.bg0, border: `1px solid ${T.red}33`, borderRadius: 6, padding: "8px 10px" }}>
+              {pkgResults.filter(r => !r.ok && !r.skipped).map(r => (
+                <div key={r.dep}>{r.dep}: {r.blocked ? "blocked" : r.error || "install failed"}</div>
+              ))}
+            </div>
+          )}
+        </div>
 
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 4 }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
