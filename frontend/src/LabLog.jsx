@@ -423,6 +423,33 @@ const Sel = ({ label, value, onChange, options }) => (
   </div>
 );
 
+// ── Global hotkey infrastructure ──────────────────────────────────────────────
+
+// Escape stack — modals push their close handler on mount, pop on unmount.
+// The global keydown listener (in App) calls the top of the stack on Escape.
+const _escStack = [];
+function pushEsc(fn) { _escStack.push(fn); }
+function popEsc(fn)  { const i = _escStack.lastIndexOf(fn); if (i >= 0) _escStack.splice(i, 1); }
+
+// Hook: registers onClose in the esc stack for the lifetime of the component.
+function useEscClose(onClose) {
+  useEffect(() => {
+    pushEsc(onClose);
+    return () => popEsc(onClose);
+  }, [onClose]);
+}
+
+// Returns an onKeyDown handler that fires onSave on Enter (skips textarea/select).
+function useModalEnter(onSave) {
+  return (e) => {
+    if (e.key === "Enter" && !e.isComposing &&
+        e.target.tagName !== "TEXTAREA" && e.target.tagName !== "SELECT") {
+      e.preventDefault();
+      onSave?.();
+    }
+  };
+}
+
 // Recursively builds a flat ordered list of folder options with depth metadata.
 // Pass `filterFn` to restrict which folders are eligible (e.g. sample-only).
 function buildFolderOptions(folders, filterFn, parentId = null, depth = 0) {
@@ -1703,7 +1730,10 @@ function LayerEditor({ layer, technique: sampleTechnique, onRemove, onDuplicate,
   };
   const saveEdit = (e) => { e.stopPropagation(); onUpdate(draft); setEditing(false); };
   const cancelEdit = (e) => { e.stopPropagation(); if (initialEditing) { onRemove(); } else { setEditing(false); } };
-  const handleEditKeyDown = (e) => { if (e.key === "Enter") { e.preventDefault(); onUpdate(draft); setEditing(false); } };
+  const handleEditKeyDown = (e) => {
+    if (e.key === "Enter" && e.target.tagName !== "TEXTAREA" && e.target.tagName !== "SELECT") { e.preventDefault(); onUpdate(draft); setEditing(false); }
+    if (e.key === "Escape") { e.stopPropagation(); setDraft(JSON.parse(JSON.stringify(layer))); setEditing(false); }
+  };
   const setDraftField = (k, v) => setDraft(p => ({ ...p, [k]: v }));
   const updateTarget = (i, t, layerDefaults)  => setDraft(p => { const ts = [...p.targets]; ts[i] = t; const patch = { ...p, targets: ts }; if (i === 0 && layerDefaults) { const { custom: newCustom, ...rest } = layerDefaults; Object.assign(patch, rest); if (newCustom) patch.custom = { ...(patch.custom || {}), ...newCustom }; } return patch; });
   const removeTarget = (i)     => setDraft(p => { const ts = p.targets.filter((_, j) => j !== i); return { ...p, targets: ts }; });
@@ -1870,6 +1900,7 @@ function splitCsvLine(line) {
 // ── AddDataModal ──────────────────────────────────────────────────────────────
 
 function AddDataModal({ onClose, moduleOptions = [], sampleId, onModuleFileAdded }) {
+  useEscClose(onClose);
   const mono = { fontFamily: "'DM Mono', monospace" };
   const [uploadingFor, setUploadingFor] = useState(null); // module id being uploaded
   const [uploading,    setUploading]    = useState(false);
@@ -2140,6 +2171,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 // ── AddLayerModal ─────────────────────────────────────────────────────────────
 
 function AddLayerModal({ technique: sampleTechnique, knownMaterials, settings, materialsLib = [], onAdd, onClose }) {
+  useEscClose(onClose);
   const [layerTech, setLayerTech] = useState(sampleTechnique);
   const [draft, setDraft] = useState(() => newLayer(sampleTechnique, settings));
 
@@ -2243,6 +2275,7 @@ function AddLayerModal({ technique: sampleTechnique, knownMaterials, settings, m
 // ── AddSampleModal ────────────────────────────────────────────────────────────
 
 function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
+  useEscClose(onClose);
   const [f, setF] = useState(() => template ? {
     id: "", date: template.date ?? new Date().toISOString().slice(0, 10),
     substrate: template.substrate ?? "", notes: template.notes ?? "",
@@ -2727,6 +2760,7 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow, bgResult = null, quick = false
 const PEAK_COLORS = ["#4a9eff", "#ff6b6b", "#51cf66", "#ffd43b", "#cc5de8", "#ff922b", "#20c997"];
 
 function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSaveXrdConfigs, onSave, onClose }) {
+  useEscClose(onClose);
   // xrd_peaks may be the old array format or the new { lines, fitWindow, fittedCurve, peakCurves } object
   const saved = sample.xrd_peaks;
   const isObj = saved && !Array.isArray(saved);
@@ -3482,6 +3516,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
 // ── ViewDataModal ──────────────────────────────────────────────────────────────
 
 function ViewDataModal({ sampleId, files, loading, onClose, onDeleteFile }) {
+  useEscClose(onClose);
 
   const fmt = (bytes) => {
     if (bytes < 1024) return `${bytes} B`;
@@ -3592,6 +3627,7 @@ function ViewDataModal({ sampleId, files, loading, onClose, onDeleteFile }) {
 // mod.mode: "view" (built-in, read-only) | "edit" (user, editable) | "create" (new module)
 
 function ModuleSourceModal({ mod, onClose, onSave, existingIds = [] }) {
+  useEscClose(onClose);
   const isView   = mod.mode === "view";
   const isEdit   = mod.mode === "edit";
   const isCreate = mod.mode === "create";
@@ -5101,6 +5137,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
 // ── ExportModal ────────────────────────────────────────────────────────────────
 
 function ExportModal({ samples, onClose }) {
+  useEscClose(onClose);
   const sampleTechnique = s => s.technique || "";
 
   const allSubstrates = [...new Set(samples.map(s => s.substrate).filter(Boolean))].sort();
@@ -5268,6 +5305,7 @@ function ExportModal({ samples, onClose }) {
 //   onClose     () => void
 
 function ImportModal({ type, onConfirm, onClose }) {
+  useEscClose(onClose);
   const mono = { fontFamily: "'DM Mono', monospace" };
 
   // ── File + preview state ──────────────────────────────────────────────────
@@ -5560,6 +5598,7 @@ function ImportModal({ type, onConfirm, onClose }) {
 // ── SettingsModal ─────────────────────────────────────────────────────────────
 
 function MaterialEditorModal({ material, settings, onSave, onDelete, onClose }) {
+  useEscClose(onClose);
   // material is null for new entries, or an existing entry for editing
   const isNew = !material?.id;
   const blank = { id: "", name: "", formula: "", composition: {}, parent: "", notes: "", crystal: {}, properties: {}, growth_defaults: {} };
@@ -5772,6 +5811,7 @@ function MaterialEditorModal({ material, settings, onSave, onDelete, onClose }) 
 }
 
 function SettingsModal({ settings, onSave, onClose }) {
+  useEscClose(onClose);
   const [draft, setDraft] = useState(() => JSON.parse(JSON.stringify(settings)));
   const [techOpen, setTechOpen] = useState({});
   const set = (path, v) => setDraft(p => {
@@ -6156,12 +6196,14 @@ function AddSampleFolderModal({ onSave, onClose, existing, allFolders = [] }) {
   const [name,     setName]     = useState(existing?.name || "");
   const [color,    setColor]    = useState(existing?.color || COLOR_OPTIONS[0]);
   const [parentId, setParentId] = useState(existing?.parent_id || "");
+  useEscClose(onClose);
   const sampleFolders = allFolders.filter(f => !f.book_folder && !f.module_folder && !f.mat_folder);
   const getDescendantIds = (id, set = new Set()) => { set.add(id); sampleFolders.filter(f => f.parent_id === id).forEach(c => getDescendantIds(c.id, set)); return set; };
   const excludeIds = existing ? getDescendantIds(existing.id) : new Set();
   const parentOptions = sampleFolders.filter(f => !excludeIds.has(f.id));
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+    <div onKeyDown={useModalEnter(() => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: false, parent_id: parentId || null }))}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 20 }}>{existing ? "Edit Folder" : "New Sample Folder"}</h2>
         <Input label="Name" value={name} onChange={setName} placeholder="e.g. BTO Series" />
@@ -6193,8 +6235,10 @@ function AddSampleFolderModal({ onSave, onClose, existing, allFolders = [] }) {
 function AddBookFolderModal({ onSave, onClose, existing, allFolders = [] }) {
   const [name,  setName]  = useState(existing?.name || "");
   const [color, setColor] = useState(existing?.color || COLOR_OPTIONS[0]);
+  useEscClose(onClose);
+  const doSave = () => name.trim() && onSave({ name: name.trim(), color, book_folder: true, module_folder: false, parent_id: null });
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+    <div onKeyDown={useModalEnter(doSave)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.blue, fontSize: 20 }}>{existing ? "Edit Folder" : "New Book Folder"}</h2>
         <Input label="Name" value={name} onChange={setName} placeholder="e.g. Thickness Study" />
@@ -6206,7 +6250,7 @@ function AddBookFolderModal({ onSave, onClose, existing, allFolders = [] }) {
         </div>
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn onClick={() => name.trim() && onSave({ name: name.trim(), color, book_folder: true, module_folder: false, parent_id: null })} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
+          <Btn onClick={doSave} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
         </div>
       </div>
     </div>
@@ -6216,8 +6260,10 @@ function AddBookFolderModal({ onSave, onClose, existing, allFolders = [] }) {
 function AddModuleFolderModal({ onSave, onClose, existing }) {
   const [name,  setName]  = useState(existing?.name || "");
   const [color, setColor] = useState(existing?.color || COLOR_OPTIONS[0]);
+  useEscClose(onClose);
+  const doSave = () => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: true, parent_id: null });
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+    <div onKeyDown={useModalEnter(doSave)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.teal, fontSize: 20 }}>{existing ? "Edit Folder" : "New Module Folder"}</h2>
         <Input label="Name" value={name} onChange={setName} placeholder="e.g. Electrical" />
@@ -6229,7 +6275,7 @@ function AddModuleFolderModal({ onSave, onClose, existing }) {
         </div>
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn onClick={() => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: true, parent_id: null })} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
+          <Btn onClick={doSave} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
         </div>
       </div>
     </div>
@@ -6239,8 +6285,10 @@ function AddModuleFolderModal({ onSave, onClose, existing }) {
 function AddMatFolderModal({ onSave, onClose, existing }) {
   const [name,  setName]  = useState(existing?.name || "");
   const [color, setColor] = useState(existing?.color || COLOR_OPTIONS[0]);
+  useEscClose(onClose);
+  const doSave = () => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: false, mat_folder: true, parent_id: null });
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+    <div onKeyDown={useModalEnter(doSave)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.teal, fontSize: 20 }}>{existing ? "Edit Folder" : "New Material Folder"}</h2>
         <Input label="Name" value={name} onChange={setName} placeholder="e.g. Substrates" />
@@ -6252,7 +6300,7 @@ function AddMatFolderModal({ onSave, onClose, existing }) {
         </div>
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn onClick={() => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: false, mat_folder: true, parent_id: null })} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
+          <Btn onClick={doSave} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
         </div>
       </div>
     </div>
@@ -6445,6 +6493,7 @@ function ModuleComparisonPanel({ moduleId, sampleOrder, samples, colors, labels 
 
 // Inline sample picker shown inside SampleRoster
 function SamplePicker({ samples, alreadySelected, onAdd, onClose }) {
+  useEscClose(onClose);
   const [sel, setSel] = useState(new Set());
   const available = samples
     .filter(s => !alreadySelected.includes(s.id))
@@ -10882,6 +10931,7 @@ function AnalysisBookTile({ book, onDelete, onEdit, onDuplicate, onClick, onDrag
 }
 
 function AddBookModal({ onSave, onClose, existing, samples, folders = [], bookFolders = [] }) {
+  useEscClose(onClose);
   const [name,     setName]     = useState(existing?.name || "");
   const [folderId, setFolderId] = useState(existing?.folder_id || "");
   const [selected, setSelected] = useState(new Set(existing?.sample_ids || []));
@@ -11019,9 +11069,13 @@ function FilterChip({ condition, onRemove }) {
   );
 }
 
-function SampleFilter({ settings, samples = [], onFilterChange }) {
+const SampleFilter = React.forwardRef(function SampleFilter({ settings, samples = [], onFilterChange }, ref) {
   const [conditions,  setConditions]  = useState([]);
   const [panelOpen,   setPanelOpen]   = useState(false);
+  const fieldSelectRef = useRef(null);
+  React.useImperativeHandle(ref, () => ({ open() { setPanelOpen(true); } }));
+  // Auto-focus the field select when panel opens
+  useEffect(() => { if (panelOpen) setTimeout(() => fieldSelectRef.current?.focus(), 30); }, [panelOpen]);
   const [newField,    setNewField]    = useState("");
   const [newOp,       setNewOp]       = useState("between");
   const [newVal,      setNewVal]      = useState("");
@@ -11120,7 +11174,7 @@ function SampleFilter({ settings, samples = [], onFilterChange }) {
             {/* Field selector */}
             <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
               <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Field</span>
-              <select value={newField} onChange={e => handleFieldChange(e.target.value)}
+              <select ref={fieldSelectRef} value={newField} onChange={e => handleFieldChange(e.target.value)}
                 style={{ ...inputSm, width: "100%", cursor: "pointer" }}>
                 <option value="">— select —</option>
                 {groups.map(g => (
@@ -11197,7 +11251,7 @@ function SampleFilter({ settings, samples = [], onFilterChange }) {
       )}
     </div>
   );
-}
+});
 
 // ── MatFolderTile ─────────────────────────────────────────────────────────────
 
@@ -11261,6 +11315,7 @@ function MatFolderTile({ folder, mats, onOpenMat, onEdit, onDelete, onDropMat, o
 // ── MaterialsLibrarySection ───────────────────────────────────────────────────
 
 function MatImportModal({ onClose, onImported }) {
+  useEscClose(onClose);
   const [preview, setPreview]       = useState(null); // {to_add, conflicts}
   const [resolutions, setResolutions] = useState({}); // {name: "skip"|"overwrite"|"merge"}
   const [importing, setImporting]   = useState(false);
@@ -11519,6 +11574,7 @@ export default function App() {
   const [addingBookFolder,   setAddingBookFolder]   = useState(false);
   const [addingModuleFolder, setAddingModuleFolder] = useState(false);
   const [addingMatFolder,    setAddingMatFolder]    = useState(false);
+  const filterRef = useRef(null);
   const [editingFolder, setEditingFolder] = useState(null); // folder object being edited — type inferred from its flags
   const [importModalType, setImportModalType] = useState(null); // "sample"|"book"|"module"|null
   const [importing,       setImporting]       = useState(false);
@@ -12002,6 +12058,31 @@ export default function App() {
   // reset edit mode whenever the active sample changes
   useEffect(() => { setEditingMeta(false); }, [active]);
 
+  // ── Global hotkeys ───────────────────────────────────────────────────────
+  useEffect(() => {
+    const isTyping = t => t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable;
+    const handler = e => {
+      // Escape — pop the top registered close handler
+      if (e.key === "Escape") {
+        if (_escStack.length > 0) { _escStack[_escStack.length - 1](); return; }
+      }
+      // Cmd/Ctrl+K — open sample filter panel (home page only)
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        filterRef.current?.open();
+        return;
+      }
+      // Back navigation (← or Backspace) when not typing
+      if (!isTyping(e.target) && (e.key === "ArrowLeft" || e.key === "Backspace")) {
+        if (active) { setActive(null); e.preventDefault(); }
+        else if (activeBook) { setActiveBook(null); e.preventDefault(); }
+        else if (activeModule) { setActiveModule(null); e.preventDefault(); }
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [active, activeBook, activeModule]);
+
   // ── Render ───────────────────────────────────────────────────────────────
 
   const activeSample  = samples.find(s => s.id === active);
@@ -12164,7 +12245,7 @@ export default function App() {
 
                 {/* Filter bar */}
                 <div style={{ marginBottom: 14 }}>
-                  <SampleFilter settings={settings} samples={samples} onFilterChange={setSampleFilterConds} />
+                  <SampleFilter ref={filterRef} settings={settings} samples={samples} onFilterChange={setSampleFilterConds} />
                 </div>
 
                 {/* Foldered groups — recursive tree */}
