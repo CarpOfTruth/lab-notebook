@@ -1019,6 +1019,175 @@ function fmtAreaMicron(m2) {
   return um2 >= 1000 ? `${(um2 / 1000).toFixed(2)}×10³ µm²` : `${um2.toFixed(2)} µm²`;
 }
 
+// ── ManageDataModal ───────────────────────────────────────────────────────────
+
+function ManageDataModal({ mod, sample, onClose, onChanged }) {
+  useEscClose(onClose);
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  const [files,     setFiles]     = useState([]);
+  const [loading,   setLoading]   = useState(true);
+  const [uploading, setUploading] = useState(false);
+  const [dragOver,  setDragOver]  = useState(false);
+  const fileInputRef = useRef(null);
+  const paramFields  = mod.param_manifest || [];
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const res = await api("GET", `/samples/${sample.id}/module-files/${mod.id}`);
+      setFiles(Array.isArray(res) ? res : []);
+    } catch (_) {}
+    setLoading(false);
+  };
+
+  useEffect(() => { load(); }, [mod.id, sample.id]);
+
+  const handleUpload = async (file) => {
+    setUploading(true);
+    const fd = new FormData();
+    fd.append("file", file);
+    try {
+      await fetch(`/api/samples/${sample.id}/module-files/${mod.id}`, { method: "POST", body: fd });
+      await load();
+      onChanged?.();
+    } catch (_) {}
+    setUploading(false);
+  };
+
+  const handleDelete = async (fileId) => {
+    try {
+      await api("DELETE", `/samples/${sample.id}/module-files/${mod.id}/${fileId}`);
+      await load();
+      onChanged?.();
+    } catch (_) {}
+  };
+
+  const handleSetPrimary = async (fileId) => {
+    try {
+      await api("PATCH", `/samples/${sample.id}/module-files/${mod.id}/${fileId}`, { is_primary: true });
+      setFiles(prev => prev.map(f => ({ ...f, is_primary: f.id === fileId })));
+      onChanged?.();
+    } catch (_) {}
+  };
+
+  const handleParamChange = async (fileId, paramId, value) => {
+    const f = files.find(x => x.id === fileId);
+    if (!f) return;
+    const updated = { ...f.params, [paramId]: value };
+    try {
+      await api("PATCH", `/samples/${sample.id}/module-files/${mod.id}/${fileId}`, { params: updated });
+      setFiles(prev => prev.map(x => x.id === fileId ? { ...x, params: updated } : x));
+    } catch (_) {}
+  };
+
+  const truncName = (name, max = 28) => name.length > max ? name.slice(0, max - 1) + "…" : name;
+
+  return (
+    <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, width: 700, maxWidth: "90vw", maxHeight: "85vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        {/* Header */}
+        <div style={{ padding: "12px 18px", borderBottom: `1px solid ${T.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+          <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>
+            {mod.name} — Data · <span style={{ color: T.textDim }}>{sample.id}</span>
+          </span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1 }}>✕</button>
+        </div>
+
+        {/* File list */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "12px 18px" }}>
+          {loading ? (
+            <div style={{ ...mono, fontSize: 12, color: T.textDim, padding: "24px 0", textAlign: "center" }}>Loading…</div>
+          ) : files.length === 0 ? (
+            <div style={{ ...mono, fontSize: 12, color: T.textDim, padding: "24px 0", textAlign: "center" }}>No files yet — add some below.</div>
+          ) : (
+            <table style={{ width: "100%", borderCollapse: "collapse", ...mono, fontSize: 12 }}>
+              <thead>
+                <tr>
+                  <th style={{ width: 28, padding: "6px 8px", textAlign: "center", color: T.textDim, fontWeight: 400, fontSize: 10, letterSpacing: 0.3 }}>★</th>
+                  <th style={{ padding: "6px 12px 6px 4px", textAlign: "left", color: T.textDim, fontWeight: 400, fontSize: 10, letterSpacing: 0.3, textTransform: "uppercase" }}>File</th>
+                  {paramFields.map(p => (
+                    <th key={p.id} style={{ padding: "6px 8px", textAlign: "left", color: T.textDim, fontWeight: 400, fontSize: 10, letterSpacing: 0.3, textTransform: "uppercase" }}>
+                      {p.label || p.id}{p.unit ? ` (${p.unit})` : ""}
+                    </th>
+                  ))}
+                  <th style={{ width: 32 }} />
+                </tr>
+              </thead>
+              <tbody>
+                {files.map(f => (
+                  <tr key={f.id} style={{ borderTop: `1px solid ${T.border}44` }}>
+                    <td style={{ padding: "6px 8px", textAlign: "center" }}>
+                      <input type="radio" checked={!!f.is_primary} onChange={() => handleSetPrimary(f.id)}
+                        style={{ accentColor: T.amber, cursor: "pointer" }} />
+                    </td>
+                    <td style={{ padding: "6px 12px 6px 4px", color: T.textSecondary, whiteSpace: "nowrap", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }} title={f.filename}>
+                      {truncName(f.filename)}
+                    </td>
+                    {paramFields.map(p => (
+                      <td key={p.id} style={{ padding: "4px 6px" }}>
+                        {p.type === "boolean" ? (
+                          <input type="checkbox"
+                            checked={!!(f.params?.[p.id] ?? p.default ?? false)}
+                            onChange={e => handleParamChange(f.id, p.id, e.target.checked)}
+                            style={{ accentColor: T.teal, cursor: "pointer" }} />
+                        ) : p.type === "select" ? (
+                          <select value={f.params?.[p.id] ?? p.default ?? ""}
+                            onChange={e => handleParamChange(f.id, p.id, e.target.value)}
+                            style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, ...mono, fontSize: 11, padding: "3px 5px", outline: "none", maxWidth: 120 }}>
+                            {(p.choices || []).map(ch => <option key={ch} value={ch}>{ch}</option>)}
+                          </select>
+                        ) : (
+                          <input
+                            type={p.type === "number" ? "number" : "text"}
+                            defaultValue={f.params?.[p.id] ?? p.default ?? ""}
+                            key={`${f.id}-${p.id}`}
+                            onBlur={e => handleParamChange(f.id, p.id, p.type === "number" ? (e.target.value === "" ? null : Number(e.target.value)) : e.target.value)}
+                            style={{ width: 90, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, ...mono, fontSize: 11, padding: "3px 6px", outline: "none" }} />
+                        )}
+                      </td>
+                    ))}
+                    <td style={{ padding: "4px 6px", textAlign: "center" }}>
+                      <button onClick={() => handleDelete(f.id)} title="Delete file"
+                        style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 14, lineHeight: 1, padding: "2px 4px" }}
+                        onMouseEnter={e => e.currentTarget.style.color = T.red}
+                        onMouseLeave={e => e.currentTarget.style.color = T.textDim}>✕</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {/* Drop zone */}
+        <div
+          onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={e => { e.preventDefault(); setDragOver(false); [...e.dataTransfer.files].forEach(handleUpload); }}
+          onClick={() => fileInputRef.current?.click()}
+          style={{
+            margin: "0 18px 12px", border: `2px dashed ${dragOver ? T.amber : T.border}`,
+            borderRadius: 8, padding: "18px 0", textAlign: "center", cursor: "pointer",
+            transition: "border-color .15s", background: dragOver ? T.amber + "08" : "transparent", flexShrink: 0,
+          }}>
+          <input ref={fileInputRef} type="file" accept={mod.accepts?.join(",")} multiple
+            style={{ display: "none" }}
+            onChange={e => { [...(e.target.files || [])].forEach(f => handleUpload(f)); e.target.value = ""; }} />
+          <span style={{ ...mono, fontSize: 12, color: dragOver ? T.amber : T.textDim }}>
+            {uploading ? "Uploading…" : "⬆ Drop files here or click to add"}
+          </span>
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding: "10px 18px", borderTop: `1px solid ${T.border}`, display: "flex", justifyContent: "flex-end", flexShrink: 0 }}>
+          <Btn onClick={onClose}>Done</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── ModuleCard ────────────────────────────────────────────────────────────────
 // ── ModuleConfigModal ─────────────────────────────────────────────────────────
 
@@ -1108,8 +1277,14 @@ function ModuleConfigModal({ mod, sample, onClose, onSaved }) {
 function ModuleCard({ mod, sample, onRemoved, onSampleUpdate }) {
   const mono = "'DM Mono', monospace";
 
-  const filename = sample.filenames?.[mod.id];
-  if (!filename) return null; // only render when a file has been added
+  const hasSingleFile   = !!sample.filenames?.[mod.id];
+  const hasCollFiles    = (sample.module_file_counts?.[mod.id] ?? 0) > 0;
+  const hasData         = hasSingleFile || hasCollFiles;
+  if (!hasData) return null; // only render when a file has been added
+
+  const isCollectionMode = mod.file_mode === "collection";
+  const filename         = sample.filenames?.[mod.id];
+  const fileCount        = sample.module_file_counts?.[mod.id] ?? 0;
 
   const initControls = () => {
     const s = {};
@@ -1125,6 +1300,7 @@ function ModuleCard({ mod, sample, onRemoved, onSampleUpdate }) {
   const [areaM2,       setAreaM2]       = useState(sample.area_m2 ?? null);
   const [corrExpr,     setCorrExpr]     = useState(String(sample.area_correction ?? areaCtrl?.default ?? 1.0));
   const [configOpen,   setConfigOpen]   = useState(false);
+  const [manageOpen,   setManageOpen]   = useState(false);
 
   const fetchPlot = async (overrides = {}) => {
     setLoading(true); setFetchError(null);
@@ -1200,8 +1376,22 @@ function ModuleCard({ mod, sample, onRemoved, onSampleUpdate }) {
             <button onClick={() => setConfigOpen(true)} title="Module configuration"
               style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, lineHeight: 1, padding: "0 2px" }}>⚙</button>
           )}
-          <span style={{ fontSize: 10, color: T.textDim, fontFamily: mono, maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filename}</span>
-          <button onClick={handleDelete} title="Remove data" style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 14, lineHeight: 1, padding: 0 }}>✕</button>
+          {isCollectionMode ? (
+            <>
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: mono, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, padding: "1px 7px" }}>
+                {fileCount} {fileCount === 1 ? "file" : "files"}
+              </span>
+              <button onClick={() => setManageOpen(true)}
+                style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 4, color: T.textSecondary, cursor: "pointer", fontFamily: mono, fontSize: 10, padding: "2px 8px" }}>
+                Manage
+              </button>
+            </>
+          ) : (
+            <>
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: mono, maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filename}</span>
+              <button onClick={handleDelete} title="Remove data" style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 14, lineHeight: 1, padding: 0 }}>✕</button>
+            </>
+          )}
         </div>
       </div>
       {/* Body */}
@@ -1254,6 +1444,14 @@ function ModuleCard({ mod, sample, onRemoved, onSampleUpdate }) {
           sample={sample}
           onClose={() => setConfigOpen(false)}
           onSaved={() => { onSampleUpdate?.(); fetchPlot(); }}
+        />
+      )}
+      {manageOpen && (
+        <ManageDataModal
+          mod={mod}
+          sample={sample}
+          onClose={() => setManageOpen(false)}
+          onChanged={() => { onSampleUpdate?.(); fetchPlot(); }}
         />
       )}
     </div>
@@ -1996,11 +2194,12 @@ function splitCsvLine(line) {
 
 // ── AddDataModal ──────────────────────────────────────────────────────────────
 
-function AddDataModal({ onClose, moduleOptions = [], sampleId, onModuleFileAdded }) {
+function AddDataModal({ onClose, moduleOptions = [], sampleId, sample, onModuleFileAdded }) {
   useEscClose(onClose);
   const mono = { fontFamily: "'DM Mono', monospace" };
-  const [uploadingFor, setUploadingFor] = useState(null); // module id being uploaded
+  const [uploadingFor, setUploadingFor] = useState(null); // module id being uploaded for single-file
   const [uploading,    setUploading]    = useState(false);
+  const [manageTarget, setManageTarget] = useState(null); // mod object for ManageDataModal
 
   const handleModuleFile = async (mod, file) => {
     setUploading(true);
@@ -2014,6 +2213,18 @@ function AddDataModal({ onClose, moduleOptions = [], sampleId, onModuleFileAdded
     setUploading(false);
   };
 
+  // If a collection module was clicked, show ManageDataModal instead
+  if (manageTarget && sample) {
+    return (
+      <ManageDataModal
+        mod={manageTarget}
+        sample={sample}
+        onClose={() => { onModuleFileAdded?.(); onClose(); }}
+        onChanged={() => onModuleFileAdded?.()}
+      />
+    );
+  }
+
   return (
     <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
       style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
@@ -2026,7 +2237,17 @@ function AddDataModal({ onClose, moduleOptions = [], sampleId, onModuleFileAdded
           <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
             {moduleOptions.map(mod => (
               <div key={mod.id}>
-                {uploadingFor === mod.id ? (
+                {mod.file_mode === "collection" ? (
+                  // Collection module — clicking opens ManageDataModal directly
+                  <button onClick={() => setManageTarget(mod)}
+                    style={{ width: '100%', background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: 3, transition: 'border-color .15s' }}
+                    onMouseEnter={e => e.currentTarget.style.borderColor = T.red}
+                    onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+                    <span style={{ ...mono, fontSize: 12, color: T.red, fontWeight: 600 }}>{mod.name}</span>
+                    <span style={{ ...mono, fontSize: 10, color: T.textDim }}>{mod.description}</span>
+                    <span style={{ ...mono, fontSize: 9, color: T.amber, marginTop: 1 }}>⊞ collection — manage files →</span>
+                  </button>
+                ) : uploadingFor === mod.id ? (
                   <label style={{ background: T.bg2, border: `1px solid ${T.teal}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}>
                     <span style={{ ...mono, fontSize: 12, color: T.teal }}>{uploading ? 'Uploading…' : `↑ Choose file for ${mod.name}`}</span>
                     <input type="file" accept={mod.accepts?.join(",")} style={{ display: 'none' }}
@@ -2237,7 +2458,12 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         {addDataOpen && <AddDataModal
           onClose={() => setAddDataOpen(false)}
           sampleId={sample.id}
-          moduleOptions={modulesForSection("electrical").filter(m => !sample.filenames?.[m.id])}
+          sample={sample}
+          moduleOptions={modulesForSection("electrical").filter(m => {
+            const hasSingle = !!sample.filenames?.[m.id];
+            const hasColl   = (sample.module_file_counts?.[m.id] ?? 0) > 0;
+            return !hasSingle && !hasColl;
+          })}
           onModuleFileAdded={refreshSample}
         />}
       </section>
@@ -3960,6 +4186,8 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
   const [moduleDeps,    setModuleDeps]    = useState([]);          // ["lmfit>=1.0", ...]
   const [depStatus,     setDepStatus]     = useState([]);          // [{dep,pkg,installed,blocked}]
   const [depLoading,    setDepLoading]    = useState(false);
+  const [fileMode,      setFileMode]      = useState("single");    // "single"|"collection"
+  const [paramManifest, setParamManifest] = useState([]);          // [{id,label,type,default,unit?,choices?}]
 
   const defaultProcBlock2 = () =>
     `# Transform the imported variables into your desired output.\n# Variables from Block 1 are numpy arrays and in scope.\n# Example:\n# xs = voltage * 1000\n# ys = charge / area_m2`;
@@ -4020,6 +4248,8 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       if (cfg.card_controls)    setCardControls(cfg.card_controls);
       if (cfg.config_schema)    setConfigSchema(cfg.config_schema);
       if (cfg.dependencies)     { setModuleDeps(cfg.dependencies); }
+      if (cfg.file_mode)        setFileMode(cfg.file_mode);
+      if (cfg.param_manifest)   setParamManifest(cfg.param_manifest);
       if (cfg.delimiter)  setExDelim(cfg.delimiter);
       if (cfg.skip_rows != null) setExSkip(String(cfg.skip_rows));
     }).catch(() => {});
@@ -4097,6 +4327,8 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       card_controls: cardControls,
       config_schema: configSchema,
       dependencies: moduleDeps,
+      file_mode: fileMode,
+      param_manifest: fileMode === "collection" ? paramManifest : [],
       folder_id: mFolderId || null,
     };
     await api("PUT", `/modules/${id}/config`, cfg);
@@ -4122,6 +4354,22 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
   const hasFitData = procResult && procResult.x_fit && procResult.y_fit;
 
   const generateBlock1 = () => {
+    // Collection mode — skip all column/header parsing, emit a simple preamble comment block
+    if (fileMode === "collection") {
+      const lines = [];
+      lines.push(`# ── Block 1: Auto-generated — do not edit ────────────────────────────────`);
+      lines.push(`import numpy as np`);
+      lines.push(`import scipy`);
+      lines.push(``);
+      lines.push(`# Collection inputs (always available in proc_code):`);
+      lines.push(`#   files    = {filename: bytes}    — every file in this module's collection`);
+      lines.push(`#   registry = [{filename, params}] — param_manifest values for each file`);
+      lines.push(`#   file_bytes / filename            — primary file (backward compat)`);
+      lines.push(`#   meta["config"]                   — per-sample config values`);
+      lines.push(`#   Resources: get_material(id), list_materials(), get_technique(id), list_techniques()`);
+      lines.push(`# ─────────────────────────────────────────────────────────────────────────`);
+      return lines.join("\n");
+    }
     if (!exInfo) return "";
     const delim = exInfo.delimiter === "whitespace" ? null : (exInfo.delimiter || "\t");
     const skipRows = exInfo.skip_rows ?? 0;
@@ -4704,6 +4952,128 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
         ))}
       </div>
 
+      {/* ── File Mode section ── */}
+      <div style={section}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <h3 style={{ ...sh, margin: 0 }}>File Mode</h3>
+        </div>
+        <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 12 }}>
+          <span style={{ color: T.textPrimary }}>Single</span> — one file per sample.{" "}
+          <span style={{ color: T.textPrimary }}>Collection</span> — multiple files with tagged parameters; proc_code receives <span style={{ color: T.teal }}>files</span> and <span style={{ color: T.teal }}>registry</span>.
+        </div>
+        <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden", width: "fit-content", marginBottom: fileMode === "collection" ? 16 : 0 }}>
+          {["single", "collection"].map(mode => (
+            <button key={mode} onClick={() => setFileMode(mode)}
+              style={{ padding: "5px 18px", fontFamily: mono, fontSize: 12, border: "none", cursor: "pointer",
+                background: fileMode === mode ? T.amber : "transparent",
+                color:      fileMode === mode ? "#000" : T.textDim,
+                transition: "background 0.15s" }}>
+              {mode}
+            </button>
+          ))}
+        </div>
+
+        {fileMode === "collection" && (
+          <>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+              <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Parameter Manifest</span>
+              <button
+                onClick={() => setParamManifest(prev => [...prev, { id: "", label: "", type: "text", default: "" }])}
+                style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: T.textSecondary, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+                + Add param
+              </button>
+            </div>
+            <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 12 }}>
+              Per-file parameters declared here appear as editable columns in the Manage Data modal and as <span style={{ color: T.textPrimary }}>registry[i]["params"]</span> in proc_code.
+            </div>
+            {paramManifest.length === 0 && (
+              <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>No params — files will have no metadata columns.</div>
+            )}
+            {paramManifest.map((field, i) => (
+              <div key={i} style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "12px 14px", marginBottom: 8 }}>
+                <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>ID (key)</div>
+                    <input value={field.id}
+                      onChange={e => setParamManifest(prev => prev.map((f, j) => j === i ? { ...f, id: e.target.value } : f))}
+                      placeholder="param_id"
+                      style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.teal, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+                  </div>
+                  <div style={{ flex: 1.5 }}>
+                    <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Label</div>
+                    <input value={field.label}
+                      onChange={e => setParamManifest(prev => prev.map((f, j) => j === i ? { ...f, label: e.target.value } : f))}
+                      placeholder="Displayed label"
+                      style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+                  </div>
+                  <div>
+                    <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Type</div>
+                    <select value={field.type}
+                      onChange={e => setParamManifest(prev => prev.map((f, j) => j === i ? { ...f, type: e.target.value, choices: e.target.value === "select" ? (f.choices || ["a", "b"]) : undefined } : f))}
+                      style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 11, padding: "4px 6px", outline: "none" }}>
+                      <option value="text">text</option>
+                      <option value="number">number</option>
+                      <option value="boolean">boolean</option>
+                      <option value="select">select</option>
+                    </select>
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Default</div>
+                    {field.type === "boolean" ? (
+                      <select value={field.default === true || field.default === "true" ? "true" : "false"}
+                        onChange={e => setParamManifest(prev => prev.map((f, j) => j === i ? { ...f, default: e.target.value === "true" } : f))}
+                        style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "4px 6px", outline: "none" }}>
+                        <option value="false">false</option>
+                        <option value="true">true</option>
+                      </select>
+                    ) : (
+                      <input value={field.default ?? ""}
+                        onChange={e => setParamManifest(prev => prev.map((f, j) => j === i ? { ...f, default: field.type === "number" ? (e.target.value === "" ? "" : Number(e.target.value)) : e.target.value } : f))}
+                        type={field.type === "number" ? "number" : "text"}
+                        style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+                    )}
+                  </div>
+                  {field.type === "number" && (
+                    <div style={{ width: 80 }}>
+                      <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Unit</div>
+                      <input value={field.unit || ""}
+                        onChange={e => setParamManifest(prev => prev.map((f, j) => j === i ? { ...f, unit: e.target.value } : f))}
+                        placeholder="Hz"
+                        style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+                    </div>
+                  )}
+                  <button onClick={() => setParamManifest(prev => prev.filter((_, j) => j !== i))}
+                    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, padding: "0 4px", alignSelf: "flex-end", marginBottom: 2 }}>×</button>
+                </div>
+                {field.type === "select" && (
+                  <div style={{ marginTop: 10 }}>
+                    <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 6 }}>Choices</div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+                      {(field.choices || []).map((ch, ci) => (
+                        <div key={ci} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <input value={ch}
+                            onChange={e => setParamManifest(prev => prev.map((f, j) => {
+                              if (j !== i) return f;
+                              const c2 = [...(f.choices || [])]; c2[ci] = e.target.value; return { ...f, choices: c2 };
+                            }))}
+                            style={{ width: 80, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.teal, fontFamily: mono, fontSize: 12, padding: "3px 6px", outline: "none" }} />
+                          <button onClick={() => setParamManifest(prev => prev.map((f, j) => j !== i ? f : { ...f, choices: (f.choices || []).filter((_, k) => k !== ci) }))}
+                            style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>×</button>
+                        </div>
+                      ))}
+                      <button onClick={() => setParamManifest(prev => prev.map((f, j) => j !== i ? f : { ...f, choices: [...(f.choices || []), ""] }))}
+                        style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 10, padding: "2px 8px", cursor: "pointer" }}>
+                        + choice
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+
       {/* ── Data section ── */}
       <div style={section}>
         <div style={{ display: "flex", alignItems: "center", marginBottom: 16 }}>
@@ -4723,8 +5093,8 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
           </div>
         )}
 
-        {/* Upload dropzone — shown when no example loaded */}
-        {!isCreate && !exInfo && !exLoading && (
+        {/* Upload dropzone — hidden in collection mode (no example file needed) */}
+        {!isCreate && !exInfo && !exLoading && fileMode !== "collection" && (
           <label style={{
             display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
             border: `2px dashed ${T.border}`, borderRadius: 8, padding: "32px 20px",
@@ -4745,8 +5115,8 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
           <div style={{ fontFamily: mono, fontSize: 12, color: T.textDim, padding: "16px 0" }}>Analyzing file…</div>
         )}
 
-        {/* File loaded */}
-        {!isCreate && exInfo && !exLoading && (() => {
+        {/* File loaded — hidden in collection mode */}
+        {!isCreate && exInfo && !exLoading && fileMode !== "collection" && (() => {
           const delimLabel = exInfo.delimiter === "\t" ? "tab"
             : exInfo.delimiter === "," ? "comma"
             : exInfo.delimiter === ";" ? "semicolon"
@@ -4905,9 +5275,12 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
             background: T.bg2, border: `1px solid ${T.border}`, borderBottom: "none",
             borderRadius: "8px 8px 0 0", padding: "6px 14px" }}>
             <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, letterSpacing: "0.05em", textTransform: "uppercase" }}>
-              Block 1 — Column Imports <span style={{ color: T.textDim, fontWeight: 400 }}>(auto-generated · read-only)</span>
+              {fileMode === "collection"
+                ? <>Block 1 — Collection Preamble <span style={{ color: T.textDim, fontWeight: 400 }}>(auto-generated · read-only)</span></>
+                : <>Block 1 — Column Imports <span style={{ color: T.textDim, fontWeight: 400 }}>(auto-generated · read-only)</span></>
+              }
             </span>
-            {exInfo && (
+            {exInfo && fileMode !== "collection" && (
               <button
                 onClick={() => { setBlock1Regen(true); setTimeout(() => setBlock1Regen(false), 1500); }}
                 title="Regenerate Block 1 from current Data assignments"
@@ -4921,10 +5294,10 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
             )}
           </div>
           <textarea
-            value={exInfo ? generateBlock1() : "# Upload an example file in the Data section first."}
+            value={fileMode === "collection" ? generateBlock1() : (exInfo ? generateBlock1() : "# Upload an example file in the Data section first.")}
             readOnly
             spellCheck={false}
-            rows={Math.min(Math.max((exInfo ? generateBlock1() : "").split("\n").length, 4), 18)}
+            rows={Math.min(Math.max(generateBlock1().split("\n").length, 4), 18)}
             style={{
               width: "100%", resize: "none",
               fontFamily: mono, fontSize: 11, lineHeight: 1.65,

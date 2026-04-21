@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
-import sqlite3, json, os, shutil, re, importlib.util, subprocess, sys
+import sqlite3, json, os, shutil, re, importlib.util, subprocess, sys, uuid
 from pathlib import Path
 import modules as mod_registry
 
@@ -181,6 +181,19 @@ def init_db():
         except sqlite3.OperationalError:
             pass
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS module_files (
+                id          TEXT PRIMARY KEY,
+                sample_id   TEXT NOT NULL,
+                module_id   TEXT NOT NULL,
+                filename    TEXT NOT NULL,
+                params      TEXT DEFAULT '{}',
+                is_primary  INTEGER DEFAULT 0,
+                uploaded_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (sample_id) REFERENCES samples(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mf ON module_files(sample_id, module_id)")
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -229,6 +242,28 @@ def _mat_row_to_dict(row):
         "growth_defaults": json.loads(row["growth_defaults"] or "{}"),
         "folder_id": row["folder_id"] if "folder_id" in row.keys() else None,
     }
+
+def _mf_row_to_dict(row) -> dict:
+    """Convert a module_files DB row to a dict."""
+    return {
+        "id":          row["id"],
+        "sample_id":   row["sample_id"],
+        "module_id":   row["module_id"],
+        "filename":    row["filename"],
+        "params":      json.loads(row["params"] or "{}"),
+        "is_primary":  bool(row["is_primary"]),
+        "uploaded_at": row["uploaded_at"],
+    }
+
+
+def _get_module_files(conn, sample_id: str, module_id: str) -> list:
+    """Return all module_files rows for (sample_id, module_id), primary first."""
+    rows = conn.execute(
+        "SELECT * FROM module_files WHERE sample_id=? AND module_id=? ORDER BY is_primary DESC, uploaded_at ASC",
+        (sample_id, module_id),
+    ).fetchall()
+    return [_mf_row_to_dict(r) for r in rows]
+
 
 def _make_mat_id(name: str, existing_ids: set) -> str:
     import re
@@ -311,11 +346,35 @@ def _index_sample(conn, sample_id, layers_json, technique, substrate, lot):
 
 def row_to_sample(row):
     d = dict(row)
-    d["layers"]        = json.loads(d.get("layers")        or "[]")
-    d["filenames"]     = json.loads(d.get("filenames")     or "{}")
-    d["xrd_peaks"]     = json.loads(d.get("xrd_peaks")     or "[]")
-    d["module_config"] = json.loads(d.get("module_config") or "{}")
+    d["layers"]             = json.loads(d.get("layers")        or "[]")
+    d["filenames"]          = json.loads(d.get("filenames")     or "{}")
+    d["xrd_peaks"]          = json.loads(d.get("xrd_peaks")     or "[]")
+    d["module_config"]      = json.loads(d.get("module_config") or "{}")
+    d["module_file_counts"] = {}   # enriched separately by callers that hold a conn
     return d
+
+
+def _enrich_sample_counts(conn, sample: dict) -> dict:
+    """Add module_file_counts to an already-parsed sample dict. Mutates + returns it."""
+    counts = conn.execute(
+        "SELECT module_id, COUNT(*) as n FROM module_files WHERE sample_id=? GROUP BY module_id",
+        (sample["id"],),
+    ).fetchall()
+    sample["module_file_counts"] = {r["module_id"]: r["n"] for r in counts}
+    return sample
+
+
+def _enrich_samples_counts(conn, samples: list) -> list:
+    """Batch-enrich module_file_counts for a list of samples. Mutates + returns list."""
+    count_rows = conn.execute(
+        "SELECT sample_id, module_id, COUNT(*) as n FROM module_files GROUP BY sample_id, module_id"
+    ).fetchall()
+    by_sample: dict = {}
+    for r in count_rows:
+        by_sample.setdefault(r["sample_id"], {})[r["module_id"]] = r["n"]
+    for s in samples:
+        s["module_file_counts"] = by_sample.get(s["id"], {})
+    return samples
 
 def row_to_book(row):
     d = dict(row)
@@ -419,15 +478,19 @@ async def reorder_folders(request: Request):
 def list_samples():
     with get_db() as conn:
         rows = conn.execute("SELECT * FROM samples ORDER BY date DESC, created_at DESC").fetchall()
-    return [row_to_sample(r) for r in rows]
+        samples = [row_to_sample(r) for r in rows]
+        _enrich_samples_counts(conn, samples)
+    return samples
 
 @app.get("/api/samples/{sample_id}")
 def get_sample(sample_id: str):
     with get_db() as conn:
         row = conn.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Sample not found")
-    return row_to_sample(row)
+        if not row:
+            raise HTTPException(404, "Sample not found")
+        sample = row_to_sample(row)
+        _enrich_sample_counts(conn, sample)
+    return sample
 
 @app.post("/api/samples")
 def create_sample(sample: dict):
@@ -956,6 +1019,36 @@ async def import_sample(file: UploadFile = File(...), merge: bool = False, confi
             dest.write_bytes(zf.read(entry))
             files_written += 1
 
+    # Restore module_files rows from manifest if present
+    mf_json_name = next((n for n in names if n.endswith("/module_files.json")), None)
+    if mf_json_name:
+        try:
+            mf_manifest = json.loads(zf.read(mf_json_name))
+        except Exception:
+            mf_manifest = []
+        if mf_manifest:
+            with get_db() as conn:
+                if action in ("overwrite",) or merge:
+                    conn.execute(
+                        "DELETE FROM module_files WHERE sample_id=?", (sample_id,)
+                    )
+                for entry in mf_manifest:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO module_files
+                           (id, sample_id, module_id, filename, params, is_primary, uploaded_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            str(uuid.uuid4()),  # fresh UUID — avoid collision on re-import
+                            sample_id,
+                            entry.get("module_id", ""),
+                            entry.get("filename", ""),
+                            json.dumps(entry.get("params", {})),
+                            1 if entry.get("is_primary") else 0,
+                            entry.get("uploaded_at"),
+                        ),
+                    )
+                conn.commit()
+
     zf.close()
     return {"ok": True, "id": sample_id, "files_written": files_written, "files_skipped": files_skipped}
 
@@ -995,6 +1088,20 @@ def export_sample(sample_id: str):
 
     sample_data = row_to_sample(row)
 
+    with get_db() as conn:
+        mf_rows = conn.execute(
+            "SELECT * FROM module_files WHERE sample_id=? ORDER BY module_id, is_primary DESC, uploaded_at ASC",
+            (sample_id,),
+        ).fetchall()
+    mf_manifest = [
+        {
+            "id": r["id"], "module_id": r["module_id"], "filename": r["filename"],
+            "params": json.loads(r["params"] or "{}"),
+            "is_primary": bool(r["is_primary"]), "uploaded_at": r["uploaded_at"],
+        }
+        for r in mf_rows
+    ]
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         # 1. sample metadata as JSON
@@ -1008,6 +1115,9 @@ def export_sample(sample_id: str):
             for p in sorted(dest_dir.iterdir()):
                 if p.is_file():
                     zf.write(p, arcname=f"{sample_id}/files/{p.name}")
+        # 3. module_files manifest (no extra file copies — files already in /files/)
+        if mf_manifest:
+            zf.writestr(f"{sample_id}/module_files.json", json.dumps(mf_manifest, indent=2))
 
     buf.seek(0)
 
@@ -1237,18 +1347,28 @@ def get_module_source(module_id: str):
 
 @app.delete("/api/samples/{sample_id}/module-files/{module_id}")
 def delete_module_file(sample_id: str, module_id: str):
-    """Remove a module's file from a sample — deletes the file and clears the filenames entry."""
+    """Remove ALL files for a module on a sample — deletes from disk, module_files table, and legacy filenames."""
     with get_db() as conn:
         row = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Sample not found")
-    filenames = json.loads(row["filenames"] or "{}")
-    filename = filenames.pop(module_id, None)
-    if filename:
-        fp = FILES_DIR / sample_id / filename
-        if fp.exists():
+        if not row:
+            raise HTTPException(404, "Sample not found")
+        # Delete all module_files rows for this sample+module and remove from disk
+        mf_rows = conn.execute(
+            "SELECT filename FROM module_files WHERE sample_id=? AND module_id=?",
+            (sample_id, module_id),
+        ).fetchall()
+        for mf in mf_rows:
+            fp = FILES_DIR / sample_id / mf["filename"]
             fp.unlink(missing_ok=True)
-    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM module_files WHERE sample_id=? AND module_id=?", (sample_id, module_id)
+        )
+        # Also clear legacy filenames entry + delete that file if not already deleted
+        filenames = json.loads(row["filenames"] or "{}")
+        legacy_fname = filenames.pop(module_id, None)
+        if legacy_fname:
+            fp = FILES_DIR / sample_id / legacy_fname
+            fp.unlink(missing_ok=True)
         conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(filenames), sample_id))
         conn.commit()
     return {"ok": True}
@@ -1256,22 +1376,147 @@ def delete_module_file(sample_id: str, module_id: str):
 
 @app.post("/api/samples/{sample_id}/upload-module-file")
 async def upload_module_file(sample_id: str, module_id: str = Query(...), file: UploadFile = File(...)):
-    """Save a data file for a module on a sample, update filenames dict. No parsing."""
+    """Legacy single-file upload. Saves file, updates filenames dict AND module_files table."""
     with get_db() as conn:
         row = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, f"Sample '{sample_id}' not found")
+        if not row:
+            raise HTTPException(404, f"Sample '{sample_id}' not found")
+        dest_dir = FILES_DIR / sample_id
+        dest_dir.mkdir(exist_ok=True)
+        file_bytes = await file.read()
+        dest = dest_dir / f"{module_id}_{file.filename}"
+        dest.write_bytes(file_bytes)
+        # Update legacy filenames dict
+        filenames = json.loads(row["filenames"] or "{}")
+        filenames[module_id] = dest.name
+        conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(filenames), sample_id))
+        # Upsert into module_files table (clear old single-file entry, insert fresh primary)
+        conn.execute(
+            "DELETE FROM module_files WHERE sample_id=? AND module_id=?", (sample_id, module_id)
+        )
+        conn.execute(
+            "INSERT INTO module_files (id, sample_id, module_id, filename, params, is_primary) VALUES (?,?,?,?,?,?)",
+            (str(uuid.uuid4()), sample_id, module_id, dest.name, "{}", 1),
+        )
+    return {"ok": True, "filename": dest.name}
+
+
+# ── Module files CRUD ──────────────────────────────────────────────────────────
+
+@app.post("/api/samples/{sample_id}/module-files/{module_id}")
+async def add_module_file(sample_id: str, module_id: str, file: UploadFile = File(...)):
+    """Add a file to a module's collection for a sample. First file becomes primary."""
     dest_dir = FILES_DIR / sample_id
     dest_dir.mkdir(exist_ok=True)
     file_bytes = await file.read()
     dest = dest_dir / f"{module_id}_{file.filename}"
     dest.write_bytes(file_bytes)
-    filenames = json.loads(row["filenames"] or "{}")
-    filenames[module_id] = dest.name
     with get_db() as conn:
-        conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(filenames), sample_id))
-        conn.commit()
-    return {"ok": True, "filename": dest.name}
+        existing = conn.execute(
+            "SELECT COUNT(*) as n FROM module_files WHERE sample_id=? AND module_id=?",
+            (sample_id, module_id),
+        ).fetchone()
+        is_primary = 1 if existing["n"] == 0 else 0
+        file_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO module_files (id, sample_id, module_id, filename, params, is_primary) VALUES (?,?,?,?,?,?)",
+            (file_id, sample_id, module_id, dest.name, "{}", is_primary),
+        )
+        # Keep legacy filenames in sync if this is the primary
+        if is_primary:
+            row = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
+            if row:
+                fns = json.loads(row["filenames"] or "{}")
+                fns[module_id] = dest.name
+                conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(fns), sample_id))
+        mf = _get_module_files(conn, sample_id, module_id)
+    return {"ok": True, "file": next(f for f in mf if f["id"] == file_id), "all_files": mf}
+
+
+@app.get("/api/samples/{sample_id}/module-files/{module_id}")
+def get_module_files(sample_id: str, module_id: str):
+    """List all files in a module's collection for a sample."""
+    with get_db() as conn:
+        return _get_module_files(conn, sample_id, module_id)
+
+
+@app.delete("/api/samples/{sample_id}/module-files/{module_id}/{file_id}")
+def delete_module_file(sample_id: str, module_id: str, file_id: str):
+    """Delete a specific file from a module's collection."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT filename, is_primary FROM module_files WHERE id=? AND sample_id=? AND module_id=?",
+            (file_id, sample_id, module_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "File record not found")
+        # Delete from disk
+        fp = FILES_DIR / sample_id / row["filename"]
+        if fp.exists():
+            fp.unlink()
+        conn.execute("DELETE FROM module_files WHERE id=?", (file_id,))
+        # If deleted was primary, promote the oldest remaining file
+        if row["is_primary"]:
+            next_row = conn.execute(
+                "SELECT id FROM module_files WHERE sample_id=? AND module_id=? ORDER BY uploaded_at ASC LIMIT 1",
+                (sample_id, module_id),
+            ).fetchone()
+            if next_row:
+                conn.execute("UPDATE module_files SET is_primary=1 WHERE id=?", (next_row["id"],))
+                # Sync legacy filenames
+                new_primary = conn.execute(
+                    "SELECT filename FROM module_files WHERE id=?", (next_row["id"],)
+                ).fetchone()
+                if new_primary:
+                    frow = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
+                    if frow:
+                        fns = json.loads(frow["filenames"] or "{}")
+                        fns[module_id] = new_primary["filename"]
+                        conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(fns), sample_id))
+            else:
+                # No files remain — remove from legacy filenames
+                frow = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
+                if frow:
+                    fns = json.loads(frow["filenames"] or "{}")
+                    fns.pop(module_id, None)
+                    conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(fns), sample_id))
+        remaining = _get_module_files(conn, sample_id, module_id)
+    return {"ok": True, "remaining": remaining}
+
+
+@app.patch("/api/samples/{sample_id}/module-files/{module_id}/{file_id}")
+async def update_module_file(sample_id: str, module_id: str, file_id: str, request: Request):
+    """Update params and/or set as primary for a specific file."""
+    body = await request.json()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM module_files WHERE id=? AND sample_id=? AND module_id=?",
+            (file_id, sample_id, module_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "File record not found")
+        if "params" in body:
+            conn.execute(
+                "UPDATE module_files SET params=? WHERE id=?",
+                (json.dumps(body["params"]), file_id),
+            )
+        if body.get("is_primary"):
+            # Clear all primaries for this (sample, module), set this one
+            conn.execute(
+                "UPDATE module_files SET is_primary=0 WHERE sample_id=? AND module_id=?",
+                (sample_id, module_id),
+            )
+            conn.execute("UPDATE module_files SET is_primary=1 WHERE id=?", (file_id,))
+            # Sync legacy filenames
+            new_fn = conn.execute("SELECT filename FROM module_files WHERE id=?", (file_id,)).fetchone()
+            if new_fn:
+                frow = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
+                if frow:
+                    fns = json.loads(frow["filenames"] or "{}")
+                    fns[module_id] = new_fn["filename"]
+                    conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(fns), sample_id))
+        updated = _get_module_files(conn, sample_id, module_id)
+    return {"ok": True, "files": updated}
 
 
 @app.post("/api/modules/{module_id}/parse")
@@ -2275,6 +2520,58 @@ def preview_module_plot(module_id: str, body: dict):
     return {"ok": True, "figure": figure}
 
 
+def _resolve_module_files(conn, sample_id: str, module_id: str, filenames: dict):
+    """
+    Resolve files for a module on a sample.
+    Priority: module_files table → legacy filenames dict fallback.
+    Returns (file_bytes, filename, files, registry) or raises ValueError with a user-facing message.
+    - file_bytes / filename  → primary file (backward compat)
+    - files                  → {filename: bytes} dict of all files in collection
+    - registry               → [{filename, params}] list in is_primary-DESC, uploaded_at-ASC order
+    """
+    sample_dir = FILES_DIR / sample_id
+    rows = conn.execute(
+        "SELECT * FROM module_files WHERE sample_id=? AND module_id=? ORDER BY is_primary DESC, uploaded_at ASC",
+        (sample_id, module_id),
+    ).fetchall()
+
+    if rows:
+        files    = {}
+        registry = []
+        primary_bytes    = None
+        primary_filename = None
+        for row in rows:
+            fname = row["filename"]
+            fpath = sample_dir / fname
+            if not fpath.exists():
+                continue
+            data = fpath.read_bytes()
+            files[fname] = data
+            registry.append({"filename": fname, "params": json.loads(row["params"] or "{}")})
+            if row["is_primary"] and primary_bytes is None:
+                primary_bytes    = data
+                primary_filename = fname
+        if not files:
+            raise ValueError(f"Files registered but none found on disk for module '{module_id}'")
+        # If primary was missing on disk, promote the first available
+        if primary_bytes is None:
+            primary_filename = next(iter(files))
+            primary_bytes    = files[primary_filename]
+        return primary_bytes, primary_filename, files, registry
+    else:
+        # Legacy fallback: single filename string in samples.filenames dict
+        fname = filenames.get(module_id)
+        if not fname:
+            raise ValueError(f"No file for module '{module_id}' on sample '{sample_id}'")
+        fpath = sample_dir / fname
+        if not fpath.exists():
+            raise ValueError(f"File not found: {fname}")
+        data     = fpath.read_bytes()
+        files    = {fname: data}
+        registry = [{"filename": fname, "params": {}}]
+        return data, fname, files, registry
+
+
 @app.post("/api/modules/{module_id}/render-for-sample")
 def render_for_sample(module_id: str, body: dict):
     """
@@ -2292,29 +2589,29 @@ def render_for_sample(module_id: str, body: dict):
     x_scale = plot_cfg.get("x_scale") or "linear"
     y_scale = plot_cfg.get("y_scale") or "linear"
 
-    # Find the sample's file for this module
+    # Ensure sample data directory exists
     sample_dir = FILES_DIR / sample_id
     if not sample_dir.is_dir():
         raise HTTPException(404, f"No data directory for sample '{sample_id}'")
 
-    # Look for a file matching the module_id key in filenames
     with get_db() as conn:
         row = conn.execute(
             "SELECT filenames, thickness_nm, area_m2, module_config FROM samples WHERE id=?",
             (sample_id,),
         ).fetchone()
-    if not row:
-        raise HTTPException(404, f"Sample '{sample_id}' not found")
-    filenames   = json.loads(row["filenames"] or "{}")
-    thickness   = row["thickness_nm"] or 0.0
-    area        = row["area_m2"]
-    filename    = filenames.get(module_id)
-    if not filename:
-        return {"ok": False, "error": f"No file for module '{module_id}' on sample '{sample_id}'"}
-    file_path = sample_dir / filename
-    if not file_path.exists():
-        return {"ok": False, "error": f"File not found: {filename}"}
-    file_bytes = file_path.read_bytes()
+        if not row:
+            raise HTTPException(404, f"Sample '{sample_id}' not found")
+        filenames = json.loads(row["filenames"] or "{}")
+        thickness = row["thickness_nm"] or 0.0
+        area      = row["area_m2"]
+
+        try:
+            file_bytes, filename, files, registry = _resolve_module_files(
+                conn, sample_id, module_id, filenames
+            )
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
     area_correction = float((body.get("options") or {}).get("area_correction", 1.0) or 1.0)
 
     # Build meta — include per-sample module config with schema defaults applied
@@ -2325,10 +2622,14 @@ def render_for_sample(module_id: str, body: dict):
     meta = {"thickness_nm": thickness, "area_m2": area, "area_correction": area_correction,
             "config": mod_config}
 
-    # Run processing code
+    # Run processing code — inject files/registry alongside legacy file_bytes/filename
     indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
-    namespace: dict = {**_build_resource_api()}
+    namespace: dict = {
+        **_build_resource_api(),
+        "files": files,
+        "registry": registry,
+    }
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
         data = namespace["_proc"](file_bytes, filename, meta)
@@ -2370,19 +2671,19 @@ def compute_module_analysis_for_sample(module_id: str, body: dict):
             "SELECT filenames, thickness_nm, area_m2, area_correction, module_config FROM samples WHERE id=?",
             (sample_id,),
         ).fetchone()
-    if not row:
-        raise HTTPException(404, f"Sample '{sample_id}' not found")
-    filenames    = json.loads(row["filenames"] or "{}")
-    thickness    = row["thickness_nm"] or 0.0
-    area         = row["area_m2"]
-    area_corr    = float(row["area_correction"] or 1.0)
-    filename     = filenames.get(module_id)
-    if not filename:
-        return {"ok": False, "error": f"No file for module '{module_id}' on sample '{sample_id}'"}
-    file_path = FILES_DIR / sample_id / filename
-    if not file_path.exists():
-        return {"ok": False, "error": f"File not found: {filename}"}
-    file_bytes = file_path.read_bytes()
+        if not row:
+            raise HTTPException(404, f"Sample '{sample_id}' not found")
+        filenames = json.loads(row["filenames"] or "{}")
+        thickness = row["thickness_nm"] or 0.0
+        area      = row["area_m2"]
+        area_corr = float(row["area_correction"] or 1.0)
+
+        try:
+            file_bytes, filename, files, registry = _resolve_module_files(
+                conn, sample_id, module_id, filenames
+            )
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
 
     schema = _load_schema(module_id) or {}
     mod_config = json.loads(row["module_config"] or "{}").get(module_id, {})
@@ -2394,7 +2695,11 @@ def compute_module_analysis_for_sample(module_id: str, body: dict):
     resource_api = _build_resource_api()
     indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
-    namespace: dict = {**resource_api}
+    namespace: dict = {
+        **resource_api,
+        "files": files,
+        "registry": registry,
+    }
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
         result = namespace["_proc"](file_bytes, filename, meta)
