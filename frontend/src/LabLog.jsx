@@ -2294,7 +2294,7 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
           value={f.folder_id}
           onChange={set("folder_id")}
           folders={folders || []}
-          filterFn={fo => !fo.book_folder && !fo.module_folder}
+          filterFn={fo => !fo.book_folder && !fo.module_folder && !fo.mat_folder}
           emptyLabel="— Ungrouped —"
         />
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
@@ -5572,7 +5572,7 @@ function MaterialEditorModal({ material, settings, onSave, onDelete, onClose }) 
   const compositionDict = useMemo(() => {
     const d = {};
     for (const { el, amt } of compRows) {
-      if (el.trim()) d[el.trim()] = parseFloat(amt) || 0;
+      if (el.trim()) d[el.trim()] = amt.trim() === "" ? 1 : (parseFloat(amt) || 0);
     }
     return d;
   }, [compRows]);
@@ -5752,10 +5752,16 @@ function MaterialEditorModal({ material, settings, onSave, onDelete, onClose }) 
 
         {/* Actions */}
         <div style={{ display: "flex", gap: 8, justifyContent: "space-between", marginTop: 6 }}>
-          <div>
+          <div style={{ display: "flex", gap: 8 }}>
             {!isNew && <Btn variant="danger" small onClick={handleDelete}>Delete</Btn>}
           </div>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <Btn variant="ghost" small onClick={() => {
+              const a = document.createElement("a");
+              a.href = `${API_BASE}/materials-library/export`;
+              a.download = "materials-library.json";
+              a.click();
+            }}>Export Library</Btn>
             <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
             <Btn onClick={handleSave} disabled={saving || !draft.name.trim()}>{saving ? "Saving…" : "Save"}</Btn>
           </div>
@@ -6150,7 +6156,7 @@ function AddSampleFolderModal({ onSave, onClose, existing, allFolders = [] }) {
   const [name,     setName]     = useState(existing?.name || "");
   const [color,    setColor]    = useState(existing?.color || COLOR_OPTIONS[0]);
   const [parentId, setParentId] = useState(existing?.parent_id || "");
-  const sampleFolders = allFolders.filter(f => !f.book_folder && !f.module_folder);
+  const sampleFolders = allFolders.filter(f => !f.book_folder && !f.module_folder && !f.mat_folder);
   const getDescendantIds = (id, set = new Set()) => { set.add(id); sampleFolders.filter(f => f.parent_id === id).forEach(c => getDescendantIds(c.id, set)); return set; };
   const excludeIds = existing ? getDescendantIds(existing.id) : new Set();
   const parentOptions = sampleFolders.filter(f => !excludeIds.has(f.id));
@@ -6224,6 +6230,29 @@ function AddModuleFolderModal({ onSave, onClose, existing }) {
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
           <Btn onClick={() => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: true, parent_id: null })} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AddMatFolderModal({ onSave, onClose, existing }) {
+  const [name,  setName]  = useState(existing?.name || "");
+  const [color, setColor] = useState(existing?.color || COLOR_OPTIONS[0]);
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.teal, fontSize: 20 }}>{existing ? "Edit Folder" : "New Material Folder"}</h2>
+        <Input label="Name" value={name} onChange={setName} placeholder="e.g. Substrates" />
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <Label>Color</Label>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {COLOR_OPTIONS.map(c => <div key={c} onClick={() => setColor(c)} style={{ width: 24, height: 24, borderRadius: "50%", background: c, cursor: "pointer", border: color === c ? `3px solid ${T.textPrimary}` : "2px solid transparent", boxSizing: "border-box" }} />)}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn onClick={() => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: false, mat_folder: true, parent_id: null })} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
         </div>
       </div>
     </div>
@@ -11170,6 +11199,65 @@ function SampleFilter({ settings, samples = [], onFilterChange }) {
   );
 }
 
+// ── MatFolderTile ─────────────────────────────────────────────────────────────
+
+function MatFolderTile({ folder, mats, onOpenMat, onEdit, onDelete, onDropMat, onDragStartMat }) {
+  const lsKey = `matfolder-open-${folder.id}`;
+  const [open, setOpen] = useState(() => { try { const v = localStorage.getItem(lsKey); return v === null ? true : v === "1"; } catch { return true; } });
+  const toggleOpen = () => setOpen(v => { const next = !v; try { localStorage.setItem(lsKey, next ? "1" : "0"); } catch {} return next; });
+  const [dragOver, setDragOver] = useState(false);
+  const color = folder.color || T.borderBright;
+  return (
+    <div style={{ marginBottom: 8 }}
+      onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setDragOver(true); }}
+      onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false); }}
+      onDrop={e => { e.preventDefault(); const mid = e.dataTransfer.getData("text/x-mat"); if (mid) onDropMat?.(mid, folder.id); setDragOver(false); }}>
+      <div style={{ border: `2px solid ${dragOver ? T.amber : color}`, borderRadius: 10, overflow: "hidden", boxShadow: dragOver ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
+        <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: dragOver ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
+          onClick={toggleOpen}>
+          <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
+          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: T.textPrimary, flex: 1 }}>{folder.name}</span>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>{mats.length}</span>
+          <span style={{ color: T.textDim, fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+          <button onClick={e => { e.stopPropagation(); onEdit?.(); }} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: "0 3px" }}>✎</button>
+          <button onClick={e => { e.stopPropagation(); if (window.confirm(`Delete folder "${folder.name}"? Materials will become ungrouped.`)) onDelete?.(); }} style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, padding: "0 3px" }}>×</button>
+        </div>
+        {open && (
+          <div style={{ padding: 12, background: T.bg0 }}>
+            {mats.length > 0
+              ? <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                  {mats.map(m => (
+                    <div key={m.id}
+                      draggable
+                      onDragStart={e => { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/x-mat", m.id); onDragStartMat?.(m.id); }}
+                      onClick={() => onOpenMat?.(m)}
+                      style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 8, padding: "10px 14px", cursor: "pointer", minWidth: 160, maxWidth: 220, display: "flex", flexDirection: "column", gap: 4, transition: "border-color .15s" }}
+                      onMouseEnter={e => e.currentTarget.style.borderColor = T.amber}
+                      onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+                      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, fontWeight: 700, color: T.textPrimary }}>{m.name}</div>
+                      {Object.keys(m.composition || {}).length > 0 && (
+                        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}><ChemName name={compToFormula(m.composition)} /></div>
+                      )}
+                      {m.parent && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.teal }}>▸ {m.parent}</div>}
+                      {Object.keys(m.growth_defaults || {}).length > 0 && (
+                        <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 2 }}>
+                          {Object.keys(m.growth_defaults).map(tid => (
+                            <span key={tid} style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.amber, background: T.amberGlow, border: `1px solid ${T.amber}`, borderRadius: 3, padding: "1px 5px", textTransform: "uppercase" }}>{tid}</span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              : <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: dragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>{dragOver ? "Drop here" : "Empty folder"}</div>
+            }
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── MaterialsLibrarySection ───────────────────────────────────────────────────
 
 function MatImportModal({ onClose, onImported }) {
@@ -11287,10 +11375,11 @@ function MatImportModal({ onClose, onImported }) {
   );
 }
 
-function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete, onReplaceAll }) {
+function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete, onReplaceAll, matFolders = [], onCreateMatFolder, onDeleteMatFolder, onEditMatFolder, onAssignMatFolder }) {
   const [editorMat, setEditorMat] = useState(null); // null=closed, false=new, or material entry
   const [importOpen, setImportOpen] = useState(false);
   const [open, setOpen] = useState(true);
+  const [draggingMatId, setDraggingMatId] = useState(null);
 
   const handleSave = (result) => {
     onUpdate(result);
@@ -11301,12 +11390,35 @@ function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete, o
     setEditorMat(null);
   };
 
-  const handleExport = () => {
-    const a = document.createElement("a");
-    a.href = `${API_BASE}/materials-library/export`;
-    a.download = "materials-library.json";
-    a.click();
+  const handleDropMat = async (matId, folderId) => {
+    await onAssignMatFolder?.(matId, folderId);
+    setDraggingMatId(null);
   };
+
+  const MatCard = ({ m }) => (
+    <div
+      draggable={matFolders.length > 0}
+      onDragStart={matFolders.length > 0 ? e => { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/x-mat", m.id); setDraggingMatId(m.id); } : undefined}
+      onClick={() => setEditorMat(m)}
+      style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 8, padding: "10px 14px", cursor: "pointer", minWidth: 160, maxWidth: 220, display: "flex", flexDirection: "column", gap: 4, transition: "border-color .15s" }}
+      onMouseEnter={e => e.currentTarget.style.borderColor = T.amber}
+      onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, fontWeight: 700, color: T.textPrimary }}>{m.name}</div>
+      {Object.keys(m.composition || {}).length > 0 && (
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}><ChemName name={compToFormula(m.composition)} /></div>
+      )}
+      {m.parent && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.teal }}>▸ {m.parent}</div>}
+      {Object.keys(m.growth_defaults || {}).length > 0 && (
+        <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 2 }}>
+          {Object.keys(m.growth_defaults).map(tid => (
+            <span key={tid} style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.amber, background: T.amberGlow, border: `1px solid ${T.amber}`, borderRadius: 3, padding: "1px 5px", textTransform: "uppercase" }}>{tid}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  const ungroupedMats = materialsLib.filter(m => !m.folder_id || !matFolders.find(f => f.id === m.folder_id));
 
   return (
     <div style={{ marginBottom: 32 }}>
@@ -11317,41 +11429,50 @@ function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete, o
         </h2>
         <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{open ? "▴" : "▾"}</span>
         <div style={{ flex: 1 }} />
+        <Btn small variant="ghost" onClick={onCreateMatFolder}>+ Folder</Btn>
         <Btn small variant="ghost" onClick={() => setImportOpen(true)}>Import</Btn>
-        <Btn small variant="ghost" onClick={handleExport} disabled={materialsLib.length === 0}>Export</Btn>
         <Btn small onClick={() => setEditorMat(false)}>+ New Material</Btn>
       </div>
 
       {open && (
-        materialsLib.length === 0 ? (
-          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "12px 0" }}>
-            No materials yet. Add your first material to start building the library.
-          </div>
-        ) : (
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
-            {materialsLib.map(m => (
-              <div key={m.id} onClick={() => setEditorMat(m)}
-                style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 8, padding: "10px 14px", cursor: "pointer", minWidth: 160, maxWidth: 220, display: "flex", flexDirection: "column", gap: 4, transition: "border-color .15s" }}
-                onMouseEnter={e => e.currentTarget.style.borderColor = T.amber}
-                onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
-                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, fontWeight: 700, color: T.textPrimary }}>{m.name}</div>
-                {Object.keys(m.composition || {}).length > 0 && (
-                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>
-                    <ChemName name={compToFormula(m.composition)} />
-                  </div>
-                )}
-                {m.parent && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.teal }}>▸ {m.parent}</div>}
-                {Object.keys(m.growth_defaults || {}).length > 0 && (
-                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 2 }}>
-                    {Object.keys(m.growth_defaults).map(tid => (
-                      <span key={tid} style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.amber, background: T.amberGlow, border: `1px solid ${T.amber}`, borderRadius: 3, padding: "1px 5px", textTransform: "uppercase" }}>{tid}</span>
-                    ))}
-                  </div>
-                )}
+        <>
+          {/* Folder tiles */}
+          {matFolders.map(folder => (
+            <MatFolderTile key={folder.id}
+              folder={folder}
+              mats={materialsLib.filter(m => m.folder_id === folder.id)}
+              onOpenMat={setEditorMat}
+              onEdit={() => onEditMatFolder?.(folder)}
+              onDelete={() => onDeleteMatFolder?.(folder.id)}
+              onDropMat={handleDropMat}
+              onDragStartMat={setDraggingMatId} />
+          ))}
+
+          {/* Ungrouped */}
+          {(ungroupedMats.length > 0 || draggingMatId) && (
+            <div
+              onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
+              onDrop={e => { e.preventDefault(); const mid = e.dataTransfer.getData("text/x-mat"); if (mid) handleDropMat(mid, null); }}>
+              {matFolders.length > 0 && ungroupedMats.length > 0 && (
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>Ungrouped</div>
+              )}
+              {ungroupedMats.length === 0 && materialsLib.length === 0 && (
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "12px 0" }}>
+                  No materials yet. Add your first material to start building the library.
+                </div>
+              )}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                {ungroupedMats.map(m => <MatCard key={m.id} m={m} />)}
               </div>
-            ))}
-          </div>
-        )
+            </div>
+          )}
+
+          {materialsLib.length === 0 && matFolders.length === 0 && (
+            <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "12px 0" }}>
+              No materials yet. Add your first material to start building the library.
+            </div>
+          )}
+        </>
       )}
 
       {editorMat !== null && (
@@ -11397,6 +11518,7 @@ export default function App() {
   const [addingSampleFolder, setAddingSampleFolder] = useState(false);
   const [addingBookFolder,   setAddingBookFolder]   = useState(false);
   const [addingModuleFolder, setAddingModuleFolder] = useState(false);
+  const [addingMatFolder,    setAddingMatFolder]    = useState(false);
   const [editingFolder, setEditingFolder] = useState(null); // folder object being edited — type inferred from its flags
   const [importModalType, setImportModalType] = useState(null); // "sample"|"book"|"module"|null
   const [importing,       setImporting]       = useState(false);
@@ -11728,6 +11850,7 @@ export default function App() {
     setAddingSampleFolder(false);
     setAddingBookFolder(false);
     setAddingModuleFolder(false);
+    setAddingMatFolder(false);
   };
 
   const saveFolder = async (data) => {
@@ -11887,8 +12010,8 @@ export default function App() {
 
   const byId = (a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" });
   const sortedFolders = [...folders].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.name.localeCompare(b.name));
-  const getSiblings = (parentId, isBook) => sortedFolders.filter(f => !!f.book_folder === isBook && !f.module_folder && (f.parent_id ?? null) === parentId);
-  const allSampleFolders = folders.filter(f => !f.book_folder);
+  const getSiblings = (parentId, isBook) => sortedFolders.filter(f => !!f.book_folder === isBook && !f.module_folder && !f.mat_folder && (f.parent_id ?? null) === parentId);
+  const allSampleFolders = folders.filter(f => !f.book_folder && !f.module_folder && !f.mat_folder);
   const displaySamples = filteredSampleIds ? samples.filter(s => filteredSampleIds.has(s.id)) : samples;
   const ungrouped = displaySamples.filter(s => !s.folder_id || !allSampleFolders.find(f => f.id === s.folder_id)).sort(byId);
   const [ungroupedDragOver,     setUngroupedDragOver]     = useState(false);
@@ -12154,12 +12277,20 @@ export default function App() {
                 <MaterialsLibrarySection
                   materialsLib={materialsLib}
                   settings={settings}
+                  matFolders={folders.filter(f => f.mat_folder)}
                   onUpdate={mat => setMaterialsLib(prev => {
                     const idx = prev.findIndex(m => m.id === mat.id);
                     return idx >= 0 ? prev.map(m => m.id === mat.id ? mat : m) : [...prev, mat];
                   })}
                   onDelete={id => setMaterialsLib(prev => prev.filter(m => m.id !== id))}
-                  onReplaceAll={mats => setMaterialsLib(mats)} />
+                  onReplaceAll={mats => setMaterialsLib(mats)}
+                  onCreateMatFolder={() => setAddingMatFolder(true)}
+                  onEditMatFolder={folder => setEditingFolder(folder)}
+                  onDeleteMatFolder={id => deleteFolder(id)}
+                  onAssignMatFolder={async (matId, folderId) => {
+                    await api("PATCH", `/materials-library/${matId}/folder`, { folder_id: folderId || null });
+                    setMaterialsLib(prev => prev.map(m => m.id === matId ? { ...m, folder_id: folderId || null } : m));
+                  }} />
               </div>
 
               {/* Modules section */}
@@ -12235,14 +12366,17 @@ export default function App() {
           setSamples(p => p.map(s => s.id === active ? updated : s));
         }} />}
       {settingsOpen && <SettingsModal settings={settings} onSave={handleSaveSettings} onClose={() => setSettingsOpen(false)} />}
-      {(addingSampleFolder || (editingFolder && !editingFolder.book_folder && !editingFolder.module_folder)) && (
-        <AddSampleFolderModal onSave={saveFolder} onClose={() => { setAddingSampleFolder(false); setEditingFolder(null); }} existing={editingFolder && !editingFolder.book_folder && !editingFolder.module_folder ? editingFolder : null} allFolders={folders} />
+      {(addingSampleFolder || (editingFolder && !editingFolder.book_folder && !editingFolder.module_folder && !editingFolder.mat_folder)) && (
+        <AddSampleFolderModal onSave={saveFolder} onClose={() => { setAddingSampleFolder(false); setEditingFolder(null); }} existing={editingFolder && !editingFolder.book_folder && !editingFolder.module_folder && !editingFolder.mat_folder ? editingFolder : null} allFolders={folders} />
       )}
       {(addingBookFolder || (editingFolder?.book_folder)) && (
         <AddBookFolderModal onSave={saveFolder} onClose={() => { setAddingBookFolder(false); setEditingFolder(null); }} existing={editingFolder?.book_folder ? editingFolder : null} allFolders={folders} />
       )}
       {(addingModuleFolder || (editingFolder?.module_folder)) && (
         <AddModuleFolderModal onSave={saveFolder} onClose={() => { setAddingModuleFolder(false); setEditingFolder(null); }} existing={editingFolder?.module_folder ? editingFolder : null} />
+      )}
+      {(addingMatFolder || (editingFolder?.mat_folder)) && (
+        <AddMatFolderModal onSave={saveFolder} onClose={() => { setAddingMatFolder(false); setEditingFolder(null); }} existing={editingFolder?.mat_folder ? editingFolder : null} />
       )}
       {importModalType && (
         <ImportModal

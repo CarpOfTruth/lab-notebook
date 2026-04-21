@@ -134,6 +134,14 @@ def init_db():
         except sqlite3.OperationalError:
             pass
         try:
+            conn.execute("ALTER TABLE folders ADD COLUMN mat_folder INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE materials_library ADD COLUMN folder_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
             conn.execute("ALTER TABLE samples ADD COLUMN xrd_peaks TEXT DEFAULT '[]'")
         except sqlite3.OperationalError:
             pass
@@ -192,6 +200,7 @@ def _mat_row_to_dict(row):
         "crystal": json.loads(row["crystal"] or "{}"),
         "properties": json.loads(row["properties"] or "{}"),
         "growth_defaults": json.loads(row["growth_defaults"] or "{}"),
+        "folder_id": row["folder_id"] if "folder_id" in row.keys() else None,
     }
 
 def _make_mat_id(name: str, existing_ids: set) -> str:
@@ -299,10 +308,11 @@ def list_folders():
 def create_folder(folder: dict):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO folders (id, name, color, book_folder, module_folder, parent_id, sort_order) VALUES (:id, :name, :color, :book_folder, :module_folder, :parent_id, :sort_order)",
+            "INSERT INTO folders (id, name, color, book_folder, module_folder, mat_folder, parent_id, sort_order) VALUES (:id, :name, :color, :book_folder, :module_folder, :mat_folder, :parent_id, :sort_order)",
             {"id": folder["id"], "name": folder["name"], "color": folder.get("color", "#4a5568"),
              "book_folder": 1 if folder.get("book_folder") else 0,
              "module_folder": 1 if folder.get("module_folder") else 0,
+             "mat_folder": 1 if folder.get("mat_folder") else 0,
              "parent_id": folder.get("parent_id") or None,
              "sort_order": folder.get("sort_order", 0)},
         )
@@ -313,10 +323,11 @@ def create_folder(folder: dict):
 def update_folder(folder_id: str, folder: dict):
     with get_db() as conn:
         conn.execute(
-            "UPDATE folders SET name=:name, color=:color, book_folder=:book_folder, module_folder=:module_folder, parent_id=:parent_id, sort_order=:sort_order WHERE id=:id",
+            "UPDATE folders SET name=:name, color=:color, book_folder=:book_folder, module_folder=:module_folder, mat_folder=:mat_folder, parent_id=:parent_id, sort_order=:sort_order WHERE id=:id",
             {"id": folder_id, "name": folder["name"], "color": folder.get("color", "#4a5568"),
              "book_folder": 1 if folder.get("book_folder") else 0,
              "module_folder": 1 if folder.get("module_folder") else 0,
+             "mat_folder": 1 if folder.get("mat_folder") else 0,
              "parent_id": folder.get("parent_id") or None,
              "sort_order": folder.get("sort_order", 0)},
         )
@@ -339,6 +350,15 @@ async def update_module_folder(module_id: str, request: Request):
     else:
         cfg.pop("folder_id", None)
     schema_path.write_text(json.dumps(cfg, indent=2))
+    return {"ok": True}
+
+@app.patch("/api/materials-library/{mat_id}/folder")
+async def update_material_folder(mat_id: str, request: Request):
+    """Set (or clear) the folder_id for a material library entry."""
+    body = await request.json()
+    folder_id = body.get("folder_id") or None
+    with get_db() as conn:
+        conn.execute("UPDATE materials_library SET folder_id=? WHERE id=?", (folder_id, mat_id))
     return {"ok": True}
 
 @app.delete("/api/folders/{folder_id}")
