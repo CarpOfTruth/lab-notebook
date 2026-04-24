@@ -864,6 +864,67 @@ function TwoLinePlot({ data, cfg }) {
   );
 }
 
+// ── ModulePlot ─────────────────────────────────────────────────────────────
+// Generic N-trace plot for module cards. Reads trace list from render-for-sample.
+// traces: [{x[], y[], label, color, style ("line"|"fit"), axis ("y1"|"y2")}]
+function ModulePlot({ traces, xLabel, y1Label, y2Label }) {
+  const { ref, tooltipPos, onMouseMove } = useTooltipSide();
+  if (!traces?.length) return null;
+  const hasY2    = traces.some(t => t.axis === "y2");
+  const y1Traces = traces.filter(t => t.axis !== "y2");
+  const y2Traces = traces.filter(t => t.axis === "y2");
+  const allX     = traces.flatMap(t => t.x || []);
+  const allY1    = y1Traces.flatMap(t => t.y || []);
+  const allY2    = y2Traces.flatMap(t => t.y || []);
+  if (!allX.length || !allY1.length) return null;
+  const { ticks: xTicks, domain: xDomain } = niceLinTicks(arrMin(allX), arrMax(allX));
+  const [y1Lo, y1Hi] = padDomain(allY1);
+  const { ticks: y1Ticks, domain: y1Domain } = niceLinTicks(y1Lo, y1Hi);
+  const y2Domain = allY2.length ? padDomain(allY2) : [0, 1];
+  return (
+    <div ref={ref}>
+      <ResponsiveContainer width="100%" height={200}>
+        <ComposedChart onMouseMove={onMouseMove} margin={{ top: 6, right: hasY2 ? 44 : 12, bottom: 28, left: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+          <XAxis dataKey="x" type="number" domain={xDomain} ticks={xTicks} tickLine={false}
+            axisLine={{ stroke: T.borderBright }}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
+            label={{ value: xLabel || "", position: "insideBottom", offset: -14, fill: T.textSecondary, fontSize: 11 }} />
+          <YAxis yAxisId="y1" domain={y1Domain} ticks={y1Ticks} tickLine={false}
+            axisLine={{ stroke: T.borderBright }}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
+            label={{ value: y1Label || "", angle: -90, position: "insideLeft", offset: 14, fill: T.textSecondary, fontSize: 10 }} />
+          {hasY2 && <YAxis yAxisId="y2" orientation="right" domain={y2Domain} tickLine={false} axisLine={false}
+            tick={{ fill: T.amber, fontSize: 9, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
+            label={{ value: y2Label || "y2", angle: 90, position: "insideRight", offset: -6, fill: T.amber, fontSize: 9 }} />}
+          <Tooltip position={tooltipPos}
+            contentStyle={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11 }}
+            formatter={(v, name) => [numFmt(+v), name]}
+            labelFormatter={v => `${xLabel || "x"}: ${numFmt(+v)}`} />
+          {traces.map((tr, i) => {
+            const trData = (tr.x || []).map((xi, j) => ({ x: xi, y: (tr.y || [])[j] }));
+            return (
+              <Line key={i}
+                yAxisId={tr.axis === "y2" ? "y2" : "y1"}
+                data={trData}
+                dataKey="y"
+                dot={false}
+                stroke={tr.color || "#94a3b8"}
+                strokeWidth={1.5}
+                strokeDasharray={tr.style === "fit" ? "4 2" : undefined}
+                strokeOpacity={tr.style === "fit" ? 0.55 : 1}
+                isAnimationActive={false}
+                name={tr.label || `trace ${i + 1}`}
+              />
+            );
+          })}
+          <Customized component={PlotBox} xTicks={xTicks ?? []} yTicks={y1Ticks ?? []} />
+        </ComposedChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
 // Canvas-based RSM renderer for the sample detail view — raw display, no processing.
 function RsmCanvasPlot({ data, logIntensity = false }) {
   const wrapRef   = useRef(null);
@@ -1294,7 +1355,7 @@ function ModuleCard({ mod, sample, onRemoved, onSampleUpdate }) {
   const areaCtrl = (mod.card_controls || []).find(c => c.type === "area");
   const hasConfig = (mod.config_schema || []).length > 0;
   const [controlState, setControlState] = useState(initControls);
-  const [plotData,     setPlotData]     = useState(null); // {points, xLabel, yLabel, color}
+  const [plotData,     setPlotData]     = useState(null); // {traces, xLabel, y1Label, y2Label}
   const [loading,      setLoading]      = useState(false);
   const [fetchError,   setFetchError]   = useState(null);
   const [areaM2,       setAreaM2]       = useState(sample.area_m2 ?? null);
@@ -1323,11 +1384,17 @@ function ModuleCard({ mod, sample, onRemoved, onSampleUpdate }) {
         options,
       });
       if (res.ok) {
+        // Support both new traces format and old x/y backward compat
+        const traces = res.traces || [{
+          x: res.x || [], y: res.y || [],
+          label: res.y_label || "y", color: res.color || "#94a3b8",
+          style: "line", axis: "y1",
+        }];
         setPlotData({
-          points: res.x.map((xi, i) => ({ x: xi, y: res.y[i] })),
-          xLabel: res.x_label,
-          yLabel: res.y_label,
-          color:  res.color || "#fc8181",
+          traces,
+          xLabel:  res.x_label,
+          y1Label: res.y1_label || res.y_label,
+          y2Label: res.y2_label || null,
         });
         if (res.area_m2 != null) setAreaM2(res.area_m2);
       } else setFetchError(res.error || "Render failed");
@@ -1398,20 +1465,20 @@ function ModuleCard({ mod, sample, onRemoved, onSampleUpdate }) {
       <div style={{ padding: "10px 12px" }}>
         {plotData ? (
           <>
-            <LinePlot data={plotData.points} cfg={{
-              xLabel:    plotData.xLabel,
-              yLabel:    plotData.yLabel,
-              color:     plotData.color,
-              symXTicks: true,
-              zeroRefY:  true,
-              ySymRange: 30,
-            }} />
-            <div style={{ marginTop: 8 }}>
-              <label style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, border: `1px dashed ${T.border}`, borderRadius: 6, padding: "6px 0", cursor: "pointer", fontFamily: mono, fontSize: 11, color: T.textDim }}>
-                ↑ replace file
-                <input type="file" accept={mod.accepts?.join(",")} style={{ display: "none" }} onChange={e => { if (e.target.files[0]) { onRemoved?.(); } }} />
-              </label>
-            </div>
+            <ModulePlot
+              traces={plotData.traces}
+              xLabel={plotData.xLabel}
+              y1Label={plotData.y1Label}
+              y2Label={plotData.y2Label}
+            />
+            {!isCollectionMode && (
+              <div style={{ marginTop: 8 }}>
+                <label style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, border: `1px dashed ${T.border}`, borderRadius: 6, padding: "6px 0", cursor: "pointer", fontFamily: mono, fontSize: 11, color: T.textDim }}>
+                  ↑ replace file
+                  <input type="file" accept={mod.accepts?.join(",")} style={{ display: "none" }} onChange={e => { if (e.target.files[0]) { onRemoved?.(); } }} />
+                </label>
+              </div>
+            )}
           </>
         ) : loading ? (
           <div style={{ height: 200, display: "flex", alignItems: "center", justifyContent: "center", color: T.textDim, fontFamily: mono, fontSize: 11 }}>Loading…</div>
@@ -4164,8 +4231,9 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
   const [procError,   setProcError]   = useState(null);
 
   // ── Plot section state ────────────────────────────────────────────────────
-  const [plotConfig,  setPlotConfig]  = useState({ x_var: "", y_var: "", x_label: "", y_label: "", x_scale: "linear", y_scale: "linear", color: "", show_fit: true, primary: "data", secondary_opacity: 0.35 });
+  const [plotConfig,  setPlotConfig]  = useState({ x_var: "", y_var: "", x_label: "", y_label: "", y2_label: "", x_scale: "linear", y_scale: "linear", y2_scale: "linear", color: "", show_fit: true, primary: "data", secondary_opacity: 0.35 });
   const _fitMemory = useRef({ primary: "fit", secondary_opacity: 0.25 }); // remembered fit prefs
+  const [plotTraces,  setPlotTraces]  = useState([]); // [{x_key, y_key, label, axis, style, color}]
   const [plotVars,    setPlotVars]    = useState([]); // available array keys from last proc run
   const [plotFigure,  setPlotFigure]  = useState(null);
   const [plotLoading, setPlotLoading] = useState(false);
@@ -4225,7 +4293,19 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
         setProcBlock2(defaultProcBlock2());
         setProcBlock3(defaultProcBlock3());
       }
-      if (cfg.plot_config)       setPlotConfig(cfg.plot_config);
+      if (cfg.plot_config)       setPlotConfig(c => ({ ...c, ...cfg.plot_config }));
+      if (cfg.plot_traces && cfg.plot_traces.length > 0) {
+        setPlotTraces(cfg.plot_traces);
+      } else if (cfg.plot_config?.x_var || cfg.plot_config?.y_var) {
+        // Auto-migrate single-trace legacy config into plotTraces
+        setPlotTraces([{
+          x_key: cfg.plot_config.x_var || "x",
+          y_key: cfg.plot_config.y_var || "y",
+          label: cfg.plot_config.y_label || cfg.plot_config.y_var || "y",
+          axis: "y1", style: "line",
+          color: cfg.plot_config.color || "",
+        }]);
+      }
       if (cfg.analysis_metrics) setAnalysisMetrics(cfg.analysis_metrics);
       // Three-block analysis: prefer explicit block fields; fall back to splitting analysis_code
       if (cfg.analysis_block2 != null) {
@@ -4318,7 +4398,10 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       proc_block2: procBlock2,
       proc_block3: procBlock3,
       proc_code: fullProcCode(),       // backward compat
-      plot_config: { ...plotConfig, color: effectiveColor, opacity: dataOpacity, fit_color: effectiveColor, fit_opacity: fitOpacity },
+      plot_config: { ...plotConfig, color: effectiveColor, opacity: dataOpacity, fit_color: effectiveColor, fit_opacity: fitOpacity,
+                     x_var: plotTraces[0]?.x_key || plotConfig.x_var,
+                     y_var: plotTraces[0]?.y_key || plotConfig.y_var },
+      plot_traces: plotTraces,
       analysis_metrics: analysisMetrics,
       analysis_block2: analysisBlock2,
       analysis_block3: analysisBlock3,
@@ -4458,7 +4541,11 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
     if (!code.trim()) return;
     setPlotLoading(true); setPlotFigure(null); setPlotError(null);
     try {
-      const res = await api("POST", `/modules/${mod.id}/preview-plot`, { code, plot_config: { ...plotConfig, color: effectiveColor, opacity: dataOpacity, fit_color: effectiveColor, fit_opacity: fitOpacity } });
+      const res = await api("POST", `/modules/${mod.id}/preview-plot`, {
+        code,
+        plot_config: { ...plotConfig, color: effectiveColor, opacity: dataOpacity, fit_color: effectiveColor, fit_opacity: fitOpacity },
+        plot_traces: plotTraces,
+      });
       if (res.ok) {
         setPlotFigure(res.figure);
         if (res.figure.available_vars?.length) setPlotVars(res.figure.available_vars);
@@ -4476,7 +4563,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
     if (!_plotFigureRef.current) return;
     const t = setTimeout(() => _previewPlotRef.current?.(), 350);
     return () => clearTimeout(t);
-  }, [JSON.stringify(plotConfig)]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(plotConfig), JSON.stringify(plotTraces)]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleComputeAnalysis = async () => {
     const proc_code = fullProcCode();
@@ -4688,6 +4775,57 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
             placeholder="Describe what this module parses, expected file format, options, etc."
             style={{ ...field(), resize: "vertical", lineHeight: 1.6 }} />
         </div>
+
+        {/* ── Dependencies ── */}
+        {!isBuiltin && (
+          <div style={{ marginTop: 20 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+              <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Dependencies</span>
+              <button
+                disabled={isCreate || depLoading || depStatus.every(d => d.installed || d.blocked)}
+                onClick={async () => {
+                  setDepLoading(true);
+                  const r = await api("POST", `/modules/${mod.id}/install-dependencies`).catch(() => null);
+                  if (r?.results) setDepStatus(prev => {
+                    const map = Object.fromEntries(r.results.map(x => [x.dep, x]));
+                    return prev.map(d => map[d.dep] ? { ...d, installed: map[d.dep].ok || d.installed } : d);
+                  });
+                  setDepLoading(false);
+                }}
+                style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: (isCreate || depLoading) ? T.textDim : T.teal, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: (isCreate || depLoading) ? "default" : "pointer" }}>
+                {depLoading ? "Installing…" : "Install missing"}
+              </button>
+            </div>
+            <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 8 }}>
+              pip packages required by this module (e.g. <span style={{ color: T.textPrimary }}>lmfit&gt;=1.0</span>). One per line.
+            </div>
+            <textarea
+              value={moduleDeps.join("\n")}
+              onChange={e => {
+                const deps = e.target.value.split("\n").map(s => s.trim()).filter(Boolean);
+                setModuleDeps(deps);
+                setDepStatus([]);
+              }}
+              rows={Math.max(2, moduleDeps.length + 1)}
+              spellCheck={false}
+              style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "8px 10px", outline: "none", resize: "vertical", boxSizing: "border-box" }}
+            />
+            {depStatus.length > 0 && (
+              <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {depStatus.map((d, i) => (
+                  <span key={i} style={{
+                    fontFamily: mono, fontSize: 10, padding: "2px 8px", borderRadius: 10,
+                    border: `1px solid ${d.blocked ? T.red + "55" : d.installed ? T.teal + "55" : T.amber + "55"}`,
+                    background: d.blocked ? T.red + "12" : d.installed ? T.teal + "12" : T.amber + "12",
+                    color: d.blocked ? T.red : d.installed ? T.teal : T.amber,
+                  }}>
+                    {d.dep} {d.blocked ? "⊘ blocked" : d.installed ? "✓" : "⚠ missing"}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* ── Card section ── */}
@@ -4801,55 +4939,6 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
               )}
             </div>
           ))}
-        </div>
-
-        {/* ── Dependencies ── */}
-        <div style={{ marginTop: 20 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-            <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Dependencies</span>
-            <button
-              disabled={depLoading || depStatus.every(d => d.installed || d.blocked)}
-              onClick={async () => {
-                setDepLoading(true);
-                const r = await api("POST", `/modules/${mod.id}/install-dependencies`).catch(() => null);
-                if (r?.results) setDepStatus(prev => {
-                  const map = Object.fromEntries(r.results.map(x => [x.dep, x]));
-                  return prev.map(d => map[d.dep] ? { ...d, installed: map[d.dep].ok || d.installed } : d);
-                });
-                setDepLoading(false);
-              }}
-              style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: depLoading ? T.textDim : T.teal, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: depLoading ? "default" : "pointer" }}>
-              {depLoading ? "Installing…" : "Install missing"}
-            </button>
-          </div>
-          <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 8 }}>
-            pip packages required by this module (e.g. <span style={{ color: T.textPrimary }}>lmfit&gt;=1.0</span>). One per line.
-          </div>
-          <textarea
-            value={moduleDeps.join("\n")}
-            onChange={e => {
-              const deps = e.target.value.split("\n").map(s => s.trim()).filter(Boolean);
-              setModuleDeps(deps);
-              setDepStatus([]);
-            }}
-            rows={Math.max(2, moduleDeps.length + 1)}
-            spellCheck={false}
-            style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "8px 10px", outline: "none", resize: "vertical", boxSizing: "border-box" }}
-          />
-          {depStatus.length > 0 && (
-            <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 6 }}>
-              {depStatus.map((d, i) => (
-                <span key={i} style={{
-                  fontFamily: mono, fontSize: 10, padding: "2px 8px", borderRadius: 10,
-                  border: `1px solid ${d.blocked ? T.red + "55" : d.installed ? T.teal + "55" : T.amber + "55"}`,
-                  background: d.blocked ? T.red + "12" : d.installed ? T.teal + "12" : T.amber + "12",
-                  color: d.blocked ? T.red : d.installed ? T.teal : T.amber,
-                }}>
-                  {d.dep} {d.blocked ? "⊘ blocked" : d.installed ? "✓" : "⚠ missing"}
-                </span>
-              ))}
-            </div>
-          )}
         </div>
       </div>
 
@@ -5093,8 +5182,8 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
           </div>
         )}
 
-        {/* Upload dropzone — hidden in collection mode (no example file needed) */}
-        {!isCreate && !exInfo && !exLoading && fileMode !== "collection" && (
+        {/* Upload dropzone */}
+        {!isCreate && !exInfo && !exLoading && (
           <label style={{
             display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
             border: `2px dashed ${T.border}`, borderRadius: 8, padding: "32px 20px",
@@ -5103,7 +5192,12 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
           onDragOver={e => e.preventDefault()}
           onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) handleExampleUpload(f); }}>
             <input type="file" style={{ display: "none" }} onChange={e => { const f = e.target.files[0]; if (f) handleExampleUpload(f); }} />
-            <span style={{ fontFamily: mono, fontSize: 13, color: T.textDim }}>Drop an example file or click to upload</span>
+            <span style={{ fontFamily: mono, fontSize: 13, color: T.textDim }}>
+              {fileMode === "collection" ? "Drop a representative file or click to upload" : "Drop an example file or click to upload"}
+            </span>
+            {fileMode === "collection" && (
+              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Used for Block 1 generation only — proc_code receives the full collection at runtime</span>
+            )}
             {mAccepts.length > 0 && (
               <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Accepts: {mAccepts.join(", ")}</span>
             )}
@@ -5434,47 +5528,78 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
           </button>
         </div>
 
-        {/* Visual config grid */}
+        {/* ── Traces table ── */}
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Traces</span>
+            <button onClick={() => setPlotTraces(prev => [...prev, {
+              x_key: plotVars[0] || "x", y_key: plotVars[Math.min(1, plotVars.length - 1)] || "y",
+              label: "", axis: "y1", style: "line", color: COLOR_PALETTE[prev.length % COLOR_PALETTE.length],
+            }])}
+              style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: T.textSecondary, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+              + Add Trace
+            </button>
+          </div>
+          <div style={{ border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 52px 52px 26px 22px", background: T.bg2, borderBottom: plotTraces.length > 0 ? `1px solid ${T.border}` : "none", padding: "5px 12px", fontFamily: mono, fontSize: 10, color: T.textDim, letterSpacing: 0.5, textTransform: "uppercase" }}>
+              <span>X key</span><span>Y key</span><span>Label</span><span>Axis</span><span>Style</span><span/>
+            </div>
+            {plotTraces.length === 0 && (
+              <div style={{ padding: "12px 16px", fontFamily: mono, fontSize: 11, color: T.textDim, textAlign: "center" }}>
+                No traces — use <strong style={{ color: T.textSecondary }}>+ Add Trace</strong> to map proc_code outputs to plot lines
+              </div>
+            )}
+            {plotTraces.map((tr, i) => {
+              const mkVarInput = (val, key) => plotVars.length > 0 ? (
+                <select value={val} onChange={e => setPlotTraces(prev => prev.map((x, j) => j === i ? { ...x, [key]: e.target.value } : x))}
+                  style={{ background: "none", border: "none", outline: "none", fontFamily: mono, fontSize: 11, color: T.teal, padding: "2px 0", width: "100%", cursor: "pointer" }}>
+                  {plotVars.map(v => <option key={v} value={v}>{v}</option>)}
+                </select>
+              ) : (
+                <input value={val} placeholder={key === "x_key" ? "x" : "y"}
+                  onChange={e => setPlotTraces(prev => prev.map((x, j) => j === i ? { ...x, [key]: e.target.value } : x))}
+                  style={{ background: "none", border: "none", outline: "none", fontFamily: mono, fontSize: 11, color: T.teal, padding: "2px 0", width: "100%" }} />
+              );
+              const trColor = tr.color || COLOR_PALETTE[i % COLOR_PALETTE.length];
+              return (
+                <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 52px 52px 26px 22px", alignItems: "center", borderBottom: i < plotTraces.length - 1 ? `1px solid ${T.border}` : "none", padding: "4px 12px", background: i % 2 === 0 ? "transparent" : T.bg2 + "55" }}>
+                  {mkVarInput(tr.x_key, "x_key")}
+                  {mkVarInput(tr.y_key, "y_key")}
+                  <input value={tr.label} placeholder={tr.y_key || "label"}
+                    onChange={e => setPlotTraces(prev => prev.map((x, j) => j === i ? { ...x, label: e.target.value } : x))}
+                    style={{ background: "none", border: "none", outline: "none", fontFamily: mono, fontSize: 11, color: T.textPrimary, padding: "2px 0", width: "100%" }} />
+                  <select value={tr.axis} onChange={e => setPlotTraces(prev => prev.map((x, j) => j === i ? { ...x, axis: e.target.value } : x))}
+                    style={{ background: "none", border: "none", outline: "none", fontFamily: mono, fontSize: 10, color: T.textSecondary, padding: "2px 0", cursor: "pointer" }}>
+                    <option value="y1">Y1</option>
+                    <option value="y2">Y2</option>
+                  </select>
+                  <select value={tr.style} onChange={e => setPlotTraces(prev => prev.map((x, j) => j === i ? { ...x, style: e.target.value } : x))}
+                    style={{ background: "none", border: "none", outline: "none", fontFamily: mono, fontSize: 10, color: T.textSecondary, padding: "2px 0", cursor: "pointer" }}>
+                    <option value="line">line</option>
+                    <option value="fit">fit</option>
+                  </select>
+                  {/* Color swatch — click cycles palette */}
+                  <button onClick={() => {
+                    const idx = COLOR_PALETTE.indexOf(tr.color);
+                    const next = idx === -1 ? COLOR_PALETTE[0] : COLOR_PALETTE[(idx + 1) % COLOR_PALETTE.length];
+                    setPlotTraces(prev => prev.map((x, j) => j === i ? { ...x, color: next } : x));
+                  }} title="Click to change color"
+                    style={{ width: 18, height: 18, borderRadius: 3, background: trColor, border: "1px solid rgba(255,255,255,0.18)", cursor: "pointer", flexShrink: 0 }} />
+                  <button onClick={() => setPlotTraces(prev => prev.filter((_, j) => j !== i))}
+                    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 14, lineHeight: 1, padding: 0, textAlign: "center" }}>✕</button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* ── Axis labels & scales ── */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
-          {/* X variable */}
           <div>
-            <span style={label}>X variable</span>
-            {plotVars.length > 0 ? (
-              <select value={plotConfig.x_var} onChange={e => setPlotConfig(c => ({ ...c, x_var: e.target.value }))}
-                style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", width: "100%", outline: "none" }}>
-                {plotVars.map(v => <option key={v} value={v}>{v}</option>)}
-              </select>
-            ) : (
-              <input value={plotConfig.x_var} onChange={e => setPlotConfig(c => ({ ...c, x_var: e.target.value }))}
-                placeholder="e.g. x" style={field()} />
-            )}
-          </div>
-          {/* Y variable */}
-          <div>
-            <span style={label}>Y variable</span>
-            {plotVars.length > 0 ? (
-              <select value={plotConfig.y_var} onChange={e => setPlotConfig(c => ({ ...c, y_var: e.target.value }))}
-                style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", width: "100%", outline: "none" }}>
-                {plotVars.map(v => <option key={v} value={v}>{v}</option>)}
-              </select>
-            ) : (
-              <input value={plotConfig.y_var} onChange={e => setPlotConfig(c => ({ ...c, y_var: e.target.value }))}
-                placeholder="e.g. y" style={field()} />
-            )}
-          </div>
-          {/* X label */}
-          <div>
-            <span style={label}>X axis label <span style={{ color: T.textDim }}>(blank = auto from data)</span></span>
+            <span style={label}>X axis label <span style={{ color: T.textDim }}>(blank = auto)</span></span>
             <input value={plotConfig.x_label} onChange={e => setPlotConfig(c => ({ ...c, x_label: e.target.value }))}
               placeholder="auto" style={field()} />
           </div>
-          {/* Y label */}
-          <div>
-            <span style={label}>Y axis label <span style={{ color: T.textDim }}>(blank = auto from data)</span></span>
-            <input value={plotConfig.y_label} onChange={e => setPlotConfig(c => ({ ...c, y_label: e.target.value }))}
-              placeholder="auto" style={field()} />
-          </div>
-          {/* X scale */}
           <div>
             <span style={label}>X scale</span>
             <select value={plotConfig.x_scale} onChange={e => setPlotConfig(c => ({ ...c, x_scale: e.target.value }))}
@@ -5483,89 +5608,99 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
               <option value="log">Log</option>
             </select>
           </div>
-          {/* Y scale */}
           <div>
-            <span style={label}>Y scale</span>
+            <span style={label}>{plotTraces.some(t => t.axis === "y2") ? "Y1 axis label" : "Y axis label"} <span style={{ color: T.textDim }}>(blank = auto)</span></span>
+            <input value={plotConfig.y_label} onChange={e => setPlotConfig(c => ({ ...c, y_label: e.target.value }))}
+              placeholder="auto" style={field()} />
+          </div>
+          <div>
+            <span style={label}>{plotTraces.some(t => t.axis === "y2") ? "Y1 scale" : "Y scale"}</span>
             <select value={plotConfig.y_scale} onChange={e => setPlotConfig(c => ({ ...c, y_scale: e.target.value }))}
               style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", width: "100%", outline: "none" }}>
               <option value="linear">Linear</option>
               <option value="log">Log</option>
             </select>
           </div>
-        </div>
-
-        {/* Aesthetics */}
-        <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 16, flexWrap: "wrap" }}>
-          {/* Color swatches */}
-          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-            <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginRight: 2 }}>Color</span>
-            {/* Auto (section default) */}
-            <button onClick={() => setPlotConfig(c => ({ ...c, color: "" }))} title="Section default"
-              style={{ width: 22, height: 22, borderRadius: 4, background: sectionDefaultColor, padding: 0, cursor: "pointer", flexShrink: 0,
-                border: plotConfig.color === "" ? `2px solid ${T.textPrimary}` : "2px solid transparent",
-                display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <span style={{ fontFamily: mono, fontSize: 8, color: "rgba(255,255,255,0.85)", fontWeight: "bold", pointerEvents: "none" }}>A</span>
-            </button>
-            {COLOR_PALETTE.map(hex => (
-              <button key={hex} onClick={() => setPlotConfig(c => ({ ...c, color: hex }))} title={hex}
-                style={{ width: 22, height: 22, borderRadius: 4, background: hex, padding: 0, cursor: "pointer", flexShrink: 0,
-                  border: plotConfig.color === hex ? `2px solid ${T.textPrimary}` : "2px solid transparent" }} />
-            ))}
-          </div>
-
-          <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
-
-          {/* Fit overlay toggle */}
-          <label style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
-            <input type="checkbox" checked={plotConfig.show_fit}
-              onChange={e => {
-                if (e.target.checked) {
-                  setPlotConfig(c => ({ ...c, show_fit: true, ..._fitMemory.current }));
-                } else {
-                  setPlotConfig(c => {
-                    _fitMemory.current = { primary: c.primary, secondary_opacity: c.secondary_opacity };
-                    return { ...c, show_fit: false, primary: "data", secondary_opacity: 1.0 };
-                  });
-                }
-              }} />
-            <span style={{ fontFamily: mono, fontSize: 10, color: T.textSecondary, whiteSpace: "nowrap" }}>Fit overlay</span>
-          </label>
-          {!hasFitData && <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim }}>(no x_fit/y_fit yet)</span>}
-
-          {plotConfig.show_fit && <>
-            <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
-
-            {/* Primary trace */}
-            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Primary</span>
-              {[["data", "Data"], ["fit", "Fit"]].map(([val, lbl]) => (
-                <button key={val} onClick={() => setPlotConfig(c => ({ ...c, primary: val }))}
-                  style={{ fontFamily: mono, fontSize: 10, padding: "3px 10px", borderRadius: 4, cursor: "pointer",
-                    border: `1px solid ${plotConfig.primary === val ? T.teal : T.border}`,
-                    background: plotConfig.primary === val ? T.teal + "22" : "none",
-                    color: plotConfig.primary === val ? T.teal : T.textDim }}>
-                  {lbl}
-                </button>
-              ))}
+          {plotTraces.some(t => t.axis === "y2") && <>
+            <div>
+              <span style={label}>Y2 axis label</span>
+              <input value={plotConfig.y2_label || ""} onChange={e => setPlotConfig(c => ({ ...c, y2_label: e.target.value }))}
+                placeholder="right axis" style={field()} />
             </div>
-
-            <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
-
-            {/* Opacity ratio */}
-            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Opacity</span>
-              {[[1.0,"100/100"],[0.5,"100/50"],[0.25,"100/25"],[0.1,"100/10"]].map(([val, lbl]) => (
-                <button key={lbl} onClick={() => setPlotConfig(c => ({ ...c, secondary_opacity: val }))}
-                  style={{ fontFamily: mono, fontSize: 10, padding: "3px 10px", borderRadius: 4, cursor: "pointer",
-                    border: `1px solid ${plotConfig.secondary_opacity === val ? T.teal : T.border}`,
-                    background: plotConfig.secondary_opacity === val ? T.teal + "22" : "none",
-                    color: plotConfig.secondary_opacity === val ? T.teal : T.textDim }}>
-                  {lbl}
-                </button>
-              ))}
+            <div>
+              <span style={label}>Y2 scale</span>
+              <select value={plotConfig.y2_scale || "linear"} onChange={e => setPlotConfig(c => ({ ...c, y2_scale: e.target.value }))}
+                style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", width: "100%", outline: "none" }}>
+                <option value="linear">Linear</option>
+                <option value="log">Log</option>
+              </select>
             </div>
           </>}
         </div>
+
+        {/* ── Fit overlay (legacy single-trace mode) ── */}
+        {plotTraces.length === 0 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 16, flexWrap: "wrap" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginRight: 2 }}>Color</span>
+              <button onClick={() => setPlotConfig(c => ({ ...c, color: "" }))} title="Section default"
+                style={{ width: 22, height: 22, borderRadius: 4, background: sectionDefaultColor, padding: 0, cursor: "pointer", flexShrink: 0,
+                  border: plotConfig.color === "" ? `2px solid ${T.textPrimary}` : "2px solid transparent",
+                  display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <span style={{ fontFamily: mono, fontSize: 8, color: "rgba(255,255,255,0.85)", fontWeight: "bold", pointerEvents: "none" }}>A</span>
+              </button>
+              {COLOR_PALETTE.map(hex => (
+                <button key={hex} onClick={() => setPlotConfig(c => ({ ...c, color: hex }))} title={hex}
+                  style={{ width: 22, height: 22, borderRadius: 4, background: hex, padding: 0, cursor: "pointer", flexShrink: 0,
+                    border: plotConfig.color === hex ? `2px solid ${T.textPrimary}` : "2px solid transparent" }} />
+              ))}
+            </div>
+            <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
+            <label style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
+              <input type="checkbox" checked={plotConfig.show_fit}
+                onChange={e => {
+                  if (e.target.checked) {
+                    setPlotConfig(c => ({ ...c, show_fit: true, ..._fitMemory.current }));
+                  } else {
+                    setPlotConfig(c => {
+                      _fitMemory.current = { primary: c.primary, secondary_opacity: c.secondary_opacity };
+                      return { ...c, show_fit: false, primary: "data", secondary_opacity: 1.0 };
+                    });
+                  }
+                }} />
+              <span style={{ fontFamily: mono, fontSize: 10, color: T.textSecondary, whiteSpace: "nowrap" }}>Fit overlay</span>
+            </label>
+            {!hasFitData && <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim }}>(no x_fit/y_fit yet)</span>}
+            {plotConfig.show_fit && <>
+              <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Primary</span>
+                {[["data", "Data"], ["fit", "Fit"]].map(([val, lbl]) => (
+                  <button key={val} onClick={() => setPlotConfig(c => ({ ...c, primary: val }))}
+                    style={{ fontFamily: mono, fontSize: 10, padding: "3px 10px", borderRadius: 4, cursor: "pointer",
+                      border: `1px solid ${plotConfig.primary === val ? T.teal : T.border}`,
+                      background: plotConfig.primary === val ? T.teal + "22" : "none",
+                      color: plotConfig.primary === val ? T.teal : T.textDim }}>
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+              <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Opacity</span>
+                {[[1.0,"100/100"],[0.5,"100/50"],[0.25,"100/25"],[0.1,"100/10"]].map(([val, lbl]) => (
+                  <button key={lbl} onClick={() => setPlotConfig(c => ({ ...c, secondary_opacity: val }))}
+                    style={{ fontFamily: mono, fontSize: 10, padding: "3px 10px", borderRadius: 4, cursor: "pointer",
+                      border: `1px solid ${plotConfig.secondary_opacity === val ? T.teal : T.border}`,
+                      background: plotConfig.secondary_opacity === val ? T.teal + "22" : "none",
+                      color: plotConfig.secondary_opacity === val ? T.teal : T.textDim }}>
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+            </>}
+          </div>
+        )}
 
         {/* Error */}
         {plotError && (
@@ -5589,6 +5724,11 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
                   title: { text: plotFigure.layout?.xaxis?.title || "", font: { color: T.textSecondary, size: 11 } } },
                 yaxis: { ...(plotFigure.layout?.yaxis || {}), gridcolor: T.border, zerolinecolor: T.border,
                   title: { text: plotFigure.layout?.yaxis?.title || "", font: { color: T.textSecondary, size: 11 } } },
+                ...(plotFigure.layout?.yaxis2 ? { yaxis2: {
+                  ...(plotFigure.layout.yaxis2 || {}),
+                  title: { text: plotFigure.layout.yaxis2?.title || "", font: { color: T.amber, size: 11 } },
+                  tickfont: { color: T.amber },
+                }} : {}),
               }}
               config={{ displayModeBar: false, responsive: true }}
               style={{ width: "100%" }}

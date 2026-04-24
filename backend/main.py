@@ -2433,17 +2433,18 @@ def run_module_processing(module_id: str, body: dict):
 def preview_module_plot(module_id: str, body: dict):
     """Run processing code, then build a Plotly figure from visual plot config."""
     import traceback as tb
-    code       = body.get("code", "")
-    plot_cfg   = body.get("plot_config", {})
-    x_var      = plot_cfg.get("x_var") or "x"
-    y_var      = plot_cfg.get("y_var") or "y"
-    color      = plot_cfg.get("color") or "#94a3b8"
-    opacity    = float(plot_cfg.get("opacity") or 1.0)
-    show_fit   = plot_cfg.get("show_fit", True)
-    fit_color  = plot_cfg.get("fit_color") or None
-    fit_opacity= float(plot_cfg.get("fit_opacity") or 0.6)
-    x_scale    = plot_cfg.get("x_scale") or "linear"
-    y_scale    = plot_cfg.get("y_scale") or "linear"
+    import numpy as np
+    code         = body.get("code", "")
+    plot_cfg     = body.get("plot_config", {})
+    plot_traces_cfg = body.get("plot_traces", [])
+    color        = plot_cfg.get("color") or "#94a3b8"
+    opacity      = float(plot_cfg.get("opacity") or 1.0)
+    show_fit     = plot_cfg.get("show_fit", True)
+    fit_color    = plot_cfg.get("fit_color") or None
+    fit_opacity  = float(plot_cfg.get("fit_opacity") or 0.6)
+    x_scale      = plot_cfg.get("x_scale") or "linear"
+    y1_scale     = plot_cfg.get("y1_scale") or plot_cfg.get("y_scale") or "linear"
+    y2_scale     = plot_cfg.get("y2_scale") or "linear"
 
     f, _ = _find_example(module_id)
     if not f:
@@ -2463,8 +2464,7 @@ def preview_module_plot(module_id: str, body: dict):
         return {"ok": False, "stage": "processing", "error": str(exc), "traceback": tb.format_exc()}
     if not isinstance(data, dict):
         return {"ok": False, "stage": "plot", "error": "Processing result must be a dict"}
-    # Extract x/y arrays from result — handle both lists and numpy arrays
-    import numpy as np
+
     def _to_list(v):
         if isinstance(v, np.ndarray):
             return v.tolist()
@@ -2473,20 +2473,72 @@ def preview_module_plot(module_id: str, body: dict):
     def _is_numeric_array(v):
         if isinstance(v, np.ndarray):
             return v.ndim == 1 and np.issubdtype(v.dtype, np.number) and len(v) > 0
-        return isinstance(v, list) and v and isinstance(v[0], (int, float))
+        return isinstance(v, list) and bool(v) and isinstance(v[0], (int, float))
 
-    x_data = data.get(x_var)
-    y_data = data.get(y_var)
-    missing = (x_data is None or (hasattr(x_data, '__len__') and len(x_data) == 0))
-    missing = missing or (y_data is None or (hasattr(y_data, '__len__') and len(y_data) == 0))
+    available_vars = [k for k, v in data.items() if _is_numeric_array(v)]
+
+    # ── Multi-trace mode ──────────────────────────────────────────────────────
+    if plot_traces_cfg:
+        x_label  = plot_cfg.get("x_label") or data.get("x_label") or "x"
+        y1_label = plot_cfg.get("y1_label") or plot_cfg.get("y_label") or data.get("y_label") or "y"
+        y2_label = plot_cfg.get("y2_label") or None
+        has_y2   = any(t.get("axis") == "y2" for t in plot_traces_cfg)
+
+        plotly_traces = []
+        for tr in plot_traces_cfg:
+            x_key  = tr.get("x_key", "x")
+            y_key  = tr.get("y_key", "y")
+            x_data = data.get(x_key)
+            y_data = data.get(y_key)
+            if x_data is None or y_data is None:
+                continue
+            tr_color   = tr.get("color") or color
+            is_fit     = tr.get("style") == "fit"
+            tr_opacity = fit_opacity if is_fit else opacity
+            on_y2      = tr.get("axis") == "y2"
+            lbl        = tr.get("label", y_key)
+            plotly_traces.append({
+                "x": _to_list(x_data), "y": _to_list(y_data),
+                "type": "scatter", "mode": "lines",
+                "name": lbl,
+                "yaxis": "y2" if on_y2 else "y",
+                "opacity": tr_opacity,
+                "line": {"color": tr_color, "width": 1.5, "dash": "dash" if is_fit else "solid"},
+                "hovertemplate": f"%{{x:.3g}}<br>{lbl}: %{{y:.3g}}<extra></extra>",
+            })
+
+        if not plotly_traces:
+            return {"ok": False, "stage": "plot",
+                    "error": f"No trace variables found. Available: {available_vars}"}
+
+        layout = {
+            "xaxis":  {"title": x_label,  "type": x_scale,  "zeroline": True, "zerolinewidth": 1},
+            "yaxis":  {"title": y1_label, "type": y1_scale, "zeroline": True, "zerolinewidth": 1},
+            "margin": {"t": 20, "r": 20 if not has_y2 else 60, "b": 56, "l": 72},
+            "showlegend": len(plotly_traces) > 1, "hovermode": "closest",
+        }
+        if has_y2:
+            layout["yaxis2"] = {
+                "title": y2_label or "y2", "type": y2_scale,
+                "overlaying": "y", "side": "right",
+                "showgrid": False, "zeroline": False,
+            }
+        figure = {"data": plotly_traces, "layout": layout, "available_vars": available_vars}
+        return {"ok": True, "figure": figure}
+
+    # ── Single-trace backward-compat mode ─────────────────────────────────────
+    x_var   = plot_cfg.get("x_var") or "x"
+    y_var   = plot_cfg.get("y_var") or "y"
+    x_data  = data.get(x_var)
+    y_data  = data.get(y_var)
+    missing = (x_data is None or (hasattr(x_data, "__len__") and len(x_data) == 0))
+    missing = missing or (y_data is None or (hasattr(y_data, "__len__") and len(y_data) == 0))
     if missing:
-        available = [k for k, v in data.items() if _is_numeric_array(v)]
         return {"ok": False, "stage": "plot",
                 "error": f"Variable '{x_var}' or '{y_var}' not found or empty. "
-                         f"Available array keys: {available}"}
-    x_data = _to_list(x_data)
-    y_data = _to_list(y_data)
-    # Derive axis labels: prefer explicit config, fall back to result metadata
+                         f"Available array keys: {available_vars}"}
+    x_data  = _to_list(x_data)
+    y_data  = _to_list(y_data)
     x_label = plot_cfg.get("x_label") or data.get("x_label") or x_var
     y_label = plot_cfg.get("y_label") or data.get("y_label") or y_var
 
@@ -2497,7 +2549,6 @@ def preview_module_plot(module_id: str, body: dict):
         "line": {"color": color, "width": 1.5},
         "hovertemplate": f"%{{x:.3g}} {x_label}<br>%{{y:.3g}} {y_label}<extra></extra>",
     }]
-    # Fit overlay — add if x_fit/y_fit in result and show_fit is True
     if show_fit and data.get("x_fit") and data.get("y_fit"):
         traces.append({
             "x": _to_list(data["x_fit"]), "y": _to_list(data["y_fit"]),
@@ -2511,11 +2562,11 @@ def preview_module_plot(module_id: str, body: dict):
         "data": traces,
         "layout": {
             "xaxis": {"title": x_label, "type": x_scale, "zeroline": True, "zerolinewidth": 1},
-            "yaxis": {"title": y_label, "type": y_scale, "zeroline": True, "zerolinewidth": 1},
+            "yaxis": {"title": y_label, "type": y1_scale, "zeroline": True, "zerolinewidth": 1},
             "margin": {"t": 20, "r": 20, "b": 56, "l": 72},
             "showlegend": False, "hovermode": "closest",
         },
-        "available_vars": [k for k, v in data.items() if _is_numeric_array(v)],
+        "available_vars": available_vars,
     }
     return {"ok": True, "figure": figure}
 
@@ -2638,23 +2689,81 @@ def render_for_sample(module_id: str, body: dict):
     if not isinstance(data, dict):
         return {"ok": False, "stage": "plot", "error": "Processing result must be a dict"}
 
+    import numpy as np
+    def _is_num_arr(v):
+        if isinstance(v, np.ndarray):
+            return v.ndim == 1 and np.issubdtype(v.dtype, np.number) and len(v) > 0
+        return isinstance(v, list) and bool(v) and isinstance(v[0], (int, float))
+
+    available_vars = [k for k, v in data.items() if _is_num_arr(v)]
+    result_area    = data.get("area_m2")
+
+    # ── Multi-trace mode (schema has plot_traces) ─────────────────────────────
+    plot_traces_cfg = schema.get("plot_traces", [])
+    if plot_traces_cfg:
+        x_label  = plot_cfg.get("x_label")  or data.get("x_label")  or "x"
+        y1_label = plot_cfg.get("y1_label") or plot_cfg.get("y_label") or data.get("y_label") or "y"
+        y2_label = plot_cfg.get("y2_label") or None
+        traces   = []
+        for tr in plot_traces_cfg:
+            x_key  = tr.get("x_key", "x")
+            y_key  = tr.get("y_key", "y")
+            x_data = data.get(x_key)
+            y_data = data.get(y_key)
+            if x_data is None or y_data is None:
+                continue
+            traces.append({
+                "x":     _json_safe(x_data),
+                "y":     _json_safe(y_data),
+                "label": tr.get("label", y_key),
+                "color": tr.get("color") or color,
+                "style": tr.get("style", "line"),
+                "axis":  tr.get("axis", "y1"),
+            })
+        if not traces:
+            return {"ok": False, "stage": "plot",
+                    "error": f"No plot_traces variables found in result. Available: {available_vars}"}
+        first = traces[0]
+        return {
+            "ok": True,
+            "traces":       traces,
+            "x_label":      x_label,
+            "y1_label":     y1_label,
+            "y2_label":     y2_label,
+            "available_vars": available_vars,
+            "area_m2":      result_area,
+            # backward-compat fields (books panel etc.)
+            "x": first["x"], "y": first["y"],
+            "y_label": y1_label, "color": first["color"],
+        }
+
+    # ── Single-trace backward-compat mode ─────────────────────────────────────
     x_data = data.get(x_var)
     y_data = data.get(y_var)
     if not x_data or not y_data:
-        available = [k for k, v in data.items() if isinstance(v, list) and v and isinstance(v[0], (int, float))]
         return {"ok": False, "stage": "plot",
-                "error": f"Variable '{x_var}' or '{y_var}' not found. Available: {available}"}
+                "error": f"Variable '{x_var}' or '{y_var}' not found. Available: {available_vars}"}
     x_label = plot_cfg.get("x_label") or data.get("x_label") or x_var
     y_label = plot_cfg.get("y_label") or data.get("y_label") or y_var
-    result_area = data.get("area_m2")
+    x_safe  = _json_safe(x_data)
+    y_safe  = _json_safe(y_data)
+    traces_out = [{"x": x_safe, "y": y_safe, "label": y_label, "color": color, "style": "line", "axis": "y1"}]
+    # Fit trace (backward compat)
+    if data.get("x_fit") and data.get("y_fit"):
+        traces_out.append({
+            "x": _json_safe(data["x_fit"]), "y": _json_safe(data["y_fit"]),
+            "label": f"{y_label} (fit)", "color": color, "style": "fit", "axis": "y1",
+        })
     return {
         "ok": True,
-        "x": _json_safe(x_data),
-        "y": _json_safe(y_data),
-        "x_label": x_label,
-        "y_label": y_label,
-        "color": color,
-        "area_m2": result_area,
+        "traces":       traces_out,
+        "x_label":      x_label,
+        "y1_label":     y_label,
+        "y2_label":     None,
+        "available_vars": available_vars,
+        "area_m2":      result_area,
+        # backward-compat fields
+        "x": x_safe, "y": y_safe, "y_label": y_label, "color": color,
     }
 
 
