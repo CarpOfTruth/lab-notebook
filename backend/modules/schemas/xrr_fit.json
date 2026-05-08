@@ -1,0 +1,43 @@
+{
+  "name": "XRR Fit",
+  "description": "Parratt reflectivity fit using refnx",
+  "version": "0.1",
+  "author": "built-in",
+  "section": "structural",
+  "accepts": [],
+  "file_mode": "derived",
+  "upstream": [
+    { "id": "xrr", "required": true, "label": "XRR data" }
+  ],
+  "dependencies": [],
+  "config_schema": [
+    { "id": "wavelength_aa", "label": "Wavelength", "type": "number", "default": 1.5406, "unit": "Å" },
+    { "id": "theta_min",     "label": "Fit θ min",  "type": "number", "default": 0.1,    "unit": "°" },
+    { "id": "theta_max",     "label": "Fit θ max",  "type": "number", "default": 5.0,    "unit": "°" }
+  ],
+  "plot_traces": [
+    { "x_key": "theta", "y_key": "intensity", "label": "Data", "axis": "y1", "style": "line", "color": "#94a3b8" },
+    { "x_key": "theta", "y_key": "fit",       "label": "Fit",  "axis": "y1", "style": "fit",  "color": "#2dd4bf" }
+  ],
+  "plot_config": {
+    "x_var": "theta",
+    "y_var": "intensity",
+    "x_label": "2θ (°)",
+    "y_label": "Intensity",
+    "y1_label": "Intensity",
+    "y_scale": "log",
+    "y1_scale": "log",
+    "x_scale": "linear",
+    "color": "#2dd4bf"
+  },
+  "proc_block2": "# Pull data from upstream XRR module — no file is uploaded for this module.\n# upstream[\"xrr\"][\"result\"] contains the dict returned by the XRR module's proc_code.\nxrr_result = upstream[\"xrr\"][\"result\"]\ntheta     = xrr_result[\"theta\"]\nintensity = xrr_result[\"intensity\"]\n\n# Placeholder for the fit curve — will be populated by analysis_code via _overlay_traces.\nfit = []",
+  "proc_block3": "return {\n    \"theta\":     theta,\n    \"intensity\": intensity,\n    \"fit\":       fit,\n    \"x_label\":   xrr_result.get(\"x_label\", \"2θ (°)\"),\n    \"y_label\":   xrr_result.get(\"y_label\", \"Intensity\"),\n}",
+  "proc_code": "# ── Block 1: Auto-generated ───────────────────────────────────────────────\nimport numpy as np\n\n# ── Block 2: Processing ───────────────────────────────────────────────────\n# Pull data from upstream XRR module — no file is uploaded for this module.\n# upstream[\"xrr\"][\"result\"] contains the dict returned by the XRR module's proc_code.\nxrr_result = upstream[\"xrr\"][\"result\"]\ntheta     = xrr_result[\"theta\"]\nintensity = xrr_result[\"intensity\"]\n\n# Placeholder for the fit curve — will be populated by analysis_code via _overlay_traces.\nfit = []\n\n# ── Block 3: Return ───────────────────────────────────────────────────────\nreturn {\n    \"theta\":     theta,\n    \"intensity\": intensity,\n    \"fit\":       fit,\n    \"x_label\":   xrr_result.get(\"x_label\", \"2θ (°)\"),\n    \"y_label\":   xrr_result.get(\"y_label\", \"Intensity\"),\n}",
+  "analysis_code": "# Stub analysis — full refnx fitting will land in step 8.\n# Available variables:\n#   result    — dict returned by proc_code (theta, intensity, fit, ...)\n#   params    — merged config_schema defaults + saved module_config + workspace overrides\n#   layers    — sample's layer list\n#   substrate — sample's substrate (string; may have substrate_stack metadata)\n#   upstream  — same dict as in proc_code\n#   get_material(), list_materials() — resource API\nimport numpy as np\n\ntheta     = np.array(result[\"theta\"])\nintensity = np.array(result[\"intensity\"])\n\n# Placeholder fit: return the raw data as the fit curve so we can verify the\n# overlay rendering pipeline before plugging in refnx.\nreturn {\n    \"_overlay_traces\": [\n        {\"x\": theta.tolist(), \"y\": intensity.tolist(),\n         \"label\": \"Fit (stub)\", \"style\": \"fit\", \"axis\": \"y1\", \"color\": \"#2dd4bf\"}\n    ],\n    \"_fit_params\": {},\n    \"chi2\":       0.0,\n    \"rmse\":       0.0,\n    \"n_points\":   len(theta),\n}",
+  "analysis_metrics": [
+    { "name": "chi2",     "label": "χ²",       "unit": "" },
+    { "name": "rmse",     "label": "RMSE",     "unit": "" },
+    { "name": "n_points", "label": "N points", "unit": "" }
+  ],
+  "card_controls": []
+}

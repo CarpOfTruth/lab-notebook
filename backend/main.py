@@ -2354,6 +2354,139 @@ def _build_resource_api() -> dict:
     )
 
 
+def _resolve_upstream(conn, sample_id: str, module_id: str, body_cache: dict | None = None,
+                      depth: int = 0, _visited: set | None = None) -> dict:
+    """Resolve upstream data dependencies for a module against a sample.
+
+    Returns dict keyed by upstream module id:
+        { id, name, result, analysis, input: {filename, file_bytes, files, registry, config} }
+
+    If body_cache contains an entry for an upstream id, it's used verbatim instead of
+    recomputing. The caller (e.g. fit workspace) can pass cached upstream results to
+    skip re-running upstream proc_code on every iteration.
+
+    Cycle detection: depth limit (10) + visited set.
+    """
+    if depth > 10:
+        raise ValueError(f"Upstream chain too deep (>10) — possible cycle at '{module_id}'")
+    visited = (_visited or set()) | {module_id}
+
+    schema = _load_schema(module_id) or {}
+    upstream_decl = schema.get("upstream", []) or []
+    if not upstream_decl:
+        return {}
+
+    body_cache = body_cache or {}
+    out: dict = {}
+
+    row = conn.execute(
+        "SELECT filenames, module_config FROM samples WHERE id=?", (sample_id,)
+    ).fetchone()
+    if not row:
+        raise ValueError(f"Sample '{sample_id}' not found")
+    sample_filenames  = json.loads(row["filenames"]      or "{}")
+    sample_mod_config = json.loads(row["module_config"]  or "{}")
+
+    for entry in upstream_decl:
+        u_id     = entry.get("id")
+        required = entry.get("required", True)
+        if not u_id:
+            continue
+        if u_id in visited:
+            raise ValueError(f"Upstream cycle: '{module_id}' → '{u_id}' (already in chain)")
+
+        # Cache hit
+        if u_id in body_cache:
+            cached = body_cache[u_id]
+            u_schema_for_name = _load_schema(u_id) or {}
+            out[u_id] = {
+                "id":       u_id,
+                "name":     u_schema_for_name.get("name", u_id),
+                "result":   cached.get("result"),
+                "analysis": cached.get("analysis"),
+                "input":    cached.get("input") or {"filename": None, "file_bytes": None,
+                                                      "files": {}, "registry": [], "config": {}},
+            }
+            continue
+
+        u_schema = _load_schema(u_id)
+        if not u_schema:
+            if required:
+                raise ValueError(f"Upstream module '{u_id}' not found")
+            out[u_id] = None
+            continue
+
+        # Recursively resolve upstream's own upstream first
+        nested = _resolve_upstream(conn, sample_id, u_id, body_cache, depth + 1, visited)
+
+        # Resolve upstream's files
+        try:
+            u_file_bytes, u_filename, u_files, u_registry = _resolve_module_files(
+                conn, sample_id, u_id, sample_filenames
+            )
+        except ValueError as e:
+            if required:
+                raise ValueError(f"Upstream '{u_id}': {e}")
+            out[u_id] = None
+            continue
+
+        # Build upstream's meta from its config schema + sample's saved config
+        u_config = dict(sample_mod_config.get(u_id, {}))
+        for fld in u_schema.get("config_schema", []):
+            u_config.setdefault(fld["id"], fld.get("default"))
+        u_meta = {"config": u_config}
+
+        # Run upstream proc_code
+        u_proc = u_schema.get("proc_code", "")
+        if not u_proc:
+            if required:
+                raise ValueError(f"Upstream '{u_id}' has no proc_code")
+            out[u_id] = None
+            continue
+
+        u_ns = {**_build_resource_api(), "files": u_files, "registry": u_registry,
+                "upstream": nested}
+        u_indented = "\n".join(f"    {line}" for line in u_proc.splitlines())
+        u_wrapped  = f"def _proc(file_bytes, filename, meta):\n{u_indented}\n"
+        try:
+            exec(compile(u_wrapped, f"<upstream:{u_id}:proc>", "exec"), u_ns)   # noqa: S102
+            u_result = u_ns["_proc"](u_file_bytes, u_filename, u_meta)
+        except Exception as exc:
+            raise ValueError(f"Upstream '{u_id}' processing failed: {exc}")
+        if not isinstance(u_result, dict):
+            raise ValueError(f"Upstream '{u_id}' proc_code must return a dict")
+
+        # Optionally run upstream analysis_code (best-effort; failure doesn't block downstream)
+        u_analysis = None
+        u_acode = u_schema.get("analysis_code", "")
+        if u_acode:
+            try:
+                a_ns = {**_build_resource_api(), "upstream": nested,
+                        "params": u_config, "layers": [], "substrate": None}
+                a_ind = "\n".join(f"    {line}" for line in u_acode.splitlines())
+                a_wrap = f"def _analysis(result):\n{a_ind}\n"
+                exec(compile(a_wrap, f"<upstream:{u_id}:analysis>", "exec"), a_ns)   # noqa: S102
+                u_analysis = a_ns["_analysis"](u_result)
+            except Exception:
+                u_analysis = None
+
+        out[u_id] = {
+            "id":       u_id,
+            "name":     u_schema.get("name", u_id),
+            "result":   u_result,
+            "analysis": u_analysis,
+            "input": {
+                "filename":   u_filename,
+                "file_bytes": u_file_bytes,
+                "files":      u_files,
+                "registry":   u_registry,
+                "config":     u_config,
+            },
+        }
+
+    return out
+
+
 def _check_dep(dep_str: str) -> dict:
     """Check whether a pip dependency is installed and not blacklisted."""
     pkg_name = re.split(r"[>=<!;\[]", dep_str)[0].strip().replace("-", "_").lower()
@@ -2645,6 +2778,10 @@ def render_for_sample(module_id: str, body: dict):
     if not sample_dir.is_dir():
         raise HTTPException(404, f"No data directory for sample '{sample_id}'")
 
+    # Load schema early so we can check file_mode
+    schema = _load_schema(module_id) or {}
+    is_derived = schema.get("file_mode") == "derived"
+
     with get_db() as conn:
         row = conn.execute(
             "SELECT filenames, thickness_nm, area_m2, module_config FROM samples WHERE id=?",
@@ -2656,30 +2793,40 @@ def render_for_sample(module_id: str, body: dict):
         thickness = row["thickness_nm"] or 0.0
         area      = row["area_m2"]
 
+        if is_derived:
+            file_bytes, filename, files, registry = b"", None, {}, []
+        else:
+            try:
+                file_bytes, filename, files, registry = _resolve_module_files(
+                    conn, sample_id, module_id, filenames
+                )
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+
+        # Resolve any upstream data dependencies before exec
         try:
-            file_bytes, filename, files, registry = _resolve_module_files(
-                conn, sample_id, module_id, filenames
-            )
+            upstream = _resolve_upstream(conn, sample_id, module_id, body.get("upstream_cache"))
         except ValueError as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "stage": "upstream", "error": str(e)}
 
     area_correction = float((body.get("options") or {}).get("area_correction", 1.0) or 1.0)
 
     # Build meta — include per-sample module config with schema defaults applied
-    schema = _load_schema(module_id) or {}
+    # (schema already loaded above)
     mod_config = json.loads(row["module_config"] or "{}").get(module_id, {})
     for field in schema.get("config_schema", []):
         mod_config.setdefault(field["id"], field.get("default"))
     meta = {"thickness_nm": thickness, "area_m2": area, "area_correction": area_correction,
             "config": mod_config}
 
-    # Run processing code — inject files/registry alongside legacy file_bytes/filename
+    # Run processing code — inject files/registry/upstream alongside legacy file_bytes/filename
     indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
     namespace: dict = {
         **_build_resource_api(),
-        "files": files,
+        "files":    files,
         "registry": registry,
+        "upstream": upstream,
     }
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
@@ -2775,9 +2922,12 @@ def compute_module_analysis_for_sample(module_id: str, body: dict):
     proc_code     = body.get("proc_code", "")
     analysis_code = body.get("analysis_code", "")
 
+    schema = _load_schema(module_id) or {}
+    is_derived = schema.get("file_mode") == "derived"
+
     with get_db() as conn:
         row = conn.execute(
-            "SELECT filenames, thickness_nm, area_m2, area_correction, module_config FROM samples WHERE id=?",
+            "SELECT filenames, thickness_nm, area_m2, area_correction, module_config, layers, substrate FROM samples WHERE id=?",
             (sample_id,),
         ).fetchone()
         if not row:
@@ -2786,28 +2936,44 @@ def compute_module_analysis_for_sample(module_id: str, body: dict):
         thickness = row["thickness_nm"] or 0.0
         area      = row["area_m2"]
         area_corr = float(row["area_correction"] or 1.0)
+        sample_layers    = json.loads(row["layers"] or "[]")
+        sample_substrate = row["substrate"]
 
+        if is_derived:
+            file_bytes, filename, files, registry = b"", None, {}, []
+        else:
+            try:
+                file_bytes, filename, files, registry = _resolve_module_files(
+                    conn, sample_id, module_id, filenames
+                )
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+
+        # Resolve upstream data dependencies
         try:
-            file_bytes, filename, files, registry = _resolve_module_files(
-                conn, sample_id, module_id, filenames
-            )
+            upstream = _resolve_upstream(conn, sample_id, module_id, body.get("upstream_cache"))
         except ValueError as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "stage": "upstream", "error": str(e)}
 
-    schema = _load_schema(module_id) or {}
     mod_config = json.loads(row["module_config"] or "{}").get(module_id, {})
     for field in schema.get("config_schema", []):
         mod_config.setdefault(field["id"], field.get("default"))
     meta = {"thickness_nm": thickness, "area_m2": area, "area_correction": area_corr,
             "config": mod_config}
 
+    # Merge params: schema defaults → saved module_config → body params (workspace overrides)
+    params = {f["id"]: f.get("default") for f in schema.get("config_schema", [])}
+    params.update(mod_config)
+    params.update(body.get("params") or {})
+
     resource_api = _build_resource_api()
     indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
     namespace: dict = {
         **resource_api,
-        "files": files,
+        "files":    files,
         "registry": registry,
+        "upstream": upstream,
     }
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
@@ -2819,7 +2985,14 @@ def compute_module_analysis_for_sample(module_id: str, body: dict):
 
     indented2 = "\n".join(f"    {line}" for line in analysis_code.splitlines())
     wrapped2  = f"def _analysis(result):\n{indented2}\n"
-    namespace2: dict = {**resource_api}
+    namespace2: dict = {
+        **resource_api,
+        "upstream":  upstream,
+        "params":    params,
+        "layers":    sample_layers,
+        "substrate": sample_substrate,
+        "meta":      meta,
+    }
     try:
         exec(compile(wrapped2, "<analysis>", "exec"), namespace2)   # noqa: S102
         metrics = namespace2["_analysis"](result)
