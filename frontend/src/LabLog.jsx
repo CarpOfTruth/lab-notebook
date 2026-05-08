@@ -7188,6 +7188,7 @@ function defaultPanelConfig(type) {
   const saved = loadDefaultPanelConfig(type);
   const base =
     type === "xrd"  ? { offset_decades: 2, theta_min: null, theta_max: null, pad_above: 2, pad_below: 1 } :
+    type === "xrr"  ? { offset_decades: 2, theta_min: null, theta_max: null, pad_above: 2, pad_below: 1 } :
     type === "meta" ? { x_param: "", y_param: "" } :
     {};
   return saved ? { ...base, ...saved } : base;
@@ -8341,6 +8342,82 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
   );
 }
 
+// ── XRR comparison ────────────────────────────────────────────────────────────
+
+function XRRComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, config, plotStyle }) {
+  const ps = plotStyle || DEFAULT_PLOT_STYLE;
+  const offsetDecades = config.offset_decades ?? 2;
+  const thetaMin      = config.theta_min != null ? Number(config.theta_min) : null;
+  const thetaMax      = config.theta_max != null ? Number(config.theta_max) : null;
+  const padAbove      = config.pad_above  ?? 2;
+  const padBelow      = config.pad_below  ?? 1;
+  const normalizeBase = config.normalize_baseline ?? true;
+
+  const { traces, yDomMin, yDomMax, xTicks, xDomain } = useMemo(() => {
+    const traces = sampleOrder.map((sid, i) => {
+      let pts = plotCache[sid]?.xrr || [];
+      if (thetaMin != null && !isNaN(thetaMin)) pts = pts.filter(p => p.x >= thetaMin);
+      if (thetaMax != null && !isNaN(thetaMax)) pts = pts.filter(p => p.x <= thetaMax);
+      if (pts.length === 0) return null;
+      const maxY  = Math.max(...pts.map(p => p.y));
+      const norm  = normalizeBase && maxY > 0 ? maxY : 1;
+      const scale = Math.pow(10, i * offsetDecades);
+      const data  = pts.map(p => ({ x: p.x, y: p.y / norm * scale }));
+      return { sid, color: colors[i], data };
+    }).filter(Boolean);
+    const posY    = traces.flatMap(t => t.data.map(p => p.y).filter(y => y > 0));
+    const yDomMin = posY.length ? Math.pow(10, Math.floor(Math.log10(Math.min(...posY))) - padBelow) : 1e-1;
+    const yDomMax = posY.length ? Math.pow(10, Math.ceil(Math.log10(Math.max(...posY)))  + padAbove) : 1e8;
+    const allX    = traces.flatMap(t => t.data.map(p => p.x));
+    const { ticks: xTicksAuto, domain: xDomainAuto } = allX.length
+      ? niceLinTicks(Math.min(...allX), Math.max(...allX))
+      : { ticks: [], domain: ["auto", "auto"] };
+    const xDomLo  = thetaMin != null ? thetaMin : xDomainAuto[0];
+    const xDomHi  = thetaMax != null ? thetaMax : xDomainAuto[1];
+    const xDomain = (xDomLo === "auto" || xDomHi === "auto") ? xDomainAuto : [xDomLo, xDomHi];
+    const { ticks: xTicks } = xDomain[0] !== "auto"
+      ? niceLinTicks(xDomain[0], xDomain[1])
+      : { ticks: xTicksAuto };
+    return { traces, yDomMin, yDomMax, xTicks, xDomain };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sampleOrder.join(","), plotCache, thetaMin, thetaMax, offsetDecades, padAbove, padBelow, normalizeBase, colors.join(",")]);
+
+  const plotlyTraces = traces.map(t => ({
+    x: t.data.map(p => p.x), y: t.data.map(p => p.y),
+    type: "scatter", mode: "lines",
+    line: { color: t.color, width: ps.lineWidth },
+    showlegend: false, hovertemplate: "<extra></extra>",
+  }));
+
+  const layout = buildPlotLayout(ps,
+    { range: xDomain[0] === "auto" ? undefined : xDomain, tickvals: xTicks.length ? xTicks : undefined,
+      tickformat: "~g",
+      title: { text: "2θ (°)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+    { type: "log", range: [Math.log10(yDomMin), Math.log10(yDomMax)],
+      showticklabels: false, showgrid: false,
+      title: { text: "Intensity (arb.)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
+    [],
+    { uirevision: `xrr-${thetaMin ?? "a"}-${thetaMax ?? "a"}`, dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 } }
+  );
+
+  if (traces.length === 0) return (
+    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No XRR data loaded for selected samples.</div>
+  );
+
+  return (
+    <>
+      <SciPlotWrap ps={ps} cursorLabel={x => `2θ = ${x.toFixed(3)}°`}>
+        {setCursor => (
+          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("xrr", ps)}
+            style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
+            onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+        )}
+      </SciPlotWrap>
+      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
+    </>
+  );
+}
+
 // ── P–E Hysteresis comparison ─────────────────────────────────────────────────
 
 function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {}, plotStyle, config: panelConfig = {}, onUpdate }) {
@@ -9101,7 +9178,7 @@ function AfmComparisonPanel({ sampleOrder, plotCache, labels = {}, plotStyle, co
 
 // ── Panel wrapper + add panel row ─────────────────────────────────────────────
 
-const PANEL_LABELS = { xrd: "XRD ω–2θ", pe: "P–E Hysteresis", rsm: "RSM", afm: "Scanning Probe", de: "εᵣ vs E", df: "εᵣ vs f", meta: "Meta-analysis", stats: "Statistical Analysis", parcoords: "Parallel Coordinates" };
+const PANEL_LABELS = { xrd: "XRD ω–2θ", xrr: "XRR", pe: "P–E Hysteresis", rsm: "RSM", afm: "Scanning Probe", de: "εᵣ vs E", df: "εᵣ vs f", meta: "Meta-analysis", stats: "Statistical Analysis", parcoords: "Parallel Coordinates" };
 function panelLabel(type, modules = []) {
   if (PANEL_LABELS[type]) return PANEL_LABELS[type];
   if (type.startsWith("mod:")) {
@@ -10878,7 +10955,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                 </div>
               </div>
               {/* Zero lines */}
-              {type !== "xrd" && type !== "afm" && (
+              {type !== "xrd" && type !== "xrr" && type !== "afm" && (
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>ZERO LINES</span>
                   <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
@@ -10892,7 +10969,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                 </div>
               )}
               {/* Tick spacing overrides */}
-              {type !== "xrd" && type !== "afm" && (
+              {type !== "xrd" && type !== "xrr" && type !== "afm" && (
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>TICK STEP</span>
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -10992,8 +11069,8 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                   </div>
                 </div>
               )}
-              {/* X/Y Range — for panels other than xrd/rsm/afm which have their own range controls */}
-              {type !== "xrd" && type !== "rsm" && type !== "afm" && <>
+              {/* X/Y Range — for panels other than xrd/xrr/rsm/afm which have their own range controls */}
+              {type !== "xrd" && type !== "xrr" && type !== "rsm" && type !== "afm" && <>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>X RANGE</span>
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -11051,7 +11128,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                 </div>
               </>}
               {/* XRD-specific */}
-              {type === "xrd" && <>
+              {(type === "xrd" || type === "xrr") && <>
                 <div style={{ borderTop: `1px solid ${T.border}`, margin: "2px 0" }} />
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>OFFSET</span>
@@ -11235,6 +11312,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
           style={btnStyle}>×</button>
       </div>
       {type === "xrd"  && <XRDComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} structures={structures} config={config} plotStyle={ps} onUpdate={onUpdate} />}
+      {type === "xrr"  && <XRRComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} />}
       {type === "pe"   && <PEComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
       {type === "rsm"  && <RSMComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} structures={structures} />}
       {type === "afm"  && <AfmComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
@@ -11431,6 +11509,7 @@ function AddPanelRow({ onAdd, modules = [] }) {
   const mono = "'DM Mono', monospace";
   const PANEL_TYPES = [
     { type: "xrd",       label: "XRD ω–2θ"              },
+    { type: "xrr",       label: "XRR"                   },
     { type: "rsm",       label: "RSM"                   },
     { type: "afm",       label: "Scanning Probe"        },
     { type: "pe",        label: "P–E Hysteresis"        },
