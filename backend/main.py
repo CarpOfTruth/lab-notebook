@@ -1325,6 +1325,9 @@ def list_modules():
         info["analysis_metrics"] = cfg.get("analysis_metrics", [])
         info["analysis_code"]    = cfg.get("analysis_code", "")
         info["folder_id"]        = cfg.get("folder_id", None)
+        info["file_mode"]        = cfg.get("file_mode", "single")
+        info["upstream"]         = cfg.get("upstream", [])
+        info["config_schema"]    = cfg.get("config_schema", [])
         result.append(info)
     return result
 

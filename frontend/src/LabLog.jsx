@@ -1353,17 +1353,29 @@ function ModuleConfigModal({ mod, sample, onClose, onSaved }) {
 
 // Generic card for user/built-in modules on the sample detail page.
 
-function ModuleCard({ mod, sample, onRemoved, onSampleUpdate }) {
+function ModuleCard({ mod, sample, modules = [], onRemoved, onSampleUpdate }) {
   const mono = "'DM Mono', monospace";
+
+  const isDerivedMode    = mod.file_mode === "derived";
+  const isCollectionMode = mod.file_mode === "collection";
+
+  // Derived modules: show whenever all required upstream modules have data on this sample.
+  const upstreamMissing = (mod.upstream || []).filter(u => {
+    if (!u.required) return false;
+    const hasFile = !!sample.filenames?.[u.id] || (sample.module_file_counts?.[u.id] ?? 0) > 0;
+    return !hasFile;
+  });
 
   const hasSingleFile   = !!sample.filenames?.[mod.id];
   const hasCollFiles    = (sample.module_file_counts?.[mod.id] ?? 0) > 0;
-  const hasData         = hasSingleFile || hasCollFiles;
-  if (!hasData) return null; // only render when a file has been added
+  const hasData = isDerivedMode
+    ? upstreamMissing.length === 0
+    : (hasSingleFile || hasCollFiles);
+  if (!hasData) return null; // only render when data is available
 
-  const isCollectionMode = mod.file_mode === "collection";
   const filename         = sample.filenames?.[mod.id];
   const fileCount        = sample.module_file_counts?.[mod.id] ?? 0;
+  const upstreamMods     = (mod.upstream || []).map(u => modules.find(m => m.id === u.id) || { id: u.id, name: u.label || u.id });
 
   const initControls = () => {
     const s = {};
@@ -1462,7 +1474,12 @@ function ModuleCard({ mod, sample, onRemoved, onSampleUpdate }) {
             <button onClick={() => setConfigOpen(true)} title="Module configuration"
               style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, lineHeight: 1, padding: "0 2px" }}>⚙</button>
           )}
-          {isCollectionMode ? (
+          {isDerivedMode ? (
+            <span style={{ fontSize: 10, color: T.teal, fontFamily: mono, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, padding: "1px 7px" }}
+              title={`Data sourced from ${upstreamMods.map(u => u.name).join(", ")}`}>
+              src: {upstreamMods.map(u => u.name).join(" + ") || "—"}
+            </span>
+          ) : isCollectionMode ? (
             <>
               <span style={{ fontSize: 10, color: T.textDim, fontFamily: mono, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, padding: "1px 7px" }}>
                 {fileCount} {fileCount === 1 ? "file" : "files"}
@@ -1491,7 +1508,7 @@ function ModuleCard({ mod, sample, onRemoved, onSampleUpdate }) {
               y2Label={plotData.y2Label}
               y1Scale={plotData.y1Scale || "linear"}
             />
-            {!isCollectionMode && (
+            {!isCollectionMode && !isDerivedMode && (
               <div style={{ marginTop: 8 }}>
                 <label style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, border: `1px dashed ${T.border}`, borderRadius: 6, padding: "6px 0", cursor: "pointer", fontFamily: mono, fontSize: 11, color: T.textDim }}>
                   ↑ replace file
@@ -2496,7 +2513,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               onAnalyze={t === "xrd_ot" ? () => setXrdAnalysisOpen(true) : undefined} />
           ))}
           {modulesForSection("structural").map(m => (
-            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
+            <ModuleCard key={m.id} mod={m} sample={sample} modules={modules} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
           ))}
           {xrdAnalysisOpen && (
             <XRDAnalysisModal
@@ -2516,7 +2533,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
           <AfmCard afmData={pd.afm} filename={sample.filenames?.afm} onFile={file => handleFile("afm", file)} />
           {modulesForSection("scanning_probe").map(m => (
-            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
+            <ModuleCard key={m.id} mod={m} sample={sample} modules={modules} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
           ))}
         </div>
       </section>
@@ -2539,7 +2556,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               onAreaChange={handleAreaChange} />
           ))}
           {modulesForSection("electrical").map(m => (
-            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
+            <ModuleCard key={m.id} mod={m} sample={sample} modules={modules} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
           ))}
         </div>
         {addDataOpen && <AddDataModal
@@ -2547,6 +2564,8 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
           sampleId={sample.id}
           sample={sample}
           moduleOptions={modulesForSection("electrical").filter(m => {
+            // Derived modules auto-appear via their upstream — never offered for upload
+            if (m.file_mode === "derived") return false;
             const hasSingle = !!sample.filenames?.[m.id];
             const hasColl   = (sample.module_file_counts?.[m.id] ?? 0) > 0;
             return !hasSingle && !hasColl;
@@ -2560,7 +2579,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         <section>
           <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Optical</div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
-            {modulesForSection("optical").map(m => <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} onSampleUpdate={refreshSample} />)}
+            {modulesForSection("optical").map(m => <ModuleCard key={m.id} mod={m} sample={sample} modules={modules} onRemoved={refreshSample} onSampleUpdate={refreshSample} />)}
           </div>
         </section>
       )}
@@ -2570,7 +2589,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         <section>
           <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Other</div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
-            {modulesForSection("other").map(m => <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} onSampleUpdate={refreshSample} />)}
+            {modulesForSection("other").map(m => <ModuleCard key={m.id} mod={m} sample={sample} modules={modules} onRemoved={refreshSample} onSampleUpdate={refreshSample} />)}
           </div>
         </section>
       )}
@@ -4274,8 +4293,9 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
   const [moduleDeps,    setModuleDeps]    = useState([]);          // ["lmfit>=1.0", ...]
   const [depStatus,     setDepStatus]     = useState([]);          // [{dep,pkg,installed,blocked}]
   const [depLoading,    setDepLoading]    = useState(false);
-  const [fileMode,      setFileMode]      = useState("single");    // "single"|"collection"
+  const [fileMode,      setFileMode]      = useState("single");    // "single"|"collection"|"derived"
   const [paramManifest, setParamManifest] = useState([]);          // [{id,label,type,default,unit?,choices?}]
+  const [upstreamList,  setUpstreamList]  = useState([]);          // [{id, required, label}]
 
   const defaultProcBlock2 = () =>
     `# Transform the imported variables into your desired output.\n# Variables from Block 1 are numpy arrays and in scope.\n# Example:\n# xs = voltage * 1000\n# ys = charge / area_m2`;
@@ -4350,6 +4370,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       if (cfg.dependencies)     { setModuleDeps(cfg.dependencies); }
       if (cfg.file_mode)        setFileMode(cfg.file_mode);
       if (cfg.param_manifest)   setParamManifest(cfg.param_manifest);
+      if (cfg.upstream)         setUpstreamList(cfg.upstream);
       if (cfg.delimiter)  setExDelim(cfg.delimiter);
       if (cfg.skip_rows != null) setExSkip(String(cfg.skip_rows));
     }).catch(() => {});
@@ -4432,6 +4453,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       dependencies: moduleDeps,
       file_mode: fileMode,
       param_manifest: fileMode === "collection" ? paramManifest : [],
+      upstream: upstreamList,
       folder_id: mFolderId || null,
     };
     await api("PUT", `/modules/${id}/config`, cfg);
@@ -4796,6 +4818,57 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
             style={{ ...field(), resize: "vertical", lineHeight: 1.6 }} />
         </div>
 
+        {/* ── Data Sources (upstream modules) ── */}
+        <div style={{ marginTop: 20 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Data Sources</span>
+            {!isBuiltin && (
+              <button onClick={() => setUpstreamList(prev => [...prev, { id: "", required: true, label: "" }])}
+                style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: T.textSecondary, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+                + Add upstream
+              </button>
+            )}
+          </div>
+          <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 8 }}>
+            Modules whose output this module reads. Available in proc_code/analysis_code as <span style={{ color: T.textPrimary }}>upstream["module_id"]</span>.
+            {upstreamList.length > 0 && fileMode !== "derived" && (
+              <span style={{ color: T.amber, marginLeft: 6 }}>Tip: set File Mode to "derived" to skip file upload entirely.</span>
+            )}
+          </div>
+          {upstreamList.length === 0 ? (
+            <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, fontStyle: "italic" }}>No upstream — module is independent.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {upstreamList.map((u, i) => {
+                const upstreamOpts = (allModules || []).filter(m => m.id !== mod.id && m.id !== mId);
+                return (
+                  <div key={i} style={{ display: "flex", gap: 8, alignItems: "center", background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, padding: "6px 10px" }}>
+                    <select value={u.id || ""} disabled={isBuiltin}
+                      onChange={e => setUpstreamList(prev => prev.map((x, j) => j === i ? { ...x, id: e.target.value } : x))}
+                      style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: u.id ? T.teal : T.textDim, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", flex: 1 }}>
+                      <option value="">— pick module —</option>
+                      {upstreamOpts.map(m => <option key={m.id} value={m.id}>{m.name} ({m.id})</option>)}
+                    </select>
+                    <input value={u.label || ""} disabled={isBuiltin}
+                      onChange={e => setUpstreamList(prev => prev.map((x, j) => j === i ? { ...x, label: e.target.value } : x))}
+                      placeholder="Label (optional)"
+                      style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", width: 180 }} />
+                    <label style={{ display: "flex", alignItems: "center", gap: 4, fontFamily: mono, fontSize: 11, color: u.required ? T.teal : T.textDim, cursor: isBuiltin ? "default" : "pointer" }}>
+                      <input type="checkbox" checked={!!u.required} disabled={isBuiltin}
+                        onChange={e => setUpstreamList(prev => prev.map((x, j) => j === i ? { ...x, required: e.target.checked } : x))} />
+                      required
+                    </label>
+                    {!isBuiltin && (
+                      <button onClick={() => setUpstreamList(prev => prev.filter((_, j) => j !== i))}
+                        style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, padding: "0 4px" }}>×</button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
         {/* ── Dependencies ── */}
         {!isBuiltin && (
           <div style={{ marginTop: 20 }}>
@@ -5098,10 +5171,11 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
         </div>
         <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 12 }}>
           <span style={{ color: T.textPrimary }}>Single</span> — one file per sample.{" "}
-          <span style={{ color: T.textPrimary }}>Collection</span> — multiple files with tagged parameters; proc_code receives <span style={{ color: T.teal }}>files</span> and <span style={{ color: T.teal }}>registry</span>.
+          <span style={{ color: T.textPrimary }}>Collection</span> — multiple files with tagged parameters; proc_code receives <span style={{ color: T.teal }}>files</span> and <span style={{ color: T.teal }}>registry</span>.{" "}
+          <span style={{ color: T.textPrimary }}>Derived</span> — no file upload; data sourced entirely from upstream modules.
         </div>
         <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden", width: "fit-content", marginBottom: fileMode === "collection" ? 16 : 0 }}>
-          {["single", "collection"].map(mode => (
+          {["single", "collection", "derived"].map(mode => (
             <button key={mode} onClick={() => setFileMode(mode)}
               style={{ padding: "5px 18px", fontFamily: mono, fontSize: 12, border: "none", cursor: "pointer",
                 background: fileMode === mode ? T.amber : "transparent",
