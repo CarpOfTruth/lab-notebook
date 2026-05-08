@@ -5034,6 +5034,36 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
               <button onClick={() => setConfigSchema(prev => prev.filter((_, j) => j !== i))}
                 style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, padding: "0 4px", alignSelf: "flex-end", marginBottom: 2 }}>×</button>
             </div>
+            {field.type === "number" && (
+              <div style={{ marginTop: 10, display: "flex", gap: 12, alignItems: "center", paddingTop: 8, borderTop: `1px dashed ${T.border}` }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontFamily: mono, fontSize: 11, color: field.fittable ? T.teal : T.textDim }}>
+                  <input type="checkbox" checked={!!field.fittable}
+                    onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, fittable: e.target.checked } : f))} />
+                  Fittable
+                </label>
+                {field.fittable && (
+                  <>
+                    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>min</span>
+                      <input value={field.min ?? ""}
+                        onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, min: e.target.value === "" ? undefined : Number(e.target.value) } : f))}
+                        type="number" placeholder="—"
+                        style={{ width: 70, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "3px 6px", outline: "none", textAlign: "center" }} />
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>max</span>
+                      <input value={field.max ?? ""}
+                        onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, max: e.target.value === "" ? undefined : Number(e.target.value) } : f))}
+                        type="number" placeholder="—"
+                        style={{ width: 70, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "3px 6px", outline: "none", textAlign: "center" }} />
+                    </div>
+                    <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>
+                      Param appears in the Fit workspace as an adjustable input with these bounds.
+                    </span>
+                  </>
+                )}
+              </div>
+            )}
             {field.type === "select" && (
               <div style={{ marginTop: 10 }}>
                 <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 6 }}>Choices</div>
