@@ -6410,13 +6410,27 @@ function ImportModal({ type, onConfirm, onClose }) {
 
 // ── SettingsModal ─────────────────────────────────────────────────────────────
 
-function MaterialEditorModal({ material, settings, onSave, onDelete, onClose }) {
+function MaterialEditorModal({ material, settings, onSave, onDelete, onClose, materialsLib = [] }) {
   useEscClose(onClose);
   // material is null for new entries, or an existing entry for editing
   const isNew = !material?.id;
   const blank = { id: "", name: "", formula: "", composition: {}, parent: "", notes: "", crystal: {}, properties: {}, growth_defaults: {} };
   const [draft, setDraft] = useState(() => material ? JSON.parse(JSON.stringify(material)) : blank);
   const [saving, setSaving] = useState(false);
+
+  // Substrate-stack rows. Last row may have no thickness (bulk).
+  const stackRows = draft.properties?.substrate_stack || [];
+  const setStackRows = (rows) => setDraft(p => {
+    const props = { ...(p.properties || {}) };
+    if (rows.length === 0) delete props.substrate_stack;
+    else props.substrate_stack = rows;
+    return { ...p, properties: props };
+  });
+  // Other materials (excluding self) for the picker
+  const stackPickerOptions = useMemo(() =>
+    (materialsLib || []).filter(m => m.id !== draft.id).map(m => m.name).sort(),
+    [materialsLib, draft.id]
+  );
 
   // Composition as editable rows: [{el, amount}]
   const [compRows, setCompRows] = useState(() => Object.entries(draft.composition || {}).map(([el, amt]) => ({ el, amt: String(amt) })));
@@ -6574,11 +6588,52 @@ function MaterialEditorModal({ material, settings, onSave, onDelete, onClose }) 
             <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
               <input value={draft.properties?.density_g_cm3 ?? ""}
                 onChange={e => setDraft(p => ({ ...p, properties: { ...(p.properties || {}), density_g_cm3: e.target.value === "" ? null : (parseFloat(e.target.value) || 0) } }))}
-                placeholder="—" type="number" step="0.01"
-                style={{ width: 80, background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+                placeholder="—" type="number" step="0.01" disabled={stackRows.length > 0}
+                style={{ width: 80, background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: stackRows.length > 0 ? T.textDim : T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
               <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", whiteSpace: "nowrap" }}>g/cm³</span>
             </div>
           </div>
+          {stackRows.length > 0 && (
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, paddingBottom: 6 }}>
+              (density set per layer below)
+            </span>
+          )}
+        </div>
+
+        {/* Substrate stack — for compound substrates like Si:STO */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Substrate stack</span>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>
+              (top → bottom; last row with no thickness = semi-infinite bulk)
+            </span>
+          </div>
+          {stackRows.map((row, i) => (
+            <div key={i} style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 18, textAlign: "right" }}>{i + 1}.</span>
+              <select value={row.material || ""}
+                onChange={e => setStackRows(stackRows.map((r, j) => j === i ? { ...r, material: e.target.value } : r))}
+                style={{ ...IS, width: 140 }}>
+                <option value="">— pick material —</option>
+                {stackPickerOptions.map(n => <option key={n} value={n}>{n}</option>)}
+              </select>
+              <input value={row.thickness_nm ?? ""}
+                onChange={e => {
+                  const v = e.target.value === "" ? null : parseFloat(e.target.value);
+                  setStackRows(stackRows.map((r, j) => j === i ? { ...r, thickness_nm: v } : r));
+                }}
+                placeholder={i === stackRows.length - 1 ? "bulk" : "nm"}
+                type="number" step="0.1"
+                style={{ ...IS, width: 70, textAlign: "center" }} />
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>nm</span>
+              <button onClick={() => setStackRows(stackRows.filter((_, j) => j !== i))}
+                style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 0 }}>×</button>
+            </div>
+          ))}
+          <button onClick={() => setStackRows([...stackRows, { material: "", thickness_nm: stackRows.length === 0 ? null : 5 }])}
+            style={{ alignSelf: "flex-start", background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+            + Add layer
+          </button>
         </div>
 
         {/* Growth defaults */}
@@ -12645,6 +12700,7 @@ function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete, o
         <MaterialEditorModal
           material={editorMat || null}
           settings={settings}
+          materialsLib={materialsLib}
           onSave={handleSave}
           onDelete={handleDelete}
           onClose={() => setEditorMat(null)} />
