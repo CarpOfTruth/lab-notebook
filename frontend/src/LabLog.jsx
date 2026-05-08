@@ -1454,10 +1454,14 @@ function FitWorkspaceModal({ mod, sample, onClose, onSaved }) {
     setRunning(true); setError(null);
     try {
       const params = {};
+      const bounds = {};
       const fixed_ids = [];
       for (const [id, f] of Object.entries(fields)) {
         params[id] = f.value;
         if (f.fittable && f.fixed) fixed_ids.push(id);
+        if (f.fittable && (f.min !== undefined || f.max !== undefined)) {
+          bounds[id] = { min: f.min, max: f.max };
+        }
       }
       if (fixed_ids.length) params.__fixed__ = fixed_ids;
 
@@ -1466,6 +1470,7 @@ function FitWorkspaceModal({ mod, sample, onClose, onSaved }) {
         proc_code:     cfg.proc_code || "",
         analysis_code: cfg.analysis_code || "",
         params,
+        bounds,
       };
       if (Object.keys(upstreamCache).length) body.upstream_cache = upstreamCache;
 
@@ -5235,29 +5240,34 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
           )}
         </div>
 
-        {/* ── Dependencies ── */}
-        {!isBuiltin && (
-          <div style={{ marginTop: 20 }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-              <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Dependencies</span>
-              <button
-                disabled={isCreate || depLoading || depStatus.every(d => d.installed || d.blocked)}
-                onClick={async () => {
-                  setDepLoading(true);
-                  const r = await api("POST", `/modules/${mod.id}/install-dependencies`).catch(() => null);
-                  if (r?.results) setDepStatus(prev => {
-                    const map = Object.fromEntries(r.results.map(x => [x.dep, x]));
-                    return prev.map(d => map[d.dep] ? { ...d, installed: map[d.dep].ok || d.installed } : d);
-                  });
-                  setDepLoading(false);
-                }}
-                style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: (isCreate || depLoading) ? T.textDim : T.teal, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: (isCreate || depLoading) ? "default" : "pointer" }}>
-                {depLoading ? "Installing…" : "Install missing"}
-              </button>
+        {/* ── Dependencies ── (visible for both user and built-in modules) */}
+        <div style={{ marginTop: 20 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Dependencies</span>
+            <button
+              disabled={isCreate || depLoading || (depStatus.length > 0 && depStatus.every(d => d.installed || d.blocked))}
+              onClick={async () => {
+                setDepLoading(true);
+                const r = await api("POST", `/modules/${mod.id}/install-dependencies`).catch(() => null);
+                if (r?.results) setDepStatus(prev => {
+                  const map = Object.fromEntries(r.results.map(x => [x.dep, x]));
+                  return prev.map(d => map[d.dep] ? { ...d, installed: map[d.dep].ok || d.installed } : d);
+                });
+                setDepLoading(false);
+              }}
+              style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: (isCreate || depLoading) ? T.textDim : T.teal, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: (isCreate || depLoading) ? "default" : "pointer" }}>
+              {depLoading ? "Installing…" : "Install missing"}
+            </button>
+          </div>
+          <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 8 }}>
+            pip packages required by this module (e.g. <span style={{ color: T.textPrimary }}>lmfit&gt;=1.0</span>). One per line.
+            {isBuiltin && <span> Built-in modules' deps are read-only here.</span>}
+          </div>
+          {isBuiltin ? (
+            <div style={{ fontFamily: mono, fontSize: 12, color: T.textPrimary, padding: "8px 10px", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, whiteSpace: "pre-line" }}>
+              {moduleDeps.length === 0 ? <span style={{ color: T.textDim }}>(none)</span> : moduleDeps.join("\n")}
             </div>
-            <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 8 }}>
-              pip packages required by this module (e.g. <span style={{ color: T.textPrimary }}>lmfit&gt;=1.0</span>). One per line.
-            </div>
+          ) : (
             <textarea
               value={moduleDeps.join("\n")}
               onChange={e => {
@@ -5269,22 +5279,22 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
               spellCheck={false}
               style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "8px 10px", outline: "none", resize: "vertical", boxSizing: "border-box" }}
             />
-            {depStatus.length > 0 && (
-              <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 6 }}>
-                {depStatus.map((d, i) => (
-                  <span key={i} style={{
-                    fontFamily: mono, fontSize: 10, padding: "2px 8px", borderRadius: 10,
-                    border: `1px solid ${d.blocked ? T.red + "55" : d.installed ? T.teal + "55" : T.amber + "55"}`,
-                    background: d.blocked ? T.red + "12" : d.installed ? T.teal + "12" : T.amber + "12",
-                    color: d.blocked ? T.red : d.installed ? T.teal : T.amber,
-                  }}>
-                    {d.dep} {d.blocked ? "⊘ blocked" : d.installed ? "✓" : "⚠ missing"}
-                  </span>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+          )}
+          {depStatus.length > 0 && (
+            <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {depStatus.map((d, i) => (
+                <span key={i} style={{
+                  fontFamily: mono, fontSize: 10, padding: "2px 8px", borderRadius: 10,
+                  border: `1px solid ${d.blocked ? T.red + "55" : d.installed ? T.teal + "55" : T.amber + "55"}`,
+                  background: d.blocked ? T.red + "12" : d.installed ? T.teal + "12" : T.amber + "12",
+                  color: d.blocked ? T.red : d.installed ? T.teal : T.amber,
+                }}>
+                  {d.dep} {d.blocked ? "⊘ blocked" : d.installed ? "✓" : "⚠ missing"}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* ── Card section ── */}

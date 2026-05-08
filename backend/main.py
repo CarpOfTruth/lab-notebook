@@ -2277,13 +2277,15 @@ def _materialize_layer_fields(template: list, prefix: str, group_label: str,
                               layer_ctx: dict) -> list:
     """Expand a per-layer schema template into concrete config_schema entries.
 
-    template:    list of field templates (id, label, type, unit, fittable, min, max,
-                 default, default_from). `id` is the SUFFIX — the materialized id is
-                 `{prefix}_{template.id}` (e.g. layer_0_thickness).
-    prefix:      string prefix for this materialization (e.g. "layer_0", "buffer_1",
-                 "substrate").
-    group_label: human-readable group (e.g. "Layer 0 (BTO)") shown in the field label.
-    layer_ctx:   dict with at least {layer, material} for default_from resolution.
+    template:    list of field templates. Supported keys:
+                   id, label, type, unit, fittable, default, default_from
+                   min, max                — static bounds
+                   min_factor, max_factor  — bounds = factor × nominal (multiplicative)
+                   min_offset, max_offset  — bounds = nominal + offset (additive)
+                 `id` is the SUFFIX — materialized id is `{prefix}_{id}`.
+    prefix:      string prefix for this materialization.
+    group_label: human-readable group (e.g. "Layer 1 (SRO)").
+    layer_ctx:   dict with {layer, material} for default_from resolution.
     """
     out = []
     for tmpl in template:
@@ -2292,12 +2294,34 @@ def _materialize_layer_fields(template: list, prefix: str, group_label: str,
         materialized["id"] = f"{prefix}_{suffix}"
         if "label" in tmpl:
             materialized["label"] = f"{group_label} — {tmpl['label']}"
-        # Resolve default_from if the template specifies it
+
+        # Resolve default_from if specified
+        nominal = materialized.get("default")
         if "default_from" in tmpl:
             v = _resolve_default_from(tmpl["default_from"], layer_ctx)
             if v is not None:
+                nominal = v
                 materialized["default"] = v
             materialized.pop("default_from", None)
+
+        # Resolve relative bounds if specified
+        try:
+            nom = float(nominal) if nominal is not None else None
+        except (ValueError, TypeError):
+            nom = None
+        if nom is not None:
+            if "min_factor" in tmpl and "min" not in tmpl:
+                materialized["min"] = nom * float(tmpl["min_factor"])
+            if "max_factor" in tmpl and "max" not in tmpl:
+                materialized["max"] = nom * float(tmpl["max_factor"])
+            if "min_offset" in tmpl and "min" not in tmpl:
+                materialized["min"] = nom + float(tmpl["min_offset"])
+            if "max_offset" in tmpl and "max" not in tmpl:
+                materialized["max"] = nom + float(tmpl["max_offset"])
+        # Strip the directive keys from the materialized field
+        for k in ("min_factor", "max_factor", "min_offset", "max_offset"):
+            materialized.pop(k, None)
+
         out.append(materialized)
     return out
 
@@ -3135,6 +3159,10 @@ def compute_module_analysis_for_sample(module_id: str, body: dict):
     params.update(mod_config)
     params.update(body.get("params") or {})
 
+    # Bounds: per-field {min, max} overrides from the fit workspace.
+    # Body shape: {"bounds": {"layer_0_thickness": {"min": 25, "max": 75}, ...}}
+    bounds = body.get("bounds") or {}
+
     resource_api = _build_resource_api()
     indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
@@ -3158,6 +3186,7 @@ def compute_module_analysis_for_sample(module_id: str, body: dict):
         **resource_api,
         "upstream":  upstream,
         "params":    params,
+        "bounds":    bounds,
         "layers":    sample_layers,
         "substrate": sample_substrate,
         "meta":      meta,
