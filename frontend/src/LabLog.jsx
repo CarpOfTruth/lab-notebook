@@ -6566,6 +6566,21 @@ function MaterialEditorModal({ material, settings, onSave, onDelete, onClose }) 
           {crystalField("poisson", "ν", "", 50)}
         </div>
 
+        {/* Properties */}
+        {sHdr("Properties")}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Density</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+              <input value={draft.properties?.density_g_cm3 ?? ""}
+                onChange={e => setDraft(p => ({ ...p, properties: { ...(p.properties || {}), density_g_cm3: e.target.value === "" ? null : (parseFloat(e.target.value) || 0) } }))}
+                placeholder="—" type="number" step="0.01"
+                style={{ width: 80, background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", whiteSpace: "nowrap" }}>g/cm³</span>
+            </div>
+          </div>
+        </div>
+
         {/* Growth defaults */}
         {techniques.length > 0 && sHdr("Growth Defaults")}
         {techniques.map(tech => {
