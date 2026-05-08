@@ -17,6 +17,23 @@
     { "id": "scale",         "label": "Overlay scale", "type": "number", "default": 1.0, "unit": "×",
       "fittable": true, "min": 0.1, "max": 10 }
   ],
+  "per_layer_schema": [
+    { "id": "thickness", "label": "Thickness", "type": "number", "unit": "nm",
+      "fittable": true, "min": 0.5, "max": 1000, "default": 50,
+      "default_from": "layer.thickness_nm" },
+    { "id": "roughness", "label": "Roughness", "type": "number", "unit": "nm",
+      "fittable": true, "min": 0,   "max": 10,   "default": 1.0 },
+    { "id": "density",   "label": "Density",   "type": "number", "unit": "g/cm³",
+      "fittable": true, "min": 0.1, "max": 30,   "default": 5.0,
+      "default_from": "material.properties.density_g_cm3" }
+  ],
+  "per_substrate_schema": [
+    { "id": "roughness", "label": "Roughness", "type": "number", "unit": "nm",
+      "fittable": true, "min": 0, "max": 10, "default": 0.5 },
+    { "id": "density",   "label": "Density",   "type": "number", "unit": "g/cm³",
+      "fittable": true, "min": 0.1, "max": 30, "default": 2.33,
+      "default_from": "material.properties.density_g_cm3" }
+  ],
   "plot_traces": [
     { "x_key": "theta", "y_key": "intensity", "label": "Data", "axis": "y1", "style": "line", "color": "#94a3b8" },
     { "x_key": "theta", "y_key": "fit",       "label": "Fit",  "axis": "y1", "style": "fit",  "color": "#2dd4bf" }

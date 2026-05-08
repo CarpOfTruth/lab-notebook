@@ -1389,12 +1389,15 @@ function FitWorkspaceModal({ mod, sample, onClose, onSaved }) {
     (async () => {
       setLoading(true); setError(null);
       try {
-        const c = await api("GET", `/modules/${mod.id}/config`);
+        const [c, eff] = await Promise.all([
+          api("GET", `/modules/${mod.id}/config`),
+          api("GET", `/modules/${mod.id}/effective-schema?sample_id=${encodeURIComponent(sample.id)}`).catch(() => null),
+        ]);
         if (cancelled) return;
         setCfg(c);
 
         const saved = (sample.module_config || {})[mod.id] || {};
-        const schema = c.config_schema || [];
+        const schema = (eff && eff.config_schema) || c.config_schema || [];
         const init = {};
         for (const f of schema) {
           init[f.id] = {
@@ -1549,11 +1552,10 @@ function FitWorkspaceModal({ mod, sample, onClose, onSaved }) {
   const renderField = (f) => {
     const isFittable = f.fittable && f.type === "number";
     return (
-      <div key={f.id} style={{ display: "flex", flexDirection: "column", gap: 4, paddingBottom: 8, borderBottom: `1px solid ${T.border}` }}>
+      <div key={f.id} style={{ display: "flex", flexDirection: "column", gap: 4, paddingBottom: 6 }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
-          <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, fontWeight: 600 }}>{f.label}</span>
+          <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, fontWeight: 600 }}>{f.displayLabel || f.label}</span>
           {f.unit && <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim }}>({f.unit})</span>}
-          <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim, marginLeft: "auto" }}>{f.id}</span>
         </div>
         <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
           {f.type === "boolean" ? (
@@ -1593,6 +1595,24 @@ function FitWorkspaceModal({ mod, sample, onClose, onSaved }) {
   };
 
   const fieldList = Object.values(fields);
+  // Group fields by the part of the label before " — " (set by effective-schema)
+  const fieldGroups = useMemo(() => {
+    const groups = []; // [{ name, fields: [] }]
+    let lastGroup = null;
+    for (const f of fieldList) {
+      const lbl   = f.label || "";
+      const idx   = lbl.indexOf(" — ");
+      const gName = idx > 0 ? lbl.slice(0, idx) : "General";
+      const fName = idx > 0 ? lbl.slice(idx + 3) : lbl;
+      if (lastGroup !== gName) {
+        groups.push({ name: gName, fields: [] });
+        lastGroup = gName;
+      }
+      groups[groups.length - 1].fields.push({ ...f, displayLabel: fName });
+    }
+    return groups;
+  }, [fieldList]);
+
   const metricEntries = Object.entries(metrics).filter(([k]) => !k.startsWith("_"));
   const metricMap = Object.fromEntries((cfg?.analysis_metrics || []).map(m => [m.name, m]));
 
@@ -1612,14 +1632,19 @@ function FitWorkspaceModal({ mod, sample, onClose, onSaved }) {
         {/* Body */}
         <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
           {/* Param panel */}
-          <div style={{ width: 360, borderRight: `1px solid ${T.border}`, padding: "14px 16px", overflowY: "auto", display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ width: 380, borderRight: `1px solid ${T.border}`, padding: "14px 16px", overflowY: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
             <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>Parameters</div>
             {loading ? (
               <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>Loading…</div>
             ) : fieldList.length === 0 ? (
               <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, fontStyle: "italic" }}>No parameters declared.</div>
             ) : (
-              fieldList.map(renderField)
+              fieldGroups.map((g, gi) => (
+                <div key={gi} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div style={{ fontFamily: mono, fontSize: 10, color: T.amber, textTransform: "uppercase", letterSpacing: 1, borderBottom: `1px solid ${T.border}`, paddingBottom: 4 }}>{g.name}</div>
+                  {g.fields.map(renderField)}
+                </div>
+              ))
             )}
           </div>
 

@@ -2258,6 +2258,172 @@ def save_module_config(module_id: str, body: dict):
     return {"ok": True}
 
 
+def _resolve_default_from(spec: str, ctx: dict) -> object:
+    """Look up `spec` (a dotted path) against ctx and return the value, or None."""
+    if not spec or not isinstance(spec, str):
+        return None
+    cur = ctx
+    for part in spec.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
+
+
+def _materialize_layer_fields(template: list, prefix: str, group_label: str,
+                              layer_ctx: dict) -> list:
+    """Expand a per-layer schema template into concrete config_schema entries.
+
+    template:    list of field templates (id, label, type, unit, fittable, min, max,
+                 default, default_from). `id` is the SUFFIX — the materialized id is
+                 `{prefix}_{template.id}` (e.g. layer_0_thickness).
+    prefix:      string prefix for this materialization (e.g. "layer_0", "buffer_1",
+                 "substrate").
+    group_label: human-readable group (e.g. "Layer 0 (BTO)") shown in the field label.
+    layer_ctx:   dict with at least {layer, material} for default_from resolution.
+    """
+    out = []
+    for tmpl in template:
+        materialized = dict(tmpl)
+        suffix = tmpl.get("id", "field")
+        materialized["id"] = f"{prefix}_{suffix}"
+        if "label" in tmpl:
+            materialized["label"] = f"{group_label} — {tmpl['label']}"
+        # Resolve default_from if the template specifies it
+        if "default_from" in tmpl:
+            v = _resolve_default_from(tmpl["default_from"], layer_ctx)
+            if v is not None:
+                materialized["default"] = v
+            materialized.pop("default_from", None)
+        out.append(materialized)
+    return out
+
+
+@app.get("/api/modules/{module_id}/effective-schema")
+def get_effective_schema(module_id: str, sample_id: str):
+    """Return the module's config_schema with per-layer entries materialized
+    against the given sample's layers/substrate.
+
+    Module schema may declare:
+      - per_layer_schema: [field templates] — expanded once per user layer
+      - per_substrate_schema: [field templates] — expanded once for the bulk
+                              substrate (and once per buffer layer if the
+                              substrate has substrate_stack metadata)
+
+    Each template uses `id` as a suffix. The materialized id is
+    `{prefix}_{suffix}` where prefix is `layer_{i}`, `buffer_{i}`, or
+    `substrate`. Templates may use `default_from` (dotted path against
+    {layer, material}) to pull initial values from the sample.
+
+    Modules without these templates return their static config_schema unchanged.
+    """
+    schema = _load_schema(module_id)
+    if schema is None:
+        raise HTTPException(404, f"Module '{module_id}' not found")
+
+    base_fields = list(schema.get("config_schema", []))
+    layer_tmpl     = schema.get("per_layer_schema", []) or []
+    substrate_tmpl = schema.get("per_substrate_schema", []) or []
+
+    # If neither template is set, this is a no-op — return as-is for compatibility
+    if not layer_tmpl and not substrate_tmpl:
+        return {"config_schema": base_fields, "layers": [], "substrate": None}
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT layers, substrate FROM samples WHERE id=?", (sample_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, f"Sample '{sample_id}' not found")
+        layers    = json.loads(row["layers"] or "[]")
+        substrate = row["substrate"]
+
+        # Look up the substrate material to find its substrate_stack (if any)
+        substrate_mat = None
+        if substrate:
+            mr = conn.execute("SELECT * FROM materials_library WHERE name=?", (substrate,)).fetchone()
+            substrate_mat = _mat_row_to_dict(mr) if mr else None
+
+        # Pre-fetch material rows for all referenced layer materials in one pass
+        all_names = set()
+        for lyr in layers:
+            for t in (lyr.get("targets") or []):
+                if t.get("material"):
+                    all_names.add(t["material"])
+        if substrate_mat and substrate_mat.get("properties", {}).get("substrate_stack"):
+            for buf in substrate_mat["properties"]["substrate_stack"]:
+                if buf.get("material"):
+                    all_names.add(buf["material"])
+        materials_by_name = {}
+        if all_names:
+            placeholders = ",".join("?" * len(all_names))
+            rows = conn.execute(
+                f"SELECT * FROM materials_library WHERE name IN ({placeholders})",
+                tuple(all_names),
+            ).fetchall()
+            for r in rows:
+                m = _mat_row_to_dict(r)
+                materials_by_name[m["name"]] = m
+
+    # Build expanded entries
+    expanded = []
+
+    # User layers (deposition order: layers[0] = first deposited / bottom)
+    for i, lyr in enumerate(layers):
+        # Pick the first target's material as the layer's primary material
+        tgt = (lyr.get("targets") or [{}])[0]
+        mat_name = tgt.get("material") or ""
+        mat      = materials_by_name.get(mat_name)
+        thick    = lyr.get("thickness_nm")
+        group    = f"Layer {i+1}" + (f" ({mat_name})" if mat_name else "")
+        ctx = {
+            "layer":    {"thickness_nm": thick, "material": mat_name, **(lyr or {})},
+            "material": mat or {},
+        }
+        expanded.extend(_materialize_layer_fields(layer_tmpl, f"layer_{i}", group, ctx))
+
+    # Substrate buffer layers (from substrate_stack metadata, if any)
+    sub_props = (substrate_mat or {}).get("properties", {})
+    sub_stack = sub_props.get("substrate_stack") or []
+    bulk_material_name = substrate or ""
+    if sub_stack:
+        # Last entry in substrate_stack with no thickness = bulk; everything else is a buffer
+        for i, buf in enumerate(sub_stack):
+            buf_mat_name = buf.get("material") or ""
+            buf_thick    = buf.get("thickness_nm")
+            buf_mat      = materials_by_name.get(buf_mat_name)
+            ctx = {
+                "layer":    {"thickness_nm": buf_thick, "material": buf_mat_name},
+                "material": buf_mat or {},
+            }
+            if buf_thick is None:
+                # This is the bulk
+                bulk_material_name = buf_mat_name or bulk_material_name
+                bulk_mat_for_substrate = buf_mat
+                continue
+            group = f"Buffer {i+1}" + (f" ({buf_mat_name})" if buf_mat_name else "")
+            expanded.extend(_materialize_layer_fields(layer_tmpl, f"buffer_{i}", group, ctx))
+
+    # Bulk substrate — applies per_substrate_schema once
+    bulk_mat = materials_by_name.get(bulk_material_name) or substrate_mat
+    sub_ctx = {
+        "layer":    {"material": bulk_material_name},
+        "material": bulk_mat or {},
+    }
+    sub_group = f"Substrate ({bulk_material_name})" if bulk_material_name else "Substrate"
+    expanded.extend(_materialize_layer_fields(substrate_tmpl, "substrate", sub_group, sub_ctx))
+
+    return {
+        "config_schema": base_fields + expanded,
+        "layers":        layers,
+        "substrate":     substrate,
+        "bulk_material": bulk_material_name,
+    }
+
+
 @app.get("/api/modules/{module_id}/dependencies")
 def get_module_dependencies(module_id: str):
     """Return dependency status for a module's declared dependencies."""
