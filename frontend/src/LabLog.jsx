@@ -1351,6 +1351,331 @@ function ModuleConfigModal({ mod, sample, onClose, onSaved }) {
   );
 }
 
+// ── FitWorkspaceModal ─────────────────────────────────────────────────────────
+// Generalized fit workspace: any module declaring fittable config_schema entries
+// can be opened here. Renders the data + fit overlay, lets the user adjust params
+// and bounds, runs the fit via compute-analysis-for-sample, and saves results.
+
+function FitWorkspaceModal({ mod, sample, onClose, onSaved }) {
+  const mono = "'DM Mono', monospace";
+  useEscClose(onClose);
+
+  // Loaded once: full schema (proc_code, analysis_code, plot_traces, config_schema)
+  const [cfg, setCfg] = useState(null);
+
+  // Per-field state: { id: { value, min, max, fixed, fittable, type, label, unit, default, choices } }
+  const [fields, setFields] = useState({});
+
+  // Plot state
+  const [dataTraces,    setDataTraces]    = useState([]);   // [{x, y, label, color, style}]
+  const [overlayTraces, setOverlayTraces] = useState([]);
+  const [xLabel, setXLabel] = useState("x");
+  const [yLabel, setYLabel] = useState("y");
+  const [yScale, setYScale] = useState("linear");
+
+  // Cached upstream results from the initial render — passed as upstream_cache on Run Fit
+  const [upstreamCache, setUpstreamCache] = useState({});
+
+  const [metrics,    setMetrics]    = useState({});
+  const [running,    setRunning]    = useState(false);
+  const [saving,     setSaving]     = useState(false);
+  const [error,      setError]      = useState(null);
+  const [loading,    setLoading]    = useState(true);
+  const [hasUnsaved, setHasUnsaved] = useState(false);
+
+  // ── Load module config + initial render ────────────────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true); setError(null);
+      try {
+        const c = await api("GET", `/modules/${mod.id}/config`);
+        if (cancelled) return;
+        setCfg(c);
+
+        const saved = (sample.module_config || {})[mod.id] || {};
+        const schema = c.config_schema || [];
+        const init = {};
+        for (const f of schema) {
+          init[f.id] = {
+            id:       f.id,
+            label:    f.label || f.id,
+            unit:     f.unit  || "",
+            type:     f.type  || "text",
+            choices:  f.choices,
+            default:  f.default,
+            fittable: !!f.fittable,
+            min:      f.min,
+            max:      f.max,
+            fixed:    false,
+            value:    saved[f.id] !== undefined ? saved[f.id] : f.default,
+          };
+        }
+        setFields(init);
+
+        setYScale(c.plot_config?.y1_scale || c.plot_config?.y_scale || "linear");
+
+        // Initial render
+        const r = await api("POST", `/modules/${mod.id}/render-for-sample`, {
+          sample_id:   sample.id,
+          proc_code:   c.proc_code || "",
+          plot_config: c.plot_config || {},
+          options:     {},
+        });
+        if (cancelled) return;
+        if (r.ok) {
+          // Keep only the data trace(s) — exclude fit-style ones (they'll come from analysis)
+          const dataOnly = (r.traces || []).filter(t => t.style !== "fit");
+          setDataTraces(dataOnly);
+          setXLabel(r.x_label || "x");
+          setYLabel(r.y1_label || r.y_label || "y");
+        } else {
+          setError(r.error || "Render failed");
+        }
+      } catch (e) { if (!cancelled) setError(e.message || "Failed to load workspace"); }
+      if (!cancelled) setLoading(false);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mod.id, sample.id]);
+
+  // ── Field updates ──────────────────────────────────────────────────────────
+  const setField = (id, patch) => {
+    setFields(prev => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+    setHasUnsaved(true);
+  };
+
+  // ── Run fit ────────────────────────────────────────────────────────────────
+  const runFit = async () => {
+    if (!cfg) return;
+    setRunning(true); setError(null);
+    try {
+      const params = {};
+      const fixed_ids = [];
+      for (const [id, f] of Object.entries(fields)) {
+        params[id] = f.value;
+        if (f.fittable && f.fixed) fixed_ids.push(id);
+      }
+      if (fixed_ids.length) params.__fixed__ = fixed_ids;
+
+      const body = {
+        sample_id:     sample.id,
+        proc_code:     cfg.proc_code || "",
+        analysis_code: cfg.analysis_code || "",
+        params,
+      };
+      if (Object.keys(upstreamCache).length) body.upstream_cache = upstreamCache;
+
+      const res = await api("POST", `/modules/${mod.id}/compute-analysis-for-sample`, body);
+      if (!res.ok) {
+        setError(res.error || "Fit failed");
+      } else {
+        const vals = res.values || {};
+        const overlay = vals._overlay_traces || [];
+        const fitParams = vals._fit_params || {};
+        setOverlayTraces(overlay);
+
+        // Reflect _fit_params into fittable, non-fixed fields
+        if (Object.keys(fitParams).length) {
+          setFields(prev => {
+            const next = { ...prev };
+            for (const [id, v] of Object.entries(fitParams)) {
+              if (next[id] && next[id].fittable && !next[id].fixed) {
+                next[id] = { ...next[id], value: v };
+              }
+            }
+            return next;
+          });
+          setHasUnsaved(true);
+        }
+
+        // Strip overlay/fit-param keys from metrics display
+        const { _overlay_traces, _fit_params, ...m } = vals;
+        setMetrics(m);
+      }
+    } catch (e) { setError(e.message || "Fit request failed"); }
+    setRunning(false);
+  };
+
+  // ── Save params back to sample ─────────────────────────────────────────────
+  const doSave = async () => {
+    setSaving(true); setError(null);
+    try {
+      const out = {};
+      for (const [id, f] of Object.entries(fields)) out[id] = f.value;
+      await api("PATCH", `/samples/${sample.id}/module-config/${mod.id}`, out);
+      setHasUnsaved(false);
+      onSaved?.();
+    } catch (e) { setError(e.message || "Save failed"); }
+    setSaving(false);
+  };
+
+  // ── Build Plotly traces from data + overlay ────────────────────────────────
+  const plotlyTraces = useMemo(() => {
+    const out = [];
+    for (const t of dataTraces) {
+      out.push({
+        x: t.x, y: t.y,
+        type: "scatter", mode: "lines",
+        name: t.label || "data",
+        line: { color: t.color || "#94a3b8", width: 1.2 },
+      });
+    }
+    for (const t of overlayTraces) {
+      out.push({
+        x: t.x, y: t.y,
+        type: "scatter", mode: "lines",
+        name: t.label || "fit",
+        line: { color: t.color || "#2dd4bf", width: 1.6, dash: t.style === "fit" ? "dash" : "solid" },
+        opacity: t.style === "fit" ? 0.85 : 1,
+      });
+    }
+    return out;
+  }, [dataTraces, overlayTraces]);
+
+  const plotLayout = {
+    margin: { t: 14, r: 18, b: 50, l: 70 },
+    xaxis: { title: { text: xLabel, font: { size: 12, color: T.textSecondary } },
+             gridcolor: T.border, zeroline: false },
+    yaxis: { title: { text: yLabel, font: { size: 12, color: T.textSecondary } },
+             type: yScale === "log" ? "log" : "linear",
+             gridcolor: T.border, zeroline: false },
+    paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
+    font: { color: T.textSecondary, family: mono, size: 11 },
+    showlegend: true, legend: { orientation: "h", y: 1.06, font: { size: 11 } },
+  };
+
+  // ── Param row renderer ─────────────────────────────────────────────────────
+  const renderField = (f) => {
+    const isFittable = f.fittable && f.type === "number";
+    return (
+      <div key={f.id} style={{ display: "flex", flexDirection: "column", gap: 4, paddingBottom: 8, borderBottom: `1px solid ${T.border}` }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+          <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, fontWeight: 600 }}>{f.label}</span>
+          {f.unit && <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim }}>({f.unit})</span>}
+          <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim, marginLeft: "auto" }}>{f.id}</span>
+        </div>
+        <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+          {f.type === "boolean" ? (
+            <input type="checkbox" checked={!!f.value}
+              onChange={e => setField(f.id, { value: e.target.checked })} />
+          ) : f.type === "select" ? (
+            <select value={f.value ?? ""} onChange={e => setField(f.id, { value: e.target.value })}
+              style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none" }}>
+              {(f.choices || []).map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          ) : (
+            <input type={f.type === "number" ? "number" : "text"}
+              value={f.value ?? ""}
+              onChange={e => setField(f.id, { value: f.type === "number" ? (e.target.value === "" ? "" : Number(e.target.value)) : e.target.value })}
+              style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", width: 90, textAlign: "center" }} />
+          )}
+          {isFittable && (
+            <>
+              <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim }}>min</span>
+              <input type="number" value={f.min ?? ""}
+                onChange={e => setField(f.id, { min: e.target.value === "" ? undefined : Number(e.target.value) })}
+                style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "3px 6px", outline: "none", width: 60, textAlign: "center" }} />
+              <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim }}>max</span>
+              <input type="number" value={f.max ?? ""}
+                onChange={e => setField(f.id, { max: e.target.value === "" ? undefined : Number(e.target.value) })}
+                style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "3px 6px", outline: "none", width: 60, textAlign: "center" }} />
+              <label style={{ display: "flex", alignItems: "center", gap: 3, fontFamily: mono, fontSize: 10, color: f.fixed ? T.amber : T.textDim, cursor: "pointer" }}>
+                <input type="checkbox" checked={!!f.fixed}
+                  onChange={e => setField(f.id, { fixed: e.target.checked })} />
+                fixed
+              </label>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const fieldList = Object.values(fields);
+  const metricEntries = Object.entries(metrics).filter(([k]) => !k.startsWith("_"));
+  const metricMap = Object.fromEntries((cfg?.analysis_metrics || []).map(m => [m.name, m]));
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 950, display: "flex", alignItems: "center", justifyContent: "center" }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 12, width: "min(95vw, 1200px)", height: "min(90vh, 800px)", display: "flex", flexDirection: "column" }}>
+        {/* Header */}
+        <div style={{ display: "flex", alignItems: "center", padding: "12px 18px", borderBottom: `1px solid ${T.border}`, gap: 12 }}>
+          <span style={{ fontFamily: mono, fontSize: 14, color: T.textPrimary, fontWeight: 600 }}>{mod.name} — Fit</span>
+          <span style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>· {sample.id}</span>
+          {hasUnsaved && <span style={{ fontFamily: mono, fontSize: 10, color: T.amber, marginLeft: 8 }}>● unsaved</span>}
+          <span style={{ flex: 1 }} />
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, lineHeight: 1 }}>✕</button>
+        </div>
+
+        {/* Body */}
+        <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+          {/* Param panel */}
+          <div style={{ width: 360, borderRight: `1px solid ${T.border}`, padding: "14px 16px", overflowY: "auto", display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>Parameters</div>
+            {loading ? (
+              <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>Loading…</div>
+            ) : fieldList.length === 0 ? (
+              <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, fontStyle: "italic" }}>No parameters declared.</div>
+            ) : (
+              fieldList.map(renderField)
+            )}
+          </div>
+
+          {/* Plot panel */}
+          <div style={{ flex: 1, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10, overflow: "hidden" }}>
+            <div style={{ flex: 1, minHeight: 0 }}>
+              {loading ? (
+                <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: T.textDim, fontFamily: mono, fontSize: 12 }}>Loading data…</div>
+              ) : plotlyTraces.length === 0 ? (
+                <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: T.textDim, fontFamily: mono, fontSize: 12 }}>No data</div>
+              ) : (
+                <Suspense fallback={<div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: T.textDim }}>Loading plot…</div>}>
+                  <Plot data={plotlyTraces} layout={plotLayout}
+                    config={{ displaylogo: false, responsive: true, modeBarButtonsToRemove: ["lasso2d", "select2d"] }}
+                    style={{ width: "100%", height: "100%" }} useResizeHandler />
+                </Suspense>
+              )}
+            </div>
+
+            {/* Metrics */}
+            {metricEntries.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 12, paddingTop: 8, borderTop: `1px solid ${T.border}` }}>
+                {metricEntries.map(([k, v]) => {
+                  const meta = metricMap[k];
+                  const label = meta?.label || k;
+                  const unit  = meta?.unit  || "";
+                  const display = (typeof v === "number" && isFinite(v)) ? (Math.abs(v) >= 1000 || (v !== 0 && Math.abs(v) < 0.01) ? v.toExponential(3) : v.toFixed(4)) : String(v);
+                  return (
+                    <div key={k} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                      <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim, textTransform: "uppercase", letterSpacing: 0.5 }}>{label}</span>
+                      <span style={{ fontFamily: mono, fontSize: 12, color: T.textPrimary }}>{display}{unit && <span style={{ color: T.textDim }}> {unit}</span>}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div style={{ display: "flex", alignItems: "center", padding: "10px 18px", borderTop: `1px solid ${T.border}`, gap: 10 }}>
+          {error && <span style={{ fontFamily: mono, fontSize: 11, color: T.red, flex: 1 }}>{error}</span>}
+          {!error && <span style={{ flex: 1 }} />}
+          <Btn variant="ghost" small onClick={onClose}>Close</Btn>
+          <Btn variant="primary" small onClick={runFit} disabled={loading || running || !cfg?.analysis_code}>
+            {running ? "Fitting…" : "Run Fit"}
+          </Btn>
+          <Btn variant="primary" small onClick={doSave} disabled={saving || !hasUnsaved}>
+            {saving ? "Saving…" : "Save to sample"}
+          </Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Generic card for user/built-in modules on the sample detail page.
 
 function ModuleCard({ mod, sample, modules = [], onRemoved, onSampleUpdate }) {
@@ -1383,7 +1708,8 @@ function ModuleCard({ mod, sample, modules = [], onRemoved, onSampleUpdate }) {
     return s;
   };
   const areaCtrl = (mod.card_controls || []).find(c => c.type === "area");
-  const hasConfig = (mod.config_schema || []).length > 0;
+  const hasConfig   = (mod.config_schema || []).length > 0;
+  const hasFittable = (mod.config_schema || []).some(f => f.fittable);
   const [controlState, setControlState] = useState(initControls);
   const [plotData,     setPlotData]     = useState(null); // {traces, xLabel, y1Label, y2Label}
   const [loading,      setLoading]      = useState(false);
@@ -1392,6 +1718,7 @@ function ModuleCard({ mod, sample, modules = [], onRemoved, onSampleUpdate }) {
   const [corrExpr,     setCorrExpr]     = useState(String(sample.area_correction ?? areaCtrl?.default ?? 1.0));
   const [configOpen,   setConfigOpen]   = useState(false);
   const [manageOpen,   setManageOpen]   = useState(false);
+  const [fitOpen,      setFitOpen]      = useState(false);
 
   const fetchPlot = async (overrides = {}) => {
     setLoading(true); setFetchError(null);
@@ -1473,6 +1800,12 @@ function ModuleCard({ mod, sample, modules = [], onRemoved, onSampleUpdate }) {
           {hasConfig && (
             <button onClick={() => setConfigOpen(true)} title="Module configuration"
               style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, lineHeight: 1, padding: "0 2px" }}>⚙</button>
+          )}
+          {hasFittable && (
+            <button onClick={() => setFitOpen(true)} title="Open fit workspace"
+              style={{ background: "none", border: `1px solid ${T.teal}55`, borderRadius: 4, color: T.teal, cursor: "pointer", fontFamily: mono, fontSize: 10, padding: "2px 8px" }}>
+              Fit ▸
+            </button>
           )}
           {isDerivedMode ? (
             <span style={{ fontSize: 10, color: T.teal, fontFamily: mono, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, padding: "1px 7px" }}
@@ -1556,6 +1889,14 @@ function ModuleCard({ mod, sample, modules = [], onRemoved, onSampleUpdate }) {
           sample={sample}
           onClose={() => setManageOpen(false)}
           onChanged={() => { onSampleUpdate?.(); fetchPlot(); }}
+        />
+      )}
+      {fitOpen && (
+        <FitWorkspaceModal
+          mod={mod}
+          sample={sample}
+          onClose={() => setFitOpen(false)}
+          onSaved={() => { onSampleUpdate?.(); fetchPlot(); }}
         />
       )}
     </div>
