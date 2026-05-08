@@ -2295,30 +2295,38 @@ def _materialize_layer_fields(template: list, prefix: str, group_label: str,
         if "label" in tmpl:
             materialized["label"] = f"{group_label} — {tmpl['label']}"
 
-        # Resolve default_from if specified
+        # Resolve default_from. Track whether it resolved — relative bounds
+        # only apply when we have a real per-layer nominal; static min/max in
+        # the template act as fallbacks when default_from is missing or null.
         nominal = materialized.get("default")
+        df_resolved = False
         if "default_from" in tmpl:
             v = _resolve_default_from(tmpl["default_from"], layer_ctx)
             if v is not None:
                 nominal = v
                 materialized["default"] = v
+                df_resolved = True
             materialized.pop("default_from", None)
 
-        # Resolve relative bounds if specified
         try:
             nom = float(nominal) if nominal is not None else None
         except (ValueError, TypeError):
             nom = None
-        if nom is not None:
-            if "min_factor" in tmpl and "min" not in tmpl:
+
+        # Apply relative directives only when the nominal is data-backed.
+        # If df_resolved is False, the static min/max from the template (if any)
+        # remain as fallback bounds. If both relative and static are given, the
+        # relative wins when df_resolved.
+        if nom is not None and df_resolved:
+            if "min_factor" in tmpl:
                 materialized["min"] = nom * float(tmpl["min_factor"])
-            if "max_factor" in tmpl and "max" not in tmpl:
+            if "max_factor" in tmpl:
                 materialized["max"] = nom * float(tmpl["max_factor"])
-            if "min_offset" in tmpl and "min" not in tmpl:
+            if "min_offset" in tmpl:
                 materialized["min"] = nom + float(tmpl["min_offset"])
-            if "max_offset" in tmpl and "max" not in tmpl:
+            if "max_offset" in tmpl:
                 materialized["max"] = nom + float(tmpl["max_offset"])
-        # Strip the directive keys from the materialized field
+        # Strip directive keys regardless
         for k in ("min_factor", "max_factor", "min_offset", "max_offset"):
             materialized.pop(k, None)
 
