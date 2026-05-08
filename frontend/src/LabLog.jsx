@@ -867,19 +867,34 @@ function TwoLinePlot({ data, cfg }) {
 // ── ModulePlot ─────────────────────────────────────────────────────────────
 // Generic N-trace plot for module cards. Reads trace list from render-for-sample.
 // traces: [{x[], y[], label, color, style ("line"|"fit"), axis ("y1"|"y2")}]
-function ModulePlot({ traces, xLabel, y1Label, y2Label }) {
+function ModulePlot({ traces, xLabel, y1Label, y2Label, y1Scale = "linear" }) {
   const { ref, tooltipPos, onMouseMove } = useTooltipSide();
   if (!traces?.length) return null;
+  const isLog    = y1Scale === "log";
   const hasY2    = traces.some(t => t.axis === "y2");
   const y1Traces = traces.filter(t => t.axis !== "y2");
   const y2Traces = traces.filter(t => t.axis === "y2");
   const allX     = traces.flatMap(t => t.x || []);
-  const allY1    = y1Traces.flatMap(t => t.y || []);
+  // For log scale, only use positive values for domain/tick calculations
+  const allY1Raw = y1Traces.flatMap(t => t.y || []);
+  const allY1    = isLog ? allY1Raw.filter(v => v > 0) : allY1Raw;
   const allY2    = y2Traces.flatMap(t => t.y || []);
   if (!allX.length || !allY1.length) return null;
   const { ticks: xTicks, domain: xDomain } = niceLinTicks(arrMin(allX), arrMax(allX));
-  const [y1Lo, y1Hi] = padDomain(allY1);
-  const { ticks: y1Ticks, domain: y1Domain } = niceLinTicks(y1Lo, y1Hi);
+
+  // Y1: linear or log
+  let y1Ticks, y1Domain, y1AxisExtra;
+  if (isLog) {
+    const lo = Math.floor(Math.log10(Math.min(...allY1)));
+    const hi = Math.ceil(Math.log10(Math.max(...allY1)));
+    y1Ticks  = Array.from({ length: hi - lo + 1 }, (_, k) => Math.pow(10, lo + k));
+    y1Domain = [Math.pow(10, lo), Math.pow(10, hi)];
+    y1AxisExtra = { scale: "log", tickFormatter: v => `10^${Math.round(Math.log10(v))}` };
+  } else {
+    const [y1Lo, y1Hi] = padDomain(allY1);
+    ({ ticks: y1Ticks, domain: y1Domain } = niceLinTicks(y1Lo, y1Hi));
+    y1AxisExtra = { tickFormatter: v => numFmt(v) };
+  }
   const y2Domain = allY2.length ? padDomain(allY2) : [0, 1];
   return (
     <div ref={ref}>
@@ -892,8 +907,9 @@ function ModulePlot({ traces, xLabel, y1Label, y2Label }) {
             label={{ value: xLabel || "", position: "insideBottom", offset: -14, fill: T.textSecondary, fontSize: 11 }} />
           <YAxis yAxisId="y1" domain={y1Domain} ticks={y1Ticks} tickLine={false}
             axisLine={{ stroke: T.borderBright }}
-            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
-            label={{ value: y1Label || "", angle: -90, position: "insideLeft", offset: 14, fill: T.textSecondary, fontSize: 10 }} />
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
+            label={{ value: y1Label || "", angle: -90, position: "insideLeft", offset: 14, fill: T.textSecondary, fontSize: 10 }}
+            {...y1AxisExtra} />
           {hasY2 && <YAxis yAxisId="y2" orientation="right" domain={y2Domain} tickLine={false} axisLine={false}
             tick={{ fill: T.amber, fontSize: 9, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
             label={{ value: y2Label || "y2", angle: 90, position: "insideRight", offset: -6, fill: T.amber, fontSize: 9 }} />}
@@ -902,7 +918,9 @@ function ModulePlot({ traces, xLabel, y1Label, y2Label }) {
             formatter={(v, name) => [numFmt(+v), name]}
             labelFormatter={v => `${xLabel || "x"}: ${numFmt(+v)}`} />
           {traces.map((tr, i) => {
-            const trData = (tr.x || []).map((xi, j) => ({ x: xi, y: (tr.y || [])[j] }));
+            let trData = (tr.x || []).map((xi, j) => ({ x: xi, y: (tr.y || [])[j] }));
+            // Drop non-positive values for log scale (log(0) = -∞)
+            if (isLog && tr.axis !== "y2") trData = trData.filter(p => p.y > 0);
             return (
               <Line key={i}
                 yAxisId={tr.axis === "y2" ? "y2" : "y1"}
@@ -1395,6 +1413,7 @@ function ModuleCard({ mod, sample, onRemoved, onSampleUpdate }) {
           xLabel:  res.x_label,
           y1Label: res.y1_label || res.y_label,
           y2Label: res.y2_label || null,
+          y1Scale: cfg.plot_config?.y1_scale || cfg.plot_config?.y_scale || "linear",
         });
         if (res.area_m2 != null) setAreaM2(res.area_m2);
       } else setFetchError(res.error || "Render failed");
@@ -1470,6 +1489,7 @@ function ModuleCard({ mod, sample, onRemoved, onSampleUpdate }) {
               xLabel={plotData.xLabel}
               y1Label={plotData.y1Label}
               y2Label={plotData.y2Label}
+              y1Scale={plotData.y1Scale || "linear"}
             />
             {!isCollectionMode && (
               <div style={{ marginTop: 8 }}>
