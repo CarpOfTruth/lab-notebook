@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.tool_input.command // \"\"'); if echo \"$CMD\" | grep -qE 'gh pr create' && echo \"$CMD\" | grep -qE -- '--base[[:space:]]+main|--base=main'; then echo '{\"decision\": \"block\", \"reason\": \"PRs must target dev, not main.\", \"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"deny\", \"permissionDecisionReason\": \"PRs must target dev, not main. Use --base dev instead. Only merge to main when changes are stable and reviewed.\"}}'; fi",
+            "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.tool_input.command // \"\"'); if echo \"$CMD\" | grep -qE 'gh pr create' && echo \"$CMD\" | grep -qE -- '(--base|-B)([[:space:]]+|=)main([[:space:]]|$)' && ! echo \"$CMD\" | grep -qE -- '(--head|-H)([[:space:]]+|=)dev([[:space:]]|$)'; then echo '{\"decision\": \"block\", \"reason\": \"PRs into main must come from dev.\", \"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"deny\", \"permissionDecisionReason\": \"PRs into main must come from dev: use gh pr create --base main --head dev. Feature and fix PRs target dev.\"}}'; fi",
             "statusMessage": "Checking branch policy…"
           }
         ]
