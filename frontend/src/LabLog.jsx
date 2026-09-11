@@ -397,6 +397,122 @@ function csvToPlotData(text, type, thicknessNm) {
   return rows.map(r => ({ x: r[0], y: r[1] }));
 }
 
+// ── X-ray file handling (.rasx + CSV) ─────────────────────────────────────────
+// The three X-ray cards accept Rigaku SmartLab .rasx files as well as text
+// exports. A .rasx is parsed server-side (backend/rasx.py); the frontend
+// validates it through /api/xray/inspect *before* anything is stored.
+
+const XRAY_ACCEPTS = {
+  xrd_ot: [".rasx", ".csv", ".txt", ".dat", ".xy"],
+  xrr:    [".rasx", ".csv", ".txt", ".dat", ".xy"],
+  rsm:    [".rasx", ".csv", ".txt"],
+};
+const XRAY_CARD_NAMES = { xrd_ot: "XRD ω–2θ", xrr: "XRR", rsm: "RSM" };
+
+function fileExt(name) {
+  const m = /\.([^./\\]+)$/.exec(name || "");
+  return m ? `.${m[1].toLowerCase()}` : "";
+}
+const isRasxFile = name => fileExt(name) === ".rasx";
+
+// Expand the compact payload from /api/xray/inspect or /api/samples/{id}/xray/{file}
+// into the plot-data shape the cards already use: [{x, y}] for 1D scans,
+// [{x: Qx, y: Qz, z: I}] (Q/2π in nm⁻¹) for RSMs.
+function xrayPayloadToPlotData(payload) {
+  if (!payload) return null;
+  if (Array.isArray(payload.omega) && Array.isArray(payload.two_theta)) {
+    const lamNm = (payload.wavelength_A || 1.540593) / 10;
+    const rad = Math.PI / 180;
+    const tt = payload.two_theta.map(v => v * rad);
+    const out = new Array(payload.omega.length * tt.length);
+    let k = 0;
+    for (let i = 0; i < payload.omega.length; i++) {
+      const om = payload.omega[i] * rad;
+      const row = payload.intensity[i];
+      const cosOm = Math.cos(om), sinOm = Math.sin(om);
+      for (let j = 0; j < tt.length; j++) {
+        out[k++] = { x: (Math.cos(tt[j] - om) - cosOm) / lamNm, y: (sinOm + Math.sin(tt[j] - om)) / lamNm, z: row[j] };
+      }
+    }
+    return out;
+  }
+  if (Array.isArray(payload.x) && Array.isArray(payload.y)) return payload.x.map((x, i) => ({ x, y: payload.y[i] }));
+  return null;
+}
+
+// Does this text file look like a SmartLab RSM export (Qx, Qz, I columns)?
+function looksLikeRsmExport(text, rows) {
+  const head = text.split(/\r?\n/).slice(0, 5).join(" ").toLowerCase();
+  if (/\bq[xz]\b|q[xz]\s*\/|q[xz]\(/.test(head)) return true;
+  if (rows.length > 20 && rows.every(r => r.length >= 3)) {
+    // 2θ scans are monotonic in x; an RSM's Qx sweeps back and forth.
+    let up = 0, down = 0;
+    for (let i = 1; i < rows.length; i++) { if (rows[i][0] > rows[i - 1][0]) up++; else if (rows[i][0] < rows[i - 1][0]) down++; }
+    if (up > 0 && down > 0 && Math.min(up, down) / rows.length > 0.05) return true;
+  }
+  return false;
+}
+
+// Text-file path for the X-ray cards. Returns { parsed } or { error }.
+function xrayTextToPlotData(text, type) {
+  const rows = parseCSV(text);
+  if (!rows.length) return { error: "No numeric data found in this file." };
+  const rsmLike = looksLikeRsmExport(text, rows);
+  if (type === "rsm") {
+    if (!rows.every(r => r.length >= 3)) return { error: "An RSM export needs three columns (Qx, Qz, intensity)." };
+    if (!rsmLike && rows.length > 20) return { error: "This looks like a 1D scan, not an RSM. Drop it on the XRD or XRR card." };
+  } else if (rsmLike) {
+    return { error: "This looks like an RSM export. Drop it on the RSM card." };
+  }
+  const parsed = csvToPlotData(text, type, 0);
+  if (!parsed || !hasPlotData(parsed)) return { error: "No numeric data found in this file." };
+  return { parsed };
+}
+
+// Single validation path for both the initial drop zone and "↑ replace file".
+// Checks the extension (drag-and-drop ignores the input's accept attribute),
+// then either parses text locally or asks the backend to inspect a .rasx.
+async function validateXrayFile(file, type) {
+  const accepts = XRAY_ACCEPTS[type];
+  const ext = fileExt(file.name);
+  if (!accepts.includes(ext)) {
+    return { error: `${ext || "This file type"} isn't accepted here. Use ${accepts.join(", ")}.` };
+  }
+  if (ext === ".rasx") {
+    const fd = new FormData();
+    fd.append("file", file);
+    let res, json;
+    try {
+      res  = await fetch(`${API_BASE}/xray/inspect`, { method: "POST", body: fd });
+      json = await res.json();
+    } catch (e) { return { error: `Could not inspect file: ${e.message}` }; }
+    if (!res.ok) return { error: json?.detail || `Could not read .rasx (${res.status})` };
+    if (!json.kind) return { error: json.reason || "This .rasx type is not supported yet." };
+    if (json.kind !== type) {
+      return { error: `This is ${json.description}. Drop it on the ${XRAY_CARD_NAMES[json.kind]} card.` };
+    }
+    const parsed = xrayPayloadToPlotData(json.payload);
+    if (!parsed || !hasPlotData(parsed)) return { error: "The .rasx contained no data points." };
+    return { parsed, meta: json.meta };
+  }
+  const text = await file.text();
+  return xrayTextToPlotData(text, type);
+}
+
+// Reload a stored file into plot data (used by loadSampleData and Reparse).
+// .rasx files come back parsed from the backend; everything else is text.
+async function loadStoredPlotData(sampleId, filename, measType, thicknessNm) {
+  if (isRasxFile(filename)) {
+    try {
+      const r = await api("GET", `/samples/${sampleId}/xray/${encodeURIComponent(filename)}`);
+      return { parsed: xrayPayloadToPlotData(r.payload), text: null };
+    } catch { return { parsed: null, text: null }; }
+  }
+  const text = await fetchFile(sampleId, filename);
+  if (!text) return { parsed: null, text: null };
+  return { parsed: csvToPlotData(text, measType, thicknessNm), text };
+}
+
 // ── UI primitives ─────────────────────────────────────────────────────────────
 
 const Btn = ({ children, onClick, variant = "primary", small, disabled }) => {
@@ -1165,7 +1281,7 @@ function MeasPlot({ data, type, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, l
 
 // ── UploadZone ────────────────────────────────────────────────────────────────
 
-function UploadZone({ type, onFile, hasData, thicknessNm = 0 }) {
+function UploadZone({ type, onFile, hasData, thicknessNm = 0, accept = ".csv,.txt,.dat", label = "drop .csv/.txt or click" }) {
   const ref = useRef();
   const [drag, setDrag] = useState(false);
   return (
@@ -1174,9 +1290,9 @@ function UploadZone({ type, onFile, hasData, thicknessNm = 0 }) {
       onDragLeave={() => setDrag(false)}
       onDrop={e => { e.preventDefault(); setDrag(false); onFile(e.dataTransfer.files[0], type, thicknessNm); }}
       style={{ border: `1px dashed ${drag ? T.amber : T.borderBright}`, borderRadius: 6, padding: "8px 14px", cursor: "pointer", textAlign: "center", background: drag ? T.amberGlow : "transparent", transition: "all .15s", fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>
-      <input ref={ref} type="file" accept=".csv,.txt,.dat" style={{ display: "none" }}
-        onChange={e => onFile(e.target.files[0], type, thicknessNm)} />
-      {hasData ? "↑ replace file" : "drop .csv/.txt or click"}
+      <input ref={ref} type="file" accept={accept} style={{ display: "none" }}
+        onChange={e => { onFile(e.target.files[0], type, thicknessNm); e.target.value = ""; }} />
+      {hasData ? "↑ replace file" : label}
     </div>
   );
 }
@@ -2051,8 +2167,13 @@ function xrdSubstrateRef(substrate, structures) {
   return { label: def.label, twoTheta };
 }
 
-function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze, substrate, structures }) {
+function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze, substrate, structures, uploadError }) {
   const cfg = MEAS_TYPES[type];
+  const xrayAccepts = XRAY_ACCEPTS[type];
+  const zoneProps = xrayAccepts ? { accept: xrayAccepts.join(","), label: "drop .rasx/.csv or click" } : {};
+  const errorLine = uploadError ? (
+    <div style={{ marginTop: 6, fontSize: 10, color: T.red, fontFamily: "'DM Mono', monospace", lineHeight: 1.4, textAlign: "center" }}>{uploadError}</div>
+  ) : null;
   const [corrExpr,      setCorrExpr]      = useState(String(areaCorrFactor ?? 1.0));
   const [peLoop,        setPeLoop]        = useState("all"); // "all" | "second"
   const [rsmLog,        setRsmLog]        = useState(false); // lin by default
@@ -2138,11 +2259,13 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
         {has ? (
           <>
             <MeasPlot data={isXRD ? xrdDisplayData : displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} logIntensity={rsmLog} />
-            <div style={{ marginTop: 8 }}><UploadZone type={type} onFile={(file) => onFile(type, file)} hasData={true} thicknessNm={thicknessNm} /></div>
+            <div style={{ marginTop: 8 }}><UploadZone type={type} onFile={(file) => onFile(type, file)} hasData={true} thicknessNm={thicknessNm} {...zoneProps} /></div>
+            {errorLine}
           </>
         ) : (
-          <div style={{ height: 80, display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <UploadZone type={type} onFile={(file) => onFile(type, file)} hasData={false} thicknessNm={thicknessNm} />
+          <div style={{ minHeight: 80, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+            <UploadZone type={type} onFile={(file) => onFile(type, file)} hasData={false} thicknessNm={thicknessNm} {...zoneProps} />
+            {errorLine}
           </div>
         )}
         {isPE && (
@@ -3264,6 +3387,8 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
   const [knownMaterials, setKnownMaterials] = useState([]);
   const [xrdAnalysisOpen, setXrdAnalysisOpen] = useState(false);
   const [addDataOpen, setAddDataOpen]         = useState(false);
+  const [uploadErrors, setUploadErrors]       = useState({});   // measType → message
+  const uploadErrorTimers = useRef({});
 
   // Flatten materialsLib crystal data into the shape XRD panels expect: {name, a, b, c, ...}
   const structuresCompat = useMemo(
@@ -3314,19 +3439,40 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
     setDragIdx(null); setOverIdx(null);
   };
 
-  const handleFile = (measType, file) => {
+  // Rejection messages shown under a card's drop zone; cleared on the next
+  // successful upload or after a few seconds.
+  const showUploadError = (measType, msg) => {
+    clearTimeout(uploadErrorTimers.current[measType]);
+    setUploadErrors(p => ({ ...p, [measType]: msg }));
+    uploadErrorTimers.current[measType] = setTimeout(() => {
+      setUploadErrors(p => { const n = { ...p }; delete n[measType]; return n; });
+    }, 8000);
+  };
+  const clearUploadError = measType => {
+    clearTimeout(uploadErrorTimers.current[measType]);
+    setUploadErrors(p => (measType in p ? (() => { const n = { ...p }; delete n[measType]; return n; })() : p));
+  };
+  useEffect(() => () => Object.values(uploadErrorTimers.current).forEach(clearTimeout), []);
+
+  const handleFile = async (measType, file) => {
+    if (!file) return;
     if (measType === "afm") { onUploadFile("afm", file, null, null); return; }
     // Route PE through the server-side module
     if (measType === "pe") { onUploadFile("pe", file, null, null, true); return; }
-    const reader = new FileReader();
-    reader.onload = e => {
-      const text = e.target.result;
-      const thick = sample.thickness_nm || 0;
-      const parsed = csvToPlotData(text, measType, thick);
-      if (!parsed || !hasPlotData(parsed)) return;
-      onUploadFile(measType, file, parsed, null);
-    };
-    reader.readAsText(file);
+    // X-ray cards: validate (extension, content, .rasx kind) before anything is uploaded
+    if (XRAY_ACCEPTS[measType]) {
+      const r = await validateXrayFile(file, measType);
+      if (r.error) { showUploadError(measType, r.error); return; }
+      clearUploadError(measType);
+      onUploadFile(measType, file, r.parsed, null);
+      return;
+    }
+    const text = await file.text();
+    const thick = sample.thickness_nm || 0;
+    const parsed = csvToPlotData(text, measType, thick);
+    if (!parsed || !hasPlotData(parsed)) { showUploadError(measType, "No numeric data found in this file."); return; }
+    clearUploadError(measType);
+    onUploadFile(measType, file, parsed, null);
   };
 
   // Per-layer deposition-log upload (drop zone lives on each layer row).
@@ -3409,6 +3555,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
           {["xrd_ot", "xrr", "rsm"].map(t => (
             <MeasCard key={t} type={t} plotData={pd[t]} filename={sample.filenames?.[t]}
               onFile={(measType, file) => handleFile(measType, file)}
+              uploadError={uploadErrors[t]}
               substrate={t === "xrd_ot" ? sample.substrate : undefined}
               structures={t === "xrd_ot" ? structuresCompat : undefined}
               onAnalyze={t === "xrd_ot" ? () => setXrdAnalysisOpen(true) : undefined} />
@@ -3451,6 +3598,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               filename={sample.filenames?.[t]}
               filenames={sample.filenames}
               onFile={(measType, file) => handleFile(measType, file)}
+              uploadError={uploadErrors[t] || uploadErrors[`${t}_up`] || uploadErrors[`${t}_down`]}
               thicknessNm={sample.thickness_nm || 0}
               areaM2={sample.area_m2 ?? null}
               areaCorrFactor={sample.area_correction ?? 1.0}
@@ -14606,11 +14754,9 @@ export default function App() {
         try { newCache.afm = await api("GET", `/samples/${sample.id}/afm_data`); } catch {}
         continue;
       }
-      const text = await fetchFile(sample.id, filename);
-      if (!text) continue;
-      const parsed = csvToPlotData(text, measType, thick);
+      const { parsed, text } = await loadStoredPlotData(sample.id, filename, measType, thick);
       if (!parsed || !hasPlotData(parsed)) continue;
-      if (measType === "pe" && !newArea) newArea = findAreaFromFile(text);
+      if (measType === "pe" && !newArea && text) newArea = findAreaFromFile(text);
       newCache[measType] = parsed;
     }
     setPlotCache(p => ({ ...p, [active]: { ...(p[active] || {}), ...newCache } }));
@@ -14632,9 +14778,7 @@ export default function App() {
         try { cache.afm = await api("GET", `/samples/${id}/afm_data`); } catch {}
         continue;
       }
-      const text = await fetchFile(id, filename);
-      if (!text) continue;
-      const parsed = csvToPlotData(text, measType, thick);
+      const { parsed } = await loadStoredPlotData(id, filename, measType, thick);
       if (parsed && hasPlotData(parsed)) cache[measType] = parsed;
     }
     setPlotCache(p => ({ ...p, [id]: cache }));
