@@ -862,6 +862,53 @@ def get_file(sample_id: str, filename: str):
     return FileResponse(path)
 
 
+# ── Sputter deposition logs ───────────────────────────────────────────────────
+# One log file = one deposited layer. The raw CSV is stored under FILES_DIR; the
+# layer records the filename (frontend owns layer editing). Parsing happens
+# server-side (wide CSVs, timestamp handling, window stats) and on demand.
+
+@app.post("/api/samples/{sample_id}/sputter-log")
+async def upload_sputter_log(sample_id: str, file: UploadFile = File(...)):
+    """Store a deposition-log CSV and return its parsed structure."""
+    from sputter_log import parse_sputter_log
+
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+
+    result = parse_sputter_log(text)
+    if result is None:
+        raise HTTPException(422, "File does not look like a sputter deposition log")
+
+    dest_dir = FILES_DIR / sample_id
+    dest_dir.mkdir(exist_ok=True)
+    dest = dest_dir / f"sputterlog_{file.filename}"
+    dest.write_bytes(raw)
+
+    return {"ok": True, "filename": dest.name, "data": result}
+
+
+@app.get("/api/samples/{sample_id}/sputter-log/{filename}")
+def get_sputter_log(sample_id: str, filename: str):
+    """Re-read a stored deposition log and return its parsed structure."""
+    from sputter_log import parse_sputter_log
+
+    path = FILES_DIR / sample_id / filename
+    if not path.exists():
+        raise HTTPException(404, "Log file not found")
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+    result = parse_sputter_log(text)
+    if result is None:
+        raise HTTPException(422, "Stored file could not be parsed")
+    return {"ok": True, "filename": filename, "data": result}
+
+
 @app.post("/api/samples/import-preview")
 async def import_sample_preview(file: UploadFile = File(...)):
     """Read a .zip sample export and return a conflict preview without writing anything."""
