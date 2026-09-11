@@ -24,7 +24,7 @@ class XRRModule(LabModule):
     id          = "xrr"
     name        = "XRR"
     description = "X-ray reflectivity — raw 2θ vs. intensity"
-    accepts     = [".xy", ".xye", ".dat", ".txt", ".csv", ".asc"]
+    accepts     = [".rasx", ".xy", ".xye", ".dat", ".txt", ".csv", ".asc"]
     version     = "1.0"
     author      = "built-in"
 
