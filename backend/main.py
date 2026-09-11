@@ -862,6 +862,40 @@ def get_file(sample_id: str, filename: str):
     return FileResponse(path)
 
 
+# ── Rigaku .rasx (SmartLab) X-ray files ───────────────────────────────────────
+# Parsed server-side (see rasx.py). The frontend validates a dropped .rasx with
+# the stateless /api/xray/inspect endpoint before anything is stored, then reloads
+# a stored file through /api/samples/{id}/xray/{filename}.
+
+@app.post("/api/xray/inspect")
+async def inspect_xray_file(file: UploadFile = File(...)):
+    """Parse + classify an uploaded .rasx without storing it.
+    Returns {kind, description, reason?, payload, meta}; kind is rsm / xrr / xrd_ot / null."""
+    from rasx import inspect_bytes
+    raw = await file.read()
+    try:
+        return inspect_bytes(raw, file.filename)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:  # malformed XML / profile
+        raise HTTPException(422, f"Could not read .rasx: {e}")
+
+
+@app.get("/api/samples/{sample_id}/xray/{filename}")
+def get_xray_file(sample_id: str, filename: str):
+    """Parse a stored .rasx and return the same payload as /api/xray/inspect."""
+    from rasx import inspect_bytes
+    path = FILES_DIR / sample_id / filename
+    if not path.exists():
+        raise HTTPException(404, "File not found")
+    try:
+        return inspect_bytes(path.read_bytes(), filename)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        raise HTTPException(422, f"Could not read .rasx: {e}")
+
+
 # ── Sputter deposition logs ───────────────────────────────────────────────────
 # One log file = one deposited layer. The raw CSV is stored under FILES_DIR; the
 # layer records the filename (frontend owns layer editing). Parsing happens
