@@ -1815,7 +1815,6 @@ function ModuleCard({ mod, sample, modules = [], onRemoved, onSampleUpdate }) {
   const hasData = isDerivedMode
     ? upstreamMissing.length === 0
     : (hasSingleFile || hasCollFiles);
-  if (!hasData) return null; // only render when data is available
 
   const filename         = sample.filenames?.[mod.id];
   const fileCount        = sample.module_file_counts?.[mod.id] ?? 0;
@@ -1879,7 +1878,7 @@ function ModuleCard({ mod, sample, modules = [], onRemoved, onSampleUpdate }) {
     setLoading(false);
   };
 
-  useEffect(() => { fetchPlot(); }, [mod.id, sample.id]);
+  useEffect(() => { if (hasData) fetchPlot(); }, [mod.id, sample.id, hasData]);
 
   const handleControlChange = (name, val) => {
     const next = { ...controlState, [name]: val };
@@ -1894,6 +1893,8 @@ function ModuleCard({ mod, sample, modules = [], onRemoved, onSampleUpdate }) {
       onRemoved?.();
     } catch (e) { setFetchError(e.message); }
   };
+
+  if (!hasData) return null; // only render when data is available (after all hooks)
 
   const effArea = (areaM2 || null) && (areaM2 * (evalMathExpr(corrExpr) || 1.0));
 
@@ -2057,6 +2058,16 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
   const [rsmLog,        setRsmLog]        = useState(false); // lin by default
   const [xrdZero,       setXrdZero]       = useState(false);
 
+  // XRD substrate zeroing (kept above the diel_b early return so hook order is stable)
+  const isXRD = type === "xrd_ot";
+  const subRef = isXRD ? xrdSubstrateRef(substrate, structures) : null;
+  const xrdDisplayData = useMemo(() => {
+    if (!isXRD || !xrdZero || !subRef || !Array.isArray(plotData) || !plotData.length) return plotData;
+    const maxPt = plotData.reduce((best, p) => (p.y > best.y ? p : best), plotData[0]);
+    const shift = subRef.twoTheta - maxPt.x;
+    return plotData.map(p => ({ ...p, x: p.x + shift }));
+  }, [isXRD, xrdZero, subRef, plotData]);
+
   if (type === "diel_b") {
     const hasUp    = !!(plotData?.up?.length);
     const hasDown  = !!(plotData?.down?.length);
@@ -2086,17 +2097,7 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
   const has  = hasPlotData(plotData);
   const isPE = type === "pe";
   const isDiel = type === "diel_f";
-  const isXRD = type === "xrd_ot";
   const displayPEData = isPE && has ? (peLoop === "second" ? splitPELoops(plotData).second : plotData) : plotData;
-
-  // XRD substrate zeroing
-  const subRef = isXRD ? xrdSubstrateRef(substrate, structures) : null;
-  const xrdDisplayData = useMemo(() => {
-    if (!isXRD || !xrdZero || !subRef || !Array.isArray(plotData) || !plotData.length) return plotData;
-    const maxPt = plotData.reduce((best, p) => (p.y > best.y ? p : best), plotData[0]);
-    const shift = subRef.twoTheta - maxPt.x;
-    return plotData.map(p => ({ ...p, x: p.x + shift }));
-  }, [isXRD, xrdZero, subRef, plotData]);
 
   return (
     <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden" }}>
