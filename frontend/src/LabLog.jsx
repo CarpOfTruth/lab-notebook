@@ -36,6 +36,95 @@ async function fetchFile(sampleId, filename) {
   return res.text();
 }
 
+async function uploadSputterLog(sampleId, file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const res = await fetch(`${API_BASE}/samples/${sampleId}/sputter-log`, { method: "POST", body: fd });
+  if (!res.ok) throw new Error(`sputter-log upload failed ${res.status}`);
+  return res.json(); // { ok, filename, data }
+}
+
+async function fetchSputterLog(sampleId, filename) {
+  const res = await fetch(`${API_BASE}/samples/${sampleId}/sputter-log/${encodeURIComponent(filename)}`);
+  if (!res.ok) return null;
+  const j = await res.json();
+  return j.data;
+}
+
+async function uploadPund(sampleId, file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const res = await fetch(`${API_BASE}/samples/${sampleId}/pund`, { method: "POST", body: fd });
+  if (!res.ok) throw new Error(`pund upload failed ${res.status}`);
+  return res.json(); // { ok, stage, stage_label, filename, data }
+}
+
+async function fetchPund(sampleId, filename) {
+  const res = await fetch(`${API_BASE}/samples/${sampleId}/pund/${encodeURIComponent(filename)}`);
+  if (!res.ok) return null;
+  return (await res.json()).data;
+}
+
+// PUND stages, identified by swept parameter (files are all "metadata.csv"). One
+// fixed card per stage; a dropped file auto-routes to its stage regardless of card.
+const PUND_STAGES = [
+  { id: "a1", label: "A1 Imprint", swept: "bias_mV" },
+  { id: "a2", label: "A2 Voltage", swept: "voltage_mV" },
+  { id: "a3", label: "A3 Speed",   swept: "pulse_width_ns" },
+  { id: "a4", label: "A4 Delay",   swept: "delay_time_ns" },
+];
+const PUND_POS_COLOR = "#f6ad55";
+const PUND_NEG_COLOR = "#63b3ed";
+
+// View definitions for the sputter deposition-log card — kept deliberately simple.
+// key resolves against parsed data.channels (or data.derived); full selection lives
+// in the analysis-book panel.
+const SPUTTER_LOG_VIEWS = [
+  { id: "temperature", label: "Temperature", key: "temp_pyro1",       axis: "T (°C)",         color: "#fc8181" },
+  { id: "pressure",    label: "Pressure",    key: "pressure_process", axis: "P (mTorr)",      color: "#63b3ed" },
+  { id: "rf_power",    label: "RF Power",    key: "ps1_fwd",          axis: "RF Fwd (W)",     color: "#f6ad55" },
+  { id: "dc_bias",     label: "DC Bias",     key: "ps1_dcbias",       axis: "DC Bias (V)",    color: "#a78bfa" },
+];
+
+// Full channel list for the analysis-book comparison panel (all selectable).
+// `key` resolves against a window's stats; "__duration" is the window length itself.
+const SPUTTER_CHANNELS = [
+  { key: "temp_pyro1",       label: "Temperature",          unit: "°C"    },
+  { key: "temp_pyro2",       label: "Temperature (pyro 2)", unit: "°C"    },
+  { key: "temp_setpoint",    label: "Temp setpoint",        unit: "°C"    },
+  { key: "pressure_process", label: "Process pressure",     unit: "mTorr" },
+  { key: "pressure_chamber", label: "Chamber pressure",     unit: "Torr"  },
+  { key: "flow_ar",          label: "Ar flow",              unit: "sccm"  },
+  { key: "flow_o2",          label: "O₂ flow",              unit: "sccm"  },
+  { key: "flow_n2",          label: "N₂ flow",              unit: "sccm"  },
+  { key: "o2_fraction",      label: "O₂ fraction",          unit: ""      },
+  { key: "ps1_fwd",          label: "RF forward power",     unit: "W"     },
+  { key: "ps1_rfl",          label: "RF reflected power",   unit: "W"     },
+  { key: "ps1_net",          label: "RF net power",         unit: "W"     },
+  { key: "ps1_rfl_pct",      label: "RF reflected",         unit: "%"     },
+  { key: "ps1_setpoint",     label: "RF setpoint",          unit: "W"     },
+  { key: "ps1_dcbias",       label: "DC bias",              unit: "V"     },
+  { key: "ps7_fwd",          label: "Substrate bias fwd",   unit: "W"     },
+  { key: "ps7_dcbias",       label: "Substrate bias DC",    unit: "V"     },
+  { key: "pyro_delta",       label: "Pyrometer Δ",          unit: "°C"    },
+  { key: "rotation",         label: "Rotation",             unit: "°/s"   },
+  { key: "__duration",       label: "Deposition duration",  unit: "s"     },
+];
+
+function sputterLayerMaterial(layer) {
+  return (layer.targets || []).map(t => t.material).filter(Boolean).join("/");
+}
+
+// Extract a single comparison value (channel mean, or window duration) from parsed
+// log data. Returns null when there's no deposition window or the channel is absent.
+function sputterWindowValue(data, channelKey) {
+  const win = (data?.deposition_windows || [])[0];
+  if (!win) return null;
+  if (channelKey === "__duration") return win.duration_s;
+  const st = win.stats?.[channelKey];
+  return st && isFinite(st.mean) ? st.mean : null;
+}
+
 // ── Theme ─────────────────────────────────────────────────────────────────────
 
 const DARK_T = {
@@ -1935,11 +2024,38 @@ function ModuleCard({ mod, sample, modules = [], onRemoved, onSampleUpdate }) {
 
 // ── MeasCard ──────────────────────────────────────────────────────────────────
 
-function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze }) {
+// Substrate → known reference material+hkl for "zero to substrate" feature.
+// Tests are checked in order — put more-specific patterns first.
+// 2θ is computed via calcTwoTheta (same path as XRD analysis panel reference lines).
+const XRD_SUBSTRATE_REFS = [
+  // Si:STO → substrate is the Si below the STO buffer; use Si 004
+  { test: s => /\bsi\b/i.test(s) && /\bsto\b/i.test(s), materialName: "Si",          hkl: "004", label: "Si 004"       },
+  // GdScO3 variants
+  { test: s => /gdsco|gdscо/i.test(s),                   materialName: "GdScO3 (o)", hkl: "220", label: "GdScO₃ 220ₒ" },
+  // STO alone → STO 002
+  { test: s => /\bsto\b/i.test(s),                        materialName: "STO",        hkl: "002", label: "STO 002"       },
+  // Bare Si
+  { test: s => /\bsi\b/i.test(s),                         materialName: "Si",          hkl: "004", label: "Si 004"       },
+];
+
+// structures = materialsLib mapped to {name, a, b, c, ...} (structuresCompat)
+function xrdSubstrateRef(substrate, structures) {
+  if (!substrate || !structures?.length) return null;
+  const def = XRD_SUBSTRATE_REFS.find(r => r.test(substrate));
+  if (!def) return null;
+  const struct = structures.find(s => s.name === def.materialName);
+  if (!struct) return null;
+  const twoTheta = calcTwoTheta(struct, def.hkl);
+  if (twoTheta == null) return null;
+  return { label: def.label, twoTheta };
+}
+
+function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze, substrate, structures }) {
   const cfg = MEAS_TYPES[type];
   const [corrExpr,      setCorrExpr]      = useState(String(areaCorrFactor ?? 1.0));
   const [peLoop,        setPeLoop]        = useState("all"); // "all" | "second"
   const [rsmLog,        setRsmLog]        = useState(false); // lin by default
+  const [xrdZero,       setXrdZero]       = useState(false);
 
   if (type === "diel_b") {
     const hasUp    = !!(plotData?.up?.length);
@@ -1970,12 +2086,23 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
   const has  = hasPlotData(plotData);
   const isPE = type === "pe";
   const isDiel = type === "diel_f";
+  const isXRD = type === "xrd_ot";
   const displayPEData = isPE && has ? (peLoop === "second" ? splitPELoops(plotData).second : plotData) : plotData;
+
+  // XRD substrate zeroing
+  const subRef = isXRD ? xrdSubstrateRef(substrate, structures) : null;
+  const xrdDisplayData = useMemo(() => {
+    if (!isXRD || !xrdZero || !subRef || !Array.isArray(plotData) || !plotData.length) return plotData;
+    const maxPt = plotData.reduce((best, p) => (p.y > best.y ? p : best), plotData[0]);
+    const shift = subRef.twoTheta - maxPt.x;
+    return plotData.map(p => ({ ...p, x: p.x + shift }));
+  }, [isXRD, xrdZero, subRef, plotData]);
+
   return (
     <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "space-between", padding: "8px 12px", borderBottom: `1px solid ${T.border}` }}>
-        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: cfg.color, fontWeight: 600 }}>{cfg.label}</span>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: cfg.color, fontWeight: 600, whiteSpace: "nowrap" }}>{cfg.label}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
           {isPE && has && <LoopToggle value={peLoop} onChange={setPeLoop} />}
           {type === "rsm" && has && (
             <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
@@ -1990,7 +2117,14 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
               </div>
             </div>
           )}
-          {type === "xrd_ot" && has && onAnalyze && (
+          {isXRD && has && subRef && (
+            <button onClick={() => setXrdZero(v => !v)}
+              title={`Zero to ${subRef.label} (${subRef.twoTheta.toFixed(2)}°)`}
+              style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "2px 7px", background: xrdZero ? T.amber : "transparent", border: `1px solid ${xrdZero ? T.amber : T.border}`, borderRadius: 4, color: xrdZero ? T.bg0 : T.textDim, cursor: "pointer", letterSpacing: 0.3, transition: "all 0.15s" }}>
+              zeroed
+            </button>
+          )}
+          {isXRD && has && onAnalyze && (
             <button onClick={onAnalyze}
               style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "2px 8px", background: T.bg3, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, cursor: "pointer", letterSpacing: 0.5 }}>
               Analyze
@@ -2002,7 +2136,7 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
       <div style={{ padding: "10px 12px" }}>
         {has ? (
           <>
-            <MeasPlot data={displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} logIntensity={rsmLog} />
+            <MeasPlot data={isXRD ? xrdDisplayData : displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} logIntensity={rsmLog} />
             <div style={{ marginTop: 8 }}><UploadZone type={type} onFile={(file) => onFile(type, file)} hasData={true} thicknessNm={thicknessNm} /></div>
           </>
         ) : (
@@ -2032,6 +2166,371 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
           </div>
         )}
         {isDiel && !areaM2 && <div style={{ marginTop: 4, fontSize: 10, color: T.amber, fontFamily: "'DM Mono', monospace" }}>⚠ area defaulted (20µm ⌀)</div>}
+      </div>
+    </div>
+  );
+}
+
+// ── Sputter deposition log ────────────────────────────────────────────────────
+// One log file per deposited layer. Card shows every layer stacked (same plot),
+// with simple view buttons; full channel selection lives in the analysis-book
+// panel. Log binds to layer.id via layer.sputter_log (filename).
+
+function sputterLayerLabel(layer, index, materialsLib) {
+  const mats = (layer.targets || []).map(t => t.material).filter(Boolean);
+  const name = mats.length ? mats.map(m => matDisplayName(m, materialsLib)).join("/") : `layer ${index + 1}`;
+  return name;
+}
+
+// Build {x,y} points for a channel from parsed log data. When a deposition window
+// exists, mask to it and zero the x-axis at shutter-open; else show the full run.
+function sputterViewPoints(data, key) {
+  const series = data.channels?.[key] || data.derived?.[key] || [];
+  const time = data.time_s || [];
+  const win = (data.deposition_windows || [])[0];
+  let pts;
+  if (win) {
+    pts = [];
+    for (let i = win.i0; i <= win.i1; i++) {
+      const y = series[i];
+      if (y != null) pts.push({ x: +(time[i] - win.start_s).toFixed(2), y });
+    }
+  } else {
+    pts = [];
+    for (let i = 0; i < time.length; i++) {
+      if (series[i] != null) pts.push({ x: +time[i].toFixed(1), y: series[i] });
+    }
+  }
+  // Down-sample long full-run traces for responsiveness.
+  if (pts.length > 1500) {
+    const stride = Math.ceil(pts.length / 1500);
+    pts = pts.filter((_, i) => i % stride === 0);
+  }
+  return { pts, win };
+}
+
+// Compact per-layer log drop target — lives on the layer row. Supports click and
+// drag-drop; stops propagation so file drops don't trigger the row's reorder-drop.
+function LayerLogDropZone({ hasLog, busy, onFile, onRemove }) {
+  const ref = useRef();
+  const [drag, setDrag] = useState(false);
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  return (
+    <div
+      onClick={e => { e.stopPropagation(); ref.current?.click(); }}
+      onDragOver={e => { e.preventDefault(); e.stopPropagation(); setDrag(true); }}
+      onDragLeave={e => { e.stopPropagation(); setDrag(false); }}
+      onDrop={e => { e.preventDefault(); e.stopPropagation(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) onFile(f); }}
+      title={hasLog ? "Deposition log attached — click or drop to replace" : "Attach deposition log (.csv) — click or drop a file"}
+      style={{ display: "inline-flex", alignItems: "center", gap: 4, ...mono, fontSize: 10, flexShrink: 0,
+        border: `1px dashed ${drag ? T.amber : (hasLog ? T.teal : T.borderBright)}`, borderRadius: 4, padding: "2px 7px",
+        cursor: "pointer", color: hasLog ? T.teal : T.textDim, background: drag ? T.amberGlow : (hasLog ? T.teal + "18" : "transparent"), transition: "all .12s" }}>
+      <input ref={ref} type="file" accept=".csv,.CSV" style={{ display: "none" }}
+        onClick={e => e.stopPropagation()} onChange={e => { const f = e.target.files?.[0]; e.target.value = ""; if (f) onFile(f); }} />
+      {busy ? "log…" : hasLog ? "✓ log" : "＋ log"}
+      {hasLog && !busy && <span onClick={e => { e.stopPropagation(); onRemove(); }} title="Remove log" style={{ color: T.textDim, fontSize: 11, lineHeight: 1 }}>×</span>}
+    </div>
+  );
+}
+
+// Recharts plot + stat line for one channel of one parsed log. Applies the app
+// axis convention (zero-anchored with buffer via metaYRange).
+function SputterChannelPlot({ data, viewDef }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  if (data === undefined) return <div style={{ ...mono, fontSize: 11, color: T.textDim, padding: "24px 0", textAlign: "center" }}>loading…</div>;
+  if (data === "error" || !data) return <div style={{ ...mono, fontSize: 11, color: T.red, padding: "24px 0", textAlign: "center" }}>⚠ could not parse log</div>;
+  const { pts, win } = sputterViewPoints(data, viewDef.key);
+  const st = win?.stats?.[viewDef.key];
+  const target = win?.source?.target || win?.source?.material || null;
+  const xLabel = win ? "deposition time (s)" : "t (s) — no deposition window";
+  const yDomain = pts.length ? metaYRange(pts.map(p => p.y), false) : [0, 1];
+  const xMax = pts.length ? arrMax(pts.map(p => p.x)) : 1;
+  return (
+    <>
+      {pts.length ? (
+        <ResponsiveContainer width="100%" height={150}>
+          <LineChart data={pts} margin={{ top: 6, right: 12, bottom: 22, left: 6 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+            <XAxis dataKey="x" type="number" domain={[0, xMax]}
+              tick={{ fill: T.textDim, fontSize: 9, fontFamily: "'DM Mono', monospace" }} tickLine={false}
+              axisLine={{ stroke: T.borderBright }} tickFormatter={v => numFmt(v)}
+              label={{ value: xLabel, position: "insideBottom", offset: -12, fill: T.textSecondary, fontSize: 9 }} />
+            <YAxis domain={yDomain} allowDataOverflow tick={{ fill: T.textDim, fontSize: 9, fontFamily: "'DM Mono', monospace" }} tickLine={false}
+              axisLine={{ stroke: T.borderBright }} tickFormatter={v => numFmt(v)} width={46}
+              label={{ content: ({ viewBox }) => {
+                const { x, y, height } = viewBox;
+                const cx = (x || 0) + 10, cy = (y || 0) + (height || 100) / 2;
+                return <text transform={`rotate(-90, ${cx}, ${cy})`} x={cx} y={cy} textAnchor="middle" fill={T.textSecondary} fontSize={9} fontFamily="'DM Mono', monospace">{viewDef.axis}</text>;
+              } }} />
+            <Tooltip position={{ y: -10 }} contentStyle={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11 }}
+              formatter={v => [numFmt(+v), viewDef.axis]} labelFormatter={v => `${numFmt(+v)} s`} />
+            <Line dataKey="y" type="monotone" stroke={viewDef.color} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      ) : (
+        <div style={{ ...mono, fontSize: 11, color: T.textDim, padding: "8px 0" }}>no data for this channel</div>
+      )}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 4, ...mono, fontSize: 10, color: T.textDim }}>
+        {target && <span>target: <span style={{ color: T.textSecondary }}>{target}</span></span>}
+        {win && <span>deposition: <span style={{ color: T.textSecondary }}>{numFmt(win.duration_s)} s</span></span>}
+        {st && <span>⌀ <span style={{ color: viewDef.color }}>{numFmt(st.mean)}</span> ± {numFmt(st.std)}</span>}
+        {!win && <span style={{ color: T.amber }}>no deposition window</span>}
+      </div>
+    </>
+  );
+}
+
+// One channel card (Pressure / Power / DC Bias) with an independent layer selector.
+function SputterLogChannelCard({ viewDef, layers, logCache, materialsLib }) {
+  const loggedLayers = layers.filter(l => l.sputter_log);
+  const [sel, setSel] = useState(() => loggedLayers[0]?.id || layers[0]?.id || null);
+  // Keep selection valid as layers/logs change; default to a logged layer.
+  useEffect(() => {
+    const stillValid = layers.some(l => l.id === sel);
+    const selHasLog = loggedLayers.some(l => l.id === sel);
+    if (!stillValid || (!selHasLog && loggedLayers.length)) {
+      setSel(loggedLayers[0]?.id || layers[0]?.id || null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layers.map(l => `${l.id}:${l.sputter_log || ""}`).join(",")]);
+
+  const layer = layers.find(l => l.id === sel) || null;
+  const data = layer?.sputter_log ? logCache[layer.sputter_log] : null;
+
+  return (
+    <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "space-between", padding: "8px 12px", borderBottom: `1px solid ${T.border}` }}>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: viewDef.color, fontWeight: 600, whiteSpace: "nowrap" }}>{viewDef.label}</span>
+        <select value={sel || ""} onChange={e => setSel(e.target.value)}
+          style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "2px 6px", cursor: "pointer", maxWidth: 180 }}>
+          {layers.map((l, i) => (
+            <option key={l.id} value={l.id}>
+              L{i + 1} {sputterLayerLabel(l, i, materialsLib)}{l.sputter_log ? "" : " — no log"}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div style={{ padding: "10px 12px" }}>
+        {layer?.sputter_log
+          ? <SputterChannelPlot data={data} viewDef={viewDef} />
+          : <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, padding: "24px 0", textAlign: "center" }}>No log for this layer — drop one on the layer in the stack above.</div>}
+      </div>
+    </div>
+  );
+}
+
+// The three fixed channel cards (Pressure / Power / DC Bias). Holds one shared
+// parsed-log cache so a layer's log is fetched once regardless of how many cards
+// display it. NB: no cancelled-flag in the fetch effect (see StrictMode note on the
+// analysis panel) — dedup via fetchingRef only.
+const SPUTTER_CARD_VIEWS = ["pressure", "rf_power", "dc_bias"].map(id => SPUTTER_LOG_VIEWS.find(v => v.id === id)).filter(Boolean);
+
+function SputterLogCards({ sample, materialsLib = [] }) {
+  const layers = sample.layers || [];
+  const loggedLayers = layers.filter(l => l.sputter_log);
+  const logKeys = loggedLayers.map(l => l.sputter_log).join(",");
+  const [cache, setCache] = useState({});
+  const fetchingRef = useRef(new Set());
+  useEffect(() => {
+    (async () => {
+      for (const l of loggedLayers) {
+        const fn = l.sputter_log;
+        if (!fn || fetchingRef.current.has(fn)) continue;
+        fetchingRef.current.add(fn);
+        const data = await fetchSputterLog(sample.id, fn);
+        setCache(c => ({ ...c, [fn]: data || "error" }));
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sample.id, logKeys]);
+
+  if (!layers.length) return null;
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
+      {SPUTTER_CARD_VIEWS.map(v => (
+        <SputterLogChannelCard key={v.id} viewDef={v} layers={layers} logCache={cache} materialsLib={materialsLib} />
+      ))}
+    </div>
+  );
+}
+
+// ── PUND ferroelectric sweeps ─────────────────────────────────────────────────
+// Four fixed stage cards (A1–A4). A dropped metadata.csv auto-routes to its stage
+// by swept parameter. Each card plots switched ΔP vs the swept variable, with a
+// +/−/both branch selector (only branches actually measured are offered).
+
+// Build a Plotly figure (traces + layout) for one parsed PUND sweep, honoring the
+// selected branch. Mirrors the backend PUNDModule.plot so the card and the module
+// endpoint agree.
+function pundFigure(data, branch) {
+  const x = data.x || [];
+  const unit = data.swept_unit || "";
+  const showPos = data.has_pos && (branch === "pos" || branch === "both");
+  const showNeg = data.has_neg && (branch === "neg" || branch === "both");
+  const err = stds => (stds || []).map(s => (s == null ? 0 : s));
+  const axisFont = { family: "'DM Mono', monospace", size: 10, color: T.textDim };
+  const traces = [];
+  if (showPos) traces.push({
+    x, y: data.dP_pos || [], type: "scatter", mode: "lines+markers", name: "ΔP⁺",
+    marker: { color: PUND_POS_COLOR, size: 7, symbol: "circle" }, line: { color: PUND_POS_COLOR, width: 1.5 },
+    error_y: { type: "data", array: err(data.dP_pos_std), visible: true, thickness: 1.1, width: 3, color: PUND_POS_COLOR },
+    hovertemplate: `%{x:g} ${unit}<br>ΔP⁺ %{y:.3g} µC/cm²<extra></extra>`,
+  });
+  if (showNeg) traces.push({
+    x, y: data.dP_neg || [], type: "scatter", mode: "lines+markers", name: "ΔP⁻",
+    marker: { color: PUND_NEG_COLOR, size: 7, symbol: "square" }, line: { color: PUND_NEG_COLOR, width: 1.5 },
+    error_y: { type: "data", array: err(data.dP_neg_std), visible: true, thickness: 1.1, width: 3, color: PUND_NEG_COLOR },
+    hovertemplate: `%{x:g} ${unit}<br>ΔP⁻ %{y:.3g} µC/cm²<extra></extra>`,
+  });
+  const layout = {
+    xaxis: { title: { text: `${data.swept_label} (${unit})`, font: axisFont }, type: data.log_x ? "log" : "linear",
+             color: T.textDim, gridcolor: T.border, linecolor: T.borderBright, zeroline: false, tickfont: axisFont },
+    yaxis: { title: { text: "Switched ΔP (µC/cm²)", font: axisFont }, rangemode: "tozero",
+             color: T.textDim, gridcolor: T.border, linecolor: T.borderBright, zeroline: true, zerolinecolor: T.borderBright, tickfont: axisFont },
+    margin: { t: 12, r: 14, b: 46, l: 56 }, showlegend: showPos && showNeg,
+    legend: { x: 0.02, y: 0.98, font: axisFont }, hovermode: "closest",
+    paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+  };
+  return { traces, layout };
+}
+
+function PundDropZone({ onFile, busy, compact }) {
+  const ref = useRef();
+  const [drag, setDrag] = useState(false);
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  return (
+    <div
+      onClick={() => !busy && ref.current?.click()}
+      onDragOver={e => { e.preventDefault(); setDrag(true); }}
+      onDragLeave={() => setDrag(false)}
+      onDrop={e => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) onFile(f); }}
+      style={{ border: `1px dashed ${drag ? T.amber : T.borderBright}`, borderRadius: 6, padding: compact ? "6px 12px" : "18px 14px",
+        cursor: busy ? "default" : "pointer", textAlign: "center", background: drag ? T.amberGlow : "transparent",
+        ...mono, fontSize: 11, color: T.textDim, transition: "all .12s" }}>
+      <input ref={ref} type="file" accept=".csv,.CSV" style={{ display: "none" }}
+        onChange={e => { const f = e.target.files?.[0]; e.target.value = ""; if (f) onFile(f); }} />
+      {busy ? "parsing…" : compact ? "↑ replace / drop metadata.csv" : "drop stage metadata.csv or click"}
+    </div>
+  );
+}
+
+function PundStageCard({ stage, filename, data, busy, onFile, onRemove }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  const [branch, setBranch] = useState("both");
+  useEffect(() => {
+    if (data && data !== "error")
+      setBranch(data.has_pos && data.has_neg ? "both" : (data.has_neg ? "neg" : "pos"));
+  }, [data]);
+
+  const branchOpts = [];
+  if (data && data !== "error") {
+    if (data.has_pos) branchOpts.push(["pos", "ΔP⁺"]);
+    if (data.has_neg) branchOpts.push(["neg", "ΔP⁻"]);
+    if (data.has_pos && data.has_neg) branchOpts.push(["both", "both"]);
+  }
+  const fig = (data && data !== "error") ? pundFigure(data, branch) : null;
+
+  return (
+    <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "space-between", padding: "8px 12px", borderBottom: `1px solid ${T.border}` }}>
+        <span style={{ ...mono, fontSize: 12, color: T.teal, fontWeight: 600, whiteSpace: "nowrap" }}>{stage.label}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          {branchOpts.length > 1 && (
+            <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+              {branchOpts.map(([val, lbl], i) => (
+                <button key={val} onClick={() => setBranch(val)}
+                  style={{ ...mono, fontSize: 10, padding: "2px 7px", background: branch === val ? T.bg3 : T.bg0, border: "none",
+                    borderLeft: i ? `1px solid ${T.border}` : "none", color: branch === val ? T.textPrimary : T.textDim, cursor: "pointer" }}>
+                  {lbl}
+                </button>
+              ))}
+            </div>
+          )}
+          {filename && <button onClick={onRemove} title="Remove" style={{ ...mono, fontSize: 13, background: "none", border: "none", color: T.textDim, cursor: "pointer", padding: "0 2px" }}>×</button>}
+        </div>
+      </div>
+      <div style={{ padding: "10px 12px" }}>
+        {!filename ? (
+          <div style={{ height: 150, display: "flex", alignItems: "center" }}><div style={{ flex: 1 }}><PundDropZone onFile={onFile} busy={busy} /></div></div>
+        ) : data === undefined ? (
+          <div style={{ ...mono, fontSize: 11, color: T.textDim, padding: "24px 0", textAlign: "center" }}>loading…</div>
+        ) : data === "error" ? (
+          <>
+            <div style={{ ...mono, fontSize: 11, color: T.red, marginBottom: 6 }}>⚠ could not parse this file</div>
+            <PundDropZone onFile={onFile} busy={busy} compact />
+          </>
+        ) : (
+          <>
+            <Suspense fallback={<div style={{ height: 240, display: "flex", alignItems: "center", justifyContent: "center", ...mono, fontSize: 11, color: T.textDim }}>Loading chart…</div>}>
+              <Plot data={fig.traces} layout={fig.layout} config={buildPlotConfig(`pund-${stage.id}`)}
+                style={{ width: "100%", height: "240px" }} useResizeHandler />
+            </Suspense>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 10, margin: "4px 0 8px", ...mono, fontSize: 10, color: T.textDim }}>
+              <span>{data.n_conditions} conditions</span>
+              {data.context?.fixed?.length ? <span>· {data.context.fixed.join(" · ")}</span> : null}
+            </div>
+            <PundDropZone onFile={onFile} busy={busy} compact />
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PundCards({ sample, onUpdate }) {
+  // Per-stage filenames live in the persisted `filenames` dict under `pund_<stage>`.
+  const fnFor = (stageId) => sample.filenames?.[`pund_${stageId}`];
+  const [cache, setCache] = useState({});   // filename → data | "error"
+  const [busy, setBusy]   = useState(false);
+  const [note, setNote]   = useState(null);
+  const fetchingRef = useRef(new Set());
+  const keys = PUND_STAGES.map(s => fnFor(s.id) || "").join(",");
+  useEffect(() => {
+    (async () => {
+      for (const s of PUND_STAGES) {
+        const fn = fnFor(s.id);
+        if (fn && !fetchingRef.current.has(fn)) {
+          fetchingRef.current.add(fn);
+          const d = await fetchPund(sample.id, fn);
+          setCache(c => ({ ...c, [fn]: d || "error" }));
+        }
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sample.id, keys]);
+
+  const setStage = (stageId, filename) =>
+    onUpdate({ ...sample, filenames: { ...(sample.filenames || {}), [`pund_${stageId}`]: filename } });
+  const removeStage = (stageId) => {
+    const fnames = { ...(sample.filenames || {}) };
+    delete fnames[`pund_${stageId}`];
+    onUpdate({ ...sample, filenames: fnames });
+  };
+
+  const handleUpload = async (droppedStageId, file) => {
+    if (!file) return;
+    setBusy(true); setNote(null);
+    try {
+      const res = await uploadPund(sample.id, file);
+      setCache(c => ({ ...c, [res.filename]: res.data }));
+      setStage(res.stage, res.filename);
+      if (droppedStageId && res.stage !== droppedStageId)
+        setNote(`That file is ${res.stage_label} (swept ${res.data.swept_key}) — routed it there.`);
+    } catch (_) {
+      setNote("Could not parse that file as a PUND metadata.csv.");
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div>
+      {note && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.amber, marginBottom: 8 }}>{note}</div>}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
+        {PUND_STAGES.map(s => {
+          const fn = fnFor(s.id);
+          return <PundStageCard key={s.id} stage={s} filename={fn} data={fn ? cache[fn] : null}
+                   busy={busy} onFile={f => handleUpload(s.id, f)} onRemove={() => removeStage(s.id)} />;
+        })}
       </div>
     </div>
   );
@@ -2462,7 +2961,7 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
   );
 }
 
-function LayerEditor({ layer, technique: sampleTechnique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials, settings, materialsLib = [], initialEditing = false }) {
+function LayerEditor({ layer, technique: sampleTechnique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials, settings, materialsLib = [], initialEditing = false, onLogUpload, onLogRemove, logBusy = false }) {
   const [editing, setEditing] = useState(initialEditing);
   const [draft, setDraft]     = useState(initialEditing ? JSON.parse(JSON.stringify(layer)) : null);
 
@@ -2569,6 +3068,10 @@ function LayerEditor({ layer, technique: sampleTechnique, onRemove, onDuplicate,
             </div>
           );
         })}
+        {onLogUpload && (
+          <LayerLogDropZone hasLog={!!layer.sputter_log} busy={logBusy}
+            onFile={f => onLogUpload(f)} onRemove={() => onLogRemove?.()} />
+        )}
         <button onClick={startEdit}   style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>✎</button>
         <button onClick={onDuplicate} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 15, padding: 0 }}>+</button>
         <button onClick={onRemove}    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, padding: 0 }}>×</button>
@@ -2825,9 +3328,25 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
     reader.readAsText(file);
   };
 
+  // Per-layer deposition-log upload (drop zone lives on each layer row).
+  const [logBusy, setLogBusy] = useState({});   // layerId → bool
+  const handleLogUpload = async (layerId, file) => {
+    if (!file) return;
+    setLogBusy(b => ({ ...b, [layerId]: true }));
+    try {
+      const res = await uploadSputterLog(sample.id, file);
+      onUpdate({ ...sample, layers: sample.layers.map(l => l.id === layerId ? { ...l, sputter_log: res.filename } : l) });
+    } catch (_) { /* invalid file — leave layer unchanged */ }
+    setLogBusy(b => ({ ...b, [layerId]: false }));
+  };
+  const handleLogRemove = (layerId) =>
+    onUpdate({ ...sample, layers: sample.layers.map(l => l.id === layerId ? { ...l, sputter_log: undefined } : l) });
+
+  const isSputter = (sample.technique || "sputter") === "sputter";
   const pd = plotData || {};
   const hasFiles = Object.keys(sample.filenames || {}).length > 0;
-  const modulesForSection = (sec) => modules.filter(m => m.section === sec);
+  // PUND has its own dedicated four-card section — exclude it from generic module rendering.
+  const modulesForSection = (sec) => modules.filter(m => m.section === sec && m.id !== "pund");
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
@@ -2860,7 +3379,8 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               onRemove={() => removeLayer(l.id)} onDuplicate={() => duplicateLayer(l.id)} onUpdate={updateLayer}
               isDragOver={overIdx === i && dragIdx !== i}
               onDragStart={() => setDragIdx(i)} onDragOver={() => setOverIdx(i)}
-              onDrop={() => handleDrop(i)} onDragEnd={() => { setDragIdx(null); setOverIdx(null); }} />
+              onDrop={() => handleDrop(i)} onDragEnd={() => { setDragIdx(null); setOverIdx(null); }}
+              {...(isSputter ? { onLogUpload: f => handleLogUpload(l.id, f), onLogRemove: () => handleLogRemove(l.id), logBusy: !!logBusy[l.id] } : {})} />
           ))}
           {!sample.layers.length && <div style={{ color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "10px 0" }}>No layers — add one above.</div>}
         </div>
@@ -2875,12 +3395,21 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         )}
       </section>
 
+      {isSputter && sample.layers.some(l => l.sputter_log) && (
+        <section>
+          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Deposition Log</div>
+          <SputterLogCards sample={sample} materialsLib={materialsLib} />
+        </section>
+      )}
+
       <section>
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>X-Ray Characterization</div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
           {["xrd_ot", "xrr", "rsm"].map(t => (
             <MeasCard key={t} type={t} plotData={pd[t]} filename={sample.filenames?.[t]}
               onFile={(measType, file) => handleFile(measType, file)}
+              substrate={t === "xrd_ot" ? sample.substrate : undefined}
+              structures={t === "xrd_ot" ? structuresCompat : undefined}
               onAnalyze={t === "xrd_ot" ? () => setXrdAnalysisOpen(true) : undefined} />
           ))}
           {modulesForSection("structural").map(m => (
@@ -2943,6 +3472,11 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
           })}
           onModuleFileAdded={refreshSample}
         />}
+      </section>
+
+      <section>
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>PUND</div>
+        <PundCards sample={sample} onUpdate={onUpdate} />
       </section>
 
       {/* Optical section — only rendered if modules exist for it */}
@@ -7935,10 +8469,11 @@ function SamplePicker({ samples, alreadySelected, onAdd, onClose }) {
   );
 }
 
-function SampleRosterRow({ sid, s, color, label, dragOver, onDragStart, onDragOver, onDrop, onDragEnd, onRemove, onLabelChange }) {
+function SampleRosterRow({ sid, s, color, label, hidden = false, onToggleVisibility, dragOver, onDragStart, onDragOver, onDrop, onDragEnd, onRemove, onLabelChange }) {
   const [localLabel, setLocalLabel] = useState(label || "");
   useEffect(() => { setLocalLabel(label || ""); }, [label]);
   const commit = () => onLabelChange?.(sid, localLabel);
+  const dim = hidden ? 0.38 : 1;
   return (
     <div
       draggable
@@ -7948,10 +8483,17 @@ function SampleRosterRow({ sid, s, color, label, dragOver, onDragStart, onDragOv
       onDragEnd={onDragEnd}
       style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 4px", borderRadius: 5, background: dragOver ? T.bg3 : "transparent", cursor: "grab", userSelect: "none" }}>
       <span style={{ color: T.textDim, fontSize: 11 }}>⠿</span>
-      <div style={{ width: 11, height: 11, borderRadius: "50%", background: color, flexShrink: 0, border: `1px solid ${color}88` }} />
-      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.amber, fontWeight: 600, minWidth: 56 }}>{sid}</span>
-      {s?.date  && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{s.date}</span>}
+      {/* Color swatch doubles as visibility toggle — filled = visible, ring = hidden.
+          Color stays pinned to the sample regardless of visibility. */}
+      <div
+        onClick={() => onToggleVisibility?.(sid)}
+        onMouseDown={e => e.stopPropagation()}
+        title={hidden ? "Hidden from plots — click to show" : "Visible — click to hide from plots"}
+        style={{ width: 12, height: 12, borderRadius: "50%", background: hidden ? "transparent" : color, flexShrink: 0, border: `1.5px solid ${color}`, cursor: "pointer" }} />
+      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.amber, fontWeight: 600, minWidth: 56, opacity: dim }}>{sid}</span>
+      {s?.date  && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, opacity: dim }}>{s.date}</span>}
       {!s       && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red }}>not found</span>}
+      {hidden   && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim, border: `1px solid ${T.border}`, borderRadius: 3, padding: "0 4px", letterSpacing: 0.5 }}>HIDDEN</span>}
       <input
         type="text"
         value={localLabel}
@@ -7960,16 +8502,16 @@ function SampleRosterRow({ sid, s, color, label, dragOver, onDragStart, onDragOv
         onChange={e => setLocalLabel(e.target.value)}
         onBlur={commit}
         onKeyDown={e => e.key === "Enter" && commit()}
-        style={{ width: 120, background: "transparent", border: "none", borderBottom: `1px solid ${T.border}`, borderRadius: 0, color: T.textSecondary, fontFamily: "'DM Mono', monospace", fontSize: 10, outline: "none", padding: "1px 2px" }} />
+        style={{ width: 120, background: "transparent", border: "none", borderBottom: `1px solid ${T.border}`, borderRadius: 0, color: T.textSecondary, fontFamily: "'DM Mono', monospace", fontSize: 10, outline: "none", padding: "1px 2px", opacity: dim }} />
       <div style={{ flex: 1 }} />
-      {s?.notes && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.notes}</span>}
+      {s?.notes && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", opacity: dim }}>{s.notes}</span>}
       <button onClick={() => onRemove(sid)}
         style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 15, lineHeight: 1, marginLeft: "auto", padding: "0 2px" }}>×</button>
     </div>
   );
 }
 
-function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, labels = {}, activeMaterial, onChangeActiveMaterial, onReorder, onRemove, onAddSamples, onChangeScale, onChangeTrim, onLabelChange }) {
+function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, labels = {}, hidden, onToggleVisibility, activeMaterial, onChangeActiveMaterial, onReorder, onRemove, onAddSamples, onChangeScale, onChangeTrim, onLabelChange }) {
   const [dragIdx,       setDragIdx]       = useState(null);
   const [dragOverIdx,   setDragOverIdx]   = useState(null);
   const [showPicker,    setShowPicker]    = useState(false);
@@ -8038,6 +8580,8 @@ function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, lab
           s={sampleMap[sid]}
           color={colors[i] || T.textDim}
           label={labels[sid] || ""}
+          hidden={hidden?.has(sid) ?? false}
+          onToggleVisibility={onToggleVisibility}
           dragOver={dragOverIdx === i}
           onDragStart={() => setDragIdx(i)}
           onDragOver={e => { e.preventDefault(); setDragOverIdx(i); }}
@@ -8543,12 +9087,15 @@ function buildPlotLayout(ps, xaxisExtra = {}, yaxisExtra = {}, extraShapes = [],
 
 function buildPlotConfig(filename = "plot", ps = null) {
   const hasSizeOverride = !!(ps?.plotWidth || ps?.plotHeight);
+  // Raster copies render at this multiple of the on-screen size so pasted PNGs stay
+  // crisp when scaled up (e.g. in PowerPoint), avoiding the need to fall back to SVG.
+  const PNG_COPY_SCALE = 4;
   // Export helper: temporarily clears background colours for transparent output, then restores.
-  const exportTransparent = async (gd, format) => {
+  const exportTransparent = async (gd, format, scale) => {
     const { paper_bgcolor, plot_bgcolor } = gd.layout;
     await window.Plotly.relayout(gd, { paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)" });
     try {
-      return await window.Plotly.toImage(gd, { format });
+      return await window.Plotly.toImage(gd, { format, ...(scale ? { scale } : {}) });
     } finally {
       await window.Plotly.relayout(gd, { paper_bgcolor, plot_bgcolor });
     }
@@ -8574,7 +9121,7 @@ function buildPlotConfig(filename = "plot", ps = null) {
         icon: { width: 24, height: 24, path: "M16 1H4C2.9 1 2 1.9 2 3v14h2V3h12V1zm3 4H8C6.9 5 6 5.9 6 7v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z" },
         click: async (gd) => {
           try {
-            const dataUrl = await exportTransparent(gd, "png");
+            const dataUrl = await exportTransparent(gd, "png", PNG_COPY_SCALE);
             const blob = await fetch(dataUrl).then(r => r.blob());
             await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
           } catch (err) { console.error("Copy to clipboard failed:", err); }
@@ -8611,7 +9158,7 @@ function SciPlotWrap({ ps, cursorLabel, children, noSpacer = false }) {
 
 // ── XRD ω–2θ comparison ───────────────────────────────────────────────────────
 
-function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, config, plotStyle, structures = [], onUpdate }) {
+function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, config, plotStyle, structures = [], onUpdate, samples = [] }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const offsetDecades   = config.offset_decades ?? 2;
   const thetaMin        = config.theta_min  != null ? Number(config.theta_min)  : null;
@@ -8619,12 +9166,26 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
   const padAbove        = config.pad_above  ?? 2;
   const padBelow        = config.pad_below  ?? 1;
   const normalizeBase   = config.normalize_baseline ?? true;
+  const zeroSubstrate   = config.zero_substrate ?? false;
+
+  const substrateMap = useMemo(
+    () => Object.fromEntries(samples.map(s => [s.id, s.substrate || ""])),
+    [samples]
+  );
 
   const { traces, yDomMin, yDomMax, xTicks, xDomain } = useMemo(() => {
     const traces = sampleOrder.map((sid, i) => {
       let pts = plotCache[sid]?.xrd_ot || [];
       if (thetaMin != null && !isNaN(thetaMin)) pts = pts.filter(p => p.x >= thetaMin);
       if (thetaMax != null && !isNaN(thetaMax)) pts = pts.filter(p => p.x <= thetaMax);
+      if (zeroSubstrate && pts.length) {
+        const ref = xrdSubstrateRef(substrateMap[sid], structures);
+        if (ref) {
+          const maxPt = pts.reduce((best, p) => (p.y > best.y ? p : best), pts[0]);
+          const shift = ref.twoTheta - maxPt.x;
+          pts = pts.map(p => ({ ...p, x: p.x + shift }));
+        }
+      }
       const pos = pts.filter(p => p.y > 0);
       if (pos.length === 0) return null;
       const sorted = [...pos.map(p => p.y)].sort((a, b) => a - b);
@@ -8651,7 +9212,7 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
       : { ticks: xTicksAuto };
     return { traces, yDomMin, yDomMax, xTicks, xDomain };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sampleOrder.join(","), plotCache, thetaMin, thetaMax, offsetDecades, padAbove, padBelow, normalizeBase, colors.join(",")]);
+  }, [sampleOrder.join(","), plotCache, thetaMin, thetaMax, offsetDecades, padAbove, padBelow, normalizeBase, zeroSubstrate, substrateMap, colors.join(",")]);
 
   const lines = config.lines || [];
   const addLine    = () => onUpdate({ lines: [...lines, { id: String(Date.now()), material: structures[0]?.name || "", hkl: "", style: "solid", color: "#888888", mode: "bulk", substrate: "" }] });
@@ -8993,7 +9554,10 @@ function XRRComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
 function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {}, plotStyle, config: panelConfig = {}, onUpdate }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const [peLoop, setPeLoop] = useState("all");
-  const xAxisMode = ps.peXAxis || "field"; // "field" (kV/cm) | "voltage" (V)
+  const xAxisMode = ps.peXAxis  || "field";
+  const layout    = ps.peLayout || "one";
+  const tight     = ps.peTight  ?? false;
+  const maxCols   = ps.peMaxCols;
 
   const traces = sampleOrder.map((sid, i) => {
     const sample = samples.find(s => s.id === sid);
@@ -9002,7 +9566,6 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
     const raw    = plotCache[sid]?.pe || [];
     const looped = peLoop === "second" ? splitPELoops(raw).second : raw;
     const data0  = (corr && corr !== 1.0) ? looped.map(p => ({ ...p, y: p.y / corr })) : looped;
-    // Convert x from field (kV/cm) → voltage (V): V = E × d_nm × 1e-4
     const data   = (xAxisMode === "voltage" && thick > 0)
       ? data0.map(p => ({ ...p, x: p.x * thick * 1e-4 }))
       : data0;
@@ -9013,6 +9576,7 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
     <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No P–E data loaded for selected samples.</div>
   );
 
+  // Shared axis ranges (used across all layout modes)
   const allX    = traces.flatMap(t => t.data.map(p => p.x));
   const allY    = traces.flatMap(t => t.data.map(p => p.y));
   const { ticks: autoXTicks, domain: autoXDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
@@ -9024,36 +9588,163 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
   const yMin = ps.yMin ?? -absYMax;
   const yMax = ps.yMax ??  absYMax;
   const autoYTicks = Array.from({ length: 2 * (absYMax / peStep) + 1 }, (_, i) => -absYMax + i * peStep);
-  const xTicks = makeTicks(xDomain[0], xDomain[1], ps.xTick) || autoXTicks;
-  const peTicks = makeTicks(yMin, yMax, ps.yTick) || autoYTicks;
+  const xTicks  = makeTicks(xDomain[0], xDomain[1], ps.xTick) || autoXTicks;
+  const yTicks  = makeTicks(yMin, yMax, ps.yTick) || autoYTicks;
+  const xLabel  = xAxisMode === "voltage" ? "V (V)" : "E (kV/cm)";
+  const xTitleObj = { text: xLabel,       font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 };
+  const yTitleObj = { text: "P (µC/cm²)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8  };
 
-  const plotlyTraces = traces.map(t => ({
-    x: t.data.map(p => p.x), y: t.data.map(p => p.y),
-    type: "scatter", mode: "lines",
-    line: { color: t.color, width: ps.lineWidth },
-    showlegend: false, hovertemplate: "<extra></extra>",
-  }));
-  const xLabel = xAxisMode === "voltage" ? "V (V)" : "E (kV/cm)";
-  const layout = buildPlotLayout(ps,
-    { tickvals: xTicks, range: xDomain,
-      title: { text: xLabel, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
-    { range: [yMin, yMax], tickvals: peTicks, tickformat: "d",
-      title: { text: "P (µC/cm²)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } }
+  const loopToggle = (
+    <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
+      <LoopToggle value={peLoop} onChange={setPeLoop} />
+    </div>
   );
+
+  // ── "one": all traces on a single plot ──────────────────────────────────────
+  if (layout === "one") {
+    const plotlyTraces = traces.map(t => ({
+      x: t.data.map(p => p.x), y: t.data.map(p => p.y),
+      type: "scatter", mode: "lines",
+      line: { color: t.color, width: ps.lineWidth },
+      showlegend: false, hovertemplate: "<extra></extra>",
+    }));
+    const onePlotLayout = buildPlotLayout(ps,
+      { tickvals: xTicks, range: xDomain, title: xTitleObj },
+      { range: [yMin, yMax], tickvals: yTicks, tickformat: "d", title: yTitleObj }
+    );
+    return (
+      <>
+        {loopToggle}
+        <SciPlotWrap ps={ps} cursorLabel={x => `${xLabel} = ${x.toFixed(3)}`}>
+          {setCursor => (
+            <Plot data={plotlyTraces} layout={onePlotLayout} config={buildPlotConfig("pe-hysteresis", ps)}
+              style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
+              onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+          )}
+        </SciPlotWrap>
+        <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
+      </>
+    );
+  }
+
+  // ── "each", loose: individual Plot per sample in a flex grid ────────────────
+  if (!tight) {
+    const panelW = ps.plotWidth  ? Math.round(ps.plotWidth  * 96) : 220;
+    const panelH = ps.plotHeight ? Math.round(ps.plotHeight * 96) : 260;
+    return (
+      <>
+        {loopToggle}
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", justifyContent: "center" }}>
+          {traces.map(t => {
+            const singleLayout = buildPlotLayout(ps,
+              { tickvals: xTicks, range: xDomain, title: xTitleObj },
+              { range: [yMin, yMax], tickvals: yTicks, tickformat: "d", title: yTitleObj }
+            );
+            return (
+              <div key={t.sid} style={{ flex: "0 0 auto" }}>
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: t.color, marginBottom: 4, textAlign: "center" }}>
+                  {labels[t.sid] || t.sid}
+                </div>
+                <Plot
+                  data={[{ x: t.data.map(p => p.x), y: t.data.map(p => p.y), type: "scatter", mode: "lines", line: { color: t.color, width: ps.lineWidth }, showlegend: false, hovertemplate: "<extra></extra>" }]}
+                  layout={singleLayout} config={buildPlotConfig(`pe-${t.sid}`, ps)}
+                  style={{ width: panelW, height: panelH }} useResizeHandler />
+              </div>
+            );
+          })}
+        </div>
+      </>
+    );
+  }
+
+  // ── "each", tight: single Plotly figure with subplot grid ───────────────────
+  const cols    = Math.min(maxCols > 0 ? maxCols : traces.length, traces.length);
+  const rows    = Math.ceil(traces.length / cols);
+  const defPW   = 200, defPH = 230;
+  const figW    = ps.plotWidth  ? Math.round(ps.plotWidth  * 96) : defPW * cols;
+  const figH    = ps.plotHeight ? Math.round(ps.plotHeight * 96) : defPH * rows;
+
+  const gridDash  = { dotted: "dot", dashed: "dash", solid: "solid" }[ps.grid] || "dash";
+  const axisBase  = {
+    showgrid: ps.grid !== "off", gridcolor: T.border, griddash: gridDash,
+    color: T.textDim, tickfont: { size: (ps.fontSize || 11) - 1, family: ps.font, color: T.textDim },
+    zeroline: ps.zeroLines ?? true, zerolinecolor: T.borderBright, zerolinewidth: 1,
+    showline: false, ticks: "inside", ticklen: 4, mirror: "ticks",
+  };
+
+  const subTraces    = [];
+  const axesLayout   = {};
+  const annotations  = [];
+  const shapes       = [];
+
+  traces.forEach((t, idx) => {
+    const n        = idx + 1;
+    const xRef     = n === 1 ? "x"  : `x${n}`;
+    const yRef     = n === 1 ? "y"  : `y${n}`;
+    const xAxisKey = n === 1 ? "xaxis"  : `xaxis${n}`;
+    const yAxisKey = n === 1 ? "yaxis"  : `yaxis${n}`;
+    const col      = idx % cols;
+    const row      = Math.floor(idx / cols);
+    const isLeft   = col === 0;
+    const isBottom = row === rows - 1 || idx >= traces.length - ((traces.length % cols) || cols);
+
+    subTraces.push({
+      x: t.data.map(p => p.x), y: t.data.map(p => p.y),
+      type: "scatter", mode: "lines",
+      line: { color: t.color, width: ps.lineWidth },
+      showlegend: false, hovertemplate: "<extra></extra>",
+      xaxis: xRef, yaxis: yRef,
+    });
+
+    axesLayout[xAxisKey] = {
+      ...axisBase,
+      range: xDomain, ...(xTicks ? { tickvals: xTicks, tickmode: "array" } : {}),
+      showticklabels: isBottom,
+      title: isBottom ? xTitleObj : { text: "" },
+    };
+    axesLayout[yAxisKey] = {
+      ...axisBase,
+      range: [yMin, yMax], tickformat: "d",
+      ...(yTicks ? { tickvals: yTicks, tickmode: "array" } : {}),
+      showticklabels: isLeft, ticklabelstandoff: 4,
+      title: isLeft ? yTitleObj : { text: "" },
+    };
+
+    annotations.push({
+      text: `<b>${labels[t.sid] || t.sid}</b>`,
+      xref: `${xRef} domain`, yref: `${yRef} domain`,
+      x: 0.03, y: 0.97, xanchor: "left", yanchor: "top",
+      showarrow: false,
+      font: { size: ps.fontSize || 11, color: t.color, family: ps.font },
+    });
+
+    if (ps.box !== "off") {
+      shapes.push({
+        type: "rect", xref: `${xRef} domain`, yref: `${yRef} domain`,
+        x0: 0, y0: 0, x1: 1, y1: 1, layer: "above",
+        line: { color: ps.box === "solid" ? T.textPrimary : T.borderBright, width: ps.box === "solid" ? 1.5 : 1, dash: ps.box === "dashed" ? "dash" : "solid" },
+      });
+    }
+  });
+
+  const tightLayout = {
+    autosize: false, width: figW, height: figH,
+    paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
+    font: { family: ps.font, size: ps.fontSize, color: T.textPrimary },
+    margin: { t: 36, r: 14, b: 58, l: 64, pad: 0 },
+    grid: { rows, columns: cols, pattern: "independent", roworder: "top to bottom", xgap: 0, ygap: 0 },
+    annotations, shapes,
+    uirevision: "pe-grid",
+    hovermode: "closest",
+    modebar: { bgcolor: "transparent", color: T.textDim, activecolor: T.textPrimary },
+    ...axesLayout,
+  };
 
   return (
     <>
-      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
-        <LoopToggle value={peLoop} onChange={setPeLoop} />
-      </div>
-      <SciPlotWrap ps={ps} cursorLabel={x => `E = ${x.toFixed(3)} kV/cm`}>
-        {setCursor => (
-          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("pe-hysteresis", ps)}
-            style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
-            onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
-        )}
-      </SciPlotWrap>
-      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
+      {loopToggle}
+      <Plot data={subTraces} layout={tightLayout} config={buildPlotConfig("pe-hysteresis", ps)}
+        style={{ width: figW, height: figH }} useResizeHandler />
     </>
   );
 }
@@ -9748,7 +10439,7 @@ function AfmComparisonPanel({ sampleOrder, plotCache, labels = {}, plotStyle, co
 
 // ── Panel wrapper + add panel row ─────────────────────────────────────────────
 
-const PANEL_LABELS = { xrd: "XRD ω–2θ", xrr: "XRR", pe: "P–E Hysteresis", rsm: "RSM", afm: "Scanning Probe", de: "εᵣ vs E", df: "εᵣ vs f", meta: "Meta-analysis", stats: "Statistical Analysis", parcoords: "Parallel Coordinates" };
+const PANEL_LABELS = { xrd: "XRD ω–2θ", xrr: "XRR", pe: "P–E Hysteresis", rsm: "RSM", afm: "Scanning Probe", de: "εᵣ vs E", df: "εᵣ vs f", meta: "Meta-analysis", stats: "Statistical Analysis", parcoords: "Parallel Coordinates", sputter: "Deposition Log", pund_a1: "PUND — A1 Imprint", pund_a2: "PUND — A2 Voltage", pund_a3: "PUND — A3 Speed", pund_a4: "PUND — A4 Delay" };
 function panelLabel(type, modules = []) {
   if (PANEL_LABELS[type]) return PANEL_LABELS[type];
   if (type.startsWith("mod:")) {
@@ -10083,7 +10774,9 @@ function metaYRange(allY, isPaired) {
   }
   const span = (hi - lo) || Math.abs(hi) * 0.5 || 1;
   const pad  = span * 0.20;
-  return [lo >= 0 ? 0 : lo - pad, hi + pad];
+  // Include zero for positive data, but float a small buffer below it too so the
+  // baseline isn't flush against the axis edge.
+  return [lo >= 0 ? -span * 0.06 : lo - pad, hi + pad];
 }
 
 function MetaScatterPlot({ points, y2Points = [], xLabel, yLabel, y2Label = "", ps = DEFAULT_PLOT_STYLE, pairedY = false, pairedY2 = false, xCategorical = false, sampleOrder = [], colors = [], labels = {}, yMarker = {}, y2Marker = {} }) {
@@ -10114,6 +10807,7 @@ function MetaScatterPlot({ points, y2Points = [], xLabel, yLabel, y2Label = "", 
       x: [pt.x], y: [pt.y], yaxis: "y",
       type: "scatter", mode: ps.metaLabels ? "markers+text" : "markers",
       marker: { color: yMarker.color ?? pt.color, size: yMarker.size ?? 9, symbol: yMarker.symbol ?? "circle", line: { color: T.bg0, width: 1.5 } },
+      ...(pt.ey != null ? { error_y: { type: "data", array: [pt.ey], visible: true, thickness: 1.2, width: 4, color: yMarker.color ?? pt.color } } : {}),
       text: ps.metaLabels ? [pt.label] : undefined,
       textposition: "top center",
       textfont: { size: (ps.fontSize || 11) - 1, family: ps.font, color: yMarker.color ?? pt.color },
@@ -10589,6 +11283,347 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
           yMarker={{ color: config.y_color ?? null, symbol: config.y_symbol ?? "circle", size: config.y_size ?? 9 }}
           y2Marker={{ color: config.y2_color ?? null, symbol: config.y2_symbol ?? "diamond", size: config.y2_size ?? 9 }}
         />
+      )}
+    </div>
+  );
+}
+
+// ── Sputter deposition-log comparison panel ───────────────────────────────────
+// Meta-panel style: pick a channel (all selectable); the layer to compare follows
+// the book's Active Layer selection. Reads per-layer logs bound via
+// layer.sputter_log and fetches their parsed window stats on demand.
+
+function SputterComparisonPanel({ sampleOrder, samples, colors, labels = {}, config = {}, plotStyle, activeMaterial = null, onUpdate }) {
+  const ps = plotStyle || DEFAULT_PLOT_STYLE;
+  const sampleMap = useMemo(() => Object.fromEntries(samples.map(s => [s.id, s])), [samples]);
+  const channelKey = config.sputter_channel || "temp_pyro1";
+  const chan = SPUTTER_CHANNELS.find(c => c.key === channelKey) || SPUTTER_CHANNELS[0];
+
+  // All (sampleId, filename) pairs we need parsed data for.
+  const wantedFiles = useMemo(() => {
+    const out = [];
+    for (const sid of sampleOrder) {
+      const s = sampleMap[sid];
+      if (!s) continue;
+      for (const l of (s.layers || [])) if (l.sputter_log) out.push([sid, l.sputter_log]);
+    }
+    return out;
+  }, [sampleOrder, sampleMap]);
+
+  const [logCache, setLogCache] = useState({});  // `${sid}::${fn}` → data | "error"
+  const fetchingRef = useRef(new Set());
+  useEffect(() => {
+    // NB: no "cancelled" guard here — combining it with the persistent fetchingRef
+    // dedup deadlocks under React StrictMode's mount/cleanup/mount (the key gets
+    // added on the first pass, then the second pass skips it and nothing is stored).
+    (async () => {
+      for (const [sid, fn] of wantedFiles) {
+        const key = `${sid}::${fn}`;
+        if (fetchingRef.current.has(key)) continue;
+        fetchingRef.current.add(key);
+        const data = await fetchSputterLog(sid, fn);
+        setLogCache(c => ({ ...c, [key]: data || "error" }));
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wantedFiles.map(([s, f]) => `${s}::${f}`).join(",")]);
+
+  // Resolve the layer to compare for a sample by the book's Active Layer material.
+  // Falls back to the first logged layer when no active layer is set.
+  const pickLayer = (s) => {
+    const logged = (s.layers || []).filter(l => l.sputter_log);
+    if (activeMaterial) {
+      return logged.find(l => l.targets?.length === 1 && l.targets[0].material === activeMaterial)
+          || logged.find(l => sputterLayerMaterial(l) === activeMaterial)
+          || null;
+    }
+    return logged[0] || null;
+  };
+
+  const mode = config.sputter_mode || "trace";  // "trace" (param vs time) | "summary" (mean ± std)
+
+  // Resolve each sample's parsed log + deposition window once, in sample order.
+  const resolved = useMemo(() => sampleOrder.map((sid, i) => {
+    const s = sampleMap[sid];
+    const layer = s ? pickLayer(s) : null;
+    const data = layer ? logCache[`${sid}::${layer.sputter_log}`] : null;
+    return { sid, i, color: colors[i], label: labels[sid] || sid, data };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [sampleOrder, sampleMap, logCache, activeMaterial, colors.join(","), labels]);
+
+  // Trace mode: one line per film, channel vs deposition time (zeroed at shutter open).
+  const traceData = useMemo(() => resolved.flatMap(r => {
+    if (!r.data || r.data === "error") return [];
+    const { pts, win } = sputterViewPoints(r.data, channelKey);
+    if (!win || !pts.length) return [];  // only films with a deposition window
+    return [{ ...r, pts }];
+  }), [resolved, channelKey]);
+
+  // Summary mode: one point per film (window mean) with ±std error bars.
+  const summaryPoints = useMemo(() => resolved.flatMap(r => {
+    if (!r.data || r.data === "error") return [];
+    const y = sputterWindowValue(r.data, channelKey);
+    if (y == null || !isFinite(y)) return [];
+    const win = (r.data.deposition_windows || [])[0];
+    const std = channelKey === "__duration" ? null : win?.stats?.[channelKey]?.std;
+    return [{ sid: r.sid, x: r.label, y, ey: (std != null && isFinite(std)) ? std : null, color: r.color, label: r.label }];
+  }), [resolved, channelKey]);
+
+  const stillLoading = wantedFiles.some(([sid, fn]) => logCache[`${sid}::${fn}`] === undefined);
+  const hasAny = mode === "trace" ? traceData.length > 0 : summaryPoints.length > 0;
+  const yLabel = `${chan.label}${chan.unit ? ` (${chan.unit})` : ""}`;
+  const selectStyle = { background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 8px", cursor: "pointer" };
+  const axisLabelStyle = { fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, flexShrink: 0 };
+
+  // Trace-mode Plotly figure (overlaid lines).
+  const traceFig = useMemo(() => {
+    if (mode !== "trace" || !traceData.length) return null;
+    const plotlyTraces = traceData.map(t => ({
+      x: t.pts.map(p => p.x), y: t.pts.map(p => p.y),
+      type: "scatter", mode: "lines",
+      line: { color: t.color, width: ps.lineWidth },
+      showlegend: false, hovertemplate: `<b>${t.label}</b><br>%{x:.0f} s<br>%{y:.4g}<extra></extra>`,
+    }));
+    // Axis ranges follow the app convention: include zero, pad the data end
+    // (metaYRange → [0, hi+pad] for positive data). Honor cog overrides.
+    const allY = traceData.flatMap(t => t.pts.map(p => p.y));
+    const allX = traceData.flatMap(t => t.pts.map(p => p.x));
+    const [yLoAuto, yHiAuto] = metaYRange(allY, false);
+    const xHi = arrMax(allX);
+    const yRange = [ps.yMin ?? yLoAuto, ps.yMax ?? yHiAuto];
+    const xRange = [ps.xMin ?? 0, ps.xMax ?? (xHi + (xHi || 1) * 0.03)];
+    const xTickExtra = ps.xTick ? { tickmode: "linear", tick0: 0, dtick: ps.xTick } : {};
+    const yTickExtra = ps.yTick ? { tickmode: "linear", tick0: 0, dtick: ps.yTick } : {};
+    const layout = buildPlotLayout(ps,
+      { range: xRange, ...xTickExtra, title: { text: "Deposition time (s)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+      { range: yRange, ...yTickExtra, title: { text: yLabel, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
+      [],
+      { uirevision: `sputter-${channelKey}`, dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 70, pad: 0 } }
+    );
+    return { plotlyTraces, layout };
+  }, [mode, traceData, channelKey, yLabel, ps]);
+
+  const modeBtn = (val, lbl) => (
+    <button key={val} onClick={() => onUpdate({ sputter_mode: val })}
+      style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: mode === val ? T.bg3 : T.bg0, border: "none", borderRight: val === "trace" ? `1px solid ${T.border}` : "none", color: mode === val ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+      {lbl}
+    </button>
+  );
+
+  return (
+    <div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <span style={axisLabelStyle}>Channel</span>
+          <select value={channelKey} onChange={e => onUpdate({ sputter_channel: e.target.value })} style={selectStyle}>
+            {SPUTTER_CHANNELS.map(c => <option key={c.key} value={c.key}>{c.label}{c.unit ? ` (${c.unit})` : ""}</option>)}
+          </select>
+          <span style={axisLabelStyle}>Layer</span>
+          {activeMaterial
+            ? <ChemName name={matDisplayName(activeMaterial, [])} />
+            : <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.amber }}>set Active Layer below</span>}
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim }}>(from Active Layer)</span>
+          <div style={{ flex: 1 }} />
+          <span style={axisLabelStyle}>View</span>
+          <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+            {modeBtn("trace", "vs time")}
+            {modeBtn("summary", "mean")}
+          </div>
+        </div>
+      </div>
+      {!hasAny ? (
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "24px 0" }}>
+          {stillLoading ? "Loading deposition logs…"
+            : activeMaterial
+              ? `No deposition-log data for the "${activeMaterial}" layer on the included samples.`
+              : "Select an Active Layer below, or attach logs to layers on each sample's page."}
+        </div>
+      ) : mode === "trace" ? (
+        <>
+          <SciPlotWrap ps={ps} cursorLabel={x => `t = ${x.toFixed(0)} s`}>
+            {setCursor => (
+              <Plot data={traceFig.plotlyTraces} layout={traceFig.layout} config={buildPlotConfig("sputter", ps)}
+                style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
+                onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+            )}
+          </SciPlotWrap>
+          <BookColorLegend sampleOrder={traceData.map(t => t.sid)} colors={traceData.map(t => t.color)} labels={labels} ps={ps} />
+        </>
+      ) : (
+        <MetaScatterPlot
+          points={summaryPoints}
+          xLabel=""
+          yLabel={yLabel}
+          ps={ps}
+          xCategorical
+          sampleOrder={summaryPoints.map(p => p.sid)}
+          colors={summaryPoints.map(p => p.color)}
+          labels={labels}
+          yMarker={{ color: config.y_color ?? null, symbol: config.y_symbol ?? "circle", size: config.y_size ?? 9 }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── PUND comparison panel ─────────────────────────────────────────────────────
+// One panel per stage (types "pund_a1".."pund_a4"). Overlays every sample's
+// switched-ΔP sweep for that stage: color = sample (book palette), branch
+// distinguished by marker/line style (ΔP⁺ circles solid, ΔP⁻ squares dashed).
+// Branch selector persists in config.pund_branch; all normal cog styling applies.
+
+function PundComparisonPanel({ stage, sampleOrder, samples, colors, labels = {}, config = {}, plotStyle, onUpdate }) {
+  const ps = plotStyle || DEFAULT_PLOT_STYLE;
+  const stageDef = PUND_STAGES.find(s => s.id === stage) || PUND_STAGES[0];
+  const sampleMap = useMemo(() => Object.fromEntries(samples.map(s => [s.id, s])), [samples]);
+
+  // (sid, filename) pairs for this stage across the visible samples.
+  const wanted = useMemo(() => sampleOrder.flatMap(sid => {
+    const fn = sampleMap[sid]?.filenames?.[`pund_${stage}`];
+    return fn ? [[sid, fn]] : [];
+  }), [sampleOrder, sampleMap, stage]);
+
+  const [cache, setCache] = useState({});  // `${sid}::${fn}` → data | "error"
+  const fetchingRef = useRef(new Set());
+  useEffect(() => {
+    // NB: no cancelled-flag — combining it with the persistent fetchingRef dedup
+    // deadlocks under StrictMode (see SputterComparisonPanel).
+    (async () => {
+      for (const [sid, fn] of wanted) {
+        const key = `${sid}::${fn}`;
+        if (fetchingRef.current.has(key)) continue;
+        fetchingRef.current.add(key);
+        const d = await fetchPund(sid, fn);
+        setCache(c => ({ ...c, [key]: d || "error" }));
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wanted.map(([s, f]) => `${s}::${f}`).join(",")]);
+
+  const loaded = useMemo(() => sampleOrder.flatMap((sid, i) => {
+    const fn = sampleMap[sid]?.filenames?.[`pund_${stage}`];
+    if (!fn) return [];
+    const d = cache[`${sid}::${fn}`];
+    if (!d || d === "error") return [];
+    return [{ sid, color: colors[i], label: labels[sid] || sid, d }];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [sampleOrder, sampleMap, cache, stage, colors.join(","), labels]);
+
+  const anyPos = loaded.some(r => r.d.has_pos);
+  const anyNeg = loaded.some(r => r.d.has_neg);
+  const branch = config.pund_branch || "both";
+  const showPos = anyPos && branch !== "neg";
+  const showNeg = anyNeg && branch !== "pos";
+  const showErr = config.pund_err ?? true;
+
+  const fig = useMemo(() => {
+    if (!loaded.length) return null;
+    const first = loaded[0].d;
+    const logX = !!first.log_x;
+    const unit = first.swept_unit || "";
+    const err = stds => (stds || []).map(s => (s == null ? 0 : s));
+    const traces = [];
+    for (const r of loaded) {
+      if (showPos && r.d.has_pos) traces.push({
+        x: r.d.x, y: r.d.dP_pos, type: "scatter", mode: "lines+markers", name: `${r.label} ΔP⁺`,
+        marker: { color: r.color, size: 6, symbol: "circle" },
+        line: { color: r.color, width: ps.lineWidth },
+        ...(showErr ? { error_y: { type: "data", array: err(r.d.dP_pos_std), visible: true, thickness: 1, width: 3, color: r.color } } : {}),
+        showlegend: false, hovertemplate: `<b>${r.label}</b> ΔP⁺<br>%{x:g} ${unit}<br>%{y:.3g} µC/cm²<extra></extra>`,
+      });
+      if (showNeg && r.d.has_neg) traces.push({
+        x: r.d.x, y: r.d.dP_neg, type: "scatter", mode: "lines+markers", name: `${r.label} ΔP⁻`,
+        marker: { color: r.color, size: 6, symbol: "square" },
+        line: { color: r.color, width: ps.lineWidth, dash: "dot" },
+        ...(showErr ? { error_y: { type: "data", array: err(r.d.dP_neg_std), visible: true, thickness: 1, width: 3, color: r.color } } : {}),
+        showlegend: false, hovertemplate: `<b>${r.label}</b> ΔP⁻<br>%{x:g} ${unit}<br>%{y:.3g} µC/cm²<extra></extra>`,
+      });
+    }
+    if (!traces.length) return null;
+
+    // Y range: zero-anchored with buffer (app convention); honor cog overrides.
+    const allY = traces.flatMap(t => t.y).filter(v => v != null && isFinite(v));
+    const [yLoAuto, yHiAuto] = metaYRange(allY, false);
+    const yRange = [ps.yMin ?? yLoAuto, ps.yMax ?? yHiAuto];
+    const yTickExtra = ps.yTick ? { tickmode: "linear", tick0: 0, dtick: ps.yTick } : {};
+    // X: log stages autorange in log space (cog overrides converted); linear stages padded.
+    let xAxisExtra;
+    if (logX) {
+      xAxisExtra = { type: "log",
+        ...(ps.xMin != null && ps.xMax != null && ps.xMin > 0 && ps.xMax > 0
+          ? { range: [Math.log10(ps.xMin), Math.log10(ps.xMax)] } : {}) };
+    } else {
+      const allX = traces.flatMap(t => t.x).filter(v => v != null && isFinite(v));
+      const xLo = arrMin(allX), xHi = arrMax(allX);
+      const xPad = ((xHi - xLo) || Math.abs(xHi) || 1) * 0.05;
+      xAxisExtra = { range: [ps.xMin ?? (xLo - xPad), ps.xMax ?? (xHi + xPad)],
+        ...(ps.xTick ? { tickmode: "linear", tick0: 0, dtick: ps.xTick } : {}) };
+    }
+    const layout = buildPlotLayout(ps,
+      { ...xAxisExtra, title: { text: `${first.swept_label} (${unit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+      { range: yRange, ...yTickExtra, title: { text: "Switched ΔP (µC/cm²)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
+      [],
+      { uirevision: `pund-${stage}-${branch}`, dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 68, pad: 0 } }
+    );
+    return { traces, layout, unit };
+  }, [loaded, showPos, showNeg, showErr, stage, branch, ps]);
+
+  const stillLoading = wanted.some(([sid, fn]) => cache[`${sid}::${fn}`] === undefined);
+  const axisLabelStyle = { fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, flexShrink: 0 };
+  const branchOpts = [];
+  if (anyPos) branchOpts.push(["pos", "ΔP⁺"]);
+  if (anyNeg) branchOpts.push(["neg", "ΔP⁻"]);
+  if (anyPos && anyNeg) branchOpts.push(["both", "both"]);
+
+  return (
+    <div>
+      {branchOpts.length > 1 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+          <span style={axisLabelStyle}>Branch</span>
+          <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+            {branchOpts.map(([val, lbl], i) => (
+              <button key={val} onClick={() => onUpdate({ pund_branch: val })}
+                style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: branch === val ? T.bg3 : T.bg0, border: "none", borderLeft: i ? `1px solid ${T.border}` : "none", color: branch === val ? T.textPrimary : T.textDim, cursor: "pointer" }}>
+                {lbl}
+              </button>
+            ))}
+          </div>
+          <span style={axisLabelStyle}>Error bars</span>
+          <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+            {[["on", true], ["off", false]].map(([lbl, val], i) => (
+              <button key={lbl} onClick={() => onUpdate({ pund_err: val })}
+                style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: showErr === val ? T.bg3 : T.bg0, border: "none", borderLeft: i ? `1px solid ${T.border}` : "none", color: showErr === val ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                {lbl}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      {!fig ? (
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "24px 0" }}>
+          {stillLoading ? "Loading PUND data…" : `No ${stageDef.label} data on the included samples — drop metadata.csv files on the PUND cards on each sample's page.`}
+        </div>
+      ) : (
+        <>
+          <SciPlotWrap ps={ps} cursorLabel={x => `${numFmt(x)} ${fig.unit}`}>
+            {setCursor => (
+              <Plot data={fig.traces} layout={fig.layout} config={buildPlotConfig(`pund-${stage}`, ps)}
+                style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
+                onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+            )}
+          </SciPlotWrap>
+          <BookColorLegend sampleOrder={loaded.map(r => r.sid)} colors={loaded.map(r => r.color)} labels={labels} ps={ps} />
+          {showPos && showNeg && (
+            <div style={{ display: "flex", justifyContent: "center", gap: 20, marginTop: 4 }}>
+              {[["circle", "ΔP⁺"], ["square", "ΔP⁻"]].map(([symbol, lbl]) => (
+                <div key={lbl} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  <MarkerGlyph symbol={symbol} size={Math.max(7, ps.fontSize - 4)} color={T.textDim} />
+                  <span style={{ fontFamily: ps.font || "'DM Mono', monospace", fontSize: Math.max(7, ps.fontSize - 4), color: T.textDim }}>{lbl}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -11428,6 +12463,9 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
     yMin:           config.y_min  != null ? Number(config.y_min)  : null,
     yMax:           config.y_max  != null ? Number(config.y_max)  : null,
     peXAxis:        config.pe_x_axis      || "field",
+    peLayout:       config.pe_layout      || "one",
+    peTight:        config.pe_tight       ?? false,
+    peMaxCols:      config.pe_max_cols    != null ? Number(config.pe_max_cols) : null,
     deXAxis:        config.de_x_axis      || "field",
     metaLabels:     config.meta_labels    ?? false,
     y2Tick:         config.plot_y2_tick   || null,
@@ -11458,7 +12496,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
             style={{ ...btnStyle, color: cogOpen ? T.textSecondary : T.textDim }}>⚙</button>
           {cogOpen && (
             <div onClick={e => e.stopPropagation()}
-              style={{ position: "absolute", right: 0, top: "calc(100% + 6px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "14px 16px", zIndex: 200, boxShadow: "0 4px 20px rgba(0,0,0,.5)", minWidth: 260, display: "flex", flexDirection: "column", gap: 12 }}>
+              style={{ position: "absolute", right: 0, top: "calc(100% + 6px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "14px 16px", zIndex: 200, boxShadow: "0 4px 20px rgba(0,0,0,.5)", minWidth: 260, maxHeight: "min(520px, 80vh)", overflowY: "auto", display: "flex", flexDirection: "column", gap: 12 }}>
               {/* Font */}
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>FONT</span>
@@ -11639,6 +12677,39 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                   </div>
                 </div>
               )}
+              {/* PE layout controls */}
+              {type === "pe" && <>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>LAYOUT</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {[["one", "one"], ["each", "each"]].map(([val, lbl], idx) => (
+                      <button key={val} onClick={() => onUpdate({ pe_layout: val })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: ps.peLayout === val ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: ps.peLayout === val ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {ps.peLayout === "each" && <>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>TIGHT</span>
+                    <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                      {["off", "on"].map((opt, idx) => (
+                        <button key={opt} onClick={() => onUpdate({ pe_tight: opt === "on" })}
+                          style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (ps.peTight ? "on" : "off") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.peTight ? "on" : "off") === opt ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                          {opt}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>COLUMNS</span>
+                    <DeferredInput type="number" value={config.pe_max_cols ?? ""} onChange={v => onUpdate({ pe_max_cols: v === "" ? null : Math.max(1, Math.round(Number(v))) })}
+                      className="no-spin" min="1" placeholder="auto"
+                      style={{ width: 60, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  </div>
+                </>}
+              </>}
               {/* X/Y Range — for panels other than xrd/xrr/rsm/afm which have their own range controls */}
               {type !== "xrd" && type !== "xrr" && type !== "rsm" && type !== "afm" && <>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -11742,6 +12813,17 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                     <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>baseline</span>
                   </label>
                 </div>
+                {type === "xrd" && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>ZERO</span>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                      <input type="checkbox" checked={config.zero_substrate ?? false}
+                        onChange={e => onUpdate({ zero_substrate: e.target.checked })}
+                        style={{ accentColor: T.amber }} />
+                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>to substrate peak</span>
+                    </label>
+                  </div>
+                )}
               </>}
               {/* RSM-specific */}
               {type === "rsm" && <>
@@ -11881,7 +12963,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
         <button onClick={onRemove} title="Remove panel"
           style={btnStyle}>×</button>
       </div>
-      {type === "xrd"  && <XRDComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} structures={structures} config={config} plotStyle={ps} onUpdate={onUpdate} />}
+      {type === "xrd"  && <XRDComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} structures={structures} config={config} plotStyle={ps} onUpdate={onUpdate} samples={samples} />}
       {type === "xrr"  && <XRRComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} />}
       {type === "pe"   && <PEComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
       {type === "rsm"  && <RSMComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} structures={structures} />}
@@ -11891,6 +12973,8 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
       {type === "meta" && <MetaAnalysisPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} modules={modules} settings={settings} onUpdate={onUpdate} />}
       {type === "xrd_pos" && <XRDPeakPositionPanel sampleOrder={sampleOrder} samples={samples} colors={colors} labels={labels} config={config} plotStyle={ps} structures={structures} onUpdate={onUpdate} />}
       {type === "stats"      && <StatisticalAnalysisPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
+      {type === "sputter"    && <SputterComparisonPanel    sampleOrder={sampleOrder} samples={samples} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} onUpdate={onUpdate} />}
+      {type.startsWith("pund_") && <PundComparisonPanel stage={type.slice(5)} sampleOrder={sampleOrder} samples={samples} colors={colors} labels={labels} config={config} plotStyle={ps} onUpdate={onUpdate} />}
       {type === "parcoords"  && <ParallelCoordsPanel       sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
       {type.startsWith("mod:") && <ModuleComparisonPanel moduleId={type.slice(4)} sampleOrder={sampleOrder} samples={samples} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} modules={modules} />}
     </div>
@@ -12088,6 +13172,7 @@ function AddPanelRow({ onAdd, modules = [] }) {
     { type: "meta",      label: "Meta-analysis"         },
     { type: "stats",     label: "Statistical Analysis"  },
     { type: "parcoords", label: "Parallel Coordinates"  },
+    { type: "sputter",   label: "Deposition Log"        },
   ];
   const toggle = () => {
     if (!open && btnRef.current) {
@@ -12112,11 +13197,18 @@ function AddPanelRow({ onAdd, modules = [] }) {
               {p.label}
             </button>
           ))}
-          {modules.length > 0 && (
+          <div style={{ borderTop: `1px solid ${T.border}`, margin: "4px 0" }} />
+          <div style={{ fontFamily: mono, fontSize: 9, color: T.textDim, padding: "2px 12px", textTransform: "uppercase", letterSpacing: 1 }}>PUND</div>
+          {PUND_STAGES.map(s => (
+            <button key={s.id} onMouseDown={() => { onAdd(`pund_${s.id}`); setOpen(false); }} style={btnItem}>
+              {s.label}
+            </button>
+          ))}
+          {modules.filter(m => m.id !== "pund").length > 0 && (
             <>
               <div style={{ borderTop: `1px solid ${T.border}`, margin: "4px 0" }} />
               <div style={{ fontFamily: mono, fontSize: 9, color: T.textDim, padding: "2px 12px", textTransform: "uppercase", letterSpacing: 1 }}>Modules</div>
-              {modules.map(m => (
+              {modules.filter(m => m.id !== "pund").map(m => (
                 <button key={m.id} onMouseDown={() => { onAdd(`mod:${m.id}`); setOpen(false); }} style={btnItem}>
                   {m.name}
                 </button>
@@ -12138,6 +13230,19 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, 
   const labels         = cfg.labels         || {};
   const activeMaterial = cfg.active_material ?? null;
   const colors      = sampleColorScale(colorScale, sampleOrder.length, colorTrim);
+
+  // Colors are assigned over the FULL sample order, so each sample keeps its color
+  // regardless of visibility. Hidden samples drop out of plots but not the palette.
+  const hiddenSet    = new Set(cfg.hidden_samples || []);
+  const colorBySid   = Object.fromEntries(sampleOrder.map((id, i) => [id, colors[i]]));
+  const visibleOrder = sampleOrder.filter(id => !hiddenSet.has(id));
+  const visibleColors = visibleOrder.map(id => colorBySid[id]);
+
+  const toggleVisibility = (sid) => {
+    const hidden = new Set(cfg.hidden_samples || []);
+    if (hidden.has(sid)) hidden.delete(sid); else hidden.add(sid);
+    updateCfg({ hidden_samples: [...hidden] });
+  };
 
   const updateCfg = (patch) => {
     const newCfg = { ...cfg, ...patch };
@@ -12172,10 +13277,12 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, 
         colorScale={colorScale}
         colorTrim={colorTrim}
         labels={labels}
+        hidden={hiddenSet}
+        onToggleVisibility={toggleVisibility}
         activeMaterial={activeMaterial}
         onChangeActiveMaterial={m => updateCfg({ active_material: m })}
         onReorder={reorderSamples}
-        onRemove={id => updateCfg({ sample_order: sampleOrder.filter(s => s !== id) })}
+        onRemove={id => updateCfg({ sample_order: sampleOrder.filter(s => s !== id), hidden_samples: (cfg.hidden_samples || []).filter(s => s !== id) })}
         onAddSamples={ids => {
           const existing = new Set(sampleOrder);
           updateCfg({ sample_order: [...sampleOrder, ...ids.filter(id => !existing.has(id))] });
@@ -12188,10 +13295,10 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, 
         <AnalysisPanelBlock
           key={panel.id}
           panel={panel}
-          sampleOrder={sampleOrder}
+          sampleOrder={visibleOrder}
           samples={samples}
           plotCache={plotCache}
-          colors={colors}
+          colors={visibleColors}
           labels={labels}
           colorScale={colorScale}
           structures={structuresCompat}
