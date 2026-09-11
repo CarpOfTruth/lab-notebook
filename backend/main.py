@@ -1,9 +1,32 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
-import sqlite3, json, os, shutil
+import sqlite3, json, os, shutil, re, importlib.util, subprocess, sys, uuid
 from pathlib import Path
 import modules as mod_registry
+
+# ── Dependency blacklist ───────────────────────────────────────────────────────
+# Packages that are never permitted to be pip-installed by user modules.
+# Covers system access, network access, privilege escalation, and unsafe
+# serialisation. The set is lowercase; package names are lowercased before
+# comparison. Stdlib modules like os/sys can't be pip-installed anyway, but
+# listing them here makes the policy explicit and auditable.
+_DEP_BLACKLIST = {
+    # System access / code execution
+    "os", "sys", "subprocess", "shutil", "ctypes", "pty", "signal", "multiprocessing",
+    "threading", "concurrent",
+    # Network access
+    "socket", "requests", "httpx", "aiohttp", "urllib3", "paramiko", "ftplib",
+    "smtplib", "http", "urllib",
+    # Privilege escalation / package management
+    "pip", "setuptools", "distutils", "pkg_resources", "wheel",
+    # Unsafe serialisation / code loading
+    "pickle", "marshal", "shelve", "dill", "cloudpickle",
+    # Filesystem / system introspection
+    "pathlib", "glob", "fnmatch", "tempfile", "io",
+    # Crypto / auth
+    "cryptography", "paramiko", "pyotp",
+}
 
 app = FastAPI(title="LabLog API")
 
@@ -134,6 +157,14 @@ def init_db():
         except sqlite3.OperationalError:
             pass
         try:
+            conn.execute("ALTER TABLE folders ADD COLUMN mat_folder INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE materials_library ADD COLUMN folder_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
             conn.execute("ALTER TABLE samples ADD COLUMN xrd_peaks TEXT DEFAULT '[]'")
         except sqlite3.OperationalError:
             pass
@@ -145,10 +176,41 @@ def init_db():
             conn.execute("ALTER TABLE samples ADD COLUMN bin TEXT")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute("ALTER TABLE samples ADD COLUMN module_config TEXT DEFAULT '{}'")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS module_files (
+                id          TEXT PRIMARY KEY,
+                sample_id   TEXT NOT NULL,
+                module_id   TEXT NOT NULL,
+                filename    TEXT NOT NULL,
+                params      TEXT DEFAULT '{}',
+                is_primary  INTEGER DEFAULT 0,
+                uploaded_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (sample_id) REFERENCES samples(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mf ON module_files(sample_id, module_id)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS materials_library (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                formula TEXT NOT NULL DEFAULT '',
+                composition TEXT NOT NULL DEFAULT '{}',
+                parent TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                crystal TEXT NOT NULL DEFAULT '{}',
+                properties TEXT NOT NULL DEFAULT '{}',
+                growth_defaults TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT DEFAULT (datetime('now'))
             )
         """)
         conn.execute("""
@@ -166,6 +228,52 @@ init_db()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _mat_row_to_dict(row):
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "formula": row["formula"],
+        "composition": json.loads(row["composition"] or "{}"),
+        "parent": row["parent"],
+        "notes": row["notes"],
+        "crystal": json.loads(row["crystal"] or "{}"),
+        "properties": json.loads(row["properties"] or "{}"),
+        "growth_defaults": json.loads(row["growth_defaults"] or "{}"),
+        "folder_id": row["folder_id"] if "folder_id" in row.keys() else None,
+    }
+
+def _mf_row_to_dict(row) -> dict:
+    """Convert a module_files DB row to a dict."""
+    return {
+        "id":          row["id"],
+        "sample_id":   row["sample_id"],
+        "module_id":   row["module_id"],
+        "filename":    row["filename"],
+        "params":      json.loads(row["params"] or "{}"),
+        "is_primary":  bool(row["is_primary"]),
+        "uploaded_at": row["uploaded_at"],
+    }
+
+
+def _get_module_files(conn, sample_id: str, module_id: str) -> list:
+    """Return all module_files rows for (sample_id, module_id), primary first."""
+    rows = conn.execute(
+        "SELECT * FROM module_files WHERE sample_id=? AND module_id=? ORDER BY is_primary DESC, uploaded_at ASC",
+        (sample_id, module_id),
+    ).fetchall()
+    return [_mf_row_to_dict(r) for r in rows]
+
+
+def _make_mat_id(name: str, existing_ids: set) -> str:
+    import re
+    slug = re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or "material"
+    if slug not in existing_ids:
+        return slug
+    i = 2
+    while f"{slug}_{i}" in existing_ids:
+        i += 1
+    return f"{slug}_{i}"
 
 def row_to_dict(row):
     return dict(row)
@@ -226,6 +334,9 @@ def _index_sample(conn, sample_id, layers_json, technique, substrate, lot):
                 n = _num(target.get(t_key))
                 if n is not None:
                     _add(idx_field, num=n)
+            pt = (target.get("power_type") or "").strip()
+            if pt:
+                _add("growth_power_type", text=pt)
 
     if rows:
         conn.executemany(
@@ -235,10 +346,35 @@ def _index_sample(conn, sample_id, layers_json, technique, substrate, lot):
 
 def row_to_sample(row):
     d = dict(row)
-    d["layers"]    = json.loads(d.get("layers")    or "[]")
-    d["filenames"] = json.loads(d.get("filenames") or "{}")
-    d["xrd_peaks"] = json.loads(d.get("xrd_peaks") or "[]")
+    d["layers"]             = json.loads(d.get("layers")        or "[]")
+    d["filenames"]          = json.loads(d.get("filenames")     or "{}")
+    d["xrd_peaks"]          = json.loads(d.get("xrd_peaks")     or "[]")
+    d["module_config"]      = json.loads(d.get("module_config") or "{}")
+    d["module_file_counts"] = {}   # enriched separately by callers that hold a conn
     return d
+
+
+def _enrich_sample_counts(conn, sample: dict) -> dict:
+    """Add module_file_counts to an already-parsed sample dict. Mutates + returns it."""
+    counts = conn.execute(
+        "SELECT module_id, COUNT(*) as n FROM module_files WHERE sample_id=? GROUP BY module_id",
+        (sample["id"],),
+    ).fetchall()
+    sample["module_file_counts"] = {r["module_id"]: r["n"] for r in counts}
+    return sample
+
+
+def _enrich_samples_counts(conn, samples: list) -> list:
+    """Batch-enrich module_file_counts for a list of samples. Mutates + returns list."""
+    count_rows = conn.execute(
+        "SELECT sample_id, module_id, COUNT(*) as n FROM module_files GROUP BY sample_id, module_id"
+    ).fetchall()
+    by_sample: dict = {}
+    for r in count_rows:
+        by_sample.setdefault(r["sample_id"], {})[r["module_id"]] = r["n"]
+    for s in samples:
+        s["module_file_counts"] = by_sample.get(s["id"], {})
+    return samples
 
 def row_to_book(row):
     d = dict(row)
@@ -259,10 +395,11 @@ def list_folders():
 def create_folder(folder: dict):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO folders (id, name, color, book_folder, module_folder, parent_id, sort_order) VALUES (:id, :name, :color, :book_folder, :module_folder, :parent_id, :sort_order)",
+            "INSERT INTO folders (id, name, color, book_folder, module_folder, mat_folder, parent_id, sort_order) VALUES (:id, :name, :color, :book_folder, :module_folder, :mat_folder, :parent_id, :sort_order)",
             {"id": folder["id"], "name": folder["name"], "color": folder.get("color", "#4a5568"),
              "book_folder": 1 if folder.get("book_folder") else 0,
              "module_folder": 1 if folder.get("module_folder") else 0,
+             "mat_folder": 1 if folder.get("mat_folder") else 0,
              "parent_id": folder.get("parent_id") or None,
              "sort_order": folder.get("sort_order", 0)},
         )
@@ -273,10 +410,11 @@ def create_folder(folder: dict):
 def update_folder(folder_id: str, folder: dict):
     with get_db() as conn:
         conn.execute(
-            "UPDATE folders SET name=:name, color=:color, book_folder=:book_folder, module_folder=:module_folder, parent_id=:parent_id, sort_order=:sort_order WHERE id=:id",
+            "UPDATE folders SET name=:name, color=:color, book_folder=:book_folder, module_folder=:module_folder, mat_folder=:mat_folder, parent_id=:parent_id, sort_order=:sort_order WHERE id=:id",
             {"id": folder_id, "name": folder["name"], "color": folder.get("color", "#4a5568"),
              "book_folder": 1 if folder.get("book_folder") else 0,
              "module_folder": 1 if folder.get("module_folder") else 0,
+             "mat_folder": 1 if folder.get("mat_folder") else 0,
              "parent_id": folder.get("parent_id") or None,
              "sort_order": folder.get("sort_order", 0)},
         )
@@ -299,6 +437,15 @@ async def update_module_folder(module_id: str, request: Request):
     else:
         cfg.pop("folder_id", None)
     schema_path.write_text(json.dumps(cfg, indent=2))
+    return {"ok": True}
+
+@app.patch("/api/materials-library/{mat_id}/folder")
+async def update_material_folder(mat_id: str, request: Request):
+    """Set (or clear) the folder_id for a material library entry."""
+    body = await request.json()
+    folder_id = body.get("folder_id") or None
+    with get_db() as conn:
+        conn.execute("UPDATE materials_library SET folder_id=? WHERE id=?", (folder_id, mat_id))
     return {"ok": True}
 
 @app.delete("/api/folders/{folder_id}")
@@ -331,15 +478,19 @@ async def reorder_folders(request: Request):
 def list_samples():
     with get_db() as conn:
         rows = conn.execute("SELECT * FROM samples ORDER BY date DESC, created_at DESC").fetchall()
-    return [row_to_sample(r) for r in rows]
+        samples = [row_to_sample(r) for r in rows]
+        _enrich_samples_counts(conn, samples)
+    return samples
 
 @app.get("/api/samples/{sample_id}")
 def get_sample(sample_id: str):
     with get_db() as conn:
         row = conn.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Sample not found")
-    return row_to_sample(row)
+        if not row:
+            raise HTTPException(404, "Sample not found")
+        sample = row_to_sample(row)
+        _enrich_sample_counts(conn, sample)
+    return sample
 
 @app.post("/api/samples")
 def create_sample(sample: dict):
@@ -515,6 +666,7 @@ def put_settings(body: dict):
 def list_materials():
     with get_db() as conn:
         rows = conn.execute("SELECT layers FROM samples").fetchall()
+        lib_rows = conn.execute("SELECT name FROM materials_library WHERE name != ''").fetchall()
     materials = set()
     for row in rows:
         layers = json.loads(row["layers"] or "[]")
@@ -523,7 +675,171 @@ def list_materials():
                 m = target.get("material", "").strip()
                 if m:
                     materials.add(m)
+    for r in lib_rows:
+        materials.add(r["name"])
     return sorted(materials)
+
+
+# ── Materials Library ─────────────────────────────────────────────────────────
+
+@app.get("/api/materials-library")
+def list_materials_library():
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM materials_library ORDER BY name").fetchall()
+    return [_mat_row_to_dict(r) for r in rows]
+
+@app.post("/api/materials-library")
+def create_material_library_entry(body: dict = Body(...)):
+    with get_db() as conn:
+        existing = {r["id"] for r in conn.execute("SELECT id FROM materials_library").fetchall()}
+        mat_id = body.get("id") or _make_mat_id(body.get("name", "material"), existing)
+        if mat_id in existing:
+            mat_id = _make_mat_id(mat_id, existing)
+        conn.execute(
+            "INSERT INTO materials_library (id,name,formula,composition,parent,notes,crystal,properties,growth_defaults) VALUES (?,?,?,?,?,?,?,?,?)",
+            (mat_id, body.get("name",""), body.get("formula",""),
+             json.dumps(body.get("composition",{})), body.get("parent",""),
+             body.get("notes",""), json.dumps(body.get("crystal",{})),
+             json.dumps(body.get("properties",{})), json.dumps(body.get("growth_defaults",{})))
+        )
+        row = conn.execute("SELECT * FROM materials_library WHERE id=?", (mat_id,)).fetchone()
+    return _mat_row_to_dict(row)
+
+@app.put("/api/materials-library/{mat_id}")
+def update_material_library_entry(mat_id: str, body: dict = Body(...)):
+    with get_db() as conn:
+        # Get old name before updating so we can cascade renames
+        old_row = conn.execute("SELECT name FROM materials_library WHERE id=?", (mat_id,)).fetchone()
+        old_name = old_row["name"] if old_row else None
+        new_name = body.get("name", "")
+
+        conn.execute(
+            "UPDATE materials_library SET name=?,formula=?,composition=?,parent=?,notes=?,crystal=?,properties=?,growth_defaults=? WHERE id=?",
+            (new_name, body.get("formula",""),
+             json.dumps(body.get("composition",{})), body.get("parent",""),
+             body.get("notes",""), json.dumps(body.get("crystal",{})),
+             json.dumps(body.get("properties",{})), json.dumps(body.get("growth_defaults",{})),
+             mat_id)
+        )
+
+        # Cascade name change to sample layers and substrates
+        if old_name and new_name and old_name != new_name:
+            rows = conn.execute("SELECT id, layers, substrate FROM samples").fetchall()
+            for row in rows:
+                changed = False
+                # Update layer target material references
+                layers = json.loads(row["layers"] or "[]")
+                for layer in layers:
+                    for target in layer.get("targets", []):
+                        if target.get("material") == old_name:
+                            target["material"] = new_name
+                            changed = True
+                # Update substrate reference
+                substrate = row["substrate"] or ""
+                new_substrate = substrate
+                if substrate == old_name:
+                    new_substrate = new_name
+                    changed = True
+                if changed:
+                    conn.execute(
+                        "UPDATE samples SET layers=?, substrate=? WHERE id=?",
+                        (json.dumps(layers), new_substrate, row["id"])
+                    )
+
+        row = conn.execute("SELECT * FROM materials_library WHERE id=?", (mat_id,)).fetchone()
+    if not row:
+        raise HTTPException(404)
+    return _mat_row_to_dict(row)
+
+@app.delete("/api/materials-library/{mat_id}")
+def delete_material_library_entry(mat_id: str):
+    with get_db() as conn:
+        conn.execute("DELETE FROM materials_library WHERE id=?", (mat_id,))
+    return {"ok": True}
+
+@app.get("/api/materials-library/export")
+def export_materials_library():
+    from fastapi.responses import Response
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM materials_library ORDER BY name").fetchall()
+    data = json.dumps([_mat_row_to_dict(r) for r in rows], indent=2)
+    return Response(
+        content=data,
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=materials-library.json"},
+    )
+
+@app.post("/api/materials-library/import-preview")
+def import_materials_preview(body: list = Body(...)):
+    with get_db() as conn:
+        existing = {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM materials_library").fetchall()}
+    to_add = []
+    conflicts = []
+    for mat in body:
+        name = (mat.get("name") or "").strip()
+        if not name:
+            continue
+        if name in existing:
+            conflicts.append({"name": name, "incoming": mat})
+        else:
+            to_add.append(mat)
+    return {"to_add": to_add, "conflicts": conflicts}
+
+@app.post("/api/materials-library/import")
+def import_materials(body: dict = Body(...)):
+    materials   = body.get("materials", [])
+    resolutions = body.get("resolutions", {})  # {name: "skip"|"overwrite"|"merge"}
+    with get_db() as conn:
+        existing     = {r["name"]: _mat_row_to_dict(r) for r in conn.execute("SELECT * FROM materials_library").fetchall()}
+        existing_ids = {r["id"] for r in conn.execute("SELECT id FROM materials_library").fetchall()}
+        imported = skipped = 0
+        for mat in materials:
+            name = (mat.get("name") or "").strip()
+            if not name:
+                continue
+            if name in existing:
+                res = resolutions.get(name, "skip")
+                if res == "skip":
+                    skipped += 1
+                    continue
+                elif res == "overwrite":
+                    conn.execute(
+                        "UPDATE materials_library SET formula=?,composition=?,parent=?,notes=?,crystal=?,properties=?,growth_defaults=? WHERE name=?",
+                        (mat.get("formula",""), json.dumps(mat.get("composition",{})),
+                         mat.get("parent",""), mat.get("notes",""),
+                         json.dumps(mat.get("crystal",{})), json.dumps(mat.get("properties",{})),
+                         json.dumps(mat.get("growth_defaults",{})), name)
+                    )
+                    imported += 1
+                elif res == "merge":
+                    ex = existing[name]
+                    merged_crystal  = {**ex["crystal"],  **{k: v for k, v in mat.get("crystal",  {}).items() if v not in ("", None)}}
+                    merged_props    = {**ex["properties"],**mat.get("properties", {})}
+                    merged_defaults = {**ex["growth_defaults"], **mat.get("growth_defaults", {})}
+                    conn.execute(
+                        "UPDATE materials_library SET formula=?,composition=?,parent=?,notes=?,crystal=?,properties=?,growth_defaults=? WHERE name=?",
+                        (mat.get("formula","") or ex["formula"],
+                         json.dumps(mat.get("composition","{}") or ex["composition"]),
+                         mat.get("parent","") or ex["parent"],
+                         mat.get("notes","") or ex["notes"],
+                         json.dumps(merged_crystal), json.dumps(merged_props),
+                         json.dumps(merged_defaults), name)
+                    )
+                    imported += 1
+            else:
+                mat_id = mat.get("id") or _make_mat_id(name, existing_ids)
+                if mat_id in existing_ids:
+                    mat_id = _make_mat_id(mat_id, existing_ids)
+                existing_ids.add(mat_id)
+                conn.execute(
+                    "INSERT INTO materials_library (id,name,formula,composition,parent,notes,crystal,properties,growth_defaults) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (mat_id, name, mat.get("formula",""), json.dumps(mat.get("composition",{})),
+                     mat.get("parent",""), mat.get("notes",""), json.dumps(mat.get("crystal",{})),
+                     json.dumps(mat.get("properties",{})), json.dumps(mat.get("growth_defaults",{})))
+                )
+                imported += 1
+        rows = conn.execute("SELECT * FROM materials_library ORDER BY name").fetchall()
+    return {"imported": imported, "skipped": skipped, "materials": [_mat_row_to_dict(r) for r in rows]}
 
 
 # ── File upload / retrieval ───────────────────────────────────────────────────
@@ -544,6 +860,95 @@ def get_file(sample_id: str, filename: str):
         raise HTTPException(404, "File not found")
     from fastapi.responses import FileResponse
     return FileResponse(path)
+
+
+# ── Sputter deposition logs ───────────────────────────────────────────────────
+# One log file = one deposited layer. The raw CSV is stored under FILES_DIR; the
+# layer records the filename (frontend owns layer editing). Parsing happens
+# server-side (wide CSVs, timestamp handling, window stats) and on demand.
+
+@app.post("/api/samples/{sample_id}/sputter-log")
+async def upload_sputter_log(sample_id: str, file: UploadFile = File(...)):
+    """Store a deposition-log CSV and return its parsed structure."""
+    from sputter_log import parse_sputter_log
+
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+
+    result = parse_sputter_log(text)
+    if result is None:
+        raise HTTPException(422, "File does not look like a sputter deposition log")
+
+    dest_dir = FILES_DIR / sample_id
+    dest_dir.mkdir(exist_ok=True)
+    dest = dest_dir / f"sputterlog_{file.filename}"
+    dest.write_bytes(raw)
+
+    return {"ok": True, "filename": dest.name, "data": result}
+
+
+@app.get("/api/samples/{sample_id}/sputter-log/{filename}")
+def get_sputter_log(sample_id: str, filename: str):
+    """Re-read a stored deposition log and return its parsed structure."""
+    from sputter_log import parse_sputter_log
+
+    path = FILES_DIR / sample_id / filename
+    if not path.exists():
+        raise HTTPException(404, "Log file not found")
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+    result = parse_sputter_log(text)
+    if result is None:
+        raise HTTPException(422, "Stored file could not be parsed")
+    return {"ok": True, "filename": filename, "data": result}
+
+
+# ── PUND ferroelectric sweeps ─────────────────────────────────────────────────
+# One metadata.csv per stage (A1–A4). The stage is identified by the swept column
+# (files are all named "metadata.csv" and the runID varies), so each file is routed
+# to a stage and saved per-stage as pund_<stage>.csv regardless of which card it
+# was dropped on.
+
+@app.post("/api/samples/{sample_id}/pund")
+async def upload_pund(sample_id: str, file: UploadFile = File(...)):
+    from modules.pund import STAGE_BY_SWEPT
+    m = mod_registry.get("pund")
+    if not m:
+        raise HTTPException(500, "PUND module not loaded")
+    raw = await file.read()
+    result = m.parse(raw, file.filename, {})
+    if result is None:
+        raise HTTPException(422, "File is not a recognizable PUND metadata.csv")
+    stage_info = STAGE_BY_SWEPT.get(result.get("swept_key"))
+    if not stage_info:
+        raise HTTPException(422, f"Unrecognized swept parameter '{result.get('swept_key')}'")
+    stage_id, stage_label = stage_info
+
+    dest_dir = FILES_DIR / sample_id
+    dest_dir.mkdir(exist_ok=True)
+    fn = f"pund_{stage_id}.csv"
+    (dest_dir / fn).write_bytes(raw)
+    return {"ok": True, "stage": stage_id, "stage_label": stage_label, "filename": fn, "data": result}
+
+
+@app.get("/api/samples/{sample_id}/pund/{filename}")
+def get_pund(sample_id: str, filename: str):
+    m = mod_registry.get("pund")
+    if not m:
+        raise HTTPException(500, "PUND module not loaded")
+    path = FILES_DIR / sample_id / filename
+    if not path.exists():
+        raise HTTPException(404, "PUND file not found")
+    result = m.parse(path.read_bytes(), filename, {})
+    if result is None:
+        raise HTTPException(422, "Stored file could not be parsed")
+    return {"ok": True, "filename": filename, "data": result}
 
 
 @app.post("/api/samples/import-preview")
@@ -703,6 +1108,36 @@ async def import_sample(file: UploadFile = File(...), merge: bool = False, confi
             dest.write_bytes(zf.read(entry))
             files_written += 1
 
+    # Restore module_files rows from manifest if present
+    mf_json_name = next((n for n in names if n.endswith("/module_files.json")), None)
+    if mf_json_name:
+        try:
+            mf_manifest = json.loads(zf.read(mf_json_name))
+        except Exception:
+            mf_manifest = []
+        if mf_manifest:
+            with get_db() as conn:
+                if action in ("overwrite",) or merge:
+                    conn.execute(
+                        "DELETE FROM module_files WHERE sample_id=?", (sample_id,)
+                    )
+                for entry in mf_manifest:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO module_files
+                           (id, sample_id, module_id, filename, params, is_primary, uploaded_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            str(uuid.uuid4()),  # fresh UUID — avoid collision on re-import
+                            sample_id,
+                            entry.get("module_id", ""),
+                            entry.get("filename", ""),
+                            json.dumps(entry.get("params", {})),
+                            1 if entry.get("is_primary") else 0,
+                            entry.get("uploaded_at"),
+                        ),
+                    )
+                conn.commit()
+
     zf.close()
     return {"ok": True, "id": sample_id, "files_written": files_written, "files_skipped": files_skipped}
 
@@ -742,6 +1177,20 @@ def export_sample(sample_id: str):
 
     sample_data = row_to_sample(row)
 
+    with get_db() as conn:
+        mf_rows = conn.execute(
+            "SELECT * FROM module_files WHERE sample_id=? ORDER BY module_id, is_primary DESC, uploaded_at ASC",
+            (sample_id,),
+        ).fetchall()
+    mf_manifest = [
+        {
+            "id": r["id"], "module_id": r["module_id"], "filename": r["filename"],
+            "params": json.loads(r["params"] or "{}"),
+            "is_primary": bool(r["is_primary"]), "uploaded_at": r["uploaded_at"],
+        }
+        for r in mf_rows
+    ]
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         # 1. sample metadata as JSON
@@ -755,6 +1204,9 @@ def export_sample(sample_id: str):
             for p in sorted(dest_dir.iterdir()):
                 if p.is_file():
                     zf.write(p, arcname=f"{sample_id}/files/{p.name}")
+        # 3. module_files manifest (no extra file copies — files already in /files/)
+        if mf_manifest:
+            zf.writestr(f"{sample_id}/module_files.json", json.dumps(mf_manifest, indent=2))
 
     buf.seek(0)
 
@@ -962,6 +1414,9 @@ def list_modules():
         info["analysis_metrics"] = cfg.get("analysis_metrics", [])
         info["analysis_code"]    = cfg.get("analysis_code", "")
         info["folder_id"]        = cfg.get("folder_id", None)
+        info["file_mode"]        = cfg.get("file_mode", "single")
+        info["upstream"]         = cfg.get("upstream", [])
+        info["config_schema"]    = cfg.get("config_schema", [])
         result.append(info)
     return result
 
@@ -984,18 +1439,28 @@ def get_module_source(module_id: str):
 
 @app.delete("/api/samples/{sample_id}/module-files/{module_id}")
 def delete_module_file(sample_id: str, module_id: str):
-    """Remove a module's file from a sample — deletes the file and clears the filenames entry."""
+    """Remove ALL files for a module on a sample — deletes from disk, module_files table, and legacy filenames."""
     with get_db() as conn:
         row = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Sample not found")
-    filenames = json.loads(row["filenames"] or "{}")
-    filename = filenames.pop(module_id, None)
-    if filename:
-        fp = FILES_DIR / sample_id / filename
-        if fp.exists():
+        if not row:
+            raise HTTPException(404, "Sample not found")
+        # Delete all module_files rows for this sample+module and remove from disk
+        mf_rows = conn.execute(
+            "SELECT filename FROM module_files WHERE sample_id=? AND module_id=?",
+            (sample_id, module_id),
+        ).fetchall()
+        for mf in mf_rows:
+            fp = FILES_DIR / sample_id / mf["filename"]
             fp.unlink(missing_ok=True)
-    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM module_files WHERE sample_id=? AND module_id=?", (sample_id, module_id)
+        )
+        # Also clear legacy filenames entry + delete that file if not already deleted
+        filenames = json.loads(row["filenames"] or "{}")
+        legacy_fname = filenames.pop(module_id, None)
+        if legacy_fname:
+            fp = FILES_DIR / sample_id / legacy_fname
+            fp.unlink(missing_ok=True)
         conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(filenames), sample_id))
         conn.commit()
     return {"ok": True}
@@ -1003,22 +1468,147 @@ def delete_module_file(sample_id: str, module_id: str):
 
 @app.post("/api/samples/{sample_id}/upload-module-file")
 async def upload_module_file(sample_id: str, module_id: str = Query(...), file: UploadFile = File(...)):
-    """Save a data file for a module on a sample, update filenames dict. No parsing."""
+    """Legacy single-file upload. Saves file, updates filenames dict AND module_files table."""
     with get_db() as conn:
         row = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, f"Sample '{sample_id}' not found")
+        if not row:
+            raise HTTPException(404, f"Sample '{sample_id}' not found")
+        dest_dir = FILES_DIR / sample_id
+        dest_dir.mkdir(exist_ok=True)
+        file_bytes = await file.read()
+        dest = dest_dir / f"{module_id}_{file.filename}"
+        dest.write_bytes(file_bytes)
+        # Update legacy filenames dict
+        filenames = json.loads(row["filenames"] or "{}")
+        filenames[module_id] = dest.name
+        conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(filenames), sample_id))
+        # Upsert into module_files table (clear old single-file entry, insert fresh primary)
+        conn.execute(
+            "DELETE FROM module_files WHERE sample_id=? AND module_id=?", (sample_id, module_id)
+        )
+        conn.execute(
+            "INSERT INTO module_files (id, sample_id, module_id, filename, params, is_primary) VALUES (?,?,?,?,?,?)",
+            (str(uuid.uuid4()), sample_id, module_id, dest.name, "{}", 1),
+        )
+    return {"ok": True, "filename": dest.name}
+
+
+# ── Module files CRUD ──────────────────────────────────────────────────────────
+
+@app.post("/api/samples/{sample_id}/module-files/{module_id}")
+async def add_module_file(sample_id: str, module_id: str, file: UploadFile = File(...)):
+    """Add a file to a module's collection for a sample. First file becomes primary."""
     dest_dir = FILES_DIR / sample_id
     dest_dir.mkdir(exist_ok=True)
     file_bytes = await file.read()
     dest = dest_dir / f"{module_id}_{file.filename}"
     dest.write_bytes(file_bytes)
-    filenames = json.loads(row["filenames"] or "{}")
-    filenames[module_id] = dest.name
     with get_db() as conn:
-        conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(filenames), sample_id))
-        conn.commit()
-    return {"ok": True, "filename": dest.name}
+        existing = conn.execute(
+            "SELECT COUNT(*) as n FROM module_files WHERE sample_id=? AND module_id=?",
+            (sample_id, module_id),
+        ).fetchone()
+        is_primary = 1 if existing["n"] == 0 else 0
+        file_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO module_files (id, sample_id, module_id, filename, params, is_primary) VALUES (?,?,?,?,?,?)",
+            (file_id, sample_id, module_id, dest.name, "{}", is_primary),
+        )
+        # Keep legacy filenames in sync if this is the primary
+        if is_primary:
+            row = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
+            if row:
+                fns = json.loads(row["filenames"] or "{}")
+                fns[module_id] = dest.name
+                conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(fns), sample_id))
+        mf = _get_module_files(conn, sample_id, module_id)
+    return {"ok": True, "file": next(f for f in mf if f["id"] == file_id), "all_files": mf}
+
+
+@app.get("/api/samples/{sample_id}/module-files/{module_id}")
+def get_module_files(sample_id: str, module_id: str):
+    """List all files in a module's collection for a sample."""
+    with get_db() as conn:
+        return _get_module_files(conn, sample_id, module_id)
+
+
+@app.delete("/api/samples/{sample_id}/module-files/{module_id}/{file_id}")
+def delete_module_file(sample_id: str, module_id: str, file_id: str):
+    """Delete a specific file from a module's collection."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT filename, is_primary FROM module_files WHERE id=? AND sample_id=? AND module_id=?",
+            (file_id, sample_id, module_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "File record not found")
+        # Delete from disk
+        fp = FILES_DIR / sample_id / row["filename"]
+        if fp.exists():
+            fp.unlink()
+        conn.execute("DELETE FROM module_files WHERE id=?", (file_id,))
+        # If deleted was primary, promote the oldest remaining file
+        if row["is_primary"]:
+            next_row = conn.execute(
+                "SELECT id FROM module_files WHERE sample_id=? AND module_id=? ORDER BY uploaded_at ASC LIMIT 1",
+                (sample_id, module_id),
+            ).fetchone()
+            if next_row:
+                conn.execute("UPDATE module_files SET is_primary=1 WHERE id=?", (next_row["id"],))
+                # Sync legacy filenames
+                new_primary = conn.execute(
+                    "SELECT filename FROM module_files WHERE id=?", (next_row["id"],)
+                ).fetchone()
+                if new_primary:
+                    frow = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
+                    if frow:
+                        fns = json.loads(frow["filenames"] or "{}")
+                        fns[module_id] = new_primary["filename"]
+                        conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(fns), sample_id))
+            else:
+                # No files remain — remove from legacy filenames
+                frow = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
+                if frow:
+                    fns = json.loads(frow["filenames"] or "{}")
+                    fns.pop(module_id, None)
+                    conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(fns), sample_id))
+        remaining = _get_module_files(conn, sample_id, module_id)
+    return {"ok": True, "remaining": remaining}
+
+
+@app.patch("/api/samples/{sample_id}/module-files/{module_id}/{file_id}")
+async def update_module_file(sample_id: str, module_id: str, file_id: str, request: Request):
+    """Update params and/or set as primary for a specific file."""
+    body = await request.json()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM module_files WHERE id=? AND sample_id=? AND module_id=?",
+            (file_id, sample_id, module_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "File record not found")
+        if "params" in body:
+            conn.execute(
+                "UPDATE module_files SET params=? WHERE id=?",
+                (json.dumps(body["params"]), file_id),
+            )
+        if body.get("is_primary"):
+            # Clear all primaries for this (sample, module), set this one
+            conn.execute(
+                "UPDATE module_files SET is_primary=0 WHERE sample_id=? AND module_id=?",
+                (sample_id, module_id),
+            )
+            conn.execute("UPDATE module_files SET is_primary=1 WHERE id=?", (file_id,))
+            # Sync legacy filenames
+            new_fn = conn.execute("SELECT filename FROM module_files WHERE id=?", (file_id,)).fetchone()
+            if new_fn:
+                frow = conn.execute("SELECT filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
+                if frow:
+                    fns = json.loads(frow["filenames"] or "{}")
+                    fns[module_id] = new_fn["filename"]
+                    conn.execute("UPDATE samples SET filenames=? WHERE id=?", (json.dumps(fns), sample_id))
+        updated = _get_module_files(conn, sample_id, module_id)
+    return {"ok": True, "files": updated}
 
 
 @app.post("/api/modules/{module_id}/parse")
@@ -1173,6 +1763,11 @@ async def import_module_preview(file: UploadFile = File(...)):
     builtin_path = BASE_DIR / "modules" / f"{module_id}.py"
     exists = user_path.exists() or builtin_path.exists()
 
+    raw_deps = schema.get("dependencies", [])
+    dep_status = [_check_dep(d) for d in raw_deps]
+    any_blocked = any(s["blocked"] for s in dep_status)
+    any_missing = any(not s["installed"] and not s["blocked"] for s in dep_status)
+
     return {
         "module_id":    module_id,
         "name":         schema.get("name", module_id),
@@ -1180,7 +1775,9 @@ async def import_module_preview(file: UploadFile = File(...)):
         "author":       schema.get("author", ""),
         "description":  schema.get("description", ""),
         "accepts":      schema.get("accepts", []),
-        "dependencies": schema.get("dependencies", []),
+        "dependencies": dep_status,
+        "has_blocked_deps": any_blocked,
+        "has_missing_deps": any_missing,
         "exists":       exists,
         "builtin":      builtin_path.exists(),
         "source_code":  source_code,
@@ -1222,6 +1819,32 @@ async def import_module(file: UploadFile = File(...), config: str = "{}"):
     if action == "skip":
         return {"ok": True, "module_id": module_id, "skipped": True}
 
+    # Read schema early to check/install dependencies before writing files
+    schema = {}
+    if "schema.json" in names:
+        schema = json.loads(zf.read("schema.json"))
+    raw_deps = schema.get("dependencies", [])
+
+    # Install dependencies (skip blocked ones — caller saw them in preview)
+    dep_results = []
+    dep_errors  = []
+    for dep in raw_deps:
+        status = _check_dep(dep)
+        if status["blocked"]:
+            dep_errors.append(f"Blocked dep: {dep}")
+        elif not status["installed"]:
+            r = _install_dep(dep)
+            dep_results.append(r)
+            if not r["ok"]:
+                dep_errors.append(f"Failed to install {dep}: {r.get('error','')}")
+        else:
+            dep_results.append({**status, "ok": True, "skipped": True})
+
+    if dep_errors:
+        return {"ok": False, "module_id": module_id,
+                "error": "Dependency installation failed",
+                "dep_errors": dep_errors, "dep_results": dep_results}
+
     installed = []
 
     # Install Python source
@@ -1234,8 +1857,7 @@ async def import_module(file: UploadFile = File(...), config: str = "{}"):
             raise HTTPException(422, f"Invalid module source: {e}")
 
     # Install schema / config (update module_id in schema if renamed)
-    if "schema.json" in names:
-        schema = json.loads(zf.read("schema.json"))
+    if schema:
         if action == "rename" and new_id:
             schema["id"] = new_id
         schema_path = SCHEMAS_DIR / f"{module_id}.json"
@@ -1253,7 +1875,8 @@ async def import_module(file: UploadFile = File(...), config: str = "{}"):
         dest.write_bytes(zf.read(entry))
         installed.append("example")
 
-    return {"ok": True, "module_id": module_id, "installed": installed}
+    return {"ok": True, "module_id": module_id, "installed": installed,
+            "dep_results": dep_results}
 
 
 @app.get("/api/books/{book_id}/export")
@@ -1724,6 +2347,467 @@ def save_module_config(module_id: str, body: dict):
     return {"ok": True}
 
 
+def _resolve_default_from(spec: str, ctx: dict) -> object:
+    """Look up `spec` (a dotted path) against ctx and return the value, or None."""
+    if not spec or not isinstance(spec, str):
+        return None
+    cur = ctx
+    for part in spec.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
+
+
+def _materialize_layer_fields(template: list, prefix: str, group_label: str,
+                              layer_ctx: dict) -> list:
+    """Expand a per-layer schema template into concrete config_schema entries.
+
+    template:    list of field templates. Supported keys:
+                   id, label, type, unit, fittable, default, default_from
+                   min, max                — static bounds
+                   min_factor, max_factor  — bounds = factor × nominal (multiplicative)
+                   min_offset, max_offset  — bounds = nominal + offset (additive)
+                 `id` is the SUFFIX — materialized id is `{prefix}_{id}`.
+    prefix:      string prefix for this materialization.
+    group_label: human-readable group (e.g. "Layer 1 (SRO)").
+    layer_ctx:   dict with {layer, material} for default_from resolution.
+    """
+    out = []
+    for tmpl in template:
+        materialized = dict(tmpl)
+        suffix = tmpl.get("id", "field")
+        materialized["id"] = f"{prefix}_{suffix}"
+        if "label" in tmpl:
+            materialized["label"] = f"{group_label} — {tmpl['label']}"
+
+        # Resolve default_from. Track whether it resolved — relative bounds
+        # only apply when we have a real per-layer nominal; static min/max in
+        # the template act as fallbacks when default_from is missing or null.
+        nominal = materialized.get("default")
+        df_resolved = False
+        if "default_from" in tmpl:
+            v = _resolve_default_from(tmpl["default_from"], layer_ctx)
+            if v is not None:
+                nominal = v
+                materialized["default"] = v
+                df_resolved = True
+            materialized.pop("default_from", None)
+
+        try:
+            nom = float(nominal) if nominal is not None else None
+        except (ValueError, TypeError):
+            nom = None
+
+        # Apply relative directives only when the nominal is data-backed.
+        # If df_resolved is False, the static min/max from the template (if any)
+        # remain as fallback bounds. If both relative and static are given, the
+        # relative wins when df_resolved.
+        if nom is not None and df_resolved:
+            if "min_factor" in tmpl:
+                materialized["min"] = nom * float(tmpl["min_factor"])
+            if "max_factor" in tmpl:
+                materialized["max"] = nom * float(tmpl["max_factor"])
+            if "min_offset" in tmpl:
+                materialized["min"] = nom + float(tmpl["min_offset"])
+            if "max_offset" in tmpl:
+                materialized["max"] = nom + float(tmpl["max_offset"])
+        # Strip directive keys regardless
+        for k in ("min_factor", "max_factor", "min_offset", "max_offset"):
+            materialized.pop(k, None)
+
+        out.append(materialized)
+    return out
+
+
+@app.get("/api/modules/{module_id}/effective-schema")
+def get_effective_schema(module_id: str, sample_id: str):
+    """Return the module's config_schema with per-layer entries materialized
+    against the given sample's layers/substrate.
+
+    Module schema may declare:
+      - per_layer_schema: [field templates] — expanded once per user layer
+      - per_substrate_schema: [field templates] — expanded once for the bulk
+                              substrate (and once per buffer layer if the
+                              substrate has substrate_stack metadata)
+
+    Each template uses `id` as a suffix. The materialized id is
+    `{prefix}_{suffix}` where prefix is `layer_{i}`, `buffer_{i}`, or
+    `substrate`. Templates may use `default_from` (dotted path against
+    {layer, material}) to pull initial values from the sample.
+
+    Modules without these templates return their static config_schema unchanged.
+    """
+    schema = _load_schema(module_id)
+    if schema is None:
+        raise HTTPException(404, f"Module '{module_id}' not found")
+
+    base_fields = list(schema.get("config_schema", []))
+    layer_tmpl     = schema.get("per_layer_schema", []) or []
+    substrate_tmpl = schema.get("per_substrate_schema", []) or []
+
+    # If neither template is set, this is a no-op — return as-is for compatibility
+    if not layer_tmpl and not substrate_tmpl:
+        return {"config_schema": base_fields, "layers": [], "substrate": None}
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT layers, substrate FROM samples WHERE id=?", (sample_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, f"Sample '{sample_id}' not found")
+        layers    = json.loads(row["layers"] or "[]")
+        substrate = row["substrate"]
+
+        # Look up the substrate material to find its substrate_stack (if any)
+        substrate_mat = None
+        if substrate:
+            mr = conn.execute("SELECT * FROM materials_library WHERE name=?", (substrate,)).fetchone()
+            substrate_mat = _mat_row_to_dict(mr) if mr else None
+
+        # Pre-fetch material rows for all referenced layer materials in one pass
+        all_names = set()
+        for lyr in layers:
+            for t in (lyr.get("targets") or []):
+                if t.get("material"):
+                    all_names.add(t["material"])
+        if substrate_mat and substrate_mat.get("properties", {}).get("substrate_stack"):
+            for buf in substrate_mat["properties"]["substrate_stack"]:
+                if buf.get("material"):
+                    all_names.add(buf["material"])
+        materials_by_name = {}
+        if all_names:
+            placeholders = ",".join("?" * len(all_names))
+            rows = conn.execute(
+                f"SELECT * FROM materials_library WHERE name IN ({placeholders})",
+                tuple(all_names),
+            ).fetchall()
+            for r in rows:
+                m = _mat_row_to_dict(r)
+                materials_by_name[m["name"]] = m
+
+    # Build expanded entries
+    expanded = []
+
+    # User layers (deposition order: layers[0] = first deposited / bottom)
+    for i, lyr in enumerate(layers):
+        # Pick the first target's material as the layer's primary material
+        tgt = (lyr.get("targets") or [{}])[0]
+        mat_name = tgt.get("material") or ""
+        mat      = materials_by_name.get(mat_name)
+        thick    = lyr.get("thickness_nm")
+        group    = f"Layer {i+1}" + (f" ({mat_name})" if mat_name else "")
+        ctx = {
+            "layer":    {"thickness_nm": thick, "material": mat_name, **(lyr or {})},
+            "material": mat or {},
+        }
+        expanded.extend(_materialize_layer_fields(layer_tmpl, f"layer_{i}", group, ctx))
+
+    # Substrate buffer layers (from substrate_stack metadata, if any)
+    sub_props = (substrate_mat or {}).get("properties", {})
+    sub_stack = sub_props.get("substrate_stack") or []
+    bulk_material_name = substrate or ""
+    if sub_stack:
+        # Last entry in substrate_stack with no thickness = bulk; everything else is a buffer
+        for i, buf in enumerate(sub_stack):
+            buf_mat_name = buf.get("material") or ""
+            buf_thick    = buf.get("thickness_nm")
+            buf_mat      = materials_by_name.get(buf_mat_name)
+            ctx = {
+                "layer":    {"thickness_nm": buf_thick, "material": buf_mat_name},
+                "material": buf_mat or {},
+            }
+            if buf_thick is None:
+                # This is the bulk
+                bulk_material_name = buf_mat_name or bulk_material_name
+                bulk_mat_for_substrate = buf_mat
+                continue
+            group = f"Buffer {i+1}" + (f" ({buf_mat_name})" if buf_mat_name else "")
+            expanded.extend(_materialize_layer_fields(layer_tmpl, f"buffer_{i}", group, ctx))
+
+    # Bulk substrate — applies per_substrate_schema once
+    bulk_mat = materials_by_name.get(bulk_material_name) or substrate_mat
+    sub_ctx = {
+        "layer":    {"material": bulk_material_name},
+        "material": bulk_mat or {},
+    }
+    sub_group = f"Substrate ({bulk_material_name})" if bulk_material_name else "Substrate"
+    expanded.extend(_materialize_layer_fields(substrate_tmpl, "substrate", sub_group, sub_ctx))
+
+    return {
+        "config_schema": base_fields + expanded,
+        "layers":        layers,
+        "substrate":     substrate,
+        "bulk_material": bulk_material_name,
+    }
+
+
+@app.get("/api/modules/{module_id}/dependencies")
+def get_module_dependencies(module_id: str):
+    """Return dependency status for a module's declared dependencies."""
+    schema = _load_schema(module_id) or {}
+    deps = schema.get("dependencies", [])
+    return {"dependencies": [_check_dep(d) for d in deps]}
+
+
+@app.post("/api/modules/{module_id}/install-dependencies")
+def install_module_dependencies(module_id: str):
+    """Install any missing (non-blocked) dependencies for a module."""
+    schema = _load_schema(module_id) or {}
+    deps = schema.get("dependencies", [])
+    results = []
+    for d in deps:
+        status = _check_dep(d)
+        if status["blocked"]:
+            results.append({**status, "ok": False})
+        elif status["installed"]:
+            results.append({**status, "ok": True, "skipped": True})
+        else:
+            results.append(_install_dep(d))
+    all_ok = all(r.get("ok") or r.get("skipped") for r in results)
+    return {"ok": all_ok, "results": results}
+
+
+@app.patch("/api/samples/{sample_id}/module-config/{module_id}")
+async def update_sample_module_config(sample_id: str, module_id: str, request: Request):
+    """Persist per-sample, per-module configuration values.
+    Body: dict of { field_id: value } for this module only.
+    Merges into the existing module_config JSON stored on the sample."""
+    body = await request.json()
+    with get_db() as conn:
+        row = conn.execute("SELECT module_config FROM samples WHERE id=?", (sample_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"Sample '{sample_id}' not found")
+        mc = json.loads(row["module_config"] or "{}")
+        mc[module_id] = {**(mc.get(module_id) or {}), **body}
+        conn.execute("UPDATE samples SET module_config=? WHERE id=?", (json.dumps(mc), sample_id))
+    return {"ok": True}
+
+
+@app.post("/api/settings/install-packages")
+async def install_global_packages(request: Request):
+    """Install all packages listed in settings.extra_packages."""
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key='main'").fetchone()
+    settings = json.loads(row["value"] if row else "{}" or "{}")
+    packages = settings.get("extra_packages", [])
+    results = []
+    for p in packages:
+        status = _check_dep(p)
+        if status["blocked"]:
+            results.append({**status, "ok": False})
+        elif status["installed"]:
+            results.append({**status, "ok": True, "skipped": True})
+        else:
+            results.append(_install_dep(p))
+    return {"ok": all(r.get("ok") or r.get("skipped") for r in results), "results": results}
+
+
+def _build_resource_api() -> dict:
+    """Return a namespace dict of read-only resource functions for injection into proc_code.
+    Each function opens its own short-lived DB connection so this can be called from
+    endpoints that don't already hold one."""
+    def get_material(mat_id):
+        with get_db() as conn:
+            row = conn.execute("SELECT * FROM materials_library WHERE id=?", (mat_id,)).fetchone()
+        return _mat_row_to_dict(row) if row else None
+
+    def list_materials():
+        with get_db() as conn:
+            rows = conn.execute("SELECT id FROM materials_library ORDER BY name").fetchall()
+        return [r["id"] for r in rows]
+
+    def get_technique(tech_id):
+        with get_db() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key='main'").fetchone()
+        if not row:
+            return None
+        s = json.loads(row["value"] or "{}")
+        return s.get("techniques", {}).get(tech_id)
+
+    def list_techniques():
+        with get_db() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key='main'").fetchone()
+        if not row:
+            return []
+        s = json.loads(row["value"] or "{}")
+        return list(s.get("techniques", {}).keys())
+
+    return dict(
+        get_material=get_material,
+        list_materials=list_materials,
+        get_technique=get_technique,
+        list_techniques=list_techniques,
+    )
+
+
+def _resolve_upstream(conn, sample_id: str, module_id: str, body_cache: dict | None = None,
+                      depth: int = 0, _visited: set | None = None) -> dict:
+    """Resolve upstream data dependencies for a module against a sample.
+
+    Returns dict keyed by upstream module id:
+        { id, name, result, analysis, input: {filename, file_bytes, files, registry, config} }
+
+    If body_cache contains an entry for an upstream id, it's used verbatim instead of
+    recomputing. The caller (e.g. fit workspace) can pass cached upstream results to
+    skip re-running upstream proc_code on every iteration.
+
+    Cycle detection: depth limit (10) + visited set.
+    """
+    if depth > 10:
+        raise ValueError(f"Upstream chain too deep (>10) — possible cycle at '{module_id}'")
+    visited = (_visited or set()) | {module_id}
+
+    schema = _load_schema(module_id) or {}
+    upstream_decl = schema.get("upstream", []) or []
+    if not upstream_decl:
+        return {}
+
+    body_cache = body_cache or {}
+    out: dict = {}
+
+    row = conn.execute(
+        "SELECT filenames, module_config FROM samples WHERE id=?", (sample_id,)
+    ).fetchone()
+    if not row:
+        raise ValueError(f"Sample '{sample_id}' not found")
+    sample_filenames  = json.loads(row["filenames"]      or "{}")
+    sample_mod_config = json.loads(row["module_config"]  or "{}")
+
+    for entry in upstream_decl:
+        u_id     = entry.get("id")
+        required = entry.get("required", True)
+        if not u_id:
+            continue
+        if u_id in visited:
+            raise ValueError(f"Upstream cycle: '{module_id}' → '{u_id}' (already in chain)")
+
+        # Cache hit
+        if u_id in body_cache:
+            cached = body_cache[u_id]
+            u_schema_for_name = _load_schema(u_id) or {}
+            out[u_id] = {
+                "id":       u_id,
+                "name":     u_schema_for_name.get("name", u_id),
+                "result":   cached.get("result"),
+                "analysis": cached.get("analysis"),
+                "input":    cached.get("input") or {"filename": None, "file_bytes": None,
+                                                      "files": {}, "registry": [], "config": {}},
+            }
+            continue
+
+        u_schema = _load_schema(u_id)
+        if not u_schema:
+            if required:
+                raise ValueError(f"Upstream module '{u_id}' not found")
+            out[u_id] = None
+            continue
+
+        # Recursively resolve upstream's own upstream first
+        nested = _resolve_upstream(conn, sample_id, u_id, body_cache, depth + 1, visited)
+
+        # Resolve upstream's files
+        try:
+            u_file_bytes, u_filename, u_files, u_registry = _resolve_module_files(
+                conn, sample_id, u_id, sample_filenames
+            )
+        except ValueError as e:
+            if required:
+                raise ValueError(f"Upstream '{u_id}': {e}")
+            out[u_id] = None
+            continue
+
+        # Build upstream's meta from its config schema + sample's saved config
+        u_config = dict(sample_mod_config.get(u_id, {}))
+        for fld in u_schema.get("config_schema", []):
+            u_config.setdefault(fld["id"], fld.get("default"))
+        u_meta = {"config": u_config}
+
+        # Run upstream proc_code
+        u_proc = u_schema.get("proc_code", "")
+        if not u_proc:
+            if required:
+                raise ValueError(f"Upstream '{u_id}' has no proc_code")
+            out[u_id] = None
+            continue
+
+        u_ns = {**_build_resource_api(), "files": u_files, "registry": u_registry,
+                "upstream": nested}
+        u_indented = "\n".join(f"    {line}" for line in u_proc.splitlines())
+        u_wrapped  = f"def _proc(file_bytes, filename, meta):\n{u_indented}\n"
+        try:
+            exec(compile(u_wrapped, f"<upstream:{u_id}:proc>", "exec"), u_ns)   # noqa: S102
+            u_result = u_ns["_proc"](u_file_bytes, u_filename, u_meta)
+        except Exception as exc:
+            raise ValueError(f"Upstream '{u_id}' processing failed: {exc}")
+        if not isinstance(u_result, dict):
+            raise ValueError(f"Upstream '{u_id}' proc_code must return a dict")
+
+        # Optionally run upstream analysis_code (best-effort; failure doesn't block downstream)
+        u_analysis = None
+        u_acode = u_schema.get("analysis_code", "")
+        if u_acode:
+            try:
+                a_ns = {**_build_resource_api(), "upstream": nested,
+                        "params": u_config, "layers": [], "substrate": None}
+                a_ind = "\n".join(f"    {line}" for line in u_acode.splitlines())
+                a_wrap = f"def _analysis(result):\n{a_ind}\n"
+                exec(compile(a_wrap, f"<upstream:{u_id}:analysis>", "exec"), a_ns)   # noqa: S102
+                u_analysis = a_ns["_analysis"](u_result)
+            except Exception:
+                u_analysis = None
+
+        out[u_id] = {
+            "id":       u_id,
+            "name":     u_schema.get("name", u_id),
+            "result":   u_result,
+            "analysis": u_analysis,
+            "input": {
+                "filename":   u_filename,
+                "file_bytes": u_file_bytes,
+                "files":      u_files,
+                "registry":   u_registry,
+                "config":     u_config,
+            },
+        }
+
+    return out
+
+
+def _check_dep(dep_str: str) -> dict:
+    """Check whether a pip dependency is installed and not blacklisted."""
+    pkg_name = re.split(r"[>=<!;\[]", dep_str)[0].strip().replace("-", "_").lower()
+    if pkg_name in _DEP_BLACKLIST:
+        return {"dep": dep_str, "pkg": pkg_name, "installed": False, "blocked": True,
+                "reason": f"Package '{pkg_name}' is not permitted"}
+    installed = importlib.util.find_spec(pkg_name) is not None
+    return {"dep": dep_str, "pkg": pkg_name, "installed": installed, "blocked": False}
+
+
+def _install_dep(dep_str: str) -> dict:
+    """Install a pip dependency. Returns status dict."""
+    pkg_name = re.split(r"[>=<!;\[]", dep_str)[0].strip().replace("-", "_").lower()
+    if pkg_name in _DEP_BLACKLIST:
+        return {"dep": dep_str, "ok": False, "blocked": True,
+                "error": f"Package '{pkg_name}' is not permitted"}
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", dep_str],
+            capture_output=True, text=True, timeout=120,
+        )
+        success = result.returncode == 0
+        return {"dep": dep_str, "ok": success, "blocked": False,
+                "output": result.stdout[-2000:] if result.stdout else "",
+                "error":  result.stderr[-1000:] if not success else ""}
+    except subprocess.TimeoutExpired:
+        return {"dep": dep_str, "ok": False, "blocked": False, "error": "Install timed out"}
+    except Exception as exc:
+        return {"dep": dep_str, "ok": False, "blocked": False, "error": str(exc)}
+
+
 def _json_safe(obj):
     """Recursively convert obj to a JSON-serialisable form."""
     if obj is None or isinstance(obj, (bool, int, float, str)):
@@ -1757,10 +2841,12 @@ def run_module_processing(module_id: str, body: dict):
     # Wrap user code (which uses `return`) in a function
     indented = "\n".join(f"    {line}" for line in code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
-    namespace: dict = {"file_bytes": file_bytes, "filename": filename, "meta": {}}
+    _meta: dict = {"config": {}}
+    namespace: dict = {"file_bytes": file_bytes, "filename": filename, "meta": _meta,
+                       **_build_resource_api()}
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
-        result = namespace["_proc"](file_bytes, filename, {})
+        result = namespace["_proc"](file_bytes, filename, _meta)
         return {"ok": True, "result": _json_safe(result)}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "traceback": tb.format_exc()}
@@ -1770,17 +2856,18 @@ def run_module_processing(module_id: str, body: dict):
 def preview_module_plot(module_id: str, body: dict):
     """Run processing code, then build a Plotly figure from visual plot config."""
     import traceback as tb
-    code       = body.get("code", "")
-    plot_cfg   = body.get("plot_config", {})
-    x_var      = plot_cfg.get("x_var") or "x"
-    y_var      = plot_cfg.get("y_var") or "y"
-    color      = plot_cfg.get("color") or "#94a3b8"
-    opacity    = float(plot_cfg.get("opacity") or 1.0)
-    show_fit   = plot_cfg.get("show_fit", True)
-    fit_color  = plot_cfg.get("fit_color") or None
-    fit_opacity= float(plot_cfg.get("fit_opacity") or 0.6)
-    x_scale    = plot_cfg.get("x_scale") or "linear"
-    y_scale    = plot_cfg.get("y_scale") or "linear"
+    import numpy as np
+    code         = body.get("code", "")
+    plot_cfg     = body.get("plot_config", {})
+    plot_traces_cfg = body.get("plot_traces", [])
+    color        = plot_cfg.get("color") or "#94a3b8"
+    opacity      = float(plot_cfg.get("opacity") or 1.0)
+    show_fit     = plot_cfg.get("show_fit", True)
+    fit_color    = plot_cfg.get("fit_color") or None
+    fit_opacity  = float(plot_cfg.get("fit_opacity") or 0.6)
+    x_scale      = plot_cfg.get("x_scale") or "linear"
+    y1_scale     = plot_cfg.get("y1_scale") or plot_cfg.get("y_scale") or "linear"
+    y2_scale     = plot_cfg.get("y2_scale") or "linear"
 
     f, _ = _find_example(module_id)
     if not f:
@@ -1790,16 +2877,17 @@ def preview_module_plot(module_id: str, body: dict):
     # Run processing code
     indented = "\n".join(f"    {line}" for line in code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
-    namespace: dict = {"file_bytes": file_bytes, "filename": filename, "meta": {}}
+    _meta: dict = {"config": {}}
+    namespace: dict = {"file_bytes": file_bytes, "filename": filename, "meta": _meta,
+                       **_build_resource_api()}
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
-        data = namespace["_proc"](file_bytes, filename, {})
+        data = namespace["_proc"](file_bytes, filename, _meta)
     except Exception as exc:
         return {"ok": False, "stage": "processing", "error": str(exc), "traceback": tb.format_exc()}
     if not isinstance(data, dict):
         return {"ok": False, "stage": "plot", "error": "Processing result must be a dict"}
-    # Extract x/y arrays from result — handle both lists and numpy arrays
-    import numpy as np
+
     def _to_list(v):
         if isinstance(v, np.ndarray):
             return v.tolist()
@@ -1808,20 +2896,72 @@ def preview_module_plot(module_id: str, body: dict):
     def _is_numeric_array(v):
         if isinstance(v, np.ndarray):
             return v.ndim == 1 and np.issubdtype(v.dtype, np.number) and len(v) > 0
-        return isinstance(v, list) and v and isinstance(v[0], (int, float))
+        return isinstance(v, list) and bool(v) and isinstance(v[0], (int, float))
 
-    x_data = data.get(x_var)
-    y_data = data.get(y_var)
-    missing = (x_data is None or (hasattr(x_data, '__len__') and len(x_data) == 0))
-    missing = missing or (y_data is None or (hasattr(y_data, '__len__') and len(y_data) == 0))
+    available_vars = [k for k, v in data.items() if _is_numeric_array(v)]
+
+    # ── Multi-trace mode ──────────────────────────────────────────────────────
+    if plot_traces_cfg:
+        x_label  = plot_cfg.get("x_label") or data.get("x_label") or "x"
+        y1_label = plot_cfg.get("y1_label") or plot_cfg.get("y_label") or data.get("y_label") or "y"
+        y2_label = plot_cfg.get("y2_label") or None
+        has_y2   = any(t.get("axis") == "y2" for t in plot_traces_cfg)
+
+        plotly_traces = []
+        for tr in plot_traces_cfg:
+            x_key  = tr.get("x_key", "x")
+            y_key  = tr.get("y_key", "y")
+            x_data = data.get(x_key)
+            y_data = data.get(y_key)
+            if x_data is None or y_data is None:
+                continue
+            tr_color   = tr.get("color") or color
+            is_fit     = tr.get("style") == "fit"
+            tr_opacity = fit_opacity if is_fit else opacity
+            on_y2      = tr.get("axis") == "y2"
+            lbl        = tr.get("label", y_key)
+            plotly_traces.append({
+                "x": _to_list(x_data), "y": _to_list(y_data),
+                "type": "scatter", "mode": "lines",
+                "name": lbl,
+                "yaxis": "y2" if on_y2 else "y",
+                "opacity": tr_opacity,
+                "line": {"color": tr_color, "width": 1.5, "dash": "dash" if is_fit else "solid"},
+                "hovertemplate": f"%{{x:.3g}}<br>{lbl}: %{{y:.3g}}<extra></extra>",
+            })
+
+        if not plotly_traces:
+            return {"ok": False, "stage": "plot",
+                    "error": f"No trace variables found. Available: {available_vars}"}
+
+        layout = {
+            "xaxis":  {"title": x_label,  "type": x_scale,  "zeroline": True, "zerolinewidth": 1},
+            "yaxis":  {"title": y1_label, "type": y1_scale, "zeroline": True, "zerolinewidth": 1},
+            "margin": {"t": 20, "r": 20 if not has_y2 else 60, "b": 56, "l": 72},
+            "showlegend": len(plotly_traces) > 1, "hovermode": "closest",
+        }
+        if has_y2:
+            layout["yaxis2"] = {
+                "title": y2_label or "y2", "type": y2_scale,
+                "overlaying": "y", "side": "right",
+                "showgrid": False, "zeroline": False,
+            }
+        figure = {"data": plotly_traces, "layout": layout, "available_vars": available_vars}
+        return {"ok": True, "figure": figure}
+
+    # ── Single-trace backward-compat mode ─────────────────────────────────────
+    x_var   = plot_cfg.get("x_var") or "x"
+    y_var   = plot_cfg.get("y_var") or "y"
+    x_data  = data.get(x_var)
+    y_data  = data.get(y_var)
+    missing = (x_data is None or (hasattr(x_data, "__len__") and len(x_data) == 0))
+    missing = missing or (y_data is None or (hasattr(y_data, "__len__") and len(y_data) == 0))
     if missing:
-        available = [k for k, v in data.items() if _is_numeric_array(v)]
         return {"ok": False, "stage": "plot",
                 "error": f"Variable '{x_var}' or '{y_var}' not found or empty. "
-                         f"Available array keys: {available}"}
-    x_data = _to_list(x_data)
-    y_data = _to_list(y_data)
-    # Derive axis labels: prefer explicit config, fall back to result metadata
+                         f"Available array keys: {available_vars}"}
+    x_data  = _to_list(x_data)
+    y_data  = _to_list(y_data)
     x_label = plot_cfg.get("x_label") or data.get("x_label") or x_var
     y_label = plot_cfg.get("y_label") or data.get("y_label") or y_var
 
@@ -1832,7 +2972,6 @@ def preview_module_plot(module_id: str, body: dict):
         "line": {"color": color, "width": 1.5},
         "hovertemplate": f"%{{x:.3g}} {x_label}<br>%{{y:.3g}} {y_label}<extra></extra>",
     }]
-    # Fit overlay — add if x_fit/y_fit in result and show_fit is True
     if show_fit and data.get("x_fit") and data.get("y_fit"):
         traces.append({
             "x": _to_list(data["x_fit"]), "y": _to_list(data["y_fit"]),
@@ -1846,13 +2985,65 @@ def preview_module_plot(module_id: str, body: dict):
         "data": traces,
         "layout": {
             "xaxis": {"title": x_label, "type": x_scale, "zeroline": True, "zerolinewidth": 1},
-            "yaxis": {"title": y_label, "type": y_scale, "zeroline": True, "zerolinewidth": 1},
+            "yaxis": {"title": y_label, "type": y1_scale, "zeroline": True, "zerolinewidth": 1},
             "margin": {"t": 20, "r": 20, "b": 56, "l": 72},
             "showlegend": False, "hovermode": "closest",
         },
-        "available_vars": [k for k, v in data.items() if _is_numeric_array(v)],
+        "available_vars": available_vars,
     }
     return {"ok": True, "figure": figure}
+
+
+def _resolve_module_files(conn, sample_id: str, module_id: str, filenames: dict):
+    """
+    Resolve files for a module on a sample.
+    Priority: module_files table → legacy filenames dict fallback.
+    Returns (file_bytes, filename, files, registry) or raises ValueError with a user-facing message.
+    - file_bytes / filename  → primary file (backward compat)
+    - files                  → {filename: bytes} dict of all files in collection
+    - registry               → [{filename, params}] list in is_primary-DESC, uploaded_at-ASC order
+    """
+    sample_dir = FILES_DIR / sample_id
+    rows = conn.execute(
+        "SELECT * FROM module_files WHERE sample_id=? AND module_id=? ORDER BY is_primary DESC, uploaded_at ASC",
+        (sample_id, module_id),
+    ).fetchall()
+
+    if rows:
+        files    = {}
+        registry = []
+        primary_bytes    = None
+        primary_filename = None
+        for row in rows:
+            fname = row["filename"]
+            fpath = sample_dir / fname
+            if not fpath.exists():
+                continue
+            data = fpath.read_bytes()
+            files[fname] = data
+            registry.append({"filename": fname, "params": json.loads(row["params"] or "{}")})
+            if row["is_primary"] and primary_bytes is None:
+                primary_bytes    = data
+                primary_filename = fname
+        if not files:
+            raise ValueError(f"Files registered but none found on disk for module '{module_id}'")
+        # If primary was missing on disk, promote the first available
+        if primary_bytes is None:
+            primary_filename = next(iter(files))
+            primary_bytes    = files[primary_filename]
+        return primary_bytes, primary_filename, files, registry
+    else:
+        # Legacy fallback: single filename string in samples.filenames dict
+        fname = filenames.get(module_id)
+        if not fname:
+            raise ValueError(f"No file for module '{module_id}' on sample '{sample_id}'")
+        fpath = sample_dir / fname
+        if not fpath.exists():
+            raise ValueError(f"File not found: {fname}")
+        data     = fpath.read_bytes()
+        files    = {fname: data}
+        registry = [{"filename": fname, "params": {}}]
+        return data, fname, files, registry
 
 
 @app.post("/api/modules/{module_id}/render-for-sample")
@@ -1872,33 +3063,61 @@ def render_for_sample(module_id: str, body: dict):
     x_scale = plot_cfg.get("x_scale") or "linear"
     y_scale = plot_cfg.get("y_scale") or "linear"
 
-    # Find the sample's file for this module
+    # Ensure sample data directory exists
     sample_dir = FILES_DIR / sample_id
     if not sample_dir.is_dir():
         raise HTTPException(404, f"No data directory for sample '{sample_id}'")
 
-    # Look for a file matching the module_id key in filenames
-    with get_db() as conn:
-        row = conn.execute("SELECT filenames, thickness_nm, area_m2 FROM samples WHERE id=?", (sample_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, f"Sample '{sample_id}' not found")
-    filenames   = json.loads(row["filenames"] or "{}")
-    thickness   = row["thickness_nm"] or 0.0
-    area        = row["area_m2"]
-    filename    = filenames.get(module_id)
-    if not filename:
-        return {"ok": False, "error": f"No file for module '{module_id}' on sample '{sample_id}'"}
-    file_path = sample_dir / filename
-    if not file_path.exists():
-        return {"ok": False, "error": f"File not found: {filename}"}
-    file_bytes = file_path.read_bytes()
-    area_correction = float((body.get("options") or {}).get("area_correction", 1.0) or 1.0)
-    meta = {"thickness_nm": thickness, "area_m2": area, "area_correction": area_correction}
+    # Load schema early so we can check file_mode
+    schema = _load_schema(module_id) or {}
+    is_derived = schema.get("file_mode") == "derived"
 
-    # Run processing code
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT filenames, thickness_nm, area_m2, module_config FROM samples WHERE id=?",
+            (sample_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, f"Sample '{sample_id}' not found")
+        filenames = json.loads(row["filenames"] or "{}")
+        thickness = row["thickness_nm"] or 0.0
+        area      = row["area_m2"]
+
+        if is_derived:
+            file_bytes, filename, files, registry = b"", None, {}, []
+        else:
+            try:
+                file_bytes, filename, files, registry = _resolve_module_files(
+                    conn, sample_id, module_id, filenames
+                )
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+
+        # Resolve any upstream data dependencies before exec
+        try:
+            upstream = _resolve_upstream(conn, sample_id, module_id, body.get("upstream_cache"))
+        except ValueError as e:
+            return {"ok": False, "stage": "upstream", "error": str(e)}
+
+    area_correction = float((body.get("options") or {}).get("area_correction", 1.0) or 1.0)
+
+    # Build meta — include per-sample module config with schema defaults applied
+    # (schema already loaded above)
+    mod_config = json.loads(row["module_config"] or "{}").get(module_id, {})
+    for field in schema.get("config_schema", []):
+        mod_config.setdefault(field["id"], field.get("default"))
+    meta = {"thickness_nm": thickness, "area_m2": area, "area_correction": area_correction,
+            "config": mod_config}
+
+    # Run processing code — inject files/registry/upstream alongside legacy file_bytes/filename
     indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
-    namespace: dict = {}
+    namespace: dict = {
+        **_build_resource_api(),
+        "files":    files,
+        "registry": registry,
+        "upstream": upstream,
+    }
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
         data = namespace["_proc"](file_bytes, filename, meta)
@@ -1907,23 +3126,81 @@ def render_for_sample(module_id: str, body: dict):
     if not isinstance(data, dict):
         return {"ok": False, "stage": "plot", "error": "Processing result must be a dict"}
 
+    import numpy as np
+    def _is_num_arr(v):
+        if isinstance(v, np.ndarray):
+            return v.ndim == 1 and np.issubdtype(v.dtype, np.number) and len(v) > 0
+        return isinstance(v, list) and bool(v) and isinstance(v[0], (int, float))
+
+    available_vars = [k for k, v in data.items() if _is_num_arr(v)]
+    result_area    = data.get("area_m2")
+
+    # ── Multi-trace mode (schema has plot_traces) ─────────────────────────────
+    plot_traces_cfg = schema.get("plot_traces", [])
+    if plot_traces_cfg:
+        x_label  = plot_cfg.get("x_label")  or data.get("x_label")  or "x"
+        y1_label = plot_cfg.get("y1_label") or plot_cfg.get("y_label") or data.get("y_label") or "y"
+        y2_label = plot_cfg.get("y2_label") or None
+        traces   = []
+        for tr in plot_traces_cfg:
+            x_key  = tr.get("x_key", "x")
+            y_key  = tr.get("y_key", "y")
+            x_data = data.get(x_key)
+            y_data = data.get(y_key)
+            if x_data is None or y_data is None:
+                continue
+            traces.append({
+                "x":     _json_safe(x_data),
+                "y":     _json_safe(y_data),
+                "label": tr.get("label", y_key),
+                "color": tr.get("color") or color,
+                "style": tr.get("style", "line"),
+                "axis":  tr.get("axis", "y1"),
+            })
+        if not traces:
+            return {"ok": False, "stage": "plot",
+                    "error": f"No plot_traces variables found in result. Available: {available_vars}"}
+        first = traces[0]
+        return {
+            "ok": True,
+            "traces":       traces,
+            "x_label":      x_label,
+            "y1_label":     y1_label,
+            "y2_label":     y2_label,
+            "available_vars": available_vars,
+            "area_m2":      result_area,
+            # backward-compat fields (books panel etc.)
+            "x": first["x"], "y": first["y"],
+            "y_label": y1_label, "color": first["color"],
+        }
+
+    # ── Single-trace backward-compat mode ─────────────────────────────────────
     x_data = data.get(x_var)
     y_data = data.get(y_var)
     if not x_data or not y_data:
-        available = [k for k, v in data.items() if isinstance(v, list) and v and isinstance(v[0], (int, float))]
         return {"ok": False, "stage": "plot",
-                "error": f"Variable '{x_var}' or '{y_var}' not found. Available: {available}"}
+                "error": f"Variable '{x_var}' or '{y_var}' not found. Available: {available_vars}"}
     x_label = plot_cfg.get("x_label") or data.get("x_label") or x_var
     y_label = plot_cfg.get("y_label") or data.get("y_label") or y_var
-    result_area = data.get("area_m2")
+    x_safe  = _json_safe(x_data)
+    y_safe  = _json_safe(y_data)
+    traces_out = [{"x": x_safe, "y": y_safe, "label": y_label, "color": color, "style": "line", "axis": "y1"}]
+    # Fit trace (backward compat)
+    if data.get("x_fit") and data.get("y_fit"):
+        traces_out.append({
+            "x": _json_safe(data["x_fit"]), "y": _json_safe(data["y_fit"]),
+            "label": f"{y_label} (fit)", "color": color, "style": "fit", "axis": "y1",
+        })
     return {
         "ok": True,
-        "x": _json_safe(x_data),
-        "y": _json_safe(y_data),
-        "x_label": x_label,
-        "y_label": y_label,
-        "color": color,
-        "area_m2": result_area,
+        "traces":       traces_out,
+        "x_label":      x_label,
+        "y1_label":     y_label,
+        "y2_label":     None,
+        "available_vars": available_vars,
+        "area_m2":      result_area,
+        # backward-compat fields
+        "x": x_safe, "y": y_safe, "y_label": y_label, "color": color,
     }
 
 
@@ -1935,26 +3212,63 @@ def compute_module_analysis_for_sample(module_id: str, body: dict):
     proc_code     = body.get("proc_code", "")
     analysis_code = body.get("analysis_code", "")
 
-    with get_db() as conn:
-        row = conn.execute("SELECT filenames, thickness_nm, area_m2, area_correction FROM samples WHERE id=?", (sample_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, f"Sample '{sample_id}' not found")
-    filenames    = json.loads(row["filenames"] or "{}")
-    thickness    = row["thickness_nm"] or 0.0
-    area         = row["area_m2"]
-    area_corr    = float(row["area_correction"] or 1.0)
-    filename     = filenames.get(module_id)
-    if not filename:
-        return {"ok": False, "error": f"No file for module '{module_id}' on sample '{sample_id}'"}
-    file_path = FILES_DIR / sample_id / filename
-    if not file_path.exists():
-        return {"ok": False, "error": f"File not found: {filename}"}
-    file_bytes = file_path.read_bytes()
-    meta = {"thickness_nm": thickness, "area_m2": area, "area_correction": area_corr}
+    schema = _load_schema(module_id) or {}
+    is_derived = schema.get("file_mode") == "derived"
 
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT filenames, thickness_nm, area_m2, area_correction, module_config, layers, substrate FROM samples WHERE id=?",
+            (sample_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, f"Sample '{sample_id}' not found")
+        filenames = json.loads(row["filenames"] or "{}")
+        thickness = row["thickness_nm"] or 0.0
+        area      = row["area_m2"]
+        area_corr = float(row["area_correction"] or 1.0)
+        sample_layers    = json.loads(row["layers"] or "[]")
+        sample_substrate = row["substrate"]
+
+        if is_derived:
+            file_bytes, filename, files, registry = b"", None, {}, []
+        else:
+            try:
+                file_bytes, filename, files, registry = _resolve_module_files(
+                    conn, sample_id, module_id, filenames
+                )
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+
+        # Resolve upstream data dependencies
+        try:
+            upstream = _resolve_upstream(conn, sample_id, module_id, body.get("upstream_cache"))
+        except ValueError as e:
+            return {"ok": False, "stage": "upstream", "error": str(e)}
+
+    mod_config = json.loads(row["module_config"] or "{}").get(module_id, {})
+    for field in schema.get("config_schema", []):
+        mod_config.setdefault(field["id"], field.get("default"))
+    meta = {"thickness_nm": thickness, "area_m2": area, "area_correction": area_corr,
+            "config": mod_config}
+
+    # Merge params: schema defaults → saved module_config → body params (workspace overrides)
+    params = {f["id"]: f.get("default") for f in schema.get("config_schema", [])}
+    params.update(mod_config)
+    params.update(body.get("params") or {})
+
+    # Bounds: per-field {min, max} overrides from the fit workspace.
+    # Body shape: {"bounds": {"layer_0_thickness": {"min": 25, "max": 75}, ...}}
+    bounds = body.get("bounds") or {}
+
+    resource_api = _build_resource_api()
     indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
-    namespace: dict = {}
+    namespace: dict = {
+        **resource_api,
+        "files":    files,
+        "registry": registry,
+        "upstream": upstream,
+    }
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
         result = namespace["_proc"](file_bytes, filename, meta)
@@ -1965,7 +3279,15 @@ def compute_module_analysis_for_sample(module_id: str, body: dict):
 
     indented2 = "\n".join(f"    {line}" for line in analysis_code.splitlines())
     wrapped2  = f"def _analysis(result):\n{indented2}\n"
-    namespace2: dict = {}
+    namespace2: dict = {
+        **resource_api,
+        "upstream":  upstream,
+        "params":    params,
+        "bounds":    bounds,
+        "layers":    sample_layers,
+        "substrate": sample_substrate,
+        "meta":      meta,
+    }
     try:
         exec(compile(wrapped2, "<analysis>", "exec"), namespace2)   # noqa: S102
         metrics = namespace2["_analysis"](result)
@@ -1991,12 +3313,14 @@ def compute_module_analysis(module_id: str, body: dict):
     filename   = f.name
 
     # Run processing code
+    _meta: dict = {"config": {}}
+    resource_api = _build_resource_api()
     indented = "\n".join(f"    {line}" for line in proc_code.splitlines())
     wrapped  = f"def _proc(file_bytes, filename, meta):\n{indented}\n"
-    namespace: dict = {}
+    namespace: dict = {**resource_api}
     try:
         exec(compile(wrapped, "<processing>", "exec"), namespace)   # noqa: S102
-        result = namespace["_proc"](file_bytes, filename, {})
+        result = namespace["_proc"](file_bytes, filename, _meta)
     except Exception as exc:
         return {"ok": False, "stage": "processing", "error": str(exc), "traceback": tb.format_exc()}
     if not isinstance(result, dict):
@@ -2005,7 +3329,7 @@ def compute_module_analysis(module_id: str, body: dict):
     # Run analysis code — wrap in a function that receives `result` and must return a dict
     indented2 = "\n".join(f"    {line}" for line in analysis_code.splitlines())
     wrapped2  = f"def _analysis(result):\n{indented2}\n"
-    namespace2: dict = {}
+    namespace2: dict = {**resource_api}
     try:
         exec(compile(wrapped2, "<analysis>", "exec"), namespace2)   # noqa: S102
         metrics = namespace2["_analysis"](result)

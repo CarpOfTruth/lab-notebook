@@ -90,8 +90,8 @@ Schema JSON lives at `backend/data/module_schemas/{id}.json` (optional, drives t
 
 ## Key conventions
 
-- **Branch**: always work on `dev`. The local app runs against `dev`. **Never push or open PRs targeting `main` directly** — a hook will block this. `main` is for stable, reviewed releases that may affect other users. Merge `dev` → `main` only after explicit review and confirmation.
-- **PRs**: always `--base dev`. Use `gh pr create --base dev ...`. A PreToolUse hook enforces this and will deny any `gh pr create --base main` command.
+- **Branch**: always work on `dev`. The local app runs against `dev`. **Never push directly to `main`** (no direct commits, no force-push). This is a single-user repo; `main` is kept up to date by merging `dev` → `main` through a PR whenever the owner asks to sync main.
+- **PRs**: feature/fix PRs use `--base dev` (`gh pr create --base dev ...`). The only PR into `main` is the dev sync: `gh pr create --base main --head dev ...`, then `gh pr merge <n> --merge` (merge commit; keep `dev`). A PreToolUse hook denies `gh pr create --base main` unless `--head dev` is given.
 - **No new files unless necessary.** Edit existing files; avoid file bloat.
 - **No speculative abstractions.** Implement exactly what was asked.
 - **T is module-level** in LabLog.jsx — never call `useTheme()` or try to import T. It's already in scope everywhere in the file.

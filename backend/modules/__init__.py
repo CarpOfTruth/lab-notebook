@@ -22,7 +22,7 @@ _USER_DIR     = Path(__file__).parent.parent / "data" / "user_modules"
 _USER_DIR.mkdir(parents=True, exist_ok=True)
 
 # Built-in module filenames (order = display order in the UI)
-_BUILTIN_MODULES = ["pe"]
+_BUILTIN_MODULES = ["pe", "xrr", "xrr_fit", "pund"]
 
 _registry: dict[str, LabModule] = {}
 

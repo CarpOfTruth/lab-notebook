@@ -36,6 +36,95 @@ async function fetchFile(sampleId, filename) {
   return res.text();
 }
 
+async function uploadSputterLog(sampleId, file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const res = await fetch(`${API_BASE}/samples/${sampleId}/sputter-log`, { method: "POST", body: fd });
+  if (!res.ok) throw new Error(`sputter-log upload failed ${res.status}`);
+  return res.json(); // { ok, filename, data }
+}
+
+async function fetchSputterLog(sampleId, filename) {
+  const res = await fetch(`${API_BASE}/samples/${sampleId}/sputter-log/${encodeURIComponent(filename)}`);
+  if (!res.ok) return null;
+  const j = await res.json();
+  return j.data;
+}
+
+async function uploadPund(sampleId, file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const res = await fetch(`${API_BASE}/samples/${sampleId}/pund`, { method: "POST", body: fd });
+  if (!res.ok) throw new Error(`pund upload failed ${res.status}`);
+  return res.json(); // { ok, stage, stage_label, filename, data }
+}
+
+async function fetchPund(sampleId, filename) {
+  const res = await fetch(`${API_BASE}/samples/${sampleId}/pund/${encodeURIComponent(filename)}`);
+  if (!res.ok) return null;
+  return (await res.json()).data;
+}
+
+// PUND stages, identified by swept parameter (files are all "metadata.csv"). One
+// fixed card per stage; a dropped file auto-routes to its stage regardless of card.
+const PUND_STAGES = [
+  { id: "a1", label: "A1 Imprint", swept: "bias_mV" },
+  { id: "a2", label: "A2 Voltage", swept: "voltage_mV" },
+  { id: "a3", label: "A3 Speed",   swept: "pulse_width_ns" },
+  { id: "a4", label: "A4 Delay",   swept: "delay_time_ns" },
+];
+const PUND_POS_COLOR = "#f6ad55";
+const PUND_NEG_COLOR = "#63b3ed";
+
+// View definitions for the sputter deposition-log card — kept deliberately simple.
+// key resolves against parsed data.channels (or data.derived); full selection lives
+// in the analysis-book panel.
+const SPUTTER_LOG_VIEWS = [
+  { id: "temperature", label: "Temperature", key: "temp_pyro1",       axis: "T (°C)",         color: "#fc8181" },
+  { id: "pressure",    label: "Pressure",    key: "pressure_process", axis: "P (mTorr)",      color: "#63b3ed" },
+  { id: "rf_power",    label: "RF Power",    key: "ps1_fwd",          axis: "RF Fwd (W)",     color: "#f6ad55" },
+  { id: "dc_bias",     label: "DC Bias",     key: "ps1_dcbias",       axis: "DC Bias (V)",    color: "#a78bfa" },
+];
+
+// Full channel list for the analysis-book comparison panel (all selectable).
+// `key` resolves against a window's stats; "__duration" is the window length itself.
+const SPUTTER_CHANNELS = [
+  { key: "temp_pyro1",       label: "Temperature",          unit: "°C"    },
+  { key: "temp_pyro2",       label: "Temperature (pyro 2)", unit: "°C"    },
+  { key: "temp_setpoint",    label: "Temp setpoint",        unit: "°C"    },
+  { key: "pressure_process", label: "Process pressure",     unit: "mTorr" },
+  { key: "pressure_chamber", label: "Chamber pressure",     unit: "Torr"  },
+  { key: "flow_ar",          label: "Ar flow",              unit: "sccm"  },
+  { key: "flow_o2",          label: "O₂ flow",              unit: "sccm"  },
+  { key: "flow_n2",          label: "N₂ flow",              unit: "sccm"  },
+  { key: "o2_fraction",      label: "O₂ fraction",          unit: ""      },
+  { key: "ps1_fwd",          label: "RF forward power",     unit: "W"     },
+  { key: "ps1_rfl",          label: "RF reflected power",   unit: "W"     },
+  { key: "ps1_net",          label: "RF net power",         unit: "W"     },
+  { key: "ps1_rfl_pct",      label: "RF reflected",         unit: "%"     },
+  { key: "ps1_setpoint",     label: "RF setpoint",          unit: "W"     },
+  { key: "ps1_dcbias",       label: "DC bias",              unit: "V"     },
+  { key: "ps7_fwd",          label: "Substrate bias fwd",   unit: "W"     },
+  { key: "ps7_dcbias",       label: "Substrate bias DC",    unit: "V"     },
+  { key: "pyro_delta",       label: "Pyrometer Δ",          unit: "°C"    },
+  { key: "rotation",         label: "Rotation",             unit: "°/s"   },
+  { key: "__duration",       label: "Deposition duration",  unit: "s"     },
+];
+
+function sputterLayerMaterial(layer) {
+  return (layer.targets || []).map(t => t.material).filter(Boolean).join("/");
+}
+
+// Extract a single comparison value (channel mean, or window duration) from parsed
+// log data. Returns null when there's no deposition window or the channel is absent.
+function sputterWindowValue(data, channelKey) {
+  const win = (data?.deposition_windows || [])[0];
+  if (!win) return null;
+  if (channelKey === "__duration") return win.duration_s;
+  const st = win.stats?.[channelKey];
+  return st && isFinite(st.mean) ? st.mean : null;
+}
+
 // ── Theme ─────────────────────────────────────────────────────────────────────
 
 const DARK_T = {
@@ -423,6 +512,33 @@ const Sel = ({ label, value, onChange, options }) => (
   </div>
 );
 
+// ── Global hotkey infrastructure ──────────────────────────────────────────────
+
+// Escape stack — modals push their close handler on mount, pop on unmount.
+// The global keydown listener (in App) calls the top of the stack on Escape.
+const _escStack = [];
+function pushEsc(fn) { _escStack.push(fn); }
+function popEsc(fn)  { const i = _escStack.lastIndexOf(fn); if (i >= 0) _escStack.splice(i, 1); }
+
+// Hook: registers onClose in the esc stack for the lifetime of the component.
+function useEscClose(onClose) {
+  useEffect(() => {
+    pushEsc(onClose);
+    return () => popEsc(onClose);
+  }, [onClose]);
+}
+
+// Returns an onKeyDown handler that fires onSave on Enter (skips textarea/select).
+function useModalEnter(onSave) {
+  return (e) => {
+    if (e.key === "Enter" && !e.isComposing &&
+        e.target.tagName !== "TEXTAREA" && e.target.tagName !== "SELECT") {
+      e.preventDefault();
+      onSave?.();
+    }
+  };
+}
+
 // Recursively builds a flat ordered list of folder options with depth metadata.
 // Pass `filterFn` to restrict which folders are eligible (e.g. sample-only).
 function buildFolderOptions(folders, filterFn, parentId = null, depth = 0) {
@@ -454,6 +570,33 @@ function FolderSelect({ label, value, onChange, folders, filterFn, emptyLabel = 
 }
 
 // Renders a chemical-formula string with digit sequences as subscripts.
+// Look up a material name in the library and return its formula string (from composition).
+// Falls back to the raw name if not found or composition is empty.
+function matDisplayName(name, materialsLib) {
+  if (!name) return name;
+  const entry = (materialsLib || []).find(m => m.name === name);
+  if (!entry || !Object.keys(entry.composition || {}).length) return name;
+  return compToFormula(entry.composition);
+}
+
+// Generate a formula string from composition rows [{el, amt}] or a composition dict {El: amount}.
+// Uses entry order; omits subscript for amount === 1.
+function compToFormula(comp) {
+  const entries = Array.isArray(comp)
+    ? comp
+    : Object.entries(comp).map(([el, amt]) => ({ el, amt }));
+  return entries
+    .filter(({ el }) => el.trim())
+    .map(({ el, amt }) => {
+      const n = parseFloat(amt);
+      if (isNaN(n) || n === 0) return el.trim();
+      if (n === 1) return el.trim();
+      const s = Number.isInteger(n) ? String(n) : String(parseFloat(n.toFixed(4)));
+      return el.trim() + s;
+    })
+    .join("");
+}
+
 // e.g. "BaTiO3" → BaTiO₃, "Ba0.5Sr0.5TiO3" → Ba₀.₅Sr₀.₅TiO₃ (via <sub>)
 function ChemName({ name }) {
   if (!name) return null;
@@ -810,6 +953,85 @@ function TwoLinePlot({ data, cfg }) {
   );
 }
 
+// ── ModulePlot ─────────────────────────────────────────────────────────────
+// Generic N-trace plot for module cards. Reads trace list from render-for-sample.
+// traces: [{x[], y[], label, color, style ("line"|"fit"), axis ("y1"|"y2")}]
+function ModulePlot({ traces, xLabel, y1Label, y2Label, y1Scale = "linear" }) {
+  const { ref, tooltipPos, onMouseMove } = useTooltipSide();
+  if (!traces?.length) return null;
+  const isLog    = y1Scale === "log";
+  const hasY2    = traces.some(t => t.axis === "y2");
+  const y1Traces = traces.filter(t => t.axis !== "y2");
+  const y2Traces = traces.filter(t => t.axis === "y2");
+  const allX     = traces.flatMap(t => t.x || []);
+  // For log scale, only use positive values for domain/tick calculations
+  const allY1Raw = y1Traces.flatMap(t => t.y || []);
+  const allY1    = isLog ? allY1Raw.filter(v => v > 0) : allY1Raw;
+  const allY2    = y2Traces.flatMap(t => t.y || []);
+  if (!allX.length || !allY1.length) return null;
+  const { ticks: xTicks, domain: xDomain } = niceLinTicks(arrMin(allX), arrMax(allX));
+
+  // Y1: linear or log
+  let y1Ticks, y1Domain, y1AxisExtra;
+  if (isLog) {
+    const lo = Math.floor(Math.log10(Math.min(...allY1)));
+    const hi = Math.ceil(Math.log10(Math.max(...allY1)));
+    y1Ticks  = Array.from({ length: hi - lo + 1 }, (_, k) => Math.pow(10, lo + k));
+    y1Domain = [Math.pow(10, lo), Math.pow(10, hi)];
+    y1AxisExtra = { scale: "log", tickFormatter: v => `10^${Math.round(Math.log10(v))}` };
+  } else {
+    const [y1Lo, y1Hi] = padDomain(allY1);
+    ({ ticks: y1Ticks, domain: y1Domain } = niceLinTicks(y1Lo, y1Hi));
+    y1AxisExtra = { tickFormatter: v => numFmt(v) };
+  }
+  const y2Domain = allY2.length ? padDomain(allY2) : [0, 1];
+  return (
+    <div ref={ref}>
+      <ResponsiveContainer width="100%" height={200}>
+        <ComposedChart onMouseMove={onMouseMove} margin={{ top: 6, right: hasY2 ? 44 : 12, bottom: 28, left: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+          <XAxis dataKey="x" type="number" domain={xDomain} ticks={xTicks} tickLine={false}
+            axisLine={{ stroke: T.borderBright }}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
+            label={{ value: xLabel || "", position: "insideBottom", offset: -14, fill: T.textSecondary, fontSize: 11 }} />
+          <YAxis yAxisId="y1" domain={y1Domain} ticks={y1Ticks} tickLine={false}
+            axisLine={{ stroke: T.borderBright }}
+            tick={{ fill: T.textDim, fontSize: 10, fontFamily: "'DM Mono', monospace" }}
+            label={{ value: y1Label || "", angle: -90, position: "insideLeft", offset: 14, fill: T.textSecondary, fontSize: 10 }}
+            {...y1AxisExtra} />
+          {hasY2 && <YAxis yAxisId="y2" orientation="right" domain={y2Domain} tickLine={false} axisLine={false}
+            tick={{ fill: T.amber, fontSize: 9, fontFamily: "'DM Mono', monospace" }} tickFormatter={v => numFmt(v)}
+            label={{ value: y2Label || "y2", angle: 90, position: "insideRight", offset: -6, fill: T.amber, fontSize: 9 }} />}
+          <Tooltip position={tooltipPos}
+            contentStyle={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11 }}
+            formatter={(v, name) => [numFmt(+v), name]}
+            labelFormatter={v => `${xLabel || "x"}: ${numFmt(+v)}`} />
+          {traces.map((tr, i) => {
+            let trData = (tr.x || []).map((xi, j) => ({ x: xi, y: (tr.y || [])[j] }));
+            // Drop non-positive values for log scale (log(0) = -∞)
+            if (isLog && tr.axis !== "y2") trData = trData.filter(p => p.y > 0);
+            return (
+              <Line key={i}
+                yAxisId={tr.axis === "y2" ? "y2" : "y1"}
+                data={trData}
+                dataKey="y"
+                dot={false}
+                stroke={tr.color || "#94a3b8"}
+                strokeWidth={1.5}
+                strokeDasharray={tr.style === "fit" ? "4 2" : undefined}
+                strokeOpacity={tr.style === "fit" ? 0.55 : 1}
+                isAnimationActive={false}
+                name={tr.label || `trace ${i + 1}`}
+              />
+            );
+          })}
+          <Customized component={PlotBox} xTicks={xTicks ?? []} yTicks={y1Ticks ?? []} />
+        </ComposedChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
 // Canvas-based RSM renderer for the sample detail view — raw display, no processing.
 function RsmCanvasPlot({ data, logIntensity = false }) {
   const wrapRef   = useRef(null);
@@ -965,14 +1187,638 @@ function fmtAreaMicron(m2) {
   return um2 >= 1000 ? `${(um2 / 1000).toFixed(2)}×10³ µm²` : `${um2.toFixed(2)} µm²`;
 }
 
+// ── ManageDataModal ───────────────────────────────────────────────────────────
+
+function ManageDataModal({ mod, sample, onClose, onChanged }) {
+  useEscClose(onClose);
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  const [files,     setFiles]     = useState([]);
+  const [loading,   setLoading]   = useState(true);
+  const [uploading, setUploading] = useState(false);
+  const [dragOver,  setDragOver]  = useState(false);
+  const fileInputRef = useRef(null);
+  const paramFields  = mod.param_manifest || [];
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const res = await api("GET", `/samples/${sample.id}/module-files/${mod.id}`);
+      setFiles(Array.isArray(res) ? res : []);
+    } catch (_) {}
+    setLoading(false);
+  };
+
+  useEffect(() => { load(); }, [mod.id, sample.id]);
+
+  const handleUpload = async (file) => {
+    setUploading(true);
+    const fd = new FormData();
+    fd.append("file", file);
+    try {
+      await fetch(`/api/samples/${sample.id}/module-files/${mod.id}`, { method: "POST", body: fd });
+      await load();
+      onChanged?.();
+    } catch (_) {}
+    setUploading(false);
+  };
+
+  const handleDelete = async (fileId) => {
+    try {
+      await api("DELETE", `/samples/${sample.id}/module-files/${mod.id}/${fileId}`);
+      await load();
+      onChanged?.();
+    } catch (_) {}
+  };
+
+  const handleSetPrimary = async (fileId) => {
+    try {
+      await api("PATCH", `/samples/${sample.id}/module-files/${mod.id}/${fileId}`, { is_primary: true });
+      setFiles(prev => prev.map(f => ({ ...f, is_primary: f.id === fileId })));
+      onChanged?.();
+    } catch (_) {}
+  };
+
+  const handleParamChange = async (fileId, paramId, value) => {
+    const f = files.find(x => x.id === fileId);
+    if (!f) return;
+    const updated = { ...f.params, [paramId]: value };
+    try {
+      await api("PATCH", `/samples/${sample.id}/module-files/${mod.id}/${fileId}`, { params: updated });
+      setFiles(prev => prev.map(x => x.id === fileId ? { ...x, params: updated } : x));
+    } catch (_) {}
+  };
+
+  const truncName = (name, max = 28) => name.length > max ? name.slice(0, max - 1) + "…" : name;
+
+  return (
+    <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 10, width: 700, maxWidth: "90vw", maxHeight: "85vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        {/* Header */}
+        <div style={{ padding: "12px 18px", borderBottom: `1px solid ${T.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+          <span style={{ ...mono, fontSize: 13, color: T.textPrimary, fontWeight: 600 }}>
+            {mod.name} — Data · <span style={{ color: T.textDim }}>{sample.id}</span>
+          </span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1 }}>✕</button>
+        </div>
+
+        {/* File list */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "12px 18px" }}>
+          {loading ? (
+            <div style={{ ...mono, fontSize: 12, color: T.textDim, padding: "24px 0", textAlign: "center" }}>Loading…</div>
+          ) : files.length === 0 ? (
+            <div style={{ ...mono, fontSize: 12, color: T.textDim, padding: "24px 0", textAlign: "center" }}>No files yet — add some below.</div>
+          ) : (
+            <table style={{ width: "100%", borderCollapse: "collapse", ...mono, fontSize: 12 }}>
+              <thead>
+                <tr>
+                  <th style={{ width: 28, padding: "6px 8px", textAlign: "center", color: T.textDim, fontWeight: 400, fontSize: 10, letterSpacing: 0.3 }}>★</th>
+                  <th style={{ padding: "6px 12px 6px 4px", textAlign: "left", color: T.textDim, fontWeight: 400, fontSize: 10, letterSpacing: 0.3, textTransform: "uppercase" }}>File</th>
+                  {paramFields.map(p => (
+                    <th key={p.id} style={{ padding: "6px 8px", textAlign: "left", color: T.textDim, fontWeight: 400, fontSize: 10, letterSpacing: 0.3, textTransform: "uppercase" }}>
+                      {p.label || p.id}{p.unit ? ` (${p.unit})` : ""}
+                    </th>
+                  ))}
+                  <th style={{ width: 32 }} />
+                </tr>
+              </thead>
+              <tbody>
+                {files.map(f => (
+                  <tr key={f.id} style={{ borderTop: `1px solid ${T.border}44` }}>
+                    <td style={{ padding: "6px 8px", textAlign: "center" }}>
+                      <input type="radio" checked={!!f.is_primary} onChange={() => handleSetPrimary(f.id)}
+                        style={{ accentColor: T.amber, cursor: "pointer" }} />
+                    </td>
+                    <td style={{ padding: "6px 12px 6px 4px", color: T.textSecondary, whiteSpace: "nowrap", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }} title={f.filename}>
+                      {truncName(f.filename)}
+                    </td>
+                    {paramFields.map(p => (
+                      <td key={p.id} style={{ padding: "4px 6px" }}>
+                        {p.type === "boolean" ? (
+                          <input type="checkbox"
+                            checked={!!(f.params?.[p.id] ?? p.default ?? false)}
+                            onChange={e => handleParamChange(f.id, p.id, e.target.checked)}
+                            style={{ accentColor: T.teal, cursor: "pointer" }} />
+                        ) : p.type === "select" ? (
+                          <select value={f.params?.[p.id] ?? p.default ?? ""}
+                            onChange={e => handleParamChange(f.id, p.id, e.target.value)}
+                            style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, ...mono, fontSize: 11, padding: "3px 5px", outline: "none", maxWidth: 120 }}>
+                            {(p.choices || []).map(ch => <option key={ch} value={ch}>{ch}</option>)}
+                          </select>
+                        ) : (
+                          <input
+                            type={p.type === "number" ? "number" : "text"}
+                            defaultValue={f.params?.[p.id] ?? p.default ?? ""}
+                            key={`${f.id}-${p.id}`}
+                            onBlur={e => handleParamChange(f.id, p.id, p.type === "number" ? (e.target.value === "" ? null : Number(e.target.value)) : e.target.value)}
+                            style={{ width: 90, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, ...mono, fontSize: 11, padding: "3px 6px", outline: "none" }} />
+                        )}
+                      </td>
+                    ))}
+                    <td style={{ padding: "4px 6px", textAlign: "center" }}>
+                      <button onClick={() => handleDelete(f.id)} title="Delete file"
+                        style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 14, lineHeight: 1, padding: "2px 4px" }}
+                        onMouseEnter={e => e.currentTarget.style.color = T.red}
+                        onMouseLeave={e => e.currentTarget.style.color = T.textDim}>✕</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {/* Drop zone */}
+        <div
+          onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={e => { e.preventDefault(); setDragOver(false); [...e.dataTransfer.files].forEach(handleUpload); }}
+          onClick={() => fileInputRef.current?.click()}
+          style={{
+            margin: "0 18px 12px", border: `2px dashed ${dragOver ? T.amber : T.border}`,
+            borderRadius: 8, padding: "18px 0", textAlign: "center", cursor: "pointer",
+            transition: "border-color .15s", background: dragOver ? T.amber + "08" : "transparent", flexShrink: 0,
+          }}>
+          <input ref={fileInputRef} type="file" accept={mod.accepts?.join(",")} multiple
+            style={{ display: "none" }}
+            onChange={e => { [...(e.target.files || [])].forEach(f => handleUpload(f)); e.target.value = ""; }} />
+          <span style={{ ...mono, fontSize: 12, color: dragOver ? T.amber : T.textDim }}>
+            {uploading ? "Uploading…" : "⬆ Drop files here or click to add"}
+          </span>
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding: "10px 18px", borderTop: `1px solid ${T.border}`, display: "flex", justifyContent: "flex-end", flexShrink: 0 }}>
+          <Btn onClick={onClose}>Done</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── ModuleCard ────────────────────────────────────────────────────────────────
+// ── ModuleConfigModal ─────────────────────────────────────────────────────────
+
+function ModuleConfigModal({ mod, sample, onClose, onSaved }) {
+  const mono = "'DM Mono', monospace";
+  const schema = mod.config_schema || [];
+  const existing = (sample.module_config || {})[mod.id] || {};
+
+  // initialise form values: use saved value if present, else field default
+  const initValues = () => {
+    const v = {};
+    for (const f of schema) v[f.id] = existing[f.id] !== undefined ? existing[f.id] : (f.default ?? "");
+    return v;
+  };
+  const [values, setValues] = useState(initValues);
+  const [saving, setSaving] = useState(false);
+
+  useEscClose(onClose);
+
+  const doSave = async () => {
+    setSaving(true);
+    try {
+      await api("PATCH", `/samples/${sample.id}/module-config/${mod.id}`, values);
+      onSaved?.();
+      onClose();
+    } catch (e) { /* silently ignore */ }
+    setSaving(false);
+  };
+
+  const set = (id, val) => setValues(prev => ({ ...prev, [id]: val }));
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 900, display: "flex", alignItems: "center", justifyContent: "center" }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div onKeyDown={useModalEnter(doSave)} style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 12, padding: "24px 28px", width: 480, maxWidth: "95vw", maxHeight: "80vh", overflow: "auto" }}>
+        <div style={{ display: "flex", alignItems: "center", marginBottom: 18 }}>
+          <span style={{ fontFamily: mono, fontSize: 13, color: T.textPrimary, fontWeight: 600, flex: 1 }}>{mod.name} — Config</span>
+          <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>{sample.id}</span>
+        </div>
+        {schema.length === 0 ? (
+          <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>No configuration fields defined for this module.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            {schema.map(field => (
+              <div key={field.id}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: T.textSecondary, marginBottom: 5, display: "flex", gap: 8, alignItems: "baseline" }}>
+                  <span>{field.label || field.id}</span>
+                  {field.unit && <span style={{ color: T.textDim }}>({field.unit})</span>}
+                  <span style={{ color: T.textDim, marginLeft: "auto" }}>{field.id}</span>
+                </div>
+                {field.type === "boolean" ? (
+                  <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                    <input type="checkbox" checked={!!values[field.id]}
+                      onChange={e => set(field.id, e.target.checked)}
+                      style={{ accentColor: T.teal, width: 14, height: 14 }} />
+                    <span style={{ fontFamily: mono, fontSize: 12, color: T.textPrimary }}>{values[field.id] ? "true" : "false"}</span>
+                  </label>
+                ) : field.type === "select" ? (
+                  <select value={values[field.id] ?? ""}
+                    onChange={e => set(field.id, e.target.value)}
+                    style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "6px 10px", outline: "none" }}>
+                    {(field.choices || []).map(ch => <option key={ch} value={ch}>{ch}</option>)}
+                  </select>
+                ) : (
+                  <input
+                    type={field.type === "number" ? "number" : "text"}
+                    value={values[field.id] ?? ""}
+                    onChange={e => set(field.id, field.type === "number" ? (e.target.value === "" ? "" : Number(e.target.value)) : e.target.value)}
+                    style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "6px 10px", outline: "none", boxSizing: "border-box" }}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 22 }}>
+          <Btn variant="ghost" small onClick={onClose}>Cancel</Btn>
+          <Btn variant="primary" small onClick={doSave} disabled={saving}>{saving ? "Saving…" : "Save"}</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── FitWorkspaceModal ─────────────────────────────────────────────────────────
+// Generalized fit workspace: any module declaring fittable config_schema entries
+// can be opened here. Renders the data + fit overlay, lets the user adjust params
+// and bounds, runs the fit via compute-analysis-for-sample, and saves results.
+
+function FitWorkspaceModal({ mod, sample, onClose, onSaved }) {
+  const mono = "'DM Mono', monospace";
+  useEscClose(onClose);
+
+  // Loaded once: full schema (proc_code, analysis_code, plot_traces, config_schema)
+  const [cfg, setCfg] = useState(null);
+
+  // Per-field state: { id: { value, min, max, fixed, fittable, type, label, unit, default, choices } }
+  const [fields, setFields] = useState({});
+
+  // Plot state
+  const [dataTraces,    setDataTraces]    = useState([]);   // [{x, y, label, color, style}]
+  const [overlayTraces, setOverlayTraces] = useState([]);
+  const [xLabel, setXLabel] = useState("x");
+  const [yLabel, setYLabel] = useState("y");
+  const [yScale, setYScale] = useState("linear");
+
+  // Cached upstream results from the initial render — passed as upstream_cache on Run Fit
+  const [upstreamCache, setUpstreamCache] = useState({});
+
+  const [metrics,    setMetrics]    = useState({});
+  const [running,    setRunning]    = useState(false);
+  const [saving,     setSaving]     = useState(false);
+  const [error,      setError]      = useState(null);
+  const [loading,    setLoading]    = useState(true);
+  const [hasUnsaved, setHasUnsaved] = useState(false);
+
+  // ── Load module config + initial render ────────────────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true); setError(null);
+      try {
+        const [c, eff] = await Promise.all([
+          api("GET", `/modules/${mod.id}/config`),
+          api("GET", `/modules/${mod.id}/effective-schema?sample_id=${encodeURIComponent(sample.id)}`).catch(() => null),
+        ]);
+        if (cancelled) return;
+        setCfg(c);
+
+        const saved = (sample.module_config || {})[mod.id] || {};
+        const schema = (eff && eff.config_schema) || c.config_schema || [];
+        const init = {};
+        for (const f of schema) {
+          init[f.id] = {
+            id:       f.id,
+            label:    f.label || f.id,
+            unit:     f.unit  || "",
+            type:     f.type  || "text",
+            choices:  f.choices,
+            default:  f.default,
+            fittable: !!f.fittable,
+            min:      f.min,
+            max:      f.max,
+            fixed:    false,
+            value:    saved[f.id] !== undefined ? saved[f.id] : f.default,
+          };
+        }
+        setFields(init);
+
+        setYScale(c.plot_config?.y1_scale || c.plot_config?.y_scale || "linear");
+
+        // Initial render
+        const r = await api("POST", `/modules/${mod.id}/render-for-sample`, {
+          sample_id:   sample.id,
+          proc_code:   c.proc_code || "",
+          plot_config: c.plot_config || {},
+          options:     {},
+        });
+        if (cancelled) return;
+        if (r.ok) {
+          // Keep only the data trace(s) — exclude fit-style ones (they'll come from analysis)
+          const dataOnly = (r.traces || []).filter(t => t.style !== "fit");
+          setDataTraces(dataOnly);
+          setXLabel(r.x_label || "x");
+          setYLabel(r.y1_label || r.y_label || "y");
+        } else {
+          setError(r.error || "Render failed");
+        }
+      } catch (e) { if (!cancelled) setError(e.message || "Failed to load workspace"); }
+      if (!cancelled) setLoading(false);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mod.id, sample.id]);
+
+  // ── Field updates ──────────────────────────────────────────────────────────
+  const setField = (id, patch) => {
+    setFields(prev => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+    setHasUnsaved(true);
+  };
+
+  // ── Run fit ────────────────────────────────────────────────────────────────
+  const runFit = async () => {
+    if (!cfg) return;
+    setRunning(true); setError(null);
+    try {
+      const params = {};
+      const bounds = {};
+      const fixed_ids = [];
+      for (const [id, f] of Object.entries(fields)) {
+        params[id] = f.value;
+        if (f.fittable && f.fixed) fixed_ids.push(id);
+        if (f.fittable && (f.min !== undefined || f.max !== undefined)) {
+          bounds[id] = { min: f.min, max: f.max };
+        }
+      }
+      if (fixed_ids.length) params.__fixed__ = fixed_ids;
+
+      const body = {
+        sample_id:     sample.id,
+        proc_code:     cfg.proc_code || "",
+        analysis_code: cfg.analysis_code || "",
+        params,
+        bounds,
+      };
+      if (Object.keys(upstreamCache).length) body.upstream_cache = upstreamCache;
+
+      const res = await api("POST", `/modules/${mod.id}/compute-analysis-for-sample`, body);
+      if (!res.ok) {
+        setError(res.error || "Fit failed");
+      } else {
+        const vals = res.values || {};
+        const overlay = vals._overlay_traces || [];
+        const fitParams = vals._fit_params || {};
+        setOverlayTraces(overlay);
+
+        // Reflect _fit_params into fittable, non-fixed fields
+        if (Object.keys(fitParams).length) {
+          setFields(prev => {
+            const next = { ...prev };
+            for (const [id, v] of Object.entries(fitParams)) {
+              if (next[id] && next[id].fittable && !next[id].fixed) {
+                next[id] = { ...next[id], value: v };
+              }
+            }
+            return next;
+          });
+          setHasUnsaved(true);
+        }
+
+        // Strip overlay/fit-param keys from metrics display
+        const { _overlay_traces, _fit_params, ...m } = vals;
+        setMetrics(m);
+      }
+    } catch (e) { setError(e.message || "Fit request failed"); }
+    setRunning(false);
+  };
+
+  // ── Save params back to sample ─────────────────────────────────────────────
+  const doSave = async () => {
+    setSaving(true); setError(null);
+    try {
+      const out = {};
+      for (const [id, f] of Object.entries(fields)) out[id] = f.value;
+      await api("PATCH", `/samples/${sample.id}/module-config/${mod.id}`, out);
+      setHasUnsaved(false);
+      onSaved?.();
+    } catch (e) { setError(e.message || "Save failed"); }
+    setSaving(false);
+  };
+
+  // ── Build Plotly traces from data + overlay ────────────────────────────────
+  const plotlyTraces = useMemo(() => {
+    const out = [];
+    for (const t of dataTraces) {
+      out.push({
+        x: t.x, y: t.y,
+        type: "scatter", mode: "lines",
+        name: t.label || "data",
+        line: { color: t.color || "#94a3b8", width: 1.2 },
+      });
+    }
+    for (const t of overlayTraces) {
+      out.push({
+        x: t.x, y: t.y,
+        type: "scatter", mode: "lines",
+        name: t.label || "fit",
+        line: { color: t.color || "#2dd4bf", width: 1.6, dash: t.style === "fit" ? "dash" : "solid" },
+        opacity: t.style === "fit" ? 0.85 : 1,
+      });
+    }
+    return out;
+  }, [dataTraces, overlayTraces]);
+
+  const plotLayout = {
+    margin: { t: 14, r: 18, b: 50, l: 70 },
+    xaxis: { title: { text: xLabel, font: { size: 12, color: T.textSecondary } },
+             gridcolor: T.border, zeroline: false },
+    yaxis: { title: { text: yLabel, font: { size: 12, color: T.textSecondary } },
+             type: yScale === "log" ? "log" : "linear",
+             gridcolor: T.border, zeroline: false },
+    paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
+    font: { color: T.textSecondary, family: mono, size: 11 },
+    showlegend: true, legend: { orientation: "h", y: 1.06, font: { size: 11 } },
+  };
+
+  // ── Param row renderer ─────────────────────────────────────────────────────
+  const renderField = (f) => {
+    const isFittable = f.fittable && f.type === "number";
+    return (
+      <div key={f.id} style={{ display: "flex", flexDirection: "column", gap: 4, paddingBottom: 6 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+          <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, fontWeight: 600 }}>{f.displayLabel || f.label}</span>
+          {f.unit && <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim }}>({f.unit})</span>}
+        </div>
+        <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+          {f.type === "boolean" ? (
+            <input type="checkbox" checked={!!f.value}
+              onChange={e => setField(f.id, { value: e.target.checked })} />
+          ) : f.type === "select" ? (
+            <select value={f.value ?? ""} onChange={e => setField(f.id, { value: e.target.value })}
+              style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none" }}>
+              {(f.choices || []).map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          ) : (
+            <input type={f.type === "number" ? "number" : "text"}
+              value={f.value ?? ""}
+              onChange={e => setField(f.id, { value: f.type === "number" ? (e.target.value === "" ? "" : Number(e.target.value)) : e.target.value })}
+              style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", width: 90, textAlign: "center" }} />
+          )}
+          {isFittable && (
+            <>
+              <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim }}>min</span>
+              <input type="number" value={f.min ?? ""}
+                onChange={e => setField(f.id, { min: e.target.value === "" ? undefined : Number(e.target.value) })}
+                style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "3px 6px", outline: "none", width: 60, textAlign: "center" }} />
+              <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim }}>max</span>
+              <input type="number" value={f.max ?? ""}
+                onChange={e => setField(f.id, { max: e.target.value === "" ? undefined : Number(e.target.value) })}
+                style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "3px 6px", outline: "none", width: 60, textAlign: "center" }} />
+              <label style={{ display: "flex", alignItems: "center", gap: 3, fontFamily: mono, fontSize: 10, color: f.fixed ? T.amber : T.textDim, cursor: "pointer" }}>
+                <input type="checkbox" checked={!!f.fixed}
+                  onChange={e => setField(f.id, { fixed: e.target.checked })} />
+                fixed
+              </label>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const fieldList = Object.values(fields);
+  // Group fields by the part of the label before " — " (set by effective-schema)
+  const fieldGroups = useMemo(() => {
+    const groups = []; // [{ name, fields: [] }]
+    let lastGroup = null;
+    for (const f of fieldList) {
+      const lbl   = f.label || "";
+      const idx   = lbl.indexOf(" — ");
+      const gName = idx > 0 ? lbl.slice(0, idx) : "General";
+      const fName = idx > 0 ? lbl.slice(idx + 3) : lbl;
+      if (lastGroup !== gName) {
+        groups.push({ name: gName, fields: [] });
+        lastGroup = gName;
+      }
+      groups[groups.length - 1].fields.push({ ...f, displayLabel: fName });
+    }
+    return groups;
+  }, [fieldList]);
+
+  const metricEntries = Object.entries(metrics).filter(([k]) => !k.startsWith("_"));
+  const metricMap = Object.fromEntries((cfg?.analysis_metrics || []).map(m => [m.name, m]));
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 950, display: "flex", alignItems: "center", justifyContent: "center" }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 12, width: "min(95vw, 1200px)", height: "min(90vh, 800px)", display: "flex", flexDirection: "column" }}>
+        {/* Header */}
+        <div style={{ display: "flex", alignItems: "center", padding: "12px 18px", borderBottom: `1px solid ${T.border}`, gap: 12 }}>
+          <span style={{ fontFamily: mono, fontSize: 14, color: T.textPrimary, fontWeight: 600 }}>{mod.name} — Fit</span>
+          <span style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>· {sample.id}</span>
+          {hasUnsaved && <span style={{ fontFamily: mono, fontSize: 10, color: T.amber, marginLeft: 8 }}>● unsaved</span>}
+          <span style={{ flex: 1 }} />
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, lineHeight: 1 }}>✕</button>
+        </div>
+
+        {/* Body */}
+        <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+          {/* Param panel */}
+          <div style={{ width: 380, borderRight: `1px solid ${T.border}`, padding: "14px 16px", overflowY: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
+            <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>Parameters</div>
+            {loading ? (
+              <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>Loading…</div>
+            ) : fieldList.length === 0 ? (
+              <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, fontStyle: "italic" }}>No parameters declared.</div>
+            ) : (
+              fieldGroups.map((g, gi) => (
+                <div key={gi} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div style={{ fontFamily: mono, fontSize: 10, color: T.amber, textTransform: "uppercase", letterSpacing: 1, borderBottom: `1px solid ${T.border}`, paddingBottom: 4 }}>{g.name}</div>
+                  {g.fields.map(renderField)}
+                </div>
+              ))
+            )}
+          </div>
+
+          {/* Plot panel */}
+          <div style={{ flex: 1, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10, overflow: "hidden" }}>
+            <div style={{ flex: 1, minHeight: 0 }}>
+              {loading ? (
+                <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: T.textDim, fontFamily: mono, fontSize: 12 }}>Loading data…</div>
+              ) : plotlyTraces.length === 0 ? (
+                <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: T.textDim, fontFamily: mono, fontSize: 12 }}>No data</div>
+              ) : (
+                <Suspense fallback={<div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: T.textDim }}>Loading plot…</div>}>
+                  <Plot data={plotlyTraces} layout={plotLayout}
+                    config={{ displaylogo: false, responsive: true, modeBarButtonsToRemove: ["lasso2d", "select2d"] }}
+                    style={{ width: "100%", height: "100%" }} useResizeHandler />
+                </Suspense>
+              )}
+            </div>
+
+            {/* Metrics */}
+            {metricEntries.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 12, paddingTop: 8, borderTop: `1px solid ${T.border}` }}>
+                {metricEntries.map(([k, v]) => {
+                  const meta = metricMap[k];
+                  const label = meta?.label || k;
+                  const unit  = meta?.unit  || "";
+                  const display = (typeof v === "number" && isFinite(v)) ? (Math.abs(v) >= 1000 || (v !== 0 && Math.abs(v) < 0.01) ? v.toExponential(3) : v.toFixed(4)) : String(v);
+                  return (
+                    <div key={k} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                      <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim, textTransform: "uppercase", letterSpacing: 0.5 }}>{label}</span>
+                      <span style={{ fontFamily: mono, fontSize: 12, color: T.textPrimary }}>{display}{unit && <span style={{ color: T.textDim }}> {unit}</span>}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div style={{ display: "flex", alignItems: "center", padding: "10px 18px", borderTop: `1px solid ${T.border}`, gap: 10 }}>
+          {error && <span style={{ fontFamily: mono, fontSize: 11, color: T.red, flex: 1 }}>{error}</span>}
+          {!error && <span style={{ flex: 1 }} />}
+          <Btn variant="ghost" small onClick={onClose}>Close</Btn>
+          <Btn variant="primary" small onClick={runFit} disabled={loading || running || !cfg?.analysis_code}>
+            {running ? "Fitting…" : "Run Fit"}
+          </Btn>
+          <Btn variant="primary" small onClick={doSave} disabled={saving || !hasUnsaved}>
+            {saving ? "Saving…" : "Save to sample"}
+          </Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Generic card for user/built-in modules on the sample detail page.
 
-function ModuleCard({ mod, sample, onRemoved }) {
+function ModuleCard({ mod, sample, modules = [], onRemoved, onSampleUpdate }) {
   const mono = "'DM Mono', monospace";
 
-  const filename = sample.filenames?.[mod.id];
-  if (!filename) return null; // only render when a file has been added
+  const isDerivedMode    = mod.file_mode === "derived";
+  const isCollectionMode = mod.file_mode === "collection";
+
+  // Derived modules: show whenever all required upstream modules have data on this sample.
+  const upstreamMissing = (mod.upstream || []).filter(u => {
+    if (!u.required) return false;
+    const hasFile = !!sample.filenames?.[u.id] || (sample.module_file_counts?.[u.id] ?? 0) > 0;
+    return !hasFile;
+  });
+
+  const hasSingleFile   = !!sample.filenames?.[mod.id];
+  const hasCollFiles    = (sample.module_file_counts?.[mod.id] ?? 0) > 0;
+  const hasData = isDerivedMode
+    ? upstreamMissing.length === 0
+    : (hasSingleFile || hasCollFiles);
+
+  const filename         = sample.filenames?.[mod.id];
+  const fileCount        = sample.module_file_counts?.[mod.id] ?? 0;
+  const upstreamMods     = (mod.upstream || []).map(u => modules.find(m => m.id === u.id) || { id: u.id, name: u.label || u.id });
 
   const initControls = () => {
     const s = {};
@@ -980,12 +1826,17 @@ function ModuleCard({ mod, sample, onRemoved }) {
     return s;
   };
   const areaCtrl = (mod.card_controls || []).find(c => c.type === "area");
+  const hasConfig   = (mod.config_schema || []).length > 0;
+  const hasFittable = (mod.config_schema || []).some(f => f.fittable);
   const [controlState, setControlState] = useState(initControls);
-  const [plotData,     setPlotData]     = useState(null); // {points, xLabel, yLabel, color}
+  const [plotData,     setPlotData]     = useState(null); // {traces, xLabel, y1Label, y2Label}
   const [loading,      setLoading]      = useState(false);
   const [fetchError,   setFetchError]   = useState(null);
   const [areaM2,       setAreaM2]       = useState(sample.area_m2 ?? null);
   const [corrExpr,     setCorrExpr]     = useState(String(sample.area_correction ?? areaCtrl?.default ?? 1.0));
+  const [configOpen,   setConfigOpen]   = useState(false);
+  const [manageOpen,   setManageOpen]   = useState(false);
+  const [fitOpen,      setFitOpen]      = useState(false);
 
   const fetchPlot = async (overrides = {}) => {
     setLoading(true); setFetchError(null);
@@ -1008,11 +1859,18 @@ function ModuleCard({ mod, sample, onRemoved }) {
         options,
       });
       if (res.ok) {
+        // Support both new traces format and old x/y backward compat
+        const traces = res.traces || [{
+          x: res.x || [], y: res.y || [],
+          label: res.y_label || "y", color: res.color || "#94a3b8",
+          style: "line", axis: "y1",
+        }];
         setPlotData({
-          points: res.x.map((xi, i) => ({ x: xi, y: res.y[i] })),
-          xLabel: res.x_label,
-          yLabel: res.y_label,
-          color:  res.color || "#fc8181",
+          traces,
+          xLabel:  res.x_label,
+          y1Label: res.y1_label || res.y_label,
+          y2Label: res.y2_label || null,
+          y1Scale: cfg.plot_config?.y1_scale || cfg.plot_config?.y_scale || "linear",
         });
         if (res.area_m2 != null) setAreaM2(res.area_m2);
       } else setFetchError(res.error || "Render failed");
@@ -1020,7 +1878,7 @@ function ModuleCard({ mod, sample, onRemoved }) {
     setLoading(false);
   };
 
-  useEffect(() => { fetchPlot(); }, [mod.id, sample.id]);
+  useEffect(() => { if (hasData) fetchPlot(); }, [mod.id, sample.id, hasData]);
 
   const handleControlChange = (name, val) => {
     const next = { ...controlState, [name]: val };
@@ -1035,6 +1893,8 @@ function ModuleCard({ mod, sample, onRemoved }) {
       onRemoved?.();
     } catch (e) { setFetchError(e.message); }
   };
+
+  if (!hasData) return null; // only render when data is available (after all hooks)
 
   const effArea = (areaM2 || null) && (areaM2 * (evalMathExpr(corrExpr) || 1.0));
 
@@ -1057,28 +1917,58 @@ function ModuleCard({ mod, sample, onRemoved }) {
               ))}
             </div>
           ))}
-          <span style={{ fontSize: 10, color: T.textDim, fontFamily: mono, maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filename}</span>
-          <button onClick={handleDelete} title="Remove data" style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 14, lineHeight: 1, padding: 0 }}>✕</button>
+          {hasConfig && (
+            <button onClick={() => setConfigOpen(true)} title="Module configuration"
+              style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, lineHeight: 1, padding: "0 2px" }}>⚙</button>
+          )}
+          {hasFittable && (
+            <button onClick={() => setFitOpen(true)} title="Open fit workspace"
+              style={{ background: "none", border: `1px solid ${T.teal}55`, borderRadius: 4, color: T.teal, cursor: "pointer", fontFamily: mono, fontSize: 10, padding: "2px 8px" }}>
+              Fit ▸
+            </button>
+          )}
+          {isDerivedMode ? (
+            <span style={{ fontSize: 10, color: T.teal, fontFamily: mono, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, padding: "1px 7px" }}
+              title={`Data sourced from ${upstreamMods.map(u => u.name).join(", ")}`}>
+              src: {upstreamMods.map(u => u.name).join(" + ") || "—"}
+            </span>
+          ) : isCollectionMode ? (
+            <>
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: mono, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, padding: "1px 7px" }}>
+                {fileCount} {fileCount === 1 ? "file" : "files"}
+              </span>
+              <button onClick={() => setManageOpen(true)}
+                style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 4, color: T.textSecondary, cursor: "pointer", fontFamily: mono, fontSize: 10, padding: "2px 8px" }}>
+                Manage
+              </button>
+            </>
+          ) : (
+            <>
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: mono, maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filename}</span>
+              <button onClick={handleDelete} title="Remove data" style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 14, lineHeight: 1, padding: 0 }}>✕</button>
+            </>
+          )}
         </div>
       </div>
       {/* Body */}
       <div style={{ padding: "10px 12px" }}>
         {plotData ? (
           <>
-            <LinePlot data={plotData.points} cfg={{
-              xLabel:    plotData.xLabel,
-              yLabel:    plotData.yLabel,
-              color:     plotData.color,
-              symXTicks: true,
-              zeroRefY:  true,
-              ySymRange: 30,
-            }} />
-            <div style={{ marginTop: 8 }}>
-              <label style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, border: `1px dashed ${T.border}`, borderRadius: 6, padding: "6px 0", cursor: "pointer", fontFamily: mono, fontSize: 11, color: T.textDim }}>
-                ↑ replace file
-                <input type="file" accept={mod.accepts?.join(",")} style={{ display: "none" }} onChange={e => { if (e.target.files[0]) { onRemoved?.(); } }} />
-              </label>
-            </div>
+            <ModulePlot
+              traces={plotData.traces}
+              xLabel={plotData.xLabel}
+              y1Label={plotData.y1Label}
+              y2Label={plotData.y2Label}
+              y1Scale={plotData.y1Scale || "linear"}
+            />
+            {!isCollectionMode && !isDerivedMode && (
+              <div style={{ marginTop: 8 }}>
+                <label style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, border: `1px dashed ${T.border}`, borderRadius: 6, padding: "6px 0", cursor: "pointer", fontFamily: mono, fontSize: 11, color: T.textDim }}>
+                  ↑ replace file
+                  <input type="file" accept={mod.accepts?.join(",")} style={{ display: "none" }} onChange={e => { if (e.target.files[0]) { onRemoved?.(); } }} />
+                </label>
+              </div>
+            )}
           </>
         ) : loading ? (
           <div style={{ height: 200, display: "flex", alignItems: "center", justifyContent: "center", color: T.textDim, fontFamily: mono, fontSize: 11 }}>Loading…</div>
@@ -1105,17 +1995,78 @@ function ModuleCard({ mod, sample, onRemoved }) {
           </div>
         )}
       </div>
+      {configOpen && (
+        <ModuleConfigModal
+          mod={mod}
+          sample={sample}
+          onClose={() => setConfigOpen(false)}
+          onSaved={() => { onSampleUpdate?.(); fetchPlot(); }}
+        />
+      )}
+      {manageOpen && (
+        <ManageDataModal
+          mod={mod}
+          sample={sample}
+          onClose={() => setManageOpen(false)}
+          onChanged={() => { onSampleUpdate?.(); fetchPlot(); }}
+        />
+      )}
+      {fitOpen && (
+        <FitWorkspaceModal
+          mod={mod}
+          sample={sample}
+          onClose={() => setFitOpen(false)}
+          onSaved={() => { onSampleUpdate?.(); fetchPlot(); }}
+        />
+      )}
     </div>
   );
 }
 
 // ── MeasCard ──────────────────────────────────────────────────────────────────
 
-function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze }) {
+// Substrate → known reference material+hkl for "zero to substrate" feature.
+// Tests are checked in order — put more-specific patterns first.
+// 2θ is computed via calcTwoTheta (same path as XRD analysis panel reference lines).
+const XRD_SUBSTRATE_REFS = [
+  // Si:STO → substrate is the Si below the STO buffer; use Si 004
+  { test: s => /\bsi\b/i.test(s) && /\bsto\b/i.test(s), materialName: "Si",          hkl: "004", label: "Si 004"       },
+  // GdScO3 variants
+  { test: s => /gdsco|gdscо/i.test(s),                   materialName: "GdScO3 (o)", hkl: "220", label: "GdScO₃ 220ₒ" },
+  // STO alone → STO 002
+  { test: s => /\bsto\b/i.test(s),                        materialName: "STO",        hkl: "002", label: "STO 002"       },
+  // Bare Si
+  { test: s => /\bsi\b/i.test(s),                         materialName: "Si",          hkl: "004", label: "Si 004"       },
+];
+
+// structures = materialsLib mapped to {name, a, b, c, ...} (structuresCompat)
+function xrdSubstrateRef(substrate, structures) {
+  if (!substrate || !structures?.length) return null;
+  const def = XRD_SUBSTRATE_REFS.find(r => r.test(substrate));
+  if (!def) return null;
+  const struct = structures.find(s => s.name === def.materialName);
+  if (!struct) return null;
+  const twoTheta = calcTwoTheta(struct, def.hkl);
+  if (twoTheta == null) return null;
+  return { label: def.label, twoTheta };
+}
+
+function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze, substrate, structures }) {
   const cfg = MEAS_TYPES[type];
   const [corrExpr,      setCorrExpr]      = useState(String(areaCorrFactor ?? 1.0));
   const [peLoop,        setPeLoop]        = useState("all"); // "all" | "second"
   const [rsmLog,        setRsmLog]        = useState(false); // lin by default
+  const [xrdZero,       setXrdZero]       = useState(false);
+
+  // XRD substrate zeroing (kept above the diel_b early return so hook order is stable)
+  const isXRD = type === "xrd_ot";
+  const subRef = isXRD ? xrdSubstrateRef(substrate, structures) : null;
+  const xrdDisplayData = useMemo(() => {
+    if (!isXRD || !xrdZero || !subRef || !Array.isArray(plotData) || !plotData.length) return plotData;
+    const maxPt = plotData.reduce((best, p) => (p.y > best.y ? p : best), plotData[0]);
+    const shift = subRef.twoTheta - maxPt.x;
+    return plotData.map(p => ({ ...p, x: p.x + shift }));
+  }, [isXRD, xrdZero, subRef, plotData]);
 
   if (type === "diel_b") {
     const hasUp    = !!(plotData?.up?.length);
@@ -1147,11 +2098,12 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
   const isPE = type === "pe";
   const isDiel = type === "diel_f";
   const displayPEData = isPE && has ? (peLoop === "second" ? splitPELoops(plotData).second : plotData) : plotData;
+
   return (
     <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "space-between", padding: "8px 12px", borderBottom: `1px solid ${T.border}` }}>
-        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: cfg.color, fontWeight: 600 }}>{cfg.label}</span>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: cfg.color, fontWeight: 600, whiteSpace: "nowrap" }}>{cfg.label}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
           {isPE && has && <LoopToggle value={peLoop} onChange={setPeLoop} />}
           {type === "rsm" && has && (
             <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
@@ -1166,7 +2118,14 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
               </div>
             </div>
           )}
-          {type === "xrd_ot" && has && onAnalyze && (
+          {isXRD && has && subRef && (
+            <button onClick={() => setXrdZero(v => !v)}
+              title={`Zero to ${subRef.label} (${subRef.twoTheta.toFixed(2)}°)`}
+              style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "2px 7px", background: xrdZero ? T.amber : "transparent", border: `1px solid ${xrdZero ? T.amber : T.border}`, borderRadius: 4, color: xrdZero ? T.bg0 : T.textDim, cursor: "pointer", letterSpacing: 0.3, transition: "all 0.15s" }}>
+              zeroed
+            </button>
+          )}
+          {isXRD && has && onAnalyze && (
             <button onClick={onAnalyze}
               style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "2px 8px", background: T.bg3, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, cursor: "pointer", letterSpacing: 0.5 }}>
               Analyze
@@ -1178,7 +2137,7 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
       <div style={{ padding: "10px 12px" }}>
         {has ? (
           <>
-            <MeasPlot data={displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} logIntensity={rsmLog} />
+            <MeasPlot data={isXRD ? xrdDisplayData : displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} logIntensity={rsmLog} />
             <div style={{ marginTop: 8 }}><UploadZone type={type} onFile={(file) => onFile(type, file)} hasData={true} thicknessNm={thicknessNm} /></div>
           </>
         ) : (
@@ -1208,6 +2167,371 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
           </div>
         )}
         {isDiel && !areaM2 && <div style={{ marginTop: 4, fontSize: 10, color: T.amber, fontFamily: "'DM Mono', monospace" }}>⚠ area defaulted (20µm ⌀)</div>}
+      </div>
+    </div>
+  );
+}
+
+// ── Sputter deposition log ────────────────────────────────────────────────────
+// One log file per deposited layer. Card shows every layer stacked (same plot),
+// with simple view buttons; full channel selection lives in the analysis-book
+// panel. Log binds to layer.id via layer.sputter_log (filename).
+
+function sputterLayerLabel(layer, index, materialsLib) {
+  const mats = (layer.targets || []).map(t => t.material).filter(Boolean);
+  const name = mats.length ? mats.map(m => matDisplayName(m, materialsLib)).join("/") : `layer ${index + 1}`;
+  return name;
+}
+
+// Build {x,y} points for a channel from parsed log data. When a deposition window
+// exists, mask to it and zero the x-axis at shutter-open; else show the full run.
+function sputterViewPoints(data, key) {
+  const series = data.channels?.[key] || data.derived?.[key] || [];
+  const time = data.time_s || [];
+  const win = (data.deposition_windows || [])[0];
+  let pts;
+  if (win) {
+    pts = [];
+    for (let i = win.i0; i <= win.i1; i++) {
+      const y = series[i];
+      if (y != null) pts.push({ x: +(time[i] - win.start_s).toFixed(2), y });
+    }
+  } else {
+    pts = [];
+    for (let i = 0; i < time.length; i++) {
+      if (series[i] != null) pts.push({ x: +time[i].toFixed(1), y: series[i] });
+    }
+  }
+  // Down-sample long full-run traces for responsiveness.
+  if (pts.length > 1500) {
+    const stride = Math.ceil(pts.length / 1500);
+    pts = pts.filter((_, i) => i % stride === 0);
+  }
+  return { pts, win };
+}
+
+// Compact per-layer log drop target — lives on the layer row. Supports click and
+// drag-drop; stops propagation so file drops don't trigger the row's reorder-drop.
+function LayerLogDropZone({ hasLog, busy, onFile, onRemove }) {
+  const ref = useRef();
+  const [drag, setDrag] = useState(false);
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  return (
+    <div
+      onClick={e => { e.stopPropagation(); ref.current?.click(); }}
+      onDragOver={e => { e.preventDefault(); e.stopPropagation(); setDrag(true); }}
+      onDragLeave={e => { e.stopPropagation(); setDrag(false); }}
+      onDrop={e => { e.preventDefault(); e.stopPropagation(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) onFile(f); }}
+      title={hasLog ? "Deposition log attached — click or drop to replace" : "Attach deposition log (.csv) — click or drop a file"}
+      style={{ display: "inline-flex", alignItems: "center", gap: 4, ...mono, fontSize: 10, flexShrink: 0,
+        border: `1px dashed ${drag ? T.amber : (hasLog ? T.teal : T.borderBright)}`, borderRadius: 4, padding: "2px 7px",
+        cursor: "pointer", color: hasLog ? T.teal : T.textDim, background: drag ? T.amberGlow : (hasLog ? T.teal + "18" : "transparent"), transition: "all .12s" }}>
+      <input ref={ref} type="file" accept=".csv,.CSV" style={{ display: "none" }}
+        onClick={e => e.stopPropagation()} onChange={e => { const f = e.target.files?.[0]; e.target.value = ""; if (f) onFile(f); }} />
+      {busy ? "log…" : hasLog ? "✓ log" : "＋ log"}
+      {hasLog && !busy && <span onClick={e => { e.stopPropagation(); onRemove(); }} title="Remove log" style={{ color: T.textDim, fontSize: 11, lineHeight: 1 }}>×</span>}
+    </div>
+  );
+}
+
+// Recharts plot + stat line for one channel of one parsed log. Applies the app
+// axis convention (zero-anchored with buffer via metaYRange).
+function SputterChannelPlot({ data, viewDef }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  if (data === undefined) return <div style={{ ...mono, fontSize: 11, color: T.textDim, padding: "24px 0", textAlign: "center" }}>loading…</div>;
+  if (data === "error" || !data) return <div style={{ ...mono, fontSize: 11, color: T.red, padding: "24px 0", textAlign: "center" }}>⚠ could not parse log</div>;
+  const { pts, win } = sputterViewPoints(data, viewDef.key);
+  const st = win?.stats?.[viewDef.key];
+  const target = win?.source?.target || win?.source?.material || null;
+  const xLabel = win ? "deposition time (s)" : "t (s) — no deposition window";
+  const yDomain = pts.length ? metaYRange(pts.map(p => p.y), false) : [0, 1];
+  const xMax = pts.length ? arrMax(pts.map(p => p.x)) : 1;
+  return (
+    <>
+      {pts.length ? (
+        <ResponsiveContainer width="100%" height={150}>
+          <LineChart data={pts} margin={{ top: 6, right: 12, bottom: 22, left: 6 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+            <XAxis dataKey="x" type="number" domain={[0, xMax]}
+              tick={{ fill: T.textDim, fontSize: 9, fontFamily: "'DM Mono', monospace" }} tickLine={false}
+              axisLine={{ stroke: T.borderBright }} tickFormatter={v => numFmt(v)}
+              label={{ value: xLabel, position: "insideBottom", offset: -12, fill: T.textSecondary, fontSize: 9 }} />
+            <YAxis domain={yDomain} allowDataOverflow tick={{ fill: T.textDim, fontSize: 9, fontFamily: "'DM Mono', monospace" }} tickLine={false}
+              axisLine={{ stroke: T.borderBright }} tickFormatter={v => numFmt(v)} width={46}
+              label={{ content: ({ viewBox }) => {
+                const { x, y, height } = viewBox;
+                const cx = (x || 0) + 10, cy = (y || 0) + (height || 100) / 2;
+                return <text transform={`rotate(-90, ${cx}, ${cy})`} x={cx} y={cy} textAnchor="middle" fill={T.textSecondary} fontSize={9} fontFamily="'DM Mono', monospace">{viewDef.axis}</text>;
+              } }} />
+            <Tooltip position={{ y: -10 }} contentStyle={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 6, fontFamily: "'DM Mono', monospace", fontSize: 11 }}
+              formatter={v => [numFmt(+v), viewDef.axis]} labelFormatter={v => `${numFmt(+v)} s`} />
+            <Line dataKey="y" type="monotone" stroke={viewDef.color} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      ) : (
+        <div style={{ ...mono, fontSize: 11, color: T.textDim, padding: "8px 0" }}>no data for this channel</div>
+      )}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 4, ...mono, fontSize: 10, color: T.textDim }}>
+        {target && <span>target: <span style={{ color: T.textSecondary }}>{target}</span></span>}
+        {win && <span>deposition: <span style={{ color: T.textSecondary }}>{numFmt(win.duration_s)} s</span></span>}
+        {st && <span>⌀ <span style={{ color: viewDef.color }}>{numFmt(st.mean)}</span> ± {numFmt(st.std)}</span>}
+        {!win && <span style={{ color: T.amber }}>no deposition window</span>}
+      </div>
+    </>
+  );
+}
+
+// One channel card (Pressure / Power / DC Bias) with an independent layer selector.
+function SputterLogChannelCard({ viewDef, layers, logCache, materialsLib }) {
+  const loggedLayers = layers.filter(l => l.sputter_log);
+  const [sel, setSel] = useState(() => loggedLayers[0]?.id || layers[0]?.id || null);
+  // Keep selection valid as layers/logs change; default to a logged layer.
+  useEffect(() => {
+    const stillValid = layers.some(l => l.id === sel);
+    const selHasLog = loggedLayers.some(l => l.id === sel);
+    if (!stillValid || (!selHasLog && loggedLayers.length)) {
+      setSel(loggedLayers[0]?.id || layers[0]?.id || null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layers.map(l => `${l.id}:${l.sputter_log || ""}`).join(",")]);
+
+  const layer = layers.find(l => l.id === sel) || null;
+  const data = layer?.sputter_log ? logCache[layer.sputter_log] : null;
+
+  return (
+    <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "space-between", padding: "8px 12px", borderBottom: `1px solid ${T.border}` }}>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: viewDef.color, fontWeight: 600, whiteSpace: "nowrap" }}>{viewDef.label}</span>
+        <select value={sel || ""} onChange={e => setSel(e.target.value)}
+          style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "2px 6px", cursor: "pointer", maxWidth: 180 }}>
+          {layers.map((l, i) => (
+            <option key={l.id} value={l.id}>
+              L{i + 1} {sputterLayerLabel(l, i, materialsLib)}{l.sputter_log ? "" : " — no log"}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div style={{ padding: "10px 12px" }}>
+        {layer?.sputter_log
+          ? <SputterChannelPlot data={data} viewDef={viewDef} />
+          : <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, padding: "24px 0", textAlign: "center" }}>No log for this layer — drop one on the layer in the stack above.</div>}
+      </div>
+    </div>
+  );
+}
+
+// The three fixed channel cards (Pressure / Power / DC Bias). Holds one shared
+// parsed-log cache so a layer's log is fetched once regardless of how many cards
+// display it. NB: no cancelled-flag in the fetch effect (see StrictMode note on the
+// analysis panel) — dedup via fetchingRef only.
+const SPUTTER_CARD_VIEWS = ["pressure", "rf_power", "dc_bias"].map(id => SPUTTER_LOG_VIEWS.find(v => v.id === id)).filter(Boolean);
+
+function SputterLogCards({ sample, materialsLib = [] }) {
+  const layers = sample.layers || [];
+  const loggedLayers = layers.filter(l => l.sputter_log);
+  const logKeys = loggedLayers.map(l => l.sputter_log).join(",");
+  const [cache, setCache] = useState({});
+  const fetchingRef = useRef(new Set());
+  useEffect(() => {
+    (async () => {
+      for (const l of loggedLayers) {
+        const fn = l.sputter_log;
+        if (!fn || fetchingRef.current.has(fn)) continue;
+        fetchingRef.current.add(fn);
+        const data = await fetchSputterLog(sample.id, fn);
+        setCache(c => ({ ...c, [fn]: data || "error" }));
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sample.id, logKeys]);
+
+  if (!layers.length) return null;
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
+      {SPUTTER_CARD_VIEWS.map(v => (
+        <SputterLogChannelCard key={v.id} viewDef={v} layers={layers} logCache={cache} materialsLib={materialsLib} />
+      ))}
+    </div>
+  );
+}
+
+// ── PUND ferroelectric sweeps ─────────────────────────────────────────────────
+// Four fixed stage cards (A1–A4). A dropped metadata.csv auto-routes to its stage
+// by swept parameter. Each card plots switched ΔP vs the swept variable, with a
+// +/−/both branch selector (only branches actually measured are offered).
+
+// Build a Plotly figure (traces + layout) for one parsed PUND sweep, honoring the
+// selected branch. Mirrors the backend PUNDModule.plot so the card and the module
+// endpoint agree.
+function pundFigure(data, branch) {
+  const x = data.x || [];
+  const unit = data.swept_unit || "";
+  const showPos = data.has_pos && (branch === "pos" || branch === "both");
+  const showNeg = data.has_neg && (branch === "neg" || branch === "both");
+  const err = stds => (stds || []).map(s => (s == null ? 0 : s));
+  const axisFont = { family: "'DM Mono', monospace", size: 10, color: T.textDim };
+  const traces = [];
+  if (showPos) traces.push({
+    x, y: data.dP_pos || [], type: "scatter", mode: "lines+markers", name: "ΔP⁺",
+    marker: { color: PUND_POS_COLOR, size: 7, symbol: "circle" }, line: { color: PUND_POS_COLOR, width: 1.5 },
+    error_y: { type: "data", array: err(data.dP_pos_std), visible: true, thickness: 1.1, width: 3, color: PUND_POS_COLOR },
+    hovertemplate: `%{x:g} ${unit}<br>ΔP⁺ %{y:.3g} µC/cm²<extra></extra>`,
+  });
+  if (showNeg) traces.push({
+    x, y: data.dP_neg || [], type: "scatter", mode: "lines+markers", name: "ΔP⁻",
+    marker: { color: PUND_NEG_COLOR, size: 7, symbol: "square" }, line: { color: PUND_NEG_COLOR, width: 1.5 },
+    error_y: { type: "data", array: err(data.dP_neg_std), visible: true, thickness: 1.1, width: 3, color: PUND_NEG_COLOR },
+    hovertemplate: `%{x:g} ${unit}<br>ΔP⁻ %{y:.3g} µC/cm²<extra></extra>`,
+  });
+  const layout = {
+    xaxis: { title: { text: `${data.swept_label} (${unit})`, font: axisFont }, type: data.log_x ? "log" : "linear",
+             color: T.textDim, gridcolor: T.border, linecolor: T.borderBright, zeroline: false, tickfont: axisFont },
+    yaxis: { title: { text: "Switched ΔP (µC/cm²)", font: axisFont }, rangemode: "tozero",
+             color: T.textDim, gridcolor: T.border, linecolor: T.borderBright, zeroline: true, zerolinecolor: T.borderBright, tickfont: axisFont },
+    margin: { t: 12, r: 14, b: 46, l: 56 }, showlegend: showPos && showNeg,
+    legend: { x: 0.02, y: 0.98, font: axisFont }, hovermode: "closest",
+    paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+  };
+  return { traces, layout };
+}
+
+function PundDropZone({ onFile, busy, compact }) {
+  const ref = useRef();
+  const [drag, setDrag] = useState(false);
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  return (
+    <div
+      onClick={() => !busy && ref.current?.click()}
+      onDragOver={e => { e.preventDefault(); setDrag(true); }}
+      onDragLeave={() => setDrag(false)}
+      onDrop={e => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) onFile(f); }}
+      style={{ border: `1px dashed ${drag ? T.amber : T.borderBright}`, borderRadius: 6, padding: compact ? "6px 12px" : "18px 14px",
+        cursor: busy ? "default" : "pointer", textAlign: "center", background: drag ? T.amberGlow : "transparent",
+        ...mono, fontSize: 11, color: T.textDim, transition: "all .12s" }}>
+      <input ref={ref} type="file" accept=".csv,.CSV" style={{ display: "none" }}
+        onChange={e => { const f = e.target.files?.[0]; e.target.value = ""; if (f) onFile(f); }} />
+      {busy ? "parsing…" : compact ? "↑ replace / drop metadata.csv" : "drop stage metadata.csv or click"}
+    </div>
+  );
+}
+
+function PundStageCard({ stage, filename, data, busy, onFile, onRemove }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  const [branch, setBranch] = useState("both");
+  useEffect(() => {
+    if (data && data !== "error")
+      setBranch(data.has_pos && data.has_neg ? "both" : (data.has_neg ? "neg" : "pos"));
+  }, [data]);
+
+  const branchOpts = [];
+  if (data && data !== "error") {
+    if (data.has_pos) branchOpts.push(["pos", "ΔP⁺"]);
+    if (data.has_neg) branchOpts.push(["neg", "ΔP⁻"]);
+    if (data.has_pos && data.has_neg) branchOpts.push(["both", "both"]);
+  }
+  const fig = (data && data !== "error") ? pundFigure(data, branch) : null;
+
+  return (
+    <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "space-between", padding: "8px 12px", borderBottom: `1px solid ${T.border}` }}>
+        <span style={{ ...mono, fontSize: 12, color: T.teal, fontWeight: 600, whiteSpace: "nowrap" }}>{stage.label}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          {branchOpts.length > 1 && (
+            <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+              {branchOpts.map(([val, lbl], i) => (
+                <button key={val} onClick={() => setBranch(val)}
+                  style={{ ...mono, fontSize: 10, padding: "2px 7px", background: branch === val ? T.bg3 : T.bg0, border: "none",
+                    borderLeft: i ? `1px solid ${T.border}` : "none", color: branch === val ? T.textPrimary : T.textDim, cursor: "pointer" }}>
+                  {lbl}
+                </button>
+              ))}
+            </div>
+          )}
+          {filename && <button onClick={onRemove} title="Remove" style={{ ...mono, fontSize: 13, background: "none", border: "none", color: T.textDim, cursor: "pointer", padding: "0 2px" }}>×</button>}
+        </div>
+      </div>
+      <div style={{ padding: "10px 12px" }}>
+        {!filename ? (
+          <div style={{ height: 150, display: "flex", alignItems: "center" }}><div style={{ flex: 1 }}><PundDropZone onFile={onFile} busy={busy} /></div></div>
+        ) : data === undefined ? (
+          <div style={{ ...mono, fontSize: 11, color: T.textDim, padding: "24px 0", textAlign: "center" }}>loading…</div>
+        ) : data === "error" ? (
+          <>
+            <div style={{ ...mono, fontSize: 11, color: T.red, marginBottom: 6 }}>⚠ could not parse this file</div>
+            <PundDropZone onFile={onFile} busy={busy} compact />
+          </>
+        ) : (
+          <>
+            <Suspense fallback={<div style={{ height: 240, display: "flex", alignItems: "center", justifyContent: "center", ...mono, fontSize: 11, color: T.textDim }}>Loading chart…</div>}>
+              <Plot data={fig.traces} layout={fig.layout} config={buildPlotConfig(`pund-${stage.id}`)}
+                style={{ width: "100%", height: "240px" }} useResizeHandler />
+            </Suspense>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 10, margin: "4px 0 8px", ...mono, fontSize: 10, color: T.textDim }}>
+              <span>{data.n_conditions} conditions</span>
+              {data.context?.fixed?.length ? <span>· {data.context.fixed.join(" · ")}</span> : null}
+            </div>
+            <PundDropZone onFile={onFile} busy={busy} compact />
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PundCards({ sample, onUpdate }) {
+  // Per-stage filenames live in the persisted `filenames` dict under `pund_<stage>`.
+  const fnFor = (stageId) => sample.filenames?.[`pund_${stageId}`];
+  const [cache, setCache] = useState({});   // filename → data | "error"
+  const [busy, setBusy]   = useState(false);
+  const [note, setNote]   = useState(null);
+  const fetchingRef = useRef(new Set());
+  const keys = PUND_STAGES.map(s => fnFor(s.id) || "").join(",");
+  useEffect(() => {
+    (async () => {
+      for (const s of PUND_STAGES) {
+        const fn = fnFor(s.id);
+        if (fn && !fetchingRef.current.has(fn)) {
+          fetchingRef.current.add(fn);
+          const d = await fetchPund(sample.id, fn);
+          setCache(c => ({ ...c, [fn]: d || "error" }));
+        }
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sample.id, keys]);
+
+  const setStage = (stageId, filename) =>
+    onUpdate({ ...sample, filenames: { ...(sample.filenames || {}), [`pund_${stageId}`]: filename } });
+  const removeStage = (stageId) => {
+    const fnames = { ...(sample.filenames || {}) };
+    delete fnames[`pund_${stageId}`];
+    onUpdate({ ...sample, filenames: fnames });
+  };
+
+  const handleUpload = async (droppedStageId, file) => {
+    if (!file) return;
+    setBusy(true); setNote(null);
+    try {
+      const res = await uploadPund(sample.id, file);
+      setCache(c => ({ ...c, [res.filename]: res.data }));
+      setStage(res.stage, res.filename);
+      if (droppedStageId && res.stage !== droppedStageId)
+        setNote(`That file is ${res.stage_label} (swept ${res.data.swept_key}) — routed it there.`);
+    } catch (_) {
+      setNote("Could not parse that file as a PUND metadata.csv.");
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div>
+      {note && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.amber, marginBottom: 8 }}>{note}</div>}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
+        {PUND_STAGES.map(s => {
+          const fn = fnFor(s.id);
+          return <PundStageCard key={s.id} stage={s} filename={fn} data={fn ? cache[fn] : null}
+                   busy={busy} onFile={f => handleUpload(s.id, f)} onRemove={() => removeStage(s.id)} />;
+        })}
       </div>
     </div>
   );
@@ -1399,32 +2723,80 @@ function AfmCard({ afmData, filename, onFile }) {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
+// Shipped technique definitions — used for new installs and as migration base.
+const SHIPPED_TECHNIQUES = [
+  {
+    id: "sputter", name: "Sputter",
+    params: [
+      { id: "temp",       name: "Temperature", unit: "°C",    default: 600,  scope: "layer",  type: "number" },
+      { id: "pressure",   name: "Pressure",    unit: "mTorr", default: 3,    scope: "layer",  type: "number" },
+      { id: "oxygen_pct", name: "O₂",          unit: "%",     default: 10,   scope: "layer",  type: "number" },
+      { id: "time_s",     name: "Time",        unit: "s",     default: 2000, scope: "layer",  type: "number" },
+      { id: "power_type", name: "Power type",  unit: "",      default: "RF", scope: "target", type: "select", options: ["RF", "DC", "Pulsed DC"] },
+      { id: "power_W",    name: "Power",       unit: "W",     default: 150,  scope: "target", type: "number" },
+    ],
+  },
+  {
+    id: "pld", name: "PLD",
+    params: [
+      { id: "temp",         name: "Temperature", unit: "°C",   default: 670,  scope: "layer",  type: "number" },
+      { id: "pressure",     name: "Pressure",    unit: "mTorr",default: 100,  scope: "layer",  type: "number" },
+      { id: "frequency_hz", name: "Rep rate",    unit: "Hz",   default: 10,   scope: "layer",  type: "number" },
+      { id: "energy_mJ",    name: "Energy",      unit: "mJ",   default: 100,  scope: "target", type: "number" },
+      { id: "pulses",       name: "Pulses",      unit: "",     default: 1000, scope: "target", type: "number" },
+    ],
+  },
+];
+
 const DEFAULT_SETTINGS = {
   defaultSubstrate: "STO (001)",
   defaultLot: "",
   defaultAreaCm2: "",
-  sputter:    { temp: 600, pressure: 10, oxygen_pct: 20, time_s: 2000, power_W: 150 },
-  pld:        { temp: 600, pressure: 2,  frequency_hz: 10, energy_mJ: 60, pulses: 10000 },
-  materials:  { sputter: [], pld: [] },
-  structures: [],
-  custom_growth_params: { sputter: [], pld: [] },
+  techniques: SHIPPED_TECHNIQUES,
 };
 
-function mergeSettings(parsed) {
+function mergeSettings(raw) {
+  if (!raw) raw = {};
+
+  // ── Migration: old settings (no techniques key) → new format ──────────────
+  if (!raw.techniques) {
+    const oldS = raw.sputter || {};
+    const oldP = raw.pld     || {};
+    const sCustom = (raw.custom_growth_params?.sputter || []);
+    const pCustom = (raw.custom_growth_params?.pld     || []);
+
+    const sputterTech = {
+      id: "sputter", name: "Sputter",
+      params: [
+        { id: "temp",       name: "Temperature", unit: "°C",    default: oldS.temp       ?? 600,  scope: "layer",  type: "number" },
+        { id: "pressure",   name: "Pressure",    unit: "mTorr", default: oldS.pressure   ?? 3,    scope: "layer",  type: "number" },
+        { id: "oxygen_pct", name: "O₂",          unit: "%",     default: oldS.oxygen_pct ?? 10,   scope: "layer",  type: "number" },
+        { id: "time_s",     name: "Time",        unit: "s",     default: oldS.time_s     ?? 2000, scope: "layer",  type: "number" },
+        { id: "power_type", name: "Power type",  unit: "",      default: "RF", scope: "target", type: "select", options: ["RF", "DC", "Pulsed DC"] },
+        { id: "power_W",    name: "Power",       unit: "W",     default: oldS.power_W    ?? 150,  scope: "target", type: "number" },
+        ...sCustom.map(p => ({ ...p, scope: p.scope || "layer", type: p.type || "number" })),
+      ],
+    };
+    const pldTech = {
+      id: "pld", name: "PLD",
+      params: [
+        { id: "temp",         name: "Temperature", unit: "°C",   default: oldP.temp         ?? 670,  scope: "layer",  type: "number" },
+        { id: "pressure",     name: "Pressure",    unit: "mTorr",default: oldP.pressure     ?? 100,  scope: "layer",  type: "number" },
+        { id: "frequency_hz", name: "Rep rate",    unit: "Hz",   default: oldP.frequency_hz ?? 10,   scope: "layer",  type: "number" },
+        { id: "energy_mJ",    name: "Energy",      unit: "mJ",   default: oldP.energy_mJ    ?? 100,  scope: "target", type: "number" },
+        { id: "pulses",       name: "Pulses",      unit: "",     default: oldP.pulses       ?? 1000, scope: "target", type: "number" },
+        ...pCustom.map(p => ({ ...p, scope: p.scope || "layer", type: p.type || "number" })),
+      ],
+    };
+    raw = { ...raw, techniques: [sputterTech, pldTech] };
+  }
+
   return {
-    ...DEFAULT_SETTINGS,
-    ...parsed,
-    sputter:    { ...DEFAULT_SETTINGS.sputter, ...parsed.sputter },
-    pld:        { ...DEFAULT_SETTINGS.pld,     ...parsed.pld },
-    materials: {
-      sputter: parsed.materials?.sputter ?? [],
-      pld:     parsed.materials?.pld     ?? [],
-    },
-    structures: parsed.structures ?? [],
-    custom_growth_params: {
-      sputter: parsed.custom_growth_params?.sputter ?? [],
-      pld:     parsed.custom_growth_params?.pld     ?? [],
-    },
+    defaultSubstrate: raw.defaultSubstrate ?? "STO (001)",
+    defaultLot:       raw.defaultLot       ?? "",
+    defaultAreaCm2:   raw.defaultAreaCm2   ?? "",
+    techniques:       raw.techniques,
+    xrd_configs:      raw.xrd_configs      ?? [],
   };
 }
 
@@ -1434,6 +2806,40 @@ function makeParamId(name) {
   const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "param";
   const suffix = Math.random().toString(36).slice(2, 6);
   return `${slug}_${suffix}`;
+}
+
+// Param IDs that are stored directly on layer/target objects (backward compat).
+// User-added params use layer.custom[id] / target.custom[id].
+const BUILTIN_LAYER_PARAM_IDS  = new Set(["temp","pressure","oxygen_pct","time_s","frequency_hz"]);
+const BUILTIN_TARGET_PARAM_IDS = new Set(["power_W","energy_mJ","pulses","power_type","material"]);
+
+// Get the technique definition object from settings.
+function getTechDef(settings, techniqueId) {
+  return (settings?.techniques || []).find(t => t.id === techniqueId) || null;
+}
+
+// Get all params for a technique.
+function getTechParams(settings, techniqueId) {
+  return getTechDef(settings, techniqueId)?.params || [];
+}
+
+// Get user-added (non-builtin) layer params for a technique.
+// These are stored in layer.custom[id], not layer[id].
+function getUserLayerParams(settings, techniqueId) {
+  return getTechParams(settings, techniqueId)
+    .filter(p => p.scope === "layer" && !BUILTIN_LAYER_PARAM_IDS.has(p.id));
+}
+
+// Read a layer param value (checks custom first for user params, falls back to direct field).
+function readLayerParam(layer, paramId) {
+  if (BUILTIN_LAYER_PARAM_IDS.has(paramId)) return layer[paramId] ?? "";
+  return layer.custom?.[paramId] ?? layer[paramId] ?? "";
+}
+
+// Read a target param value.
+function readTargetParam(target, paramId) {
+  if (BUILTIN_TARGET_PARAM_IDS.has(paramId)) return target[paramId] ?? "";
+  return target.custom?.[paramId] ?? target[paramId] ?? "";
 }
 
 // Parse a CIF file text and return { name, a, b, c, alpha, beta, gamma }
@@ -1458,67 +2864,65 @@ function saveSettings(s) {
   api("PUT", "/settings", s).catch(() => {});
 }
 
-const SPUTTER_DEFAULTS = { material: "", power_W: 150 };
-const PLD_DEFAULTS     = { material: "", energy_mJ: 60, pulses: 10000 };
-
-function newLayer(technique, settings) {
-  const cfg = settings?.[technique] || {};
-  return {
+function newLayer(techniqueId, settings) {
+  const params  = getTechParams(settings, techniqueId);
+  const layer = {
     id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
-    temp:     cfg.temp     ?? (technique === "pld" ? 600 : 600),
-    pressure: cfg.pressure ?? (technique === "pld" ? 2   : 10),
-    ...(technique === "pld"
-      ? { frequency_hz: cfg.frequency_hz ?? 10, focal_position: "" }
-      : { oxygen_pct:   cfg.oxygen_pct   ?? 20, time_s: cfg.time_s ?? 2000 }),
-    targets: [technique === "pld"
-      ? { material: "", energy_mJ: cfg.energy_mJ ?? 60, pulses: cfg.pulses ?? 10000 }
-      : { material: "", power_W:   cfg.power_W   ?? 150 }],
+    technique: techniqueId,
   };
+  // Layer-scoped params
+  for (const p of params.filter(pp => pp.scope === "layer")) {
+    const val = p.default !== "" && p.default != null ? p.default : "";
+    if (BUILTIN_LAYER_PARAM_IDS.has(p.id)) {
+      layer[p.id] = val;
+    } else {
+      if (!layer.custom) layer.custom = {};
+      layer.custom[p.id] = val;
+    }
+  }
+  // First target (target-scoped params)
+  const target = { material: "" };
+  for (const p of params.filter(pp => pp.scope === "target")) {
+    target[p.id] = p.default !== "" && p.default != null ? p.default : (p.type === "select" ? (p.options?.[0] || "") : "");
+  }
+  layer.targets = [target];
+  return layer;
 }
 
-function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMaterials, settings }) {
+function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMaterials, settings, materialsLib = [] }) {
   const s = getMaterialStyle(target.material);
-  const tField = (k, label, unit, w = 70) => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{label}</span>
-      <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-        <input value={target[k] ?? ""} onChange={e => onChange({ ...target, [k]: e.target.value })}
-          style={{ width: w, background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
-        {unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", whiteSpace: "nowrap" }}>{unit}</span>}
-      </div>
-    </div>
-  );
+  const techParams = getTechParams(settings, technique);
+  const targetParams = techParams.filter(p => p.scope === "target" && p.id !== "material");
+
   const handleMaterialChange = (v) => {
-    const lib   = settings?.materials?.[technique] || [];
-    const entry = lib.find(m => m.name === v);
+    const entry = (materialsLib || []).find(m => m.name === v);
     if (entry) {
+      const defaults = entry.growth_defaults?.[technique] || {};
       const merged = { ...target, material: v };
       const layerDefaults = {};
-      if (technique === "sputter") {
-        if (entry.power_W    != null && entry.power_W    !== "") merged.power_W          = entry.power_W;
-        if (entry.temp       != null && entry.temp       !== "") layerDefaults.temp       = entry.temp;
-        if (entry.pressure   != null && entry.pressure   !== "") layerDefaults.pressure   = entry.pressure;
-        if (entry.oxygen_pct != null && entry.oxygen_pct !== "") layerDefaults.oxygen_pct = entry.oxygen_pct;
-        if (entry.time_s     != null && entry.time_s     !== "") layerDefaults.time_s     = entry.time_s;
-      } else {
-        if (entry.energy_mJ    != null && entry.energy_mJ    !== "") merged.energy_mJ          = entry.energy_mJ;
-        if (entry.pulses       != null && entry.pulses       !== "") merged.pulses              = entry.pulses;
-        if (entry.temp         != null && entry.temp         !== "") layerDefaults.temp         = entry.temp;
-        if (entry.pressure     != null && entry.pressure     !== "") layerDefaults.pressure     = entry.pressure;
-        if (entry.frequency_hz != null && entry.frequency_hz !== "") layerDefaults.frequency_hz = entry.frequency_hz;
+      // Autofill target-scoped params
+      for (const p of targetParams) {
+        if (defaults[p.id] != null && defaults[p.id] !== "") {
+          merged[p.id] = defaults[p.id];
+        }
       }
-      // Autofill custom growth params from material library entry
-      const customParams = settings?.custom_growth_params?.[technique] || [];
-      const customFill = {};
-      for (const p of customParams) {
-        if (entry[p.id] != null && entry[p.id] !== "") customFill[p.id] = entry[p.id];
+      // Autofill layer-scoped params
+      for (const p of getTechParams(settings, technique).filter(pp => pp.scope === "layer")) {
+        if (defaults[p.id] != null && defaults[p.id] !== "") {
+          if (BUILTIN_LAYER_PARAM_IDS.has(p.id)) {
+            layerDefaults[p.id] = defaults[p.id];
+          } else {
+            if (!layerDefaults.custom) layerDefaults.custom = {};
+            layerDefaults.custom[p.id] = defaults[p.id];
+          }
+        }
       }
-      if (Object.keys(customFill).length) layerDefaults.custom = customFill;
-      onChange(merged, Object.keys(layerDefaults).length ? layerDefaults : null);
+      onChange(merged, Object.keys(layerDefaults).length ? layerDefaults : undefined);
     } else {
       onChange({ ...target, material: v });
     }
   };
+
   return (
     <div style={{ display: "flex", alignItems: "flex-end", gap: 8, flexWrap: "wrap" }}>
       <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -1527,16 +2931,30 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
           <MaterialCombobox value={target.material} onChange={handleMaterialChange} knownMaterials={knownMaterials} small />
         </div>
       </div>
-      {technique === "sputter" ? (
-        <>
-          {tField("power_W", "Power", "W", 56)}
-        </>
-      ) : (
-        <>
-          {tField("energy_mJ", "Energy", "mJ", 60)}
-          {tField("pulses",    "Pulses",  "",  72)}
-        </>
-      )}
+      {targetParams.map(p => {
+        const val = readTargetParam(target, p.id);
+        if (p.type === "select") {
+          return (
+            <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
+              <select value={val} onChange={e => onChange({ ...target, [p.id]: e.target.value })}
+                style={{ background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", cursor: "pointer" }}>
+                {(p.options || []).map(o => <option key={o} value={o}>{o}</option>)}
+              </select>
+            </div>
+          );
+        }
+        return (
+          <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+              <input value={val} onChange={e => onChange({ ...target, [p.id]: e.target.value })}
+                style={{ width: p.id === "pulses" ? 72 : 56, background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+              {p.unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", whiteSpace: "nowrap" }}>{p.unit}</span>}
+            </div>
+          </div>
+        );
+      })}
       {canRemove && (
         <button onClick={onRemove} style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px", alignSelf: "flex-end", marginBottom: 1 }}>×</button>
       )}
@@ -1544,9 +2962,36 @@ function TargetRow({ target, technique, onChange, onRemove, canRemove, knownMate
   );
 }
 
-function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials, settings, initialEditing = false }) {
+function LayerEditor({ layer, technique: sampleTechnique, onRemove, onDuplicate, onUpdate, onDragStart, onDragOver, onDrop, onDragEnd, isDragOver, knownMaterials, settings, materialsLib = [], initialEditing = false, onLogUpload, onLogRemove, logBusy = false }) {
   const [editing, setEditing] = useState(initialEditing);
   const [draft, setDraft]     = useState(initialEditing ? JSON.parse(JSON.stringify(layer)) : null);
+
+  // Effective technique: layer carries its own if set, otherwise falls back to sample's technique
+  const viewTechnique = layer.technique || sampleTechnique;
+  const editTechnique = draft?.technique || sampleTechnique;
+
+  // Change technique in edit mode — rebuilds params, preserves overlapping values and materials
+  const changeTechnique = (newTechId) => {
+    const newParams = getTechParams(settings, newTechId);
+    const newDraft = { ...draft, technique: newTechId };
+    for (const p of newParams.filter(pp => pp.scope === "layer")) {
+      const def = p.default !== "" && p.default != null ? p.default : "";
+      if (BUILTIN_LAYER_PARAM_IDS.has(p.id)) {
+        newDraft[p.id] = draft[p.id] ?? def;
+      } else {
+        newDraft.custom = { ...(newDraft.custom || {}) };
+        newDraft.custom[p.id] = draft.custom?.[p.id] ?? def;
+      }
+    }
+    newDraft.targets = draft.targets.map(t => {
+      const nt = { material: t.material };
+      for (const p of newParams.filter(pp => pp.scope === "target")) {
+        nt[p.id] = t[p.id] ?? (p.default !== "" && p.default != null ? p.default : (p.type === "select" ? (p.options?.[0] || "") : ""));
+      }
+      return nt;
+    });
+    setDraft(newDraft);
+  };
 
   const startEdit = (e) => {
     e.stopPropagation();
@@ -1555,16 +3000,20 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
   };
   const saveEdit = (e) => { e.stopPropagation(); onUpdate(draft); setEditing(false); };
   const cancelEdit = (e) => { e.stopPropagation(); if (initialEditing) { onRemove(); } else { setEditing(false); } };
-  const handleEditKeyDown = (e) => { if (e.key === "Enter") { e.preventDefault(); onUpdate(draft); setEditing(false); } };
+  const handleEditKeyDown = (e) => {
+    if (e.key === "Enter" && e.target.tagName !== "TEXTAREA" && e.target.tagName !== "SELECT") { e.preventDefault(); onUpdate(draft); setEditing(false); }
+    if (e.key === "Escape") { e.stopPropagation(); setDraft(JSON.parse(JSON.stringify(layer))); setEditing(false); }
+  };
   const setDraftField = (k, v) => setDraft(p => ({ ...p, [k]: v }));
   const updateTarget = (i, t, layerDefaults)  => setDraft(p => { const ts = [...p.targets]; ts[i] = t; const patch = { ...p, targets: ts }; if (i === 0 && layerDefaults) { const { custom: newCustom, ...rest } = layerDefaults; Object.assign(patch, rest); if (newCustom) patch.custom = { ...(patch.custom || {}), ...newCustom }; } return patch; });
   const removeTarget = (i)     => setDraft(p => { const ts = p.targets.filter((_, j) => j !== i); return { ...p, targets: ts }; });
   const addTarget = () => {
-    const cfg = settings?.[technique] || {};
-    const newTarget = technique === "pld"
-      ? { material: "", energy_mJ: cfg.energy_mJ ?? 60, pulses: cfg.pulses ?? 10000 }
-      : { material: "", power_W: cfg.power_W ?? 150 };
-    setDraft(p => ({ ...p, targets: [...p.targets, newTarget] }));
+    const params = getTechParams(settings, editTechnique);
+    const target = { material: "" };
+    for (const p of params.filter(pp => pp.scope === "target")) {
+      target[p.id] = p.default !== "" && p.default != null ? p.default : (p.type === "select" ? (p.options?.[0] || "") : "");
+    }
+    setDraft(p => ({ ...p, targets: [...p.targets, target] }));
   };
 
   const materials = layer.targets.map(t => t.material).filter(Boolean);
@@ -1580,15 +3029,22 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
       <div draggable onDragStart={onDragStart} onDragOver={e => { e.preventDefault(); onDragOver(); }} onDrop={onDrop} onDragEnd={onDragEnd}
         style={{ background: T.bg3, border: `1px solid ${isDragOver ? T.amber : T.border}`, borderRadius: 7, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10, cursor: "grab", transition: "border-color .12s", flexWrap: "wrap" }}>
         <span style={{ color: T.textDim, fontSize: 14, cursor: "grab", userSelect: "none", letterSpacing: "-1px" }}>⠿</span>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 3, padding: "1px 5px", textTransform: "uppercase", letterSpacing: 0.5, flexShrink: 0 }}>
+          {getTechDef(settings, viewTechnique)?.name || viewTechnique}
+        </span>
         <div style={{ display: "flex", gap: 5, flex: 1, flexWrap: "wrap", alignItems: "center" }}>
           {layer.targets.length && layer.targets.some(t => t.material) ? layer.targets.map((t, i) => {
             const s = getMaterialStyle(t.material || "?");
-            const detail = technique === "pld"
-              ? [t.energy_mJ != null ? `${t.energy_mJ} mJ` : null, t.pulses != null ? `${Number(t.pulses).toLocaleString()} pulses` : null].filter(Boolean).join(" · ")
-              : t.power_W != null ? `${t.power_W} W` : null;
+            const techParams = getTechParams(settings, viewTechnique);
+            const targetNumParams = techParams.filter(p => p.scope === "target" && p.type === "number" && p.id !== "material");
+            const detail = targetNumParams.map(p => {
+              const v = readTargetParam(t, p.id);
+              if (v == null || v === "") return null;
+              return `${v}${p.unit ? ` ${p.unit}` : ""}`;
+            }).filter(Boolean).join(" · ") || null;
             return (
               <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 700, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 8px" }}>
-                <ChemName name={t.material || "?"} />
+                <ChemName name={matDisplayName(t.material || "?", materialsLib)} />
                 {detail && <span style={{ fontWeight: 400, opacity: 0.7, fontSize: 11 }}>· {detail}</span>}
               </span>
             );
@@ -1603,17 +3059,20 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
             <div style={{ fontSize: 12, color: T.textPrimary, fontFamily: "'DM Mono', monospace" }}>{layer.thickness_nm}<span style={{ fontSize: 10, color: T.textDim }}> nm</span></div>
           </div>
         )}
-        {sharedField("temp", "Temp", "°C")}
-        {sharedField("pressure", "Press", "mTorr")}
-        {technique === "pld"
-          ? <>{sharedField("frequency_hz", "Rep", "Hz")}</>
-          : <>{sharedField("oxygen_pct", "O₂", "%")}{sharedField("time_s", "Time", "s")}</>}
-        {(settings?.custom_growth_params?.[technique] || []).filter(p => layer.custom?.[p.id] != null && layer.custom[p.id] !== "").map(p => (
-          <div key={p.id} style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", marginBottom: 1 }}>{p.name || p.id}</div>
-            <div style={{ fontSize: 12, color: T.textPrimary, fontFamily: "'DM Mono', monospace" }}>{layer.custom[p.id]}<span style={{ fontSize: 10, color: T.textDim }}>{p.unit ? ` ${p.unit}` : ""}</span></div>
-          </div>
-        ))}
+        {getTechParams(settings, viewTechnique).filter(p => p.scope === "layer").map(p => {
+          const v = readLayerParam(layer, p.id);
+          if (v == null || v === "") return null;
+          return (
+            <div key={p.id} style={{ textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", marginBottom: 1 }}>{p.name || p.id}</div>
+              <div style={{ fontSize: 12, color: T.textPrimary, fontFamily: "'DM Mono', monospace" }}>{v}<span style={{ fontSize: 10, color: T.textDim }}>{p.unit ? ` ${p.unit}` : ""}</span></div>
+            </div>
+          );
+        })}
+        {onLogUpload && (
+          <LayerLogDropZone hasLog={!!layer.sputter_log} busy={logBusy}
+            onFile={f => onLogUpload(f)} onRemove={() => onLogRemove?.()} />
+        )}
         <button onClick={startEdit}   style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>✎</button>
         <button onClick={onDuplicate} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 15, padding: 0 }}>+</button>
         <button onClick={onRemove}    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, padding: 0 }}>×</button>
@@ -1625,7 +3084,16 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
 
   return (
     <div onKeyDown={handleEditKeyDown} style={{ background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 7, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 12 }}>
-      {/* shared layer fields */}
+      {/* Technique selector */}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {(settings?.techniques || []).map(t => (
+          <button key={t.id} onClick={() => changeTechnique(t.id)}
+            style={{ padding: "3px 10px", fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 600, cursor: "pointer", borderRadius: 4, border: `1px solid ${editTechnique === t.id ? T.amber : T.border}`, background: editTechnique === t.id ? T.amberGlow : "transparent", color: editTechnique === t.id ? T.amber : T.textSecondary, transition: "all .15s" }}>
+            {t.name || t.id}
+          </button>
+        ))}
+      </div>
+      {/* Layer params — rendered dynamically from technique definition */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
           <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Thickness</span>
@@ -1634,72 +3102,42 @@ function LayerEditor({ layer, technique, onRemove, onDuplicate, onUpdate, onDrag
             <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>nm</span>
           </div>
         </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-          <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Temp</span>
-          <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-            <input value={draft.temp ?? ""} onChange={e => setDraftField("temp", e.target.value)} style={{ ...inputSm, width: 60 }} />
-            <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>°C</span>
-          </div>
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-          <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Pressure</span>
-          <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-            <input value={draft.pressure ?? ""} onChange={e => setDraftField("pressure", e.target.value)} style={{ ...inputSm, width: 60 }} />
-            <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>mTorr</span>
-          </div>
-        </div>
-        {technique === "sputter" && (
-          <>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>O₂</span>
+        {getTechParams(settings, editTechnique).filter(p => p.scope === "layer").map(p => {
+          const isBuiltin = BUILTIN_LAYER_PARAM_IDS.has(p.id);
+          const val = isBuiltin ? (draft[p.id] ?? "") : (draft.custom?.[p.id] ?? "");
+          const setVal = v => {
+            if (isBuiltin) setDraftField(p.id, v);
+            else setDraft(prev => ({ ...prev, custom: { ...(prev.custom || {}), [p.id]: v } }));
+          };
+          const placeholder = p.default !== "" && p.default != null ? String(p.default) : "—";
+          if (p.type === "select") {
+            return (
+              <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
+                <select value={val} onChange={e => setVal(e.target.value)}
+                  style={{ ...inputSm, cursor: "pointer", textAlign: "left" }}>
+                  {(p.options || []).map(o => <option key={o} value={o}>{o}</option>)}
+                </select>
+              </div>
+            );
+          }
+          return (
+            <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
               <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-                <input value={draft.oxygen_pct ?? ""} onChange={e => setDraftField("oxygen_pct", e.target.value)} style={{ ...inputSm, width: 50 }} />
-                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>%</span>
+                <input value={val} placeholder={placeholder} onChange={e => setVal(e.target.value)}
+                  style={{ ...inputSm, width: p.unit === "°C" || p.unit === "mTorr" || p.unit === "s" ? 60 : p.unit === "%" || p.unit === "Hz" ? 50 : 70 }} />
+                {p.unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{p.unit}</span>}
               </div>
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Time</span>
-              <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-                <input value={draft.time_s ?? ""} onChange={e => setDraftField("time_s", e.target.value)} style={{ ...inputSm, width: 60 }} />
-                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>s</span>
-              </div>
-            </div>
-          </>
-        )}
-        {technique === "pld" && (
-          <>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Rep rate</span>
-              <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-                <input value={draft.frequency_hz ?? ""} onChange={e => setDraftField("frequency_hz", e.target.value)} style={{ ...inputSm, width: 56 }} />
-                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>Hz</span>
-              </div>
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Focal pos.</span>
-              <input value={draft.focal_position ?? ""} onChange={e => setDraftField("focal_position", e.target.value)} style={{ ...inputSm, width: 80 }} />
-            </div>
-          </>
-        )}
-        {(settings?.custom_growth_params?.[technique] || []).map(p => (
-          <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
-            <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-              <input
-                value={draft.custom?.[p.id] ?? ""}
-                placeholder={p.default !== "" ? String(p.default) : "—"}
-                onChange={e => setDraft(prev => ({ ...prev, custom: { ...(prev.custom || {}), [p.id]: e.target.value } }))}
-                style={{ ...inputSm, width: 70 }} />
-              {p.unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{p.unit}</span>}
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
       {/* targets */}
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Targets</span>
         {draft.targets.map((t, i) => (
-          <TargetRow key={i} target={t} technique={technique} knownMaterials={knownMaterials} settings={settings}
+          <TargetRow key={i} target={t} technique={editTechnique} knownMaterials={knownMaterials} settings={settings} materialsLib={materialsLib}
             onChange={(t2, ld) => updateTarget(i, t2, ld)}
             onRemove={() => removeTarget(i)}
             canRemove={draft.targets.length > 1} />
@@ -1735,10 +3173,12 @@ function splitCsvLine(line) {
 
 // ── AddDataModal ──────────────────────────────────────────────────────────────
 
-function AddDataModal({ onClose, moduleOptions = [], sampleId, onModuleFileAdded }) {
+function AddDataModal({ onClose, moduleOptions = [], sampleId, sample, onModuleFileAdded }) {
+  useEscClose(onClose);
   const mono = { fontFamily: "'DM Mono', monospace" };
-  const [uploadingFor, setUploadingFor] = useState(null); // module id being uploaded
+  const [uploadingFor, setUploadingFor] = useState(null); // module id being uploaded for single-file
   const [uploading,    setUploading]    = useState(false);
+  const [manageTarget, setManageTarget] = useState(null); // mod object for ManageDataModal
 
   const handleModuleFile = async (mod, file) => {
     setUploading(true);
@@ -1752,6 +3192,18 @@ function AddDataModal({ onClose, moduleOptions = [], sampleId, onModuleFileAdded
     setUploading(false);
   };
 
+  // If a collection module was clicked, show ManageDataModal instead
+  if (manageTarget && sample) {
+    return (
+      <ManageDataModal
+        mod={manageTarget}
+        sample={sample}
+        onClose={() => { onModuleFileAdded?.(); onClose(); }}
+        onChanged={() => onModuleFileAdded?.()}
+      />
+    );
+  }
+
   return (
     <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
       style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
@@ -1764,7 +3216,17 @@ function AddDataModal({ onClose, moduleOptions = [], sampleId, onModuleFileAdded
           <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
             {moduleOptions.map(mod => (
               <div key={mod.id}>
-                {uploadingFor === mod.id ? (
+                {mod.file_mode === "collection" ? (
+                  // Collection module — clicking opens ManageDataModal directly
+                  <button onClick={() => setManageTarget(mod)}
+                    style={{ width: '100%', background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: 3, transition: 'border-color .15s' }}
+                    onMouseEnter={e => e.currentTarget.style.borderColor = T.red}
+                    onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+                    <span style={{ ...mono, fontSize: 12, color: T.red, fontWeight: 600 }}>{mod.name}</span>
+                    <span style={{ ...mono, fontSize: 10, color: T.textDim }}>{mod.description}</span>
+                    <span style={{ ...mono, fontSize: 9, color: T.amber, marginTop: 1 }}>⊞ collection — manage files →</span>
+                  </button>
+                ) : uploadingFor === mod.id ? (
                   <label style={{ background: T.bg2, border: `1px solid ${T.teal}`, borderRadius: 8, padding: '11px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}>
                     <span style={{ ...mono, fontSize: 12, color: T.teal }}>{uploading ? 'Uploading…' : `↑ Choose file for ${mod.name}`}</span>
                     <input type="file" accept={mod.accepts?.join(",")} style={{ display: 'none' }}
@@ -1794,7 +3256,7 @@ function AddDataModal({ onClose, moduleOptions = [], sampleId, onModuleFileAdded
 
 // ── SampleDetail ──────────────────────────────────────────────────────────────
 
-function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [] }) {
+function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [], materialsLib = [] }) {
   const [addingLayer, setAddingLayer]   = useState(false);
   const [meta, setMeta]                 = useState({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
   const [dragIdx, setDragIdx]           = useState(null);
@@ -1802,6 +3264,12 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
   const [knownMaterials, setKnownMaterials] = useState([]);
   const [xrdAnalysisOpen, setXrdAnalysisOpen] = useState(false);
   const [addDataOpen, setAddDataOpen]         = useState(false);
+
+  // Flatten materialsLib crystal data into the shape XRD panels expect: {name, a, b, c, ...}
+  const structuresCompat = useMemo(
+    () => materialsLib.map(m => ({ name: m.name, ...(m.crystal || {}) })),
+    [materialsLib]
+  );
 
   useEffect(() => {
     api("GET", "/materials").then(setKnownMaterials).catch(() => {});
@@ -1861,9 +3329,25 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
     reader.readAsText(file);
   };
 
+  // Per-layer deposition-log upload (drop zone lives on each layer row).
+  const [logBusy, setLogBusy] = useState({});   // layerId → bool
+  const handleLogUpload = async (layerId, file) => {
+    if (!file) return;
+    setLogBusy(b => ({ ...b, [layerId]: true }));
+    try {
+      const res = await uploadSputterLog(sample.id, file);
+      onUpdate({ ...sample, layers: sample.layers.map(l => l.id === layerId ? { ...l, sputter_log: res.filename } : l) });
+    } catch (_) { /* invalid file — leave layer unchanged */ }
+    setLogBusy(b => ({ ...b, [layerId]: false }));
+  };
+  const handleLogRemove = (layerId) =>
+    onUpdate({ ...sample, layers: sample.layers.map(l => l.id === layerId ? { ...l, sputter_log: undefined } : l) });
+
+  const isSputter = (sample.technique || "sputter") === "sputter";
   const pd = plotData || {};
   const hasFiles = Object.keys(sample.filenames || {}).length > 0;
-  const modulesForSection = (sec) => modules.filter(m => m.section === sec);
+  // PUND has its own dedicated four-card section — exclude it from generic module rendering.
+  const modulesForSection = (sec) => modules.filter(m => m.section === sec && m.id !== "pund");
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
@@ -1892,11 +3376,12 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {sample.layers.map((l, i) => (
-            <LayerEditor key={l.id} layer={l} technique={sample.technique || "sputter"} knownMaterials={knownMaterials} settings={settings}
+            <LayerEditor key={l.id} layer={l} technique={sample.technique || "sputter"} knownMaterials={knownMaterials} settings={settings} materialsLib={materialsLib}
               onRemove={() => removeLayer(l.id)} onDuplicate={() => duplicateLayer(l.id)} onUpdate={updateLayer}
               isDragOver={overIdx === i && dragIdx !== i}
               onDragStart={() => setDragIdx(i)} onDragOver={() => setOverIdx(i)}
-              onDrop={() => handleDrop(i)} onDragEnd={() => { setDragIdx(null); setOverIdx(null); }} />
+              onDrop={() => handleDrop(i)} onDragEnd={() => { setDragIdx(null); setOverIdx(null); }}
+              {...(isSputter ? { onLogUpload: f => handleLogUpload(l.id, f), onLogRemove: () => handleLogRemove(l.id), logBusy: !!logBusy[l.id] } : {})} />
           ))}
           {!sample.layers.length && <div style={{ color: T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "10px 0" }}>No layers — add one above.</div>}
         </div>
@@ -1905,10 +3390,18 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
             technique={sample.technique || "sputter"}
             knownMaterials={knownMaterials}
             settings={settings}
+            materialsLib={materialsLib}
             onAdd={addLayer}
             onClose={() => setAddingLayer(false)} />
         )}
       </section>
+
+      {isSputter && sample.layers.some(l => l.sputter_log) && (
+        <section>
+          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Deposition Log</div>
+          <SputterLogCards sample={sample} materialsLib={materialsLib} />
+        </section>
+      )}
 
       <section>
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>X-Ray Characterization</div>
@@ -1916,16 +3409,18 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
           {["xrd_ot", "xrr", "rsm"].map(t => (
             <MeasCard key={t} type={t} plotData={pd[t]} filename={sample.filenames?.[t]}
               onFile={(measType, file) => handleFile(measType, file)}
+              substrate={t === "xrd_ot" ? sample.substrate : undefined}
+              structures={t === "xrd_ot" ? structuresCompat : undefined}
               onAnalyze={t === "xrd_ot" ? () => setXrdAnalysisOpen(true) : undefined} />
           ))}
           {modulesForSection("structural").map(m => (
-            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} />
+            <ModuleCard key={m.id} mod={m} sample={sample} modules={modules} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
           ))}
           {xrdAnalysisOpen && (
             <XRDAnalysisModal
               sample={sample}
               xrdData={pd?.xrd_ot || []}
-              structures={settings?.structures || []}
+              structures={structuresCompat}
               xrdConfigs={settings?.xrd_configs || []}
               onSaveXrdConfigs={configs => onSaveSettings?.({ ...settings, xrd_configs: configs })}
               onSave={peaks => onUpdate({ ...sample, xrd_peaks: peaks })}
@@ -1939,7 +3434,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
           <AfmCard afmData={pd.afm} filename={sample.filenames?.afm} onFile={file => handleFile("afm", file)} />
           {modulesForSection("scanning_probe").map(m => (
-            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} />
+            <ModuleCard key={m.id} mod={m} sample={sample} modules={modules} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
           ))}
         </div>
       </section>
@@ -1962,15 +3457,27 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               onAreaChange={handleAreaChange} />
           ))}
           {modulesForSection("electrical").map(m => (
-            <ModuleCard key={m.id} mod={m} sample={sample} onRemoved={refreshSample} />
+            <ModuleCard key={m.id} mod={m} sample={sample} modules={modules} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
           ))}
         </div>
         {addDataOpen && <AddDataModal
           onClose={() => setAddDataOpen(false)}
           sampleId={sample.id}
-          moduleOptions={modulesForSection("electrical").filter(m => !sample.filenames?.[m.id])}
+          sample={sample}
+          moduleOptions={modulesForSection("electrical").filter(m => {
+            // Derived modules auto-appear via their upstream — never offered for upload
+            if (m.file_mode === "derived") return false;
+            const hasSingle = !!sample.filenames?.[m.id];
+            const hasColl   = (sample.module_file_counts?.[m.id] ?? 0) > 0;
+            return !hasSingle && !hasColl;
+          })}
           onModuleFileAdded={refreshSample}
         />}
+      </section>
+
+      <section>
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>PUND</div>
+        <PundCards sample={sample} onUpdate={onUpdate} />
       </section>
 
       {/* Optical section — only rendered if modules exist for it */}
@@ -1978,7 +3485,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         <section>
           <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Optical</div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
-            {modulesForSection("optical").map(m => <ModuleCard key={m.id} mod={m} sample={sample} />)}
+            {modulesForSection("optical").map(m => <ModuleCard key={m.id} mod={m} sample={sample} modules={modules} onRemoved={refreshSample} onSampleUpdate={refreshSample} />)}
           </div>
         </section>
       )}
@@ -1988,7 +3495,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         <section>
           <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Other</div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
-            {modulesForSection("other").map(m => <ModuleCard key={m.id} mod={m} sample={sample} />)}
+            {modulesForSection("other").map(m => <ModuleCard key={m.id} mod={m} sample={sample} modules={modules} onRemoved={refreshSample} onSampleUpdate={refreshSample} />)}
           </div>
         </section>
       )}
@@ -1998,52 +3505,92 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 
 // ── AddLayerModal ─────────────────────────────────────────────────────────────
 
-function AddLayerModal({ technique, knownMaterials, settings, onAdd, onClose }) {
-  const [draft, setDraft] = useState(() => newLayer(technique, settings));
+function AddLayerModal({ technique: sampleTechnique, knownMaterials, settings, materialsLib = [], onAdd, onClose }) {
+  useEscClose(onClose);
+  const [layerTech, setLayerTech] = useState(sampleTechnique);
+  const [draft, setDraft] = useState(() => newLayer(sampleTechnique, settings));
+
+  const switchTech = (newTechId) => {
+    setLayerTech(newTechId);
+    setDraft(newLayer(newTechId, settings));
+  };
+
   const setDraftField = (k, v) => setDraft(p => ({ ...p, [k]: v }));
-  const updateTarget  = (i, t, layerDefaults) => setDraft(p => { const ts = [...p.targets]; ts[i] = t; const patch = { ...p, targets: ts }; if (i === 0 && layerDefaults) Object.assign(patch, layerDefaults); return patch; });
-  const removeTarget  = (i)    => setDraft(p => ({ ...p, targets: p.targets.filter((_, j) => j !== i) }));
+  const updateTarget  = (i, t, layerDefaults) => setDraft(p => {
+    const ts = [...p.targets]; ts[i] = t;
+    const patch = { ...p, targets: ts };
+    if (i === 0 && layerDefaults) { const { custom: nc, ...rest } = layerDefaults; Object.assign(patch, rest); if (nc) patch.custom = { ...(patch.custom || {}), ...nc }; }
+    return patch;
+  });
+  const removeTarget  = (i) => setDraft(p => ({ ...p, targets: p.targets.filter((_, j) => j !== i) }));
   const addTarget = () => {
-    const cfg = settings?.[technique] || {};
-    const t = technique === "pld"
-      ? { material: "", energy_mJ: cfg.energy_mJ ?? 60, pulses: cfg.pulses ?? 10000 }
-      : { material: "", power_W: cfg.power_W ?? 150 };
+    const params = getTechParams(settings, layerTech);
+    const t = { material: "" };
+    for (const p of params.filter(pp => pp.scope === "target")) {
+      t[p.id] = p.default !== "" && p.default != null ? p.default : (p.type === "select" ? (p.options?.[0] || "") : "");
+    }
     setDraft(p => ({ ...p, targets: [...p.targets, t] }));
   };
 
   const inputSm = { background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" };
-  const field = (k, label, unit, w) => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{label}</span>
-      <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-        <input value={draft[k] ?? ""} onChange={e => setDraftField(k, e.target.value)} style={{ ...inputSm, width: w }} />
-        {unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{unit}</span>}
-      </div>
-    </div>
-  );
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 500, display: "flex", flexDirection: "column", gap: 16 }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 22 }}>New Layer</h2>
 
-        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
-          {field("temp",     "Temp",     "°C",    60)}
-          {field("pressure", "Pressure", "mTorr", 60)}
-          {technique === "sputter" && <>
-            {field("oxygen_pct", "O₂",  "%", 50)}
-            {field("time_s",     "Time", "s", 60)}
-          </>}
-          {technique === "pld" && <>
-            {field("frequency_hz",   "Rep rate",  "Hz", 56)}
-            {field("focal_position", "Focal pos.", "",   80)}
-          </>}
+        {/* Technique selector */}
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {(settings?.techniques || []).map(t => (
+            <button key={t.id} onClick={() => switchTech(t.id)}
+              style={{ flex: 1, padding: "6px 0", fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 600, cursor: "pointer", borderRadius: 5, border: `1px solid ${layerTech === t.id ? T.amber : T.border}`, background: layerTech === t.id ? T.amberGlow : "transparent", color: layerTech === t.id ? T.amber : T.textSecondary, transition: "all .15s" }}>
+              {t.name || t.id}
+            </button>
+          ))}
         </div>
 
+        {/* Layer-scoped params */}
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Thickness</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+              <input type="number" value={draft.thickness_nm ?? ""} onChange={e => setDraftField("thickness_nm", e.target.value === "" ? null : Number(e.target.value))} placeholder="—" style={{ ...inputSm, width: 60 }} />
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>nm</span>
+            </div>
+          </div>
+          {getTechParams(settings, layerTech).filter(p => p.scope === "layer").map(p => {
+            const isBuiltin = BUILTIN_LAYER_PARAM_IDS.has(p.id);
+            const val = isBuiltin ? (draft[p.id] ?? "") : (draft.custom?.[p.id] ?? "");
+            const setVal = v => {
+              if (isBuiltin) setDraftField(p.id, v);
+              else setDraft(prev => ({ ...prev, custom: { ...(prev.custom || {}), [p.id]: v } }));
+            };
+            if (p.type === "select") return (
+              <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
+                <select value={val} onChange={e => setVal(e.target.value)} style={{ ...inputSm, cursor: "pointer", textAlign: "left" }}>
+                  {(p.options || []).map(o => <option key={o} value={o}>{o}</option>)}
+                </select>
+              </div>
+            );
+            return (
+              <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name || p.id}</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                  <input value={val} placeholder={p.default != null && p.default !== "" ? String(p.default) : "—"} onChange={e => setVal(e.target.value)}
+                    style={{ ...inputSm, width: p.unit === "°C" || p.unit === "mTorr" || p.unit === "s" ? 60 : p.unit === "%" || p.unit === "Hz" ? 50 : 70 }} />
+                  {p.unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{p.unit}</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Targets */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Targets</span>
           {draft.targets.map((t, i) => (
-            <TargetRow key={i} target={t} technique={technique} knownMaterials={knownMaterials} settings={settings}
+            <TargetRow key={i} target={t} technique={layerTech} knownMaterials={knownMaterials} settings={settings} materialsLib={materialsLib}
               onChange={(t2, ld) => updateTarget(i, t2, ld)}
               onRemove={() => removeTarget(i)}
               canRemove={draft.targets.length > 1} />
@@ -2063,6 +3610,7 @@ function AddLayerModal({ technique, knownMaterials, settings, onAdd, onClose }) 
 // ── AddSampleModal ────────────────────────────────────────────────────────────
 
 function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
+  useEscClose(onClose);
   const [f, setF] = useState(() => template ? {
     id: "", date: template.date ?? new Date().toISOString().slice(0, 10),
     substrate: template.substrate ?? "", notes: template.notes ?? "",
@@ -2080,12 +3628,6 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
   });
   const set = k => v => setF(p => ({ ...p, [k]: v }));
 
-  const techniqueBtn = (v, label) => (
-    <button onClick={() => set("technique")(v)}
-      style={{ flex: 1, padding: "8px 0", fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 600, cursor: "pointer", borderRadius: 5, border: `1px solid ${f.technique === v ? T.amber : T.border}`, background: f.technique === v ? T.amberGlow : "transparent", color: f.technique === v ? T.amber : T.textSecondary, transition: "all .15s" }}>
-      {label}
-    </button>
-  );
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
@@ -2095,9 +3637,13 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
           {template && <div style={{ marginTop: 4, fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>From {template.id} — layers copied, data not included</div>}
         </div>
 
-        <div style={{ display: "flex", gap: 6 }}>
-          {techniqueBtn("sputter", "Sputter")}
-          {techniqueBtn("pld",     "PLD")}
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {(settings?.techniques || [{ id: "sputter", name: "Sputter" }, { id: "pld", name: "PLD" }]).map(t => (
+            <button key={t.id} onClick={() => set("technique")(t.id)}
+              style={{ flex: 1, minWidth: 80, padding: "8px 0", fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 600, cursor: "pointer", borderRadius: 5, border: `1px solid ${f.technique === t.id ? T.amber : T.border}`, background: f.technique === t.id ? T.amberGlow : "transparent", color: f.technique === t.id ? T.amber : T.textSecondary, transition: "all .15s" }}>
+              {t.name || t.id}
+            </button>
+          ))}
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
@@ -2116,7 +3662,7 @@ function AddSampleModal({ onAdd, onClose, folders, template, settings }) {
           value={f.folder_id}
           onChange={set("folder_id")}
           folders={folders || []}
-          filterFn={fo => !fo.book_folder && !fo.module_folder}
+          filterFn={fo => !fo.book_folder && !fo.module_folder && !fo.mat_folder}
           emptyLabel="— Ungrouped —"
         />
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
@@ -2549,6 +4095,7 @@ function fitPeaksVoigt(xrdData, peaks, fitWindow, bgResult = null, quick = false
 const PEAK_COLORS = ["#4a9eff", "#ff6b6b", "#51cf66", "#ffd43b", "#cc5de8", "#ff922b", "#20c997"];
 
 function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSaveXrdConfigs, onSave, onClose }) {
+  useEscClose(onClose);
   // xrd_peaks may be the old array format or the new { lines, fitWindow, fittedCurve, peakCurves } object
   const saved = sample.xrd_peaks;
   const isObj = saved && !Array.isArray(saved);
@@ -3304,6 +4851,7 @@ function XRDAnalysisModal({ sample, xrdData, structures, xrdConfigs = [], onSave
 // ── ViewDataModal ──────────────────────────────────────────────────────────────
 
 function ViewDataModal({ sampleId, files, loading, onClose, onDeleteFile }) {
+  useEscClose(onClose);
 
   const fmt = (bytes) => {
     if (bytes < 1024) return `${bytes} B`;
@@ -3414,6 +4962,7 @@ function ViewDataModal({ sampleId, files, loading, onClose, onDeleteFile }) {
 // mod.mode: "view" (built-in, read-only) | "edit" (user, editable) | "create" (new module)
 
 function ModuleSourceModal({ mod, onClose, onSave, existingIds = [] }) {
+  useEscClose(onClose);
   const isView   = mod.mode === "view";
   const isEdit   = mod.mode === "edit";
   const isCreate = mod.mode === "create";
@@ -3627,8 +5176,9 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
   const [procError,   setProcError]   = useState(null);
 
   // ── Plot section state ────────────────────────────────────────────────────
-  const [plotConfig,  setPlotConfig]  = useState({ x_var: "", y_var: "", x_label: "", y_label: "", x_scale: "linear", y_scale: "linear", color: "", show_fit: true, primary: "data", secondary_opacity: 0.35 });
+  const [plotConfig,  setPlotConfig]  = useState({ x_var: "", y_var: "", x_label: "", y_label: "", y2_label: "", x_scale: "linear", y_scale: "linear", y2_scale: "linear", color: "", show_fit: true, primary: "data", secondary_opacity: 0.35 });
   const _fitMemory = useRef({ primary: "fit", secondary_opacity: 0.25 }); // remembered fit prefs
+  const [plotTraces,  setPlotTraces]  = useState([]); // [{x_key, y_key, label, axis, style, color}]
   const [plotVars,    setPlotVars]    = useState([]); // available array keys from last proc run
   const [plotFigure,  setPlotFigure]  = useState(null);
   const [plotLoading, setPlotLoading] = useState(false);
@@ -3645,6 +5195,13 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
   // ── Card section state ────────────────────────────────────────────────────
   const [cardSection,   setCardSection]   = useState("");          // "electrical"|"structural"|...
   const [cardControls,  setCardControls]  = useState([]);          // [{name,type,choices,default,plot_overrides}]
+  const [configSchema,  setConfigSchema]  = useState([]);          // [{id,label,type,default,unit?,choices?}]
+  const [moduleDeps,    setModuleDeps]    = useState([]);          // ["lmfit>=1.0", ...]
+  const [depStatus,     setDepStatus]     = useState([]);          // [{dep,pkg,installed,blocked}]
+  const [depLoading,    setDepLoading]    = useState(false);
+  const [fileMode,      setFileMode]      = useState("single");    // "single"|"collection"|"derived"
+  const [paramManifest, setParamManifest] = useState([]);          // [{id,label,type,default,unit?,choices?}]
+  const [upstreamList,  setUpstreamList]  = useState([]);          // [{id, required, label}]
 
   const defaultProcBlock2 = () =>
     `# Transform the imported variables into your desired output.\n# Variables from Block 1 are numpy arrays and in scope.\n# Example:\n# xs = voltage * 1000\n# ys = charge / area_m2`;
@@ -3682,7 +5239,19 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
         setProcBlock2(defaultProcBlock2());
         setProcBlock3(defaultProcBlock3());
       }
-      if (cfg.plot_config)       setPlotConfig(cfg.plot_config);
+      if (cfg.plot_config)       setPlotConfig(c => ({ ...c, ...cfg.plot_config }));
+      if (cfg.plot_traces && cfg.plot_traces.length > 0) {
+        setPlotTraces(cfg.plot_traces);
+      } else if (cfg.plot_config?.x_var || cfg.plot_config?.y_var) {
+        // Auto-migrate single-trace legacy config into plotTraces
+        setPlotTraces([{
+          x_key: cfg.plot_config.x_var || "x",
+          y_key: cfg.plot_config.y_var || "y",
+          label: cfg.plot_config.y_label || cfg.plot_config.y_var || "y",
+          axis: "y1", style: "line",
+          color: cfg.plot_config.color || "",
+        }]);
+      }
       if (cfg.analysis_metrics) setAnalysisMetrics(cfg.analysis_metrics);
       // Three-block analysis: prefer explicit block fields; fall back to splitting analysis_code
       if (cfg.analysis_block2 != null) {
@@ -3703,6 +5272,11 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       }
       if (cfg.section)          setCardSection(cfg.section);
       if (cfg.card_controls)    setCardControls(cfg.card_controls);
+      if (cfg.config_schema)    setConfigSchema(cfg.config_schema);
+      if (cfg.dependencies)     { setModuleDeps(cfg.dependencies); }
+      if (cfg.file_mode)        setFileMode(cfg.file_mode);
+      if (cfg.param_manifest)   setParamManifest(cfg.param_manifest);
+      if (cfg.upstream)         setUpstreamList(cfg.upstream);
       if (cfg.delimiter)  setExDelim(cfg.delimiter);
       if (cfg.skip_rows != null) setExSkip(String(cfg.skip_rows));
     }).catch(() => {});
@@ -3711,6 +5285,11 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       if (info.delimiter && info.delimiter !== "auto") setExDelim(info.delimiter);
       if (info.skip_rows != null) setExSkip(String(info.skip_rows));
     }).catch(() => {});
+    if (!isCreate) {
+      api("GET", `/modules/${mod.id}/dependencies`).then(r => {
+        if (r?.dependencies) setDepStatus(r.dependencies);
+      }).catch(() => {});
+    }
   }, [mod.id, isCreate]);
 
   const handleExampleUpload = async (file) => {
@@ -3766,13 +5345,21 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       proc_block2: procBlock2,
       proc_block3: procBlock3,
       proc_code: fullProcCode(),       // backward compat
-      plot_config: { ...plotConfig, color: effectiveColor, opacity: dataOpacity, fit_color: effectiveColor, fit_opacity: fitOpacity },
+      plot_config: { ...plotConfig, color: effectiveColor, opacity: dataOpacity, fit_color: effectiveColor, fit_opacity: fitOpacity,
+                     x_var: plotTraces[0]?.x_key || plotConfig.x_var,
+                     y_var: plotTraces[0]?.y_key || plotConfig.y_var },
+      plot_traces: plotTraces,
       analysis_metrics: analysisMetrics,
       analysis_block2: analysisBlock2,
       analysis_block3: analysisBlock3,
       analysis_code: fullAnalysisCode(), // backward compat
       section: cardSection,
       card_controls: cardControls,
+      config_schema: configSchema,
+      dependencies: moduleDeps,
+      file_mode: fileMode,
+      param_manifest: fileMode === "collection" ? paramManifest : [],
+      upstream: upstreamList,
       folder_id: mFolderId || null,
     };
     await api("PUT", `/modules/${id}/config`, cfg);
@@ -3798,6 +5385,22 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
   const hasFitData = procResult && procResult.x_fit && procResult.y_fit;
 
   const generateBlock1 = () => {
+    // Collection mode — skip all column/header parsing, emit a simple preamble comment block
+    if (fileMode === "collection") {
+      const lines = [];
+      lines.push(`# ── Block 1: Auto-generated — do not edit ────────────────────────────────`);
+      lines.push(`import numpy as np`);
+      lines.push(`import scipy`);
+      lines.push(``);
+      lines.push(`# Collection inputs (always available in proc_code):`);
+      lines.push(`#   files    = {filename: bytes}    — every file in this module's collection`);
+      lines.push(`#   registry = [{filename, params}] — param_manifest values for each file`);
+      lines.push(`#   file_bytes / filename            — primary file (backward compat)`);
+      lines.push(`#   meta["config"]                   — per-sample config values`);
+      lines.push(`#   Resources: get_material(id), list_materials(), get_technique(id), list_techniques()`);
+      lines.push(`# ─────────────────────────────────────────────────────────────────────────`);
+      return lines.join("\n");
+    }
     if (!exInfo) return "";
     const delim = exInfo.delimiter === "whitespace" ? null : (exInfo.delimiter || "\t");
     const skipRows = exInfo.skip_rows ?? 0;
@@ -3857,12 +5460,14 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
       lines.push(``);
     }
 
-    // Footer comment listing available names
+    // Footer comment listing available names + resource API
     const available = ["file_bytes", "filename", "meta",
       ...namedCols.map(([, v]) => v),
       ...namedMeta.map(([, v]) => v),
     ].join(", ");
     lines.push(`# Available: ${available}`);
+    lines.push(`# meta["config"] holds per-sample config values declared in the Configuration section`);
+    lines.push(`# Resources: get_material(id), list_materials(), get_technique(id), list_techniques()`);
     lines.push(`# ─────────────────────────────────────────────────────────────────────`);
     return lines.join("\n");
   };
@@ -3884,7 +5489,11 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
     if (!code.trim()) return;
     setPlotLoading(true); setPlotFigure(null); setPlotError(null);
     try {
-      const res = await api("POST", `/modules/${mod.id}/preview-plot`, { code, plot_config: { ...plotConfig, color: effectiveColor, opacity: dataOpacity, fit_color: effectiveColor, fit_opacity: fitOpacity } });
+      const res = await api("POST", `/modules/${mod.id}/preview-plot`, {
+        code,
+        plot_config: { ...plotConfig, color: effectiveColor, opacity: dataOpacity, fit_color: effectiveColor, fit_opacity: fitOpacity },
+        plot_traces: plotTraces,
+      });
       if (res.ok) {
         setPlotFigure(res.figure);
         if (res.figure.available_vars?.length) setPlotVars(res.figure.available_vars);
@@ -3902,7 +5511,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
     if (!_plotFigureRef.current) return;
     const t = setTimeout(() => _previewPlotRef.current?.(), 350);
     return () => clearTimeout(t);
-  }, [JSON.stringify(plotConfig)]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(plotConfig), JSON.stringify(plotTraces)]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleComputeAnalysis = async () => {
     const proc_code = fullProcCode();
@@ -4114,6 +5723,113 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
             placeholder="Describe what this module parses, expected file format, options, etc."
             style={{ ...field(), resize: "vertical", lineHeight: 1.6 }} />
         </div>
+
+        {/* ── Data Sources (upstream modules) ── */}
+        <div style={{ marginTop: 20 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Data Sources</span>
+            {!isBuiltin && (
+              <button onClick={() => setUpstreamList(prev => [...prev, { id: "", required: true, label: "" }])}
+                style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: T.textSecondary, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+                + Add upstream
+              </button>
+            )}
+          </div>
+          <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 8 }}>
+            Modules whose output this module reads. Available in proc_code/analysis_code as <span style={{ color: T.textPrimary }}>upstream["module_id"]</span>.
+            {upstreamList.length > 0 && fileMode !== "derived" && (
+              <span style={{ color: T.amber, marginLeft: 6 }}>Tip: set File Mode to "derived" to skip file upload entirely.</span>
+            )}
+          </div>
+          {upstreamList.length === 0 ? (
+            <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, fontStyle: "italic" }}>No upstream — module is independent.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {upstreamList.map((u, i) => {
+                const upstreamOpts = (allModules || []).filter(m => m.id !== mod.id && m.id !== mId);
+                return (
+                  <div key={i} style={{ display: "flex", gap: 8, alignItems: "center", background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, padding: "6px 10px" }}>
+                    <select value={u.id || ""} disabled={isBuiltin}
+                      onChange={e => setUpstreamList(prev => prev.map((x, j) => j === i ? { ...x, id: e.target.value } : x))}
+                      style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: u.id ? T.teal : T.textDim, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", flex: 1 }}>
+                      <option value="">— pick module —</option>
+                      {upstreamOpts.map(m => <option key={m.id} value={m.id}>{m.name} ({m.id})</option>)}
+                    </select>
+                    <input value={u.label || ""} disabled={isBuiltin}
+                      onChange={e => setUpstreamList(prev => prev.map((x, j) => j === i ? { ...x, label: e.target.value } : x))}
+                      placeholder="Label (optional)"
+                      style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", width: 180 }} />
+                    <label style={{ display: "flex", alignItems: "center", gap: 4, fontFamily: mono, fontSize: 11, color: u.required ? T.teal : T.textDim, cursor: isBuiltin ? "default" : "pointer" }}>
+                      <input type="checkbox" checked={!!u.required} disabled={isBuiltin}
+                        onChange={e => setUpstreamList(prev => prev.map((x, j) => j === i ? { ...x, required: e.target.checked } : x))} />
+                      required
+                    </label>
+                    {!isBuiltin && (
+                      <button onClick={() => setUpstreamList(prev => prev.filter((_, j) => j !== i))}
+                        style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, padding: "0 4px" }}>×</button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* ── Dependencies ── (visible for both user and built-in modules) */}
+        <div style={{ marginTop: 20 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Dependencies</span>
+            <button
+              disabled={isCreate || depLoading || (depStatus.length > 0 && depStatus.every(d => d.installed || d.blocked))}
+              onClick={async () => {
+                setDepLoading(true);
+                const r = await api("POST", `/modules/${mod.id}/install-dependencies`).catch(() => null);
+                if (r?.results) setDepStatus(prev => {
+                  const map = Object.fromEntries(r.results.map(x => [x.dep, x]));
+                  return prev.map(d => map[d.dep] ? { ...d, installed: map[d.dep].ok || d.installed } : d);
+                });
+                setDepLoading(false);
+              }}
+              style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: (isCreate || depLoading) ? T.textDim : T.teal, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: (isCreate || depLoading) ? "default" : "pointer" }}>
+              {depLoading ? "Installing…" : "Install missing"}
+            </button>
+          </div>
+          <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 8 }}>
+            pip packages required by this module (e.g. <span style={{ color: T.textPrimary }}>lmfit&gt;=1.0</span>). One per line.
+            {isBuiltin && <span> Built-in modules' deps are read-only here.</span>}
+          </div>
+          {isBuiltin ? (
+            <div style={{ fontFamily: mono, fontSize: 12, color: T.textPrimary, padding: "8px 10px", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, whiteSpace: "pre-line" }}>
+              {moduleDeps.length === 0 ? <span style={{ color: T.textDim }}>(none)</span> : moduleDeps.join("\n")}
+            </div>
+          ) : (
+            <textarea
+              value={moduleDeps.join("\n")}
+              onChange={e => {
+                const deps = e.target.value.split("\n").map(s => s.trim()).filter(Boolean);
+                setModuleDeps(deps);
+                setDepStatus([]);
+              }}
+              rows={Math.max(2, moduleDeps.length + 1)}
+              spellCheck={false}
+              style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 6, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "8px 10px", outline: "none", resize: "vertical", boxSizing: "border-box" }}
+            />
+          )}
+          {depStatus.length > 0 && (
+            <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {depStatus.map((d, i) => (
+                <span key={i} style={{
+                  fontFamily: mono, fontSize: 10, padding: "2px 8px", borderRadius: 10,
+                  border: `1px solid ${d.blocked ? T.red + "55" : d.installed ? T.teal + "55" : T.amber + "55"}`,
+                  background: d.blocked ? T.red + "12" : d.installed ? T.teal + "12" : T.amber + "12",
+                  color: d.blocked ? T.red : d.installed ? T.teal : T.amber,
+                }}>
+                  {d.dep} {d.blocked ? "⊘ blocked" : d.installed ? "✓" : "⚠ missing"}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* ── Card section ── */}
@@ -4230,6 +5946,258 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
         </div>
       </div>
 
+      {/* ── Configuration Schema section ── */}
+      <div style={section}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <h3 style={{ ...sh, margin: 0 }}>Configuration</h3>
+          <button
+            onClick={() => setConfigSchema(prev => [...prev, { id: "", label: "", type: "text", default: "" }])}
+            style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: T.textSecondary, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+            + Add field
+          </button>
+        </div>
+        <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 12 }}>
+          Per-sample configuration fields. Values are stored per sample and available as <span style={{ color: T.textPrimary }}>meta["config"]["field_id"]</span> in proc_code.
+        </div>
+        {configSchema.length === 0 && (
+          <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>No config fields — module uses only card controls and default meta values.</div>
+        )}
+        {configSchema.map((field, i) => (
+          <div key={i} style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "12px 14px", marginBottom: 8 }}>
+            <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>ID (key)</div>
+                <input value={field.id}
+                  onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, id: e.target.value } : f))}
+                  placeholder="field_id"
+                  style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.teal, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+              </div>
+              <div style={{ flex: 1.5 }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Label</div>
+                <input value={field.label}
+                  onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, label: e.target.value } : f))}
+                  placeholder="Displayed label"
+                  style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+              </div>
+              <div>
+                <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Type</div>
+                <select value={field.type}
+                  onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, type: e.target.value, choices: e.target.value === "select" ? (f.choices || ["a", "b"]) : undefined } : f))}
+                  style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 11, padding: "4px 6px", outline: "none" }}>
+                  <option value="text">text</option>
+                  <option value="number">number</option>
+                  <option value="boolean">boolean</option>
+                  <option value="select">select</option>
+                </select>
+              </div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>{field.type === "boolean" ? "Default (true/false)" : "Default"}</div>
+                {field.type === "boolean" ? (
+                  <select value={field.default === true || field.default === "true" ? "true" : "false"}
+                    onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, default: e.target.value === "true" } : f))}
+                    style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "4px 6px", outline: "none" }}>
+                    <option value="false">false</option>
+                    <option value="true">true</option>
+                  </select>
+                ) : (
+                  <input value={field.default ?? ""}
+                    onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, default: field.type === "number" ? (e.target.value === "" ? "" : Number(e.target.value)) : e.target.value } : f))}
+                    type={field.type === "number" ? "number" : "text"}
+                    style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+                )}
+              </div>
+              {field.type === "number" && (
+                <div style={{ width: 80 }}>
+                  <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Unit</div>
+                  <input value={field.unit || ""}
+                    onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, unit: e.target.value } : f))}
+                    placeholder="Hz"
+                    style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+                </div>
+              )}
+              <button onClick={() => setConfigSchema(prev => prev.filter((_, j) => j !== i))}
+                style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, padding: "0 4px", alignSelf: "flex-end", marginBottom: 2 }}>×</button>
+            </div>
+            {field.type === "number" && (
+              <div style={{ marginTop: 10, display: "flex", gap: 12, alignItems: "center", paddingTop: 8, borderTop: `1px dashed ${T.border}` }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontFamily: mono, fontSize: 11, color: field.fittable ? T.teal : T.textDim }}>
+                  <input type="checkbox" checked={!!field.fittable}
+                    onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, fittable: e.target.checked } : f))} />
+                  Fittable
+                </label>
+                {field.fittable && (
+                  <>
+                    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>min</span>
+                      <input value={field.min ?? ""}
+                        onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, min: e.target.value === "" ? undefined : Number(e.target.value) } : f))}
+                        type="number" placeholder="—"
+                        style={{ width: 70, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "3px 6px", outline: "none", textAlign: "center" }} />
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>max</span>
+                      <input value={field.max ?? ""}
+                        onChange={e => setConfigSchema(prev => prev.map((f, j) => j === i ? { ...f, max: e.target.value === "" ? undefined : Number(e.target.value) } : f))}
+                        type="number" placeholder="—"
+                        style={{ width: 70, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "3px 6px", outline: "none", textAlign: "center" }} />
+                    </div>
+                    <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>
+                      Param appears in the Fit workspace as an adjustable input with these bounds.
+                    </span>
+                  </>
+                )}
+              </div>
+            )}
+            {field.type === "select" && (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 6 }}>Choices</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+                  {(field.choices || []).map((ch, ci) => (
+                    <div key={ci} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <input value={ch}
+                        onChange={e => setConfigSchema(prev => prev.map((f, j) => {
+                          if (j !== i) return f;
+                          const c2 = [...(f.choices || [])]; c2[ci] = e.target.value; return { ...f, choices: c2 };
+                        }))}
+                        style={{ width: 80, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.teal, fontFamily: mono, fontSize: 12, padding: "3px 6px", outline: "none" }} />
+                      <button onClick={() => setConfigSchema(prev => prev.map((f, j) => j !== i ? f : { ...f, choices: (f.choices || []).filter((_, k) => k !== ci) }))}
+                        style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>×</button>
+                    </div>
+                  ))}
+                  <button onClick={() => setConfigSchema(prev => prev.map((f, j) => j !== i ? f : { ...f, choices: [...(f.choices || []), ""] }))}
+                    style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 10, padding: "2px 8px", cursor: "pointer" }}>
+                    + choice
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* ── File Mode section ── */}
+      <div style={section}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <h3 style={{ ...sh, margin: 0 }}>File Mode</h3>
+        </div>
+        <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 12 }}>
+          <span style={{ color: T.textPrimary }}>Single</span> — one file per sample.{" "}
+          <span style={{ color: T.textPrimary }}>Collection</span> — multiple files with tagged parameters; proc_code receives <span style={{ color: T.teal }}>files</span> and <span style={{ color: T.teal }}>registry</span>.{" "}
+          <span style={{ color: T.textPrimary }}>Derived</span> — no file upload; data sourced entirely from upstream modules.
+        </div>
+        <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden", width: "fit-content", marginBottom: fileMode === "collection" ? 16 : 0 }}>
+          {["single", "collection", "derived"].map(mode => (
+            <button key={mode} onClick={() => setFileMode(mode)}
+              style={{ padding: "5px 18px", fontFamily: mono, fontSize: 12, border: "none", cursor: "pointer",
+                background: fileMode === mode ? T.amber : "transparent",
+                color:      fileMode === mode ? "#000" : T.textDim,
+                transition: "background 0.15s" }}>
+              {mode}
+            </button>
+          ))}
+        </div>
+
+        {fileMode === "collection" && (
+          <>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+              <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Parameter Manifest</span>
+              <button
+                onClick={() => setParamManifest(prev => [...prev, { id: "", label: "", type: "text", default: "" }])}
+                style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: T.textSecondary, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+                + Add param
+              </button>
+            </div>
+            <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim, marginBottom: 12 }}>
+              Per-file parameters declared here appear as editable columns in the Manage Data modal and as <span style={{ color: T.textPrimary }}>registry[i]["params"]</span> in proc_code.
+            </div>
+            {paramManifest.length === 0 && (
+              <div style={{ fontFamily: mono, fontSize: 11, color: T.textDim }}>No params — files will have no metadata columns.</div>
+            )}
+            {paramManifest.map((field, i) => (
+              <div key={i} style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "12px 14px", marginBottom: 8 }}>
+                <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>ID (key)</div>
+                    <input value={field.id}
+                      onChange={e => setParamManifest(prev => prev.map((f, j) => j === i ? { ...f, id: e.target.value } : f))}
+                      placeholder="param_id"
+                      style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.teal, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+                  </div>
+                  <div style={{ flex: 1.5 }}>
+                    <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Label</div>
+                    <input value={field.label}
+                      onChange={e => setParamManifest(prev => prev.map((f, j) => j === i ? { ...f, label: e.target.value } : f))}
+                      placeholder="Displayed label"
+                      style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+                  </div>
+                  <div>
+                    <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Type</div>
+                    <select value={field.type}
+                      onChange={e => setParamManifest(prev => prev.map((f, j) => j === i ? { ...f, type: e.target.value, choices: e.target.value === "select" ? (f.choices || ["a", "b"]) : undefined } : f))}
+                      style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 11, padding: "4px 6px", outline: "none" }}>
+                      <option value="text">text</option>
+                      <option value="number">number</option>
+                      <option value="boolean">boolean</option>
+                      <option value="select">select</option>
+                    </select>
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Default</div>
+                    {field.type === "boolean" ? (
+                      <select value={field.default === true || field.default === "true" ? "true" : "false"}
+                        onChange={e => setParamManifest(prev => prev.map((f, j) => j === i ? { ...f, default: e.target.value === "true" } : f))}
+                        style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "4px 6px", outline: "none" }}>
+                        <option value="false">false</option>
+                        <option value="true">true</option>
+                      </select>
+                    ) : (
+                      <input value={field.default ?? ""}
+                        onChange={e => setParamManifest(prev => prev.map((f, j) => j === i ? { ...f, default: field.type === "number" ? (e.target.value === "" ? "" : Number(e.target.value)) : e.target.value } : f))}
+                        type={field.type === "number" ? "number" : "text"}
+                        style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+                    )}
+                  </div>
+                  {field.type === "number" && (
+                    <div style={{ width: 80 }}>
+                      <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 3 }}>Unit</div>
+                      <input value={field.unit || ""}
+                        onChange={e => setParamManifest(prev => prev.map((f, j) => j === i ? { ...f, unit: e.target.value } : f))}
+                        placeholder="Hz"
+                        style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 12, padding: "4px 8px", outline: "none", boxSizing: "border-box" }} />
+                    </div>
+                  )}
+                  <button onClick={() => setParamManifest(prev => prev.filter((_, j) => j !== i))}
+                    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, padding: "0 4px", alignSelf: "flex-end", marginBottom: 2 }}>×</button>
+                </div>
+                {field.type === "select" && (
+                  <div style={{ marginTop: 10 }}>
+                    <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginBottom: 6 }}>Choices</div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+                      {(field.choices || []).map((ch, ci) => (
+                        <div key={ci} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <input value={ch}
+                            onChange={e => setParamManifest(prev => prev.map((f, j) => {
+                              if (j !== i) return f;
+                              const c2 = [...(f.choices || [])]; c2[ci] = e.target.value; return { ...f, choices: c2 };
+                            }))}
+                            style={{ width: 80, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.teal, fontFamily: mono, fontSize: 12, padding: "3px 6px", outline: "none" }} />
+                          <button onClick={() => setParamManifest(prev => prev.map((f, j) => j !== i ? f : { ...f, choices: (f.choices || []).filter((_, k) => k !== ci) }))}
+                            style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>×</button>
+                        </div>
+                      ))}
+                      <button onClick={() => setParamManifest(prev => prev.map((f, j) => j !== i ? f : { ...f, choices: [...(f.choices || []), ""] }))}
+                        style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 4, color: T.textDim, fontFamily: mono, fontSize: 10, padding: "2px 8px", cursor: "pointer" }}>
+                        + choice
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+
       {/* ── Data section ── */}
       <div style={section}>
         <div style={{ display: "flex", alignItems: "center", marginBottom: 16 }}>
@@ -4249,7 +6217,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
           </div>
         )}
 
-        {/* Upload dropzone — shown when no example loaded */}
+        {/* Upload dropzone */}
         {!isCreate && !exInfo && !exLoading && (
           <label style={{
             display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
@@ -4259,7 +6227,12 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
           onDragOver={e => e.preventDefault()}
           onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) handleExampleUpload(f); }}>
             <input type="file" style={{ display: "none" }} onChange={e => { const f = e.target.files[0]; if (f) handleExampleUpload(f); }} />
-            <span style={{ fontFamily: mono, fontSize: 13, color: T.textDim }}>Drop an example file or click to upload</span>
+            <span style={{ fontFamily: mono, fontSize: 13, color: T.textDim }}>
+              {fileMode === "collection" ? "Drop a representative file or click to upload" : "Drop an example file or click to upload"}
+            </span>
+            {fileMode === "collection" && (
+              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Used for Block 1 generation only — proc_code receives the full collection at runtime</span>
+            )}
             {mAccepts.length > 0 && (
               <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Accepts: {mAccepts.join(", ")}</span>
             )}
@@ -4271,8 +6244,8 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
           <div style={{ fontFamily: mono, fontSize: 12, color: T.textDim, padding: "16px 0" }}>Analyzing file…</div>
         )}
 
-        {/* File loaded */}
-        {!isCreate && exInfo && !exLoading && (() => {
+        {/* File loaded — hidden in collection mode */}
+        {!isCreate && exInfo && !exLoading && fileMode !== "collection" && (() => {
           const delimLabel = exInfo.delimiter === "\t" ? "tab"
             : exInfo.delimiter === "," ? "comma"
             : exInfo.delimiter === ";" ? "semicolon"
@@ -4431,9 +6404,12 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
             background: T.bg2, border: `1px solid ${T.border}`, borderBottom: "none",
             borderRadius: "8px 8px 0 0", padding: "6px 14px" }}>
             <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, letterSpacing: "0.05em", textTransform: "uppercase" }}>
-              Block 1 — Column Imports <span style={{ color: T.textDim, fontWeight: 400 }}>(auto-generated · read-only)</span>
+              {fileMode === "collection"
+                ? <>Block 1 — Collection Preamble <span style={{ color: T.textDim, fontWeight: 400 }}>(auto-generated · read-only)</span></>
+                : <>Block 1 — Column Imports <span style={{ color: T.textDim, fontWeight: 400 }}>(auto-generated · read-only)</span></>
+              }
             </span>
-            {exInfo && (
+            {exInfo && fileMode !== "collection" && (
               <button
                 onClick={() => { setBlock1Regen(true); setTimeout(() => setBlock1Regen(false), 1500); }}
                 title="Regenerate Block 1 from current Data assignments"
@@ -4447,10 +6423,10 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
             )}
           </div>
           <textarea
-            value={exInfo ? generateBlock1() : "# Upload an example file in the Data section first."}
+            value={fileMode === "collection" ? generateBlock1() : (exInfo ? generateBlock1() : "# Upload an example file in the Data section first.")}
             readOnly
             spellCheck={false}
-            rows={Math.min(Math.max((exInfo ? generateBlock1() : "").split("\n").length, 4), 18)}
+            rows={Math.min(Math.max(generateBlock1().split("\n").length, 4), 18)}
             style={{
               width: "100%", resize: "none",
               fontFamily: mono, fontSize: 11, lineHeight: 1.65,
@@ -4587,47 +6563,78 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
           </button>
         </div>
 
-        {/* Visual config grid */}
+        {/* ── Traces table ── */}
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <span style={{ fontFamily: mono, fontSize: 11, color: T.textSecondary, letterSpacing: 0.5, textTransform: "uppercase" }}>Traces</span>
+            <button onClick={() => setPlotTraces(prev => [...prev, {
+              x_key: plotVars[0] || "x", y_key: plotVars[Math.min(1, plotVars.length - 1)] || "y",
+              label: "", axis: "y1", style: "line", color: COLOR_PALETTE[prev.length % COLOR_PALETTE.length],
+            }])}
+              style={{ background: "none", border: `1px solid ${T.border}`, borderRadius: 6, color: T.textSecondary, fontFamily: mono, fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+              + Add Trace
+            </button>
+          </div>
+          <div style={{ border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 52px 52px 26px 22px", background: T.bg2, borderBottom: plotTraces.length > 0 ? `1px solid ${T.border}` : "none", padding: "5px 12px", fontFamily: mono, fontSize: 10, color: T.textDim, letterSpacing: 0.5, textTransform: "uppercase" }}>
+              <span>X key</span><span>Y key</span><span>Label</span><span>Axis</span><span>Style</span><span/>
+            </div>
+            {plotTraces.length === 0 && (
+              <div style={{ padding: "12px 16px", fontFamily: mono, fontSize: 11, color: T.textDim, textAlign: "center" }}>
+                No traces — use <strong style={{ color: T.textSecondary }}>+ Add Trace</strong> to map proc_code outputs to plot lines
+              </div>
+            )}
+            {plotTraces.map((tr, i) => {
+              const mkVarInput = (val, key) => plotVars.length > 0 ? (
+                <select value={val} onChange={e => setPlotTraces(prev => prev.map((x, j) => j === i ? { ...x, [key]: e.target.value } : x))}
+                  style={{ background: "none", border: "none", outline: "none", fontFamily: mono, fontSize: 11, color: T.teal, padding: "2px 0", width: "100%", cursor: "pointer" }}>
+                  {plotVars.map(v => <option key={v} value={v}>{v}</option>)}
+                </select>
+              ) : (
+                <input value={val} placeholder={key === "x_key" ? "x" : "y"}
+                  onChange={e => setPlotTraces(prev => prev.map((x, j) => j === i ? { ...x, [key]: e.target.value } : x))}
+                  style={{ background: "none", border: "none", outline: "none", fontFamily: mono, fontSize: 11, color: T.teal, padding: "2px 0", width: "100%" }} />
+              );
+              const trColor = tr.color || COLOR_PALETTE[i % COLOR_PALETTE.length];
+              return (
+                <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 52px 52px 26px 22px", alignItems: "center", borderBottom: i < plotTraces.length - 1 ? `1px solid ${T.border}` : "none", padding: "4px 12px", background: i % 2 === 0 ? "transparent" : T.bg2 + "55" }}>
+                  {mkVarInput(tr.x_key, "x_key")}
+                  {mkVarInput(tr.y_key, "y_key")}
+                  <input value={tr.label} placeholder={tr.y_key || "label"}
+                    onChange={e => setPlotTraces(prev => prev.map((x, j) => j === i ? { ...x, label: e.target.value } : x))}
+                    style={{ background: "none", border: "none", outline: "none", fontFamily: mono, fontSize: 11, color: T.textPrimary, padding: "2px 0", width: "100%" }} />
+                  <select value={tr.axis} onChange={e => setPlotTraces(prev => prev.map((x, j) => j === i ? { ...x, axis: e.target.value } : x))}
+                    style={{ background: "none", border: "none", outline: "none", fontFamily: mono, fontSize: 10, color: T.textSecondary, padding: "2px 0", cursor: "pointer" }}>
+                    <option value="y1">Y1</option>
+                    <option value="y2">Y2</option>
+                  </select>
+                  <select value={tr.style} onChange={e => setPlotTraces(prev => prev.map((x, j) => j === i ? { ...x, style: e.target.value } : x))}
+                    style={{ background: "none", border: "none", outline: "none", fontFamily: mono, fontSize: 10, color: T.textSecondary, padding: "2px 0", cursor: "pointer" }}>
+                    <option value="line">line</option>
+                    <option value="fit">fit</option>
+                  </select>
+                  {/* Color swatch — click cycles palette */}
+                  <button onClick={() => {
+                    const idx = COLOR_PALETTE.indexOf(tr.color);
+                    const next = idx === -1 ? COLOR_PALETTE[0] : COLOR_PALETTE[(idx + 1) % COLOR_PALETTE.length];
+                    setPlotTraces(prev => prev.map((x, j) => j === i ? { ...x, color: next } : x));
+                  }} title="Click to change color"
+                    style={{ width: 18, height: 18, borderRadius: 3, background: trColor, border: "1px solid rgba(255,255,255,0.18)", cursor: "pointer", flexShrink: 0 }} />
+                  <button onClick={() => setPlotTraces(prev => prev.filter((_, j) => j !== i))}
+                    style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 14, lineHeight: 1, padding: 0, textAlign: "center" }}>✕</button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* ── Axis labels & scales ── */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
-          {/* X variable */}
           <div>
-            <span style={label}>X variable</span>
-            {plotVars.length > 0 ? (
-              <select value={plotConfig.x_var} onChange={e => setPlotConfig(c => ({ ...c, x_var: e.target.value }))}
-                style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", width: "100%", outline: "none" }}>
-                {plotVars.map(v => <option key={v} value={v}>{v}</option>)}
-              </select>
-            ) : (
-              <input value={plotConfig.x_var} onChange={e => setPlotConfig(c => ({ ...c, x_var: e.target.value }))}
-                placeholder="e.g. x" style={field()} />
-            )}
-          </div>
-          {/* Y variable */}
-          <div>
-            <span style={label}>Y variable</span>
-            {plotVars.length > 0 ? (
-              <select value={plotConfig.y_var} onChange={e => setPlotConfig(c => ({ ...c, y_var: e.target.value }))}
-                style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", width: "100%", outline: "none" }}>
-                {plotVars.map(v => <option key={v} value={v}>{v}</option>)}
-              </select>
-            ) : (
-              <input value={plotConfig.y_var} onChange={e => setPlotConfig(c => ({ ...c, y_var: e.target.value }))}
-                placeholder="e.g. y" style={field()} />
-            )}
-          </div>
-          {/* X label */}
-          <div>
-            <span style={label}>X axis label <span style={{ color: T.textDim }}>(blank = auto from data)</span></span>
+            <span style={label}>X axis label <span style={{ color: T.textDim }}>(blank = auto)</span></span>
             <input value={plotConfig.x_label} onChange={e => setPlotConfig(c => ({ ...c, x_label: e.target.value }))}
               placeholder="auto" style={field()} />
           </div>
-          {/* Y label */}
-          <div>
-            <span style={label}>Y axis label <span style={{ color: T.textDim }}>(blank = auto from data)</span></span>
-            <input value={plotConfig.y_label} onChange={e => setPlotConfig(c => ({ ...c, y_label: e.target.value }))}
-              placeholder="auto" style={field()} />
-          </div>
-          {/* X scale */}
           <div>
             <span style={label}>X scale</span>
             <select value={plotConfig.x_scale} onChange={e => setPlotConfig(c => ({ ...c, x_scale: e.target.value }))}
@@ -4636,89 +6643,99 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
               <option value="log">Log</option>
             </select>
           </div>
-          {/* Y scale */}
           <div>
-            <span style={label}>Y scale</span>
+            <span style={label}>{plotTraces.some(t => t.axis === "y2") ? "Y1 axis label" : "Y axis label"} <span style={{ color: T.textDim }}>(blank = auto)</span></span>
+            <input value={plotConfig.y_label} onChange={e => setPlotConfig(c => ({ ...c, y_label: e.target.value }))}
+              placeholder="auto" style={field()} />
+          </div>
+          <div>
+            <span style={label}>{plotTraces.some(t => t.axis === "y2") ? "Y1 scale" : "Y scale"}</span>
             <select value={plotConfig.y_scale} onChange={e => setPlotConfig(c => ({ ...c, y_scale: e.target.value }))}
               style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", width: "100%", outline: "none" }}>
               <option value="linear">Linear</option>
               <option value="log">Log</option>
             </select>
           </div>
-        </div>
-
-        {/* Aesthetics */}
-        <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 16, flexWrap: "wrap" }}>
-          {/* Color swatches */}
-          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-            <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginRight: 2 }}>Color</span>
-            {/* Auto (section default) */}
-            <button onClick={() => setPlotConfig(c => ({ ...c, color: "" }))} title="Section default"
-              style={{ width: 22, height: 22, borderRadius: 4, background: sectionDefaultColor, padding: 0, cursor: "pointer", flexShrink: 0,
-                border: plotConfig.color === "" ? `2px solid ${T.textPrimary}` : "2px solid transparent",
-                display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <span style={{ fontFamily: mono, fontSize: 8, color: "rgba(255,255,255,0.85)", fontWeight: "bold", pointerEvents: "none" }}>A</span>
-            </button>
-            {COLOR_PALETTE.map(hex => (
-              <button key={hex} onClick={() => setPlotConfig(c => ({ ...c, color: hex }))} title={hex}
-                style={{ width: 22, height: 22, borderRadius: 4, background: hex, padding: 0, cursor: "pointer", flexShrink: 0,
-                  border: plotConfig.color === hex ? `2px solid ${T.textPrimary}` : "2px solid transparent" }} />
-            ))}
-          </div>
-
-          <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
-
-          {/* Fit overlay toggle */}
-          <label style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
-            <input type="checkbox" checked={plotConfig.show_fit}
-              onChange={e => {
-                if (e.target.checked) {
-                  setPlotConfig(c => ({ ...c, show_fit: true, ..._fitMemory.current }));
-                } else {
-                  setPlotConfig(c => {
-                    _fitMemory.current = { primary: c.primary, secondary_opacity: c.secondary_opacity };
-                    return { ...c, show_fit: false, primary: "data", secondary_opacity: 1.0 };
-                  });
-                }
-              }} />
-            <span style={{ fontFamily: mono, fontSize: 10, color: T.textSecondary, whiteSpace: "nowrap" }}>Fit overlay</span>
-          </label>
-          {!hasFitData && <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim }}>(no x_fit/y_fit yet)</span>}
-
-          {plotConfig.show_fit && <>
-            <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
-
-            {/* Primary trace */}
-            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Primary</span>
-              {[["data", "Data"], ["fit", "Fit"]].map(([val, lbl]) => (
-                <button key={val} onClick={() => setPlotConfig(c => ({ ...c, primary: val }))}
-                  style={{ fontFamily: mono, fontSize: 10, padding: "3px 10px", borderRadius: 4, cursor: "pointer",
-                    border: `1px solid ${plotConfig.primary === val ? T.teal : T.border}`,
-                    background: plotConfig.primary === val ? T.teal + "22" : "none",
-                    color: plotConfig.primary === val ? T.teal : T.textDim }}>
-                  {lbl}
-                </button>
-              ))}
+          {plotTraces.some(t => t.axis === "y2") && <>
+            <div>
+              <span style={label}>Y2 axis label</span>
+              <input value={plotConfig.y2_label || ""} onChange={e => setPlotConfig(c => ({ ...c, y2_label: e.target.value }))}
+                placeholder="right axis" style={field()} />
             </div>
-
-            <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
-
-            {/* Opacity ratio */}
-            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Opacity</span>
-              {[[1.0,"100/100"],[0.5,"100/50"],[0.25,"100/25"],[0.1,"100/10"]].map(([val, lbl]) => (
-                <button key={lbl} onClick={() => setPlotConfig(c => ({ ...c, secondary_opacity: val }))}
-                  style={{ fontFamily: mono, fontSize: 10, padding: "3px 10px", borderRadius: 4, cursor: "pointer",
-                    border: `1px solid ${plotConfig.secondary_opacity === val ? T.teal : T.border}`,
-                    background: plotConfig.secondary_opacity === val ? T.teal + "22" : "none",
-                    color: plotConfig.secondary_opacity === val ? T.teal : T.textDim }}>
-                  {lbl}
-                </button>
-              ))}
+            <div>
+              <span style={label}>Y2 scale</span>
+              <select value={plotConfig.y2_scale || "linear"} onChange={e => setPlotConfig(c => ({ ...c, y2_scale: e.target.value }))}
+                style={{ fontFamily: mono, fontSize: 11, background: T.bg0, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: 4, padding: "5px 8px", width: "100%", outline: "none" }}>
+                <option value="linear">Linear</option>
+                <option value="log">Log</option>
+              </select>
             </div>
           </>}
         </div>
+
+        {/* ── Fit overlay (legacy single-trace mode) ── */}
+        {plotTraces.length === 0 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 16, flexWrap: "wrap" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, marginRight: 2 }}>Color</span>
+              <button onClick={() => setPlotConfig(c => ({ ...c, color: "" }))} title="Section default"
+                style={{ width: 22, height: 22, borderRadius: 4, background: sectionDefaultColor, padding: 0, cursor: "pointer", flexShrink: 0,
+                  border: plotConfig.color === "" ? `2px solid ${T.textPrimary}` : "2px solid transparent",
+                  display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <span style={{ fontFamily: mono, fontSize: 8, color: "rgba(255,255,255,0.85)", fontWeight: "bold", pointerEvents: "none" }}>A</span>
+              </button>
+              {COLOR_PALETTE.map(hex => (
+                <button key={hex} onClick={() => setPlotConfig(c => ({ ...c, color: hex }))} title={hex}
+                  style={{ width: 22, height: 22, borderRadius: 4, background: hex, padding: 0, cursor: "pointer", flexShrink: 0,
+                    border: plotConfig.color === hex ? `2px solid ${T.textPrimary}` : "2px solid transparent" }} />
+              ))}
+            </div>
+            <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
+            <label style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
+              <input type="checkbox" checked={plotConfig.show_fit}
+                onChange={e => {
+                  if (e.target.checked) {
+                    setPlotConfig(c => ({ ...c, show_fit: true, ..._fitMemory.current }));
+                  } else {
+                    setPlotConfig(c => {
+                      _fitMemory.current = { primary: c.primary, secondary_opacity: c.secondary_opacity };
+                      return { ...c, show_fit: false, primary: "data", secondary_opacity: 1.0 };
+                    });
+                  }
+                }} />
+              <span style={{ fontFamily: mono, fontSize: 10, color: T.textSecondary, whiteSpace: "nowrap" }}>Fit overlay</span>
+            </label>
+            {!hasFitData && <span style={{ fontFamily: mono, fontSize: 9, color: T.textDim }}>(no x_fit/y_fit yet)</span>}
+            {plotConfig.show_fit && <>
+              <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Primary</span>
+                {[["data", "Data"], ["fit", "Fit"]].map(([val, lbl]) => (
+                  <button key={val} onClick={() => setPlotConfig(c => ({ ...c, primary: val }))}
+                    style={{ fontFamily: mono, fontSize: 10, padding: "3px 10px", borderRadius: 4, cursor: "pointer",
+                      border: `1px solid ${plotConfig.primary === val ? T.teal : T.border}`,
+                      background: plotConfig.primary === val ? T.teal + "22" : "none",
+                      color: plotConfig.primary === val ? T.teal : T.textDim }}>
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+              <div style={{ width: 1, height: 18, background: T.border, flexShrink: 0 }} />
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>Opacity</span>
+                {[[1.0,"100/100"],[0.5,"100/50"],[0.25,"100/25"],[0.1,"100/10"]].map(([val, lbl]) => (
+                  <button key={lbl} onClick={() => setPlotConfig(c => ({ ...c, secondary_opacity: val }))}
+                    style={{ fontFamily: mono, fontSize: 10, padding: "3px 10px", borderRadius: 4, cursor: "pointer",
+                      border: `1px solid ${plotConfig.secondary_opacity === val ? T.teal : T.border}`,
+                      background: plotConfig.secondary_opacity === val ? T.teal + "22" : "none",
+                      color: plotConfig.secondary_opacity === val ? T.teal : T.textDim }}>
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+            </>}
+          </div>
+        )}
 
         {/* Error */}
         {plotError && (
@@ -4742,6 +6759,11 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
                   title: { text: plotFigure.layout?.xaxis?.title || "", font: { color: T.textSecondary, size: 11 } } },
                 yaxis: { ...(plotFigure.layout?.yaxis || {}), gridcolor: T.border, zerolinecolor: T.border,
                   title: { text: plotFigure.layout?.yaxis?.title || "", font: { color: T.textSecondary, size: 11 } } },
+                ...(plotFigure.layout?.yaxis2 ? { yaxis2: {
+                  ...(plotFigure.layout.yaxis2 || {}),
+                  title: { text: plotFigure.layout.yaxis2?.title || "", font: { color: T.amber, size: 11 } },
+                  tickfont: { color: T.amber },
+                }} : {}),
               }}
               config={{ displayModeBar: false, responsive: true }}
               style={{ width: "100%" }}
@@ -4923,6 +6945,7 @@ function ModuleEditorPage({ mod, onBack, onSave, onDelete, onDuplicate, allModul
 // ── ExportModal ────────────────────────────────────────────────────────────────
 
 function ExportModal({ samples, onClose }) {
+  useEscClose(onClose);
   const sampleTechnique = s => s.technique || "";
 
   const allSubstrates = [...new Set(samples.map(s => s.substrate).filter(Boolean))].sort();
@@ -5090,6 +7113,7 @@ function ExportModal({ samples, onClose }) {
 //   onClose     () => void
 
 function ImportModal({ type, onConfirm, onClose }) {
+  useEscClose(onClose);
   const mono = { fontFamily: "'DM Mono', monospace" };
 
   // ── File + preview state ──────────────────────────────────────────────────
@@ -5158,7 +7182,10 @@ function ImportModal({ type, onConfirm, onClose }) {
 
   const canConfirm = preview && !previewing && (() => {
     if (type === "sample" && sampleAction === "rename") return sampleNewId.trim().length > 0;
-    if (type === "module" && moduleAction === "rename") return moduleNewId.trim().length > 0;
+    if (type === "module") {
+      if (preview.has_blocked_deps) return false;
+      if (moduleAction === "rename") return moduleNewId.trim().length > 0;
+    }
     return true;
   })();
 
@@ -5306,11 +7333,28 @@ function ImportModal({ type, onConfirm, onClose }) {
                     </span>
                     {m.description && <span style={{ ...mono, fontSize: 11, color: T.textSecondary, marginTop: 2 }}>{m.description}</span>}
                     {m.dependencies?.length > 0 && (
-                      <div style={{ marginTop: 4, display: "flex", flexWrap: "wrap", gap: 4 }}>
-                        <span style={{ ...mono, fontSize: 9, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>deps:</span>
-                        {m.dependencies.map(d => (
-                          <span key={d} style={{ ...mono, fontSize: 10, padding: "1px 6px", borderRadius: 4, background: T.bg2, color: T.teal, border: `1px solid ${T.teal}33` }}>{d}</span>
-                        ))}
+                      <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                        <span style={{ ...mono, fontSize: 9, color: T.textDim, textTransform: "uppercase", letterSpacing: 1 }}>
+                          Dependencies {m.has_blocked_deps ? "— ⊘ blocked" : m.has_missing_deps ? "— will install" : "— all installed ✓"}
+                        </span>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                          {m.dependencies.map(d => (
+                            <span key={d.dep} style={{
+                              ...mono, fontSize: 10, padding: "2px 8px", borderRadius: 10,
+                              border: `1px solid ${d.blocked ? T.red + "55" : d.installed ? T.teal + "55" : T.amber + "55"}`,
+                              background: d.blocked ? T.red + "12" : d.installed ? T.teal + "12" : T.amber + "12",
+                              color: d.blocked ? T.red : d.installed ? T.teal : T.amber,
+                            }}>
+                              {d.dep} {d.blocked ? "⊘" : d.installed ? "✓" : "⚠"}
+                            </span>
+                          ))}
+                        </div>
+                        {m.has_blocked_deps && (
+                          <span style={{ ...mono, fontSize: 10, color: T.red }}>⊘ Import blocked — archive requires a restricted package.</span>
+                        )}
+                        {!m.has_blocked_deps && m.has_missing_deps && (
+                          <span style={{ ...mono, fontSize: 10, color: T.amber }}>Missing packages will be installed automatically on import.</span>
+                        )}
                       </div>
                     )}
                   </div>
@@ -5381,11 +7425,295 @@ function ImportModal({ type, onConfirm, onClose }) {
 
 // ── SettingsModal ─────────────────────────────────────────────────────────────
 
+function MaterialEditorModal({ material, settings, onSave, onDelete, onClose, materialsLib = [] }) {
+  useEscClose(onClose);
+  // material is null for new entries, or an existing entry for editing
+  const isNew = !material?.id;
+  const blank = { id: "", name: "", formula: "", composition: {}, parent: "", notes: "", crystal: {}, properties: {}, growth_defaults: {} };
+  const [draft, setDraft] = useState(() => material ? JSON.parse(JSON.stringify(material)) : blank);
+  const [saving, setSaving] = useState(false);
+
+  // Substrate-stack rows. Last row may have no thickness (bulk).
+  const stackRows = draft.properties?.substrate_stack || [];
+  const setStackRows = (rows) => setDraft(p => {
+    const props = { ...(p.properties || {}) };
+    if (rows.length === 0) delete props.substrate_stack;
+    else props.substrate_stack = rows;
+    return { ...p, properties: props };
+  });
+  // Other materials (excluding self) for the picker
+  const stackPickerOptions = useMemo(() =>
+    (materialsLib || []).filter(m => m.id !== draft.id).map(m => m.name).sort(),
+    [materialsLib, draft.id]
+  );
+
+  // Composition as editable rows: [{el, amount}]
+  const [compRows, setCompRows] = useState(() => Object.entries(draft.composition || {}).map(([el, amt]) => ({ el, amt: String(amt) })));
+
+  const compositionDict = useMemo(() => {
+    const d = {};
+    for (const { el, amt } of compRows) {
+      if (el.trim()) d[el.trim()] = amt.trim() === "" ? 1 : (parseFloat(amt) || 0);
+    }
+    return d;
+  }, [compRows]);
+
+  const crystalField = (k, label, unit, w = 60) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textAlign: "center" }}>{label}</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+        <input value={draft.crystal?.[k] ?? ""} onChange={e => setDraft(p => ({ ...p, crystal: { ...(p.crystal || {}), [k]: e.target.value } }))}
+          placeholder="—"
+          style={{ width: w, background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+        {unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{unit}</span>}
+      </div>
+    </div>
+  );
+
+  const IS = { background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "5px 8px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" };
+
+  const handleCIF = (file) => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      const parsed = parseCIF(e.target.result);
+      setDraft(p => ({
+        ...p,
+        name: p.name || parsed.name || "",
+        crystal: { ...(p.crystal || {}), a: parsed.a, b: parsed.b, c: parsed.c, alpha: parsed.alpha, beta: parsed.beta, gamma: parsed.gamma, cif_filename: file.name },
+      }));
+    };
+    reader.readAsText(file);
+  };
+
+  const handleSave = async () => {
+    if (!draft.name.trim()) return;
+    setSaving(true);
+    const payload = { ...draft, composition: compositionDict };
+    try {
+      const result = isNew
+        ? await api("POST", "/materials-library", payload)
+        : await api("PUT", `/materials-library/${draft.id}`, payload);
+      onSave(result);
+    } catch (e) { console.error(e); }
+    setSaving(false);
+  };
+
+  const handleDelete = async () => {
+    if (!window.confirm(`Delete "${draft.name}"? This cannot be undone.`)) return;
+    await api("DELETE", `/materials-library/${draft.id}`);
+    onDelete(draft.id);
+  };
+
+  const sHdr = (label) => (
+    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2, borderBottom: `1px solid ${T.border}`, paddingBottom: 4, marginTop: 8 }}>{label}</div>
+  );
+
+  const techniques = settings?.techniques || [];
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "flex-start", justifyContent: "center", zIndex: 110, overflowY: "auto", padding: "60px 20px 40px" }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: "20px 24px", width: 580, display: "flex", flexDirection: "column", gap: 10, marginBottom: 40 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 20 }}>{isNew ? "New Material" : "Edit Material"}</h2>
+
+        {/* Identity */}
+        {sHdr("Identity")}
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <div style={{ flex: 2, minWidth: 160 }}>
+            <div style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", marginBottom: 3 }}>Name</div>
+            <input value={draft.name} onChange={e => setDraft(p => ({ ...p, name: e.target.value }))}
+              placeholder="e.g. SRO"
+              style={{ ...IS, width: "100%" }} />
+          </div>
+          <div style={{ flex: 1, minWidth: 100 }}>
+            <div style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", marginBottom: 3 }}>Family/Parent</div>
+            <input value={draft.parent} onChange={e => setDraft(p => ({ ...p, parent: e.target.value }))}
+              placeholder="e.g. BZTO"
+              style={{ ...IS, width: "100%" }} />
+          </div>
+        </div>
+        <div>
+          <div style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", marginBottom: 3 }}>Notes</div>
+          <textarea value={draft.notes} onChange={e => setDraft(p => ({ ...p, notes: e.target.value }))}
+            rows={2} placeholder="Optional notes"
+            style={{ ...IS, width: "100%", resize: "vertical" }} />
+        </div>
+
+        {/* Composition */}
+        {sHdr("Composition")}
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          {compRows.map((row, i) => (
+            <div key={i} style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input value={row.el} onChange={e => setCompRows(rs => rs.map((r, j) => j === i ? { ...r, el: e.target.value } : r))}
+                placeholder="El"
+                style={{ ...IS, width: 52, textAlign: "center" }} />
+              <span style={{ color: T.textDim, fontFamily: "'DM Mono', monospace" }}>:</span>
+              <input value={row.amt} onChange={e => setCompRows(rs => rs.map((r, j) => j === i ? { ...r, amt: e.target.value } : r))}
+                placeholder="1.0"
+                style={{ ...IS, width: 64, textAlign: "center" }} />
+              <button onClick={() => setCompRows(rs => rs.filter((_, j) => j !== i))}
+                style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 0 }}>×</button>
+            </div>
+          ))}
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 2 }}>
+            <button onClick={() => setCompRows(rs => [...rs, { el: "", amt: "" }])}
+              style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+              + Add element
+            </button>
+            {compRows.some(r => r.el.trim()) && (
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.textSecondary }}>
+                → <ChemName name={compToFormula(compRows)} />
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Crystal */}
+        {sHdr("Crystallographic")}
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: 2, minWidth: 120 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Space group</span>
+            <input value={draft.crystal?.space_group ?? ""} onChange={e => setDraft(p => ({ ...p, crystal: { ...(p.crystal || {}), space_group: e.target.value } }))}
+              placeholder="e.g. P4mm"
+              style={{ ...IS }} />
+          </div>
+          <label onDragOver={e => e.preventDefault()}
+            onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) handleCIF(f); }}
+            style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 1, background: T.bg0, border: `1px dashed ${draft.crystal?.cif_filename ? T.teal : T.border}`, borderRadius: 4, color: draft.crystal?.cif_filename ? T.teal : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "5px 10px", cursor: "pointer", whiteSpace: "nowrap", alignSelf: "flex-end" }}>
+            {draft.crystal?.cif_filename ? `↑ ${draft.crystal.cif_filename}` : "drop .cif or click"}
+            <input type="file" accept=".cif" style={{ display: "none" }} onChange={e => { if (e.target.files[0]) handleCIF(e.target.files[0]); e.target.value = ""; }} />
+          </label>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+          {crystalField("a", "a", "Å", 54)}
+          {crystalField("b", "b", "Å", 54)}
+          {crystalField("c", "c", "Å", 54)}
+          <div style={{ width: 1, alignSelf: "stretch", background: T.border, margin: "0 2px" }} />
+          {crystalField("alpha", "α", "°", 50)}
+          {crystalField("beta",  "β", "°", 50)}
+          {crystalField("gamma", "γ", "°", 50)}
+          <div style={{ width: 1, alignSelf: "stretch", background: T.border, margin: "0 2px" }} />
+          {crystalField("poisson", "ν", "", 50)}
+        </div>
+
+        {/* Properties */}
+        {sHdr("Properties")}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Density</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+              <input value={draft.properties?.density_g_cm3 ?? ""}
+                onChange={e => setDraft(p => ({ ...p, properties: { ...(p.properties || {}), density_g_cm3: e.target.value === "" ? null : (parseFloat(e.target.value) || 0) } }))}
+                placeholder="—" type="number" step="0.01" disabled={stackRows.length > 0}
+                style={{ width: 80, background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: stackRows.length > 0 ? T.textDim : T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", whiteSpace: "nowrap" }}>g/cm³</span>
+            </div>
+          </div>
+          {stackRows.length > 0 && (
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, paddingBottom: 6 }}>
+              (density set per layer below)
+            </span>
+          )}
+        </div>
+
+        {/* Substrate stack — for compound substrates like Si:STO */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Substrate stack</span>
+            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>
+              (top → bottom; last row with no thickness = semi-infinite bulk)
+            </span>
+          </div>
+          {stackRows.map((row, i) => (
+            <div key={i} style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 18, textAlign: "right" }}>{i + 1}.</span>
+              <select value={row.material || ""}
+                onChange={e => setStackRows(stackRows.map((r, j) => j === i ? { ...r, material: e.target.value } : r))}
+                style={{ ...IS, width: 140 }}>
+                <option value="">— pick material —</option>
+                {stackPickerOptions.map(n => <option key={n} value={n}>{n}</option>)}
+              </select>
+              <input value={row.thickness_nm ?? ""}
+                onChange={e => {
+                  const v = e.target.value === "" ? null : parseFloat(e.target.value);
+                  setStackRows(stackRows.map((r, j) => j === i ? { ...r, thickness_nm: v } : r));
+                }}
+                placeholder={i === stackRows.length - 1 ? "bulk" : "nm"}
+                type="number" step="0.1"
+                style={{ ...IS, width: 70, textAlign: "center" }} />
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>nm</span>
+              <button onClick={() => setStackRows(stackRows.filter((_, j) => j !== i))}
+                style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 0 }}>×</button>
+            </div>
+          ))}
+          <button onClick={() => setStackRows([...stackRows, { material: "", thickness_nm: stackRows.length === 0 ? null : 5 }])}
+            style={{ alignSelf: "flex-start", background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+            + Add layer
+          </button>
+        </div>
+
+        {/* Growth defaults */}
+        {techniques.length > 0 && sHdr("Growth Defaults")}
+        {techniques.map(tech => {
+          const defaults = draft.growth_defaults?.[tech.id] || {};
+          const setDefault = (paramId, v) => setDraft(p => ({
+            ...p,
+            growth_defaults: { ...(p.growth_defaults || {}), [tech.id]: { ...(p.growth_defaults?.[tech.id] || {}), [paramId]: v } }
+          }));
+          return (
+            <div key={tech.id} style={{ border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6 }}>
+              <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, fontWeight: 600, color: T.textSecondary }}>{tech.name || tech.id}</div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+                {tech.params.filter(p => p.name).map(p => (
+                  <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                    <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{p.name}</span>
+                    <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                      {p.type === "select" ? (
+                        <select value={defaults[p.id] ?? ""} onChange={e => setDefault(p.id, e.target.value)}
+                          style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "3px 5px", fontFamily: "'DM Mono', monospace", fontSize: 11, outline: "none" }}>
+                          <option value="">—</option>
+                          {(p.options || []).map(o => <option key={o} value={o}>{o}</option>)}
+                        </select>
+                      ) : (
+                        <input value={defaults[p.id] ?? ""} onChange={e => setDefault(p.id, e.target.value)}
+                          placeholder="—"
+                          style={{ width: 60, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "3px 5px", fontFamily: "'DM Mono', monospace", fontSize: 11, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
+                      )}
+                      {p.unit && <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{p.unit}</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+
+        {/* Actions */}
+        <div style={{ display: "flex", gap: 8, justifyContent: "space-between", marginTop: 6 }}>
+          <div style={{ display: "flex", gap: 8 }}>
+            {!isNew && <Btn variant="danger" small onClick={handleDelete}>Delete</Btn>}
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <Btn variant="ghost" small onClick={() => {
+              const a = document.createElement("a");
+              a.href = `${API_BASE}/materials-library/export`;
+              a.download = "materials-library.json";
+              a.click();
+            }}>Export Library</Btn>
+            <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+            <Btn onClick={handleSave} disabled={saving || !draft.name.trim()}>{saving ? "Saving…" : "Save"}</Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SettingsModal({ settings, onSave, onClose }) {
+  useEscClose(onClose);
   const [draft, setDraft] = useState(() => JSON.parse(JSON.stringify(settings)));
-  const [knownMaterials, setKnownMaterials] = useState([]);
-  const [libOpen, setLibOpen] = useState({ matSputter: false, matPld: false, struct: false });
-  useEffect(() => { api("GET", "/materials").then(setKnownMaterials).catch(() => {}); }, []);
+  const [techOpen, setTechOpen] = useState({});
+  const [pkgInstalling, setPkgInstalling] = useState(false);
+  const [pkgResults,    setPkgResults]    = useState(null);
   const set = (path, v) => setDraft(p => {
     const d = JSON.parse(JSON.stringify(p));
     const keys = path.split(".");
@@ -5410,222 +7738,155 @@ function SettingsModal({ settings, onSave, onClose }) {
     </div>
   );
 
-  // Custom growth param helpers
-  const addCustomParam = (tech) => setDraft(p => {
+  // Technique library helpers
+  const addTechnique = () => setDraft(p => {
     const d = JSON.parse(JSON.stringify(p));
-    d.custom_growth_params[tech].push({ id: makeParamId("param"), name: "", unit: "", default: "" });
+    d.techniques = [...(d.techniques || []), { id: makeParamId("tech"), name: "", params: [] }];
     return d;
   });
-  const removeCustomParam = (tech, i) => setDraft(p => {
+  const removeTechnique = (ti) => setDraft(p => {
     const d = JSON.parse(JSON.stringify(p));
-    d.custom_growth_params[tech].splice(i, 1);
+    d.techniques = d.techniques.filter((_, i) => i !== ti);
     return d;
   });
-  const setCustomParam = (tech, i, k, v) => setDraft(p => {
+  const setTechniqueName = (ti, v) => setDraft(p => {
     const d = JSON.parse(JSON.stringify(p));
-    // If this is the first time the name is being set and the param still has a generic id, regenerate it
-    if (k === "name" && d.custom_growth_params[tech][i].id.startsWith("param_")) {
-      d.custom_growth_params[tech][i].id = makeParamId(v);
+    d.techniques[ti].name = v;
+    return d;
+  });
+  const addTechParam = (ti) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.techniques[ti].params.push({ id: makeParamId("param"), name: "", unit: "", default: "", scope: "layer", type: "number" });
+    return d;
+  });
+  const removeTechParam = (ti, pi) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    d.techniques[ti].params.splice(pi, 1);
+    return d;
+  });
+  const setTechParam = (ti, pi, k, v) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    if (k === "name" && d.techniques[ti].params[pi].id.startsWith("param_")) {
+      d.techniques[ti].params[pi].id = makeParamId(v);
     }
-    d.custom_growth_params[tech][i][k] = v;
+    d.techniques[ti].params[pi][k] = v;
+    return d;
+  });
+  const moveTechParam = (ti, pi, dir) => setDraft(p => {
+    const d = JSON.parse(JSON.stringify(p));
+    const params = d.techniques[ti].params;
+    const ni = pi + dir;
+    if (ni < 0 || ni >= params.length) return d;
+    [params[pi], params[ni]] = [params[ni], params[pi]];
     return d;
   });
 
-  const renderCustomParams = (tech) => {
-    const params = draft.custom_growth_params?.[tech] || [];
+  const renderTechniqueLibrary = () => {
+    const techniques = draft.techniques || [];
+    const IS = { background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" };
+    const scopeBtn = (ti, pi, s) => (
+      <button onClick={() => setTechParam(ti, pi, "scope", s)}
+        style={{ background: draft.techniques[ti].params[pi].scope === s ? T.bg3 : T.bg0, border: "none", color: draft.techniques[ti].params[pi].scope === s ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 5px", cursor: "pointer" }}>
+        {s === "layer" ? "L" : "T"}
+      </button>
+    );
+    const typeBtn = (ti, pi, t, label) => (
+      <button onClick={() => setTechParam(ti, pi, "type", t)}
+        style={{ background: draft.techniques[ti].params[pi].type === t ? T.bg3 : T.bg0, border: "none", color: draft.techniques[ti].params[pi].type === t ? T.textPrimary : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 5px", cursor: "pointer" }}>
+        {label}
+      </button>
+    );
     return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
-        {params.map((p, i) => (
-          <div key={p.id} style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: 2, minWidth: 120 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Name</span>
-              <input value={p.name}
-                onChange={e => setCustomParam(tech, i, "name", e.target.value)}
-                placeholder="e.g. Ar flow"
-                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {techniques.map((tech, ti) => (
+          <div key={tech.id || ti} style={{ border: `1px solid ${T.border}`, borderRadius: 6, overflow: "hidden" }}>
+            {/* Technique header */}
+            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", background: T.bg2, cursor: "pointer" }}
+              onClick={() => setTechOpen(s => ({ ...s, [ti]: !s[ti] }))}>
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>{techOpen[ti] ? "▾" : "▸"}</span>
+              <input value={tech.name} onClick={e => e.stopPropagation()}
+                onChange={e => setTechniqueName(ti, e.target.value)}
+                placeholder="Technique name"
+                style={{ ...IS, flex: 1, background: "transparent", border: "none", fontSize: 13, fontWeight: 600, color: T.textPrimary, padding: "0" }} />
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{tech.params.length} param{tech.params.length !== 1 ? "s" : ""}</span>
+              <button onClick={e => { e.stopPropagation(); removeTechnique(ti); }}
+                style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 14, padding: "0 2px" }}>×</button>
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2, width: 72 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Unit</span>
-              <input value={p.unit}
-                onChange={e => setCustomParam(tech, i, "unit", e.target.value)}
-                placeholder="sccm"
-                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2, width: 72 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Default</span>
-              <input value={p.default}
-                onChange={e => setCustomParam(tech, i, "default", e.target.value)}
-                placeholder="—"
-                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 4, color: T.textPrimary, padding: "4px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
-            </div>
-            <button onClick={() => removeCustomParam(tech, i)}
-              style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 2px", marginBottom: 3 }}>×</button>
+            {/* Params list */}
+            {techOpen[ti] && (
+              <div style={{ padding: "8px 10px", display: "flex", flexDirection: "column", gap: 5 }}>
+                {/* Header row */}
+                {tech.params.length > 0 && (
+                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <span style={{ flex: 2, minWidth: 100, fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Name</span>
+                    <span style={{ width: 52, fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Unit</span>
+                    <span style={{ width: 64, fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Default</span>
+                    <span style={{ width: 38, fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", textAlign: "center" }}>Scope</span>
+                    <span style={{ width: 52, fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", textAlign: "center" }}>Type</span>
+                    <span style={{ width: 28 }} />
+                    <span style={{ width: 18 }} />
+                  </div>
+                )}
+                {tech.params.map((p, pi) => (
+                  <div key={p.id || pi} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                    <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                      <input value={p.name} onChange={e => setTechParam(ti, pi, "name", e.target.value)}
+                        placeholder="Param name"
+                        style={{ ...IS, flex: 2, minWidth: 100 }} />
+                      <input value={p.unit} onChange={e => setTechParam(ti, pi, "unit", e.target.value)}
+                        placeholder="unit"
+                        style={{ ...IS, width: 52 }} />
+                      <input value={String(p.default ?? "")} onChange={e => setTechParam(ti, pi, "default", e.target.value)}
+                        placeholder="—"
+                        style={{ ...IS, width: 64, textAlign: "center" }} />
+                      {/* Scope toggle: L / T */}
+                      <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 4, overflow: "hidden", width: 38 }}>
+                        {scopeBtn(ti, pi, "layer")}
+                        {scopeBtn(ti, pi, "target")}
+                      </div>
+                      {/* Type toggle: # / Aa / ▾ */}
+                      <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 4, overflow: "hidden", width: 52 }}>
+                        {typeBtn(ti, pi, "number", "#")}
+                        {typeBtn(ti, pi, "text",   "Aa")}
+                        {typeBtn(ti, pi, "select",  "▾")}
+                      </div>
+                      {/* Move up/down */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: 1, width: 14 }}>
+                        <button onClick={() => moveTechParam(ti, pi, -1)} disabled={pi === 0}
+                          style={{ background: "none", border: "none", color: pi === 0 ? T.textDim : T.textSecondary, cursor: pi === 0 ? "default" : "pointer", fontSize: 9, padding: 0, lineHeight: 1 }}>▲</button>
+                        <button onClick={() => moveTechParam(ti, pi, 1)} disabled={pi === tech.params.length - 1}
+                          style={{ background: "none", border: "none", color: pi === tech.params.length - 1 ? T.textDim : T.textSecondary, cursor: pi === tech.params.length - 1 ? "default" : "pointer", fontSize: 9, padding: 0, lineHeight: 1 }}>▼</button>
+                      </div>
+                      <button onClick={() => removeTechParam(ti, pi)}
+                        style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px" }}>×</button>
+                    </div>
+                    {/* Options row for select type */}
+                    {p.type === "select" && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 4 }}>
+                        <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>OPTIONS</span>
+                        <input value={(p.options || []).join(", ")}
+                          onChange={e => setTechParam(ti, pi, "options", e.target.value.split(",").map(s => s.trim()).filter(Boolean))}
+                          placeholder="e.g. RF, DC, Pulsed DC"
+                          style={{ ...IS, flex: 1, fontSize: 11 }} />
+                      </div>
+                    )}
+                  </div>
+                ))}
+                <button onClick={() => addTechParam(ti)}
+                  style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start", marginTop: 2 }}>
+                  + Add param
+                </button>
+              </div>
+            )}
           </div>
         ))}
-        <button onClick={() => addCustomParam(tech)}
-          style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
-          + Add param
+        <button onClick={addTechnique}
+          style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.amber, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
+          + Add technique
         </button>
       </div>
     );
   };
-
-  // Material library helpers
-  const addMat = (tech) => setDraft(p => {
-    const d = JSON.parse(JSON.stringify(p));
-    d.materials[tech].push(tech === "sputter"
-      ? { name: "", power_W: "", temp: "", pressure: "", oxygen_pct: "", time_s: "" }
-      : { name: "", energy_mJ: "", pulses: "", temp: "", pressure: "", frequency_hz: "" });
-    return d;
-  });
-  const removeMat = (tech, i) => setDraft(p => {
-    const d = JSON.parse(JSON.stringify(p));
-    d.materials[tech].splice(i, 1);
-    return d;
-  });
-  const setMat = (tech, i, k, v) => setDraft(p => {
-    const d = JSON.parse(JSON.stringify(p));
-    d.materials[tech][i][k] = v;
-    return d;
-  });
-
-  const matInput = (tech, i, k, label, unit, w = 52) => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-      <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{label}</span>
-      <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-        <input value={draft.materials[tech][i][k] ?? ""}
-          onChange={e => setMat(tech, i, k, e.target.value)}
-          placeholder="—"
-          style={{ width: w, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "3px 5px", fontFamily: "'DM Mono', monospace", fontSize: 11, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
-        {unit && <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{unit}</span>}
-      </div>
-    </div>
-  );
-
-  // Structure library helpers
-  const [cifDragIdx, setCifDragIdx] = useState(null);
-  const addStruct = () => setDraft(p => ({
-    ...p, structures: [...(p.structures || []), { name: "", a: "", b: "", c: "", alpha: "", beta: "", gamma: "", poisson: "", cif_filename: "", cif_text: "" }]
-  }));
-  const removeStruct = (i) => setDraft(p => ({ ...p, structures: p.structures.filter((_, j) => j !== i) }));
-  const setStruct = (i, k, v) => setDraft(p => {
-    const structs = [...p.structures];
-    structs[i] = { ...structs[i], [k]: v };
-    return { ...p, structures: structs };
-  });
-  const importCIF = (i, file) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const text = e.target.result;
-      const parsed = parseCIF(text);
-      setDraft(p => {
-        const structs = [...p.structures];
-        structs[i] = { ...structs[i], ...parsed, name: structs[i].name || parsed.name, cif_filename: file.name, cif_text: text };
-        return { ...p, structures: structs };
-      });
-    };
-    reader.readAsText(file);
-  };
-
-  const structInput = (i, k, label, unit, w = 62) => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-      <span style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", textAlign: "center" }}>{label}</span>
-      <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-        <input type="number" className="no-spin" value={draft.structures[i][k] ?? ""}
-          onChange={e => setStruct(i, k, e.target.value)}
-          placeholder="—"
-          style={{ width: w, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "3px 5px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box", textAlign: "center" }} />
-        {unit && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{unit}</span>}
-      </div>
-    </div>
-  );
-
-  const renderStructLib = () => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      {(draft.structures || []).map((s, i) => (
-        <div key={i} style={{ background: T.bg3, border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 10px", display: "flex", flexDirection: "column", gap: 8 }}>
-          {/* Row 1: name + CIF drop zone + delete */}
-          <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: 1 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Name</span>
-              <input value={s.name ?? ""}
-                onChange={e => setStruct(i, "name", e.target.value)}
-                placeholder="e.g. BaTiO3"
-                style={{ width: "100%", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, padding: "3px 6px", fontFamily: "'DM Mono', monospace", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>CIF</span>
-              <label
-                onDragOver={e => { e.preventDefault(); setCifDragIdx(i); }}
-                onDragLeave={() => setCifDragIdx(null)}
-                onDrop={e => { e.preventDefault(); setCifDragIdx(null); const f = e.dataTransfer.files[0]; if (f) importCIF(i, f); }}
-                style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, background: cifDragIdx === i ? T.amberGlow : T.bg0, border: `1px dashed ${cifDragIdx === i ? T.amber : s.cif_filename ? T.teal : T.border}`, borderRadius: 4, color: cifDragIdx === i ? T.amber : s.cif_filename ? T.teal : T.textDim, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 10px", cursor: "pointer", whiteSpace: "nowrap", transition: "all .15s", textAlign: "center" }}>
-                {s.cif_filename
-                  ? <span style={{ maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>↑ {s.cif_filename}</span>
-                  : "drop .cif or click"}
-                <input type="file" accept=".cif" style={{ display: "none" }} onChange={e => { if (e.target.files[0]) importCIF(i, e.target.files[0]); e.target.value = ""; }} />
-              </label>
-            </div>
-            <button onClick={() => removeStruct(i)}
-              style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 2px", marginBottom: 1 }}>×</button>
-          </div>
-          {/* Row 2: lattice params + Poisson */}
-          <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
-            {structInput(i, "a",       "a",  "Å", 54)}
-            {structInput(i, "b",       "b",  "Å", 54)}
-            {structInput(i, "c",       "c",  "Å", 54)}
-            <div style={{ width: 1, alignSelf: "stretch", background: T.border, margin: "0 2px" }} />
-            {structInput(i, "alpha",   "α",  "°", 50)}
-            {structInput(i, "beta",    "β",  "°", 50)}
-            {structInput(i, "gamma",   "γ",  "°", 50)}
-            <div style={{ width: 1, alignSelf: "stretch", background: T.border, margin: "0 2px" }} />
-            {structInput(i, "poisson", "ν",  "",  50)}
-          </div>
-        </div>
-      ))}
-      <button onClick={addStruct}
-        style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
-        + Add structure
-      </button>
-    </div>
-  );
-
-  const renderMatLib = (tech) => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      {draft.materials[tech].map((m, i) => (
-        <div key={i} style={{ background: T.bg3, border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 10px", display: "flex", alignItems: "flex-end", gap: 8, flexWrap: "wrap" }}>
-          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-            <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Material</span>
-            <div style={{ width: 100 }}>
-              <MaterialCombobox value={m.name} onChange={v => setMat(tech, i, "name", v)} knownMaterials={knownMaterials} small />
-            </div>
-          </div>
-          {tech === "sputter" ? (<>
-            {matInput(tech, i, "power_W",    "Power",  "W",    52)}
-            {matInput(tech, i, "temp",       "Temp",   "°C",   52)}
-            {matInput(tech, i, "pressure",   "Press",  "mT",   52)}
-            {matInput(tech, i, "oxygen_pct", "O₂",     "%",    44)}
-            {matInput(tech, i, "time_s",     "Time",   "s",    52)}
-          </>) : (<>
-            {matInput(tech, i, "energy_mJ",   "Energy", "mJ",   52)}
-            {matInput(tech, i, "pulses",      "Pulses", "",     64)}
-            {matInput(tech, i, "temp",        "Temp",   "°C",   52)}
-            {matInput(tech, i, "pressure",    "Press",  "mT",   52)}
-            {matInput(tech, i, "frequency_hz","Rep",    "Hz",   48)}
-          </>)}
-          {(draft.custom_growth_params?.[tech] || []).filter(p => p.name).map(p =>
-            matInput(tech, i, p.id, p.name, p.unit || "", 60)
-          )}
-          <button onClick={() => removeMat(tech, i)}
-            style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 2px", alignSelf: "flex-end", marginBottom: 1 }}>×</button>
-        </div>
-      ))}
-      <button onClick={() => addMat(tech)}
-        style={{ background: "none", border: `1px dashed ${T.border}`, borderRadius: 5, color: T.teal, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px", cursor: "pointer", alignSelf: "flex-start" }}>
-        + Add material
-      </button>
-    </div>
-  );
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "flex-start", justifyContent: "center", zIndex: 100, overflowY: "auto", padding: "80px 20px 40px" }}>
@@ -5655,62 +7916,55 @@ function SettingsModal({ settings, onSave, onClose }) {
           </div>
         </div>
 
-        {/* Sputter defaults */}
-        {sectionHdr("Sputter Defaults")}
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          {fieldSm("sputter.temp",       "Temp",    "°C")}
-          {fieldSm("sputter.pressure",   "Pressure","mTorr")}
-          {fieldSm("sputter.oxygen_pct", "O₂",      "%",  52)}
-          {fieldSm("sputter.time_s",     "Time",    "s",  72)}
-          {fieldSm("sputter.power_W",    "Power",   "W",  60)}
+        {/* Technique Library */}
+        {sectionHdr("Technique Library")}
+        {renderTechniqueLibrary()}
+
+        {/* Global Packages */}
+        {sectionHdr("Global Packages")}
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>
+            Extra pip packages available to all modules. One per line (e.g. <span style={{ color: T.textPrimary }}>lmfit&gt;=1.0</span>).
+          </div>
+          <textarea
+            value={(draft.extra_packages || []).join("\n")}
+            onChange={e => {
+              const pkgs = e.target.value.split("\n").map(s => s.trim()).filter(Boolean);
+              set("extra_packages", pkgs);
+              setPkgResults(null);
+            }}
+            rows={Math.max(2, (draft.extra_packages || []).length + 1)}
+            spellCheck={false}
+            style={{ width: "100%", background: T.bg0, border: `1px solid ${T.borderBright}`, borderRadius: 6, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "8px 10px", outline: "none", resize: "vertical", boxSizing: "border-box" }}
+          />
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <button
+              disabled={pkgInstalling || !(draft.extra_packages || []).length}
+              onClick={async () => {
+                setPkgInstalling(true); setPkgResults(null);
+                // Save settings first so backend picks up the latest package list
+                await api("PUT", "/settings", draft).catch(() => {});
+                const r = await api("POST", "/settings/install-packages").catch(() => null);
+                setPkgResults(r?.results || null);
+                setPkgInstalling(false);
+              }}
+              style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 14px", borderRadius: 6, border: `1px solid ${T.teal}55`, background: "none", color: pkgInstalling ? T.textDim : T.teal, cursor: pkgInstalling ? "default" : "pointer" }}>
+              {pkgInstalling ? "Installing…" : "Install now"}
+            </button>
+            {pkgResults && (
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: pkgResults.every(r => r.ok || r.skipped) ? T.teal : T.red }}>
+                {pkgResults.every(r => r.ok || r.skipped) ? "✓ All installed" : "⚠ Some failed — check console"}
+              </span>
+            )}
+          </div>
+          {pkgResults && pkgResults.some(r => !r.ok && !r.skipped) && (
+            <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red, background: T.bg0, border: `1px solid ${T.red}33`, borderRadius: 6, padding: "8px 10px" }}>
+              {pkgResults.filter(r => !r.ok && !r.skipped).map(r => (
+                <div key={r.dep}>{r.dep}: {r.blocked ? "blocked" : r.error || "install failed"}</div>
+              ))}
+            </div>
+          )}
         </div>
-        <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1.5, marginTop: 6, marginBottom: 2 }}>Custom Sputter Params</div>
-        {renderCustomParams("sputter")}
-
-        {/* PLD defaults */}
-        {sectionHdr("PLD Defaults")}
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          {fieldSm("pld.temp",         "Temp",     "°C")}
-          {fieldSm("pld.pressure",     "Pressure", "mTorr")}
-          {fieldSm("pld.frequency_hz", "Rep rate", "Hz",  60)}
-          {fieldSm("pld.energy_mJ",    "Energy",   "mJ",  60)}
-          {fieldSm("pld.pulses",       "Pulses",   "",    72)}
-        </div>
-        <div style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1.5, marginTop: 6, marginBottom: 2 }}>Custom PLD Params</div>
-        {renderCustomParams("pld")}
-
-        {/* Material library — Sputter (collapsible) */}
-        <button onClick={() => setLibOpen(s => ({ ...s, matSputter: !s.matSputter }))}
-          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "none", border: "none", borderBottom: `1px solid ${T.border}`, paddingBottom: 4, marginBottom: 0, marginTop: 6, cursor: "pointer", width: "100%", textAlign: "left" }}>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2 }}>Material Library — Sputter</span>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, lineHeight: 1 }}>{libOpen.matSputter ? "▴" : "▾"}</span>
-        </button>
-        {libOpen.matSputter && <>
-          <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -2, marginBottom: 2 }}>Leave fields blank to use global sputter defaults for that material.</div>
-          {renderMatLib("sputter")}
-        </>}
-
-        {/* Material library — PLD (collapsible) */}
-        <button onClick={() => setLibOpen(s => ({ ...s, matPld: !s.matPld }))}
-          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "none", border: "none", borderBottom: `1px solid ${T.border}`, paddingBottom: 4, marginBottom: 0, marginTop: 6, cursor: "pointer", width: "100%", textAlign: "left" }}>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2 }}>Material Library — PLD</span>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, lineHeight: 1 }}>{libOpen.matPld ? "▴" : "▾"}</span>
-        </button>
-        {libOpen.matPld && <>
-          <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -2, marginBottom: 2 }}>Leave fields blank to use global PLD defaults for that material.</div>
-          {renderMatLib("pld")}
-        </>}
-
-        {/* Structure library (collapsible) */}
-        <button onClick={() => setLibOpen(s => ({ ...s, struct: !s.struct }))}
-          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "none", border: "none", borderBottom: `1px solid ${T.border}`, paddingBottom: 4, marginBottom: 0, marginTop: 6, cursor: "pointer", width: "100%", textAlign: "left" }}>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 2 }}>Structure Library</span>
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, lineHeight: 1 }}>{libOpen.struct ? "▴" : "▾"}</span>
-        </button>
-        {libOpen.struct && <>
-          <div style={{ fontSize: 11, color: T.textDim, fontFamily: "'DM Mono', monospace", marginTop: -2, marginBottom: 2 }}>Lattice parameters for peak prediction and strain calculations. Drop a .cif onto an entry to auto-fill.</div>
-          {renderStructLib()}
-        </>}
 
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 4 }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
@@ -5723,7 +7977,7 @@ function SettingsModal({ settings, onSave, onClose }) {
 
 // ── SampleCard ────────────────────────────────────────────────────────────────
 
-function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, onDragStart }) {
+function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, onDragStart, materialsLib = [] }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const wasDragged = useRef(false);
   const materials = [...new Set((sample.layers || []).flatMap(l => (l.targets || []).map(t => t.material).filter(Boolean)))];
@@ -5769,7 +8023,7 @@ function SampleCard({ sample, onClick, onDelete, onDuplicateTemplate, plotData, 
       {materials.length > 0 && (
         <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
           {materials.map(m => { const s = getMaterialStyle(m); return (
-            <span key={m} style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 7px" }}><ChemName name={m} /></span>
+            <span key={m} style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: s.border, background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4, padding: "2px 7px" }} title={m}><ChemName name={matDisplayName(m, materialsLib)} /></span>
           );})}
           {(sample.layers || []).some(l => l.role === "buffer") && (
             <span style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", fontWeight: 600, color: T.teal, background: `${T.teal}22`, border: `1px solid ${T.teal}66`, borderRadius: 3, padding: "1px 5px", letterSpacing: 0.5 }}>BUF</span>
@@ -5790,7 +8044,7 @@ const COLOR_OPTIONS = ["#4a5568", "#3182ce", "#38a169", "#d69e2e", "#9f7aea", "#
 
 function FolderTile({ folder, samples, childContent = null, plotCache, depth = 0,
   onSelectSample, onDeleteSample, onDuplicateTemplate, onEdit, onDelete,
-  onDropSample, onDragStartSample, onDragStartFolder, onDropFolder }) {
+  onDropSample, onDragStartSample, onDragStartFolder, onDropFolder, materialsLib = [] }) {
   const lsKey = `folder-open-${folder.id}`;
   const [open, setOpen] = useState(() => { try { const v = localStorage.getItem(lsKey); return v === null ? false : v === "1"; } catch { return false; } });
   const toggleOpen = () => setOpen(v => { const next = !v; try { localStorage.setItem(lsKey, next ? "1" : "0"); } catch {} return next; });
@@ -5868,7 +8122,7 @@ function FolderTile({ folder, samples, childContent = null, plotCache, depth = 0
           <div style={{ padding: 12, background: T.bg0 }}>
             {childContent}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(310px,1fr))", gap: 12, marginTop: childContent ? 8 : 0 }}>
-              {samples.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => onSelectSample(s.id)} onDelete={onDeleteSample} onDuplicateTemplate={onDuplicateTemplate} onDragStart={onDragStartSample} />)}
+              {samples.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => onSelectSample(s.id)} onDelete={onDeleteSample} onDuplicateTemplate={onDuplicateTemplate} onDragStart={onDragStartSample} materialsLib={materialsLib} />)}
               {!samples.length && !childContent && (
                 <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: sampleDragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>
                   {sampleDragOver ? "Drop to add to this folder" : "Empty folder"}
@@ -5888,12 +8142,14 @@ function AddSampleFolderModal({ onSave, onClose, existing, allFolders = [] }) {
   const [name,     setName]     = useState(existing?.name || "");
   const [color,    setColor]    = useState(existing?.color || COLOR_OPTIONS[0]);
   const [parentId, setParentId] = useState(existing?.parent_id || "");
-  const sampleFolders = allFolders.filter(f => !f.book_folder && !f.module_folder);
+  useEscClose(onClose);
+  const sampleFolders = allFolders.filter(f => !f.book_folder && !f.module_folder && !f.mat_folder);
   const getDescendantIds = (id, set = new Set()) => { set.add(id); sampleFolders.filter(f => f.parent_id === id).forEach(c => getDescendantIds(c.id, set)); return set; };
   const excludeIds = existing ? getDescendantIds(existing.id) : new Set();
   const parentOptions = sampleFolders.filter(f => !excludeIds.has(f.id));
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+    <div onKeyDown={useModalEnter(() => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: false, parent_id: parentId || null }))}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 20 }}>{existing ? "Edit Folder" : "New Sample Folder"}</h2>
         <Input label="Name" value={name} onChange={setName} placeholder="e.g. BTO Series" />
@@ -5925,8 +8181,10 @@ function AddSampleFolderModal({ onSave, onClose, existing, allFolders = [] }) {
 function AddBookFolderModal({ onSave, onClose, existing, allFolders = [] }) {
   const [name,  setName]  = useState(existing?.name || "");
   const [color, setColor] = useState(existing?.color || COLOR_OPTIONS[0]);
+  useEscClose(onClose);
+  const doSave = () => name.trim() && onSave({ name: name.trim(), color, book_folder: true, module_folder: false, parent_id: null });
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+    <div onKeyDown={useModalEnter(doSave)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.blue, fontSize: 20 }}>{existing ? "Edit Folder" : "New Book Folder"}</h2>
         <Input label="Name" value={name} onChange={setName} placeholder="e.g. Thickness Study" />
@@ -5938,7 +8196,7 @@ function AddBookFolderModal({ onSave, onClose, existing, allFolders = [] }) {
         </div>
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn onClick={() => name.trim() && onSave({ name: name.trim(), color, book_folder: true, module_folder: false, parent_id: null })} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
+          <Btn onClick={doSave} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
         </div>
       </div>
     </div>
@@ -5948,8 +8206,10 @@ function AddBookFolderModal({ onSave, onClose, existing, allFolders = [] }) {
 function AddModuleFolderModal({ onSave, onClose, existing }) {
   const [name,  setName]  = useState(existing?.name || "");
   const [color, setColor] = useState(existing?.color || COLOR_OPTIONS[0]);
+  useEscClose(onClose);
+  const doSave = () => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: true, parent_id: null });
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+    <div onKeyDown={useModalEnter(doSave)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
       <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
         <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.teal, fontSize: 20 }}>{existing ? "Edit Folder" : "New Module Folder"}</h2>
         <Input label="Name" value={name} onChange={setName} placeholder="e.g. Electrical" />
@@ -5961,7 +8221,32 @@ function AddModuleFolderModal({ onSave, onClose, existing }) {
         </div>
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn onClick={() => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: true, parent_id: null })} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
+          <Btn onClick={doSave} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AddMatFolderModal({ onSave, onClose, existing }) {
+  const [name,  setName]  = useState(existing?.name || "");
+  const [color, setColor] = useState(existing?.color || COLOR_OPTIONS[0]);
+  useEscClose(onClose);
+  const doSave = () => name.trim() && onSave({ name: name.trim(), color, book_folder: false, module_folder: false, mat_folder: true, parent_id: null });
+  return (
+    <div onKeyDown={useModalEnter(doSave)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: 28, width: 340, display: "flex", flexDirection: "column", gap: 16 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.teal, fontSize: 20 }}>{existing ? "Edit Folder" : "New Material Folder"}</h2>
+        <Input label="Name" value={name} onChange={setName} placeholder="e.g. Substrates" />
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <Label>Color</Label>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {COLOR_OPTIONS.map(c => <div key={c} onClick={() => setColor(c)} style={{ width: 24, height: 24, borderRadius: "50%", background: c, cursor: "pointer", border: color === c ? `3px solid ${T.textPrimary}` : "2px solid transparent", boxSizing: "border-box" }} />)}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn onClick={doSave} disabled={!name.trim()}>{existing ? "Save" : "Create"}</Btn>
         </div>
       </div>
     </div>
@@ -6008,6 +8293,7 @@ function defaultPanelConfig(type) {
   const saved = loadDefaultPanelConfig(type);
   const base =
     type === "xrd"  ? { offset_decades: 2, theta_min: null, theta_max: null, pad_above: 2, pad_below: 1 } :
+    type === "xrr"  ? { offset_decades: 2, theta_min: null, theta_max: null, pad_above: 2, pad_below: 1 } :
     type === "meta" ? { x_param: "", y_param: "" } :
     {};
   return saved ? { ...base, ...saved } : base;
@@ -6154,6 +8440,7 @@ function ModuleComparisonPanel({ moduleId, sampleOrder, samples, colors, labels 
 
 // Inline sample picker shown inside SampleRoster
 function SamplePicker({ samples, alreadySelected, onAdd, onClose }) {
+  useEscClose(onClose);
   const [sel, setSel] = useState(new Set());
   const available = samples
     .filter(s => !alreadySelected.includes(s.id))
@@ -6183,10 +8470,11 @@ function SamplePicker({ samples, alreadySelected, onAdd, onClose }) {
   );
 }
 
-function SampleRosterRow({ sid, s, color, label, dragOver, onDragStart, onDragOver, onDrop, onDragEnd, onRemove, onLabelChange }) {
+function SampleRosterRow({ sid, s, color, label, hidden = false, onToggleVisibility, dragOver, onDragStart, onDragOver, onDrop, onDragEnd, onRemove, onLabelChange }) {
   const [localLabel, setLocalLabel] = useState(label || "");
   useEffect(() => { setLocalLabel(label || ""); }, [label]);
   const commit = () => onLabelChange?.(sid, localLabel);
+  const dim = hidden ? 0.38 : 1;
   return (
     <div
       draggable
@@ -6196,10 +8484,17 @@ function SampleRosterRow({ sid, s, color, label, dragOver, onDragStart, onDragOv
       onDragEnd={onDragEnd}
       style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 4px", borderRadius: 5, background: dragOver ? T.bg3 : "transparent", cursor: "grab", userSelect: "none" }}>
       <span style={{ color: T.textDim, fontSize: 11 }}>⠿</span>
-      <div style={{ width: 11, height: 11, borderRadius: "50%", background: color, flexShrink: 0, border: `1px solid ${color}88` }} />
-      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.amber, fontWeight: 600, minWidth: 56 }}>{sid}</span>
-      {s?.date  && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{s.date}</span>}
+      {/* Color swatch doubles as visibility toggle — filled = visible, ring = hidden.
+          Color stays pinned to the sample regardless of visibility. */}
+      <div
+        onClick={() => onToggleVisibility?.(sid)}
+        onMouseDown={e => e.stopPropagation()}
+        title={hidden ? "Hidden from plots — click to show" : "Visible — click to hide from plots"}
+        style={{ width: 12, height: 12, borderRadius: "50%", background: hidden ? "transparent" : color, flexShrink: 0, border: `1.5px solid ${color}`, cursor: "pointer" }} />
+      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, color: T.amber, fontWeight: 600, minWidth: 56, opacity: dim }}>{sid}</span>
+      {s?.date  && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, opacity: dim }}>{s.date}</span>}
       {!s       && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.red }}>not found</span>}
+      {hidden   && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim, border: `1px solid ${T.border}`, borderRadius: 3, padding: "0 4px", letterSpacing: 0.5 }}>HIDDEN</span>}
       <input
         type="text"
         value={localLabel}
@@ -6208,16 +8503,16 @@ function SampleRosterRow({ sid, s, color, label, dragOver, onDragStart, onDragOv
         onChange={e => setLocalLabel(e.target.value)}
         onBlur={commit}
         onKeyDown={e => e.key === "Enter" && commit()}
-        style={{ width: 120, background: "transparent", border: "none", borderBottom: `1px solid ${T.border}`, borderRadius: 0, color: T.textSecondary, fontFamily: "'DM Mono', monospace", fontSize: 10, outline: "none", padding: "1px 2px" }} />
+        style={{ width: 120, background: "transparent", border: "none", borderBottom: `1px solid ${T.border}`, borderRadius: 0, color: T.textSecondary, fontFamily: "'DM Mono', monospace", fontSize: 10, outline: "none", padding: "1px 2px", opacity: dim }} />
       <div style={{ flex: 1 }} />
-      {s?.notes && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.notes}</span>}
+      {s?.notes && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", opacity: dim }}>{s.notes}</span>}
       <button onClick={() => onRemove(sid)}
         style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 15, lineHeight: 1, marginLeft: "auto", padding: "0 2px" }}>×</button>
     </div>
   );
 }
 
-function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, labels = {}, activeMaterial, onChangeActiveMaterial, onReorder, onRemove, onAddSamples, onChangeScale, onChangeTrim, onLabelChange }) {
+function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, labels = {}, hidden, onToggleVisibility, activeMaterial, onChangeActiveMaterial, onReorder, onRemove, onAddSamples, onChangeScale, onChangeTrim, onLabelChange }) {
   const [dragIdx,       setDragIdx]       = useState(null);
   const [dragOverIdx,   setDragOverIdx]   = useState(null);
   const [showPicker,    setShowPicker]    = useState(false);
@@ -6286,6 +8581,8 @@ function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, lab
           s={sampleMap[sid]}
           color={colors[i] || T.textDim}
           label={labels[sid] || ""}
+          hidden={hidden?.has(sid) ?? false}
+          onToggleVisibility={onToggleVisibility}
           dragOver={dragOverIdx === i}
           onDragStart={() => setDragIdx(i)}
           onDragOver={e => { e.preventDefault(); setDragOverIdx(i); }}
@@ -6791,12 +9088,15 @@ function buildPlotLayout(ps, xaxisExtra = {}, yaxisExtra = {}, extraShapes = [],
 
 function buildPlotConfig(filename = "plot", ps = null) {
   const hasSizeOverride = !!(ps?.plotWidth || ps?.plotHeight);
+  // Raster copies render at this multiple of the on-screen size so pasted PNGs stay
+  // crisp when scaled up (e.g. in PowerPoint), avoiding the need to fall back to SVG.
+  const PNG_COPY_SCALE = 4;
   // Export helper: temporarily clears background colours for transparent output, then restores.
-  const exportTransparent = async (gd, format) => {
+  const exportTransparent = async (gd, format, scale) => {
     const { paper_bgcolor, plot_bgcolor } = gd.layout;
     await window.Plotly.relayout(gd, { paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)" });
     try {
-      return await window.Plotly.toImage(gd, { format });
+      return await window.Plotly.toImage(gd, { format, ...(scale ? { scale } : {}) });
     } finally {
       await window.Plotly.relayout(gd, { paper_bgcolor, plot_bgcolor });
     }
@@ -6822,7 +9122,7 @@ function buildPlotConfig(filename = "plot", ps = null) {
         icon: { width: 24, height: 24, path: "M16 1H4C2.9 1 2 1.9 2 3v14h2V3h12V1zm3 4H8C6.9 5 6 5.9 6 7v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z" },
         click: async (gd) => {
           try {
-            const dataUrl = await exportTransparent(gd, "png");
+            const dataUrl = await exportTransparent(gd, "png", PNG_COPY_SCALE);
             const blob = await fetch(dataUrl).then(r => r.blob());
             await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
           } catch (err) { console.error("Copy to clipboard failed:", err); }
@@ -6859,7 +9159,7 @@ function SciPlotWrap({ ps, cursorLabel, children, noSpacer = false }) {
 
 // ── XRD ω–2θ comparison ───────────────────────────────────────────────────────
 
-function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, config, plotStyle, structures = [], onUpdate }) {
+function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, config, plotStyle, structures = [], onUpdate, samples = [] }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const offsetDecades   = config.offset_decades ?? 2;
   const thetaMin        = config.theta_min  != null ? Number(config.theta_min)  : null;
@@ -6867,12 +9167,26 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
   const padAbove        = config.pad_above  ?? 2;
   const padBelow        = config.pad_below  ?? 1;
   const normalizeBase   = config.normalize_baseline ?? true;
+  const zeroSubstrate   = config.zero_substrate ?? false;
+
+  const substrateMap = useMemo(
+    () => Object.fromEntries(samples.map(s => [s.id, s.substrate || ""])),
+    [samples]
+  );
 
   const { traces, yDomMin, yDomMax, xTicks, xDomain } = useMemo(() => {
     const traces = sampleOrder.map((sid, i) => {
       let pts = plotCache[sid]?.xrd_ot || [];
       if (thetaMin != null && !isNaN(thetaMin)) pts = pts.filter(p => p.x >= thetaMin);
       if (thetaMax != null && !isNaN(thetaMax)) pts = pts.filter(p => p.x <= thetaMax);
+      if (zeroSubstrate && pts.length) {
+        const ref = xrdSubstrateRef(substrateMap[sid], structures);
+        if (ref) {
+          const maxPt = pts.reduce((best, p) => (p.y > best.y ? p : best), pts[0]);
+          const shift = ref.twoTheta - maxPt.x;
+          pts = pts.map(p => ({ ...p, x: p.x + shift }));
+        }
+      }
       const pos = pts.filter(p => p.y > 0);
       if (pos.length === 0) return null;
       const sorted = [...pos.map(p => p.y)].sort((a, b) => a - b);
@@ -6899,7 +9213,7 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
       : { ticks: xTicksAuto };
     return { traces, yDomMin, yDomMax, xTicks, xDomain };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sampleOrder.join(","), plotCache, thetaMin, thetaMax, offsetDecades, padAbove, padBelow, normalizeBase, colors.join(",")]);
+  }, [sampleOrder.join(","), plotCache, thetaMin, thetaMax, offsetDecades, padAbove, padBelow, normalizeBase, zeroSubstrate, substrateMap, colors.join(",")]);
 
   const lines = config.lines || [];
   const addLine    = () => onUpdate({ lines: [...lines, { id: String(Date.now()), material: structures[0]?.name || "", hkl: "", style: "solid", color: "#888888", mode: "bulk", substrate: "" }] });
@@ -7160,12 +9474,91 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
   );
 }
 
+// ── XRR comparison ────────────────────────────────────────────────────────────
+
+function XRRComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, config, plotStyle }) {
+  const ps = plotStyle || DEFAULT_PLOT_STYLE;
+  const offsetDecades = config.offset_decades ?? 2;
+  const thetaMin      = config.theta_min != null ? Number(config.theta_min) : null;
+  const thetaMax      = config.theta_max != null ? Number(config.theta_max) : null;
+  const padAbove      = config.pad_above  ?? 2;
+  const padBelow      = config.pad_below  ?? 1;
+  const normalizeBase = config.normalize_baseline ?? true;
+
+  const { traces, yDomMin, yDomMax, xTicks, xDomain } = useMemo(() => {
+    const traces = sampleOrder.map((sid, i) => {
+      let pts = plotCache[sid]?.xrr || [];
+      if (thetaMin != null && !isNaN(thetaMin)) pts = pts.filter(p => p.x >= thetaMin);
+      if (thetaMax != null && !isNaN(thetaMax)) pts = pts.filter(p => p.x <= thetaMax);
+      if (pts.length === 0) return null;
+      const maxY  = Math.max(...pts.map(p => p.y));
+      const norm  = normalizeBase && maxY > 0 ? maxY : 1;
+      const scale = Math.pow(10, i * offsetDecades);
+      const data  = pts.map(p => ({ x: p.x, y: p.y / norm * scale }));
+      return { sid, color: colors[i], data };
+    }).filter(Boolean);
+    const posY    = traces.flatMap(t => t.data.map(p => p.y).filter(y => y > 0));
+    const yDomMin = posY.length ? Math.pow(10, Math.floor(Math.log10(Math.min(...posY))) - padBelow) : 1e-1;
+    const yDomMax = posY.length ? Math.pow(10, Math.ceil(Math.log10(Math.max(...posY)))  + padAbove) : 1e8;
+    const allX    = traces.flatMap(t => t.data.map(p => p.x));
+    const { ticks: xTicksAuto, domain: xDomainAuto } = allX.length
+      ? niceLinTicks(Math.min(...allX), Math.max(...allX))
+      : { ticks: [], domain: ["auto", "auto"] };
+    const xDomLo  = thetaMin != null ? thetaMin : xDomainAuto[0];
+    const xDomHi  = thetaMax != null ? thetaMax : xDomainAuto[1];
+    const xDomain = (xDomLo === "auto" || xDomHi === "auto") ? xDomainAuto : [xDomLo, xDomHi];
+    const { ticks: xTicks } = xDomain[0] !== "auto"
+      ? niceLinTicks(xDomain[0], xDomain[1])
+      : { ticks: xTicksAuto };
+    return { traces, yDomMin, yDomMax, xTicks, xDomain };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sampleOrder.join(","), plotCache, thetaMin, thetaMax, offsetDecades, padAbove, padBelow, normalizeBase, colors.join(",")]);
+
+  const plotlyTraces = traces.map(t => ({
+    x: t.data.map(p => p.x), y: t.data.map(p => p.y),
+    type: "scatter", mode: "lines",
+    line: { color: t.color, width: ps.lineWidth },
+    showlegend: false, hovertemplate: "<extra></extra>",
+  }));
+
+  const layout = buildPlotLayout(ps,
+    { range: xDomain[0] === "auto" ? undefined : xDomain, tickvals: xTicks.length ? xTicks : undefined,
+      tickformat: "~g",
+      title: { text: "2θ (°)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+    { type: "log", range: [Math.log10(yDomMin), Math.log10(yDomMax)],
+      showticklabels: false, showgrid: false,
+      title: { text: "Intensity (arb.)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
+    [],
+    { uirevision: `xrr-${thetaMin ?? "a"}-${thetaMax ?? "a"}`, dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 } }
+  );
+
+  if (traces.length === 0) return (
+    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No XRR data loaded for selected samples.</div>
+  );
+
+  return (
+    <>
+      <SciPlotWrap ps={ps} cursorLabel={x => `2θ = ${x.toFixed(3)}°`}>
+        {setCursor => (
+          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("xrr", ps)}
+            style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
+            onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+        )}
+      </SciPlotWrap>
+      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
+    </>
+  );
+}
+
 // ── P–E Hysteresis comparison ─────────────────────────────────────────────────
 
 function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {}, plotStyle, config: panelConfig = {}, onUpdate }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const [peLoop, setPeLoop] = useState("all");
-  const xAxisMode = ps.peXAxis || "field"; // "field" (kV/cm) | "voltage" (V)
+  const xAxisMode = ps.peXAxis  || "field";
+  const layout    = ps.peLayout || "one";
+  const tight     = ps.peTight  ?? false;
+  const maxCols   = ps.peMaxCols;
 
   const traces = sampleOrder.map((sid, i) => {
     const sample = samples.find(s => s.id === sid);
@@ -7174,7 +9567,6 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
     const raw    = plotCache[sid]?.pe || [];
     const looped = peLoop === "second" ? splitPELoops(raw).second : raw;
     const data0  = (corr && corr !== 1.0) ? looped.map(p => ({ ...p, y: p.y / corr })) : looped;
-    // Convert x from field (kV/cm) → voltage (V): V = E × d_nm × 1e-4
     const data   = (xAxisMode === "voltage" && thick > 0)
       ? data0.map(p => ({ ...p, x: p.x * thick * 1e-4 }))
       : data0;
@@ -7185,6 +9577,7 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
     <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "20px 0" }}>No P–E data loaded for selected samples.</div>
   );
 
+  // Shared axis ranges (used across all layout modes)
   const allX    = traces.flatMap(t => t.data.map(p => p.x));
   const allY    = traces.flatMap(t => t.data.map(p => p.y));
   const { ticks: autoXTicks, domain: autoXDomain } = niceLinTicks(Math.min(...allX), Math.max(...allX));
@@ -7196,36 +9589,163 @@ function PEComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
   const yMin = ps.yMin ?? -absYMax;
   const yMax = ps.yMax ??  absYMax;
   const autoYTicks = Array.from({ length: 2 * (absYMax / peStep) + 1 }, (_, i) => -absYMax + i * peStep);
-  const xTicks = makeTicks(xDomain[0], xDomain[1], ps.xTick) || autoXTicks;
-  const peTicks = makeTicks(yMin, yMax, ps.yTick) || autoYTicks;
+  const xTicks  = makeTicks(xDomain[0], xDomain[1], ps.xTick) || autoXTicks;
+  const yTicks  = makeTicks(yMin, yMax, ps.yTick) || autoYTicks;
+  const xLabel  = xAxisMode === "voltage" ? "V (V)" : "E (kV/cm)";
+  const xTitleObj = { text: xLabel,       font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 };
+  const yTitleObj = { text: "P (µC/cm²)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8  };
 
-  const plotlyTraces = traces.map(t => ({
-    x: t.data.map(p => p.x), y: t.data.map(p => p.y),
-    type: "scatter", mode: "lines",
-    line: { color: t.color, width: ps.lineWidth },
-    showlegend: false, hovertemplate: "<extra></extra>",
-  }));
-  const xLabel = xAxisMode === "voltage" ? "V (V)" : "E (kV/cm)";
-  const layout = buildPlotLayout(ps,
-    { tickvals: xTicks, range: xDomain,
-      title: { text: xLabel, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
-    { range: [yMin, yMax], tickvals: peTicks, tickformat: "d",
-      title: { text: "P (µC/cm²)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } }
+  const loopToggle = (
+    <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
+      <LoopToggle value={peLoop} onChange={setPeLoop} />
+    </div>
   );
+
+  // ── "one": all traces on a single plot ──────────────────────────────────────
+  if (layout === "one") {
+    const plotlyTraces = traces.map(t => ({
+      x: t.data.map(p => p.x), y: t.data.map(p => p.y),
+      type: "scatter", mode: "lines",
+      line: { color: t.color, width: ps.lineWidth },
+      showlegend: false, hovertemplate: "<extra></extra>",
+    }));
+    const onePlotLayout = buildPlotLayout(ps,
+      { tickvals: xTicks, range: xDomain, title: xTitleObj },
+      { range: [yMin, yMax], tickvals: yTicks, tickformat: "d", title: yTitleObj }
+    );
+    return (
+      <>
+        {loopToggle}
+        <SciPlotWrap ps={ps} cursorLabel={x => `${xLabel} = ${x.toFixed(3)}`}>
+          {setCursor => (
+            <Plot data={plotlyTraces} layout={onePlotLayout} config={buildPlotConfig("pe-hysteresis", ps)}
+              style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
+              onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+          )}
+        </SciPlotWrap>
+        <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
+      </>
+    );
+  }
+
+  // ── "each", loose: individual Plot per sample in a flex grid ────────────────
+  if (!tight) {
+    const panelW = ps.plotWidth  ? Math.round(ps.plotWidth  * 96) : 220;
+    const panelH = ps.plotHeight ? Math.round(ps.plotHeight * 96) : 260;
+    return (
+      <>
+        {loopToggle}
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", justifyContent: "center" }}>
+          {traces.map(t => {
+            const singleLayout = buildPlotLayout(ps,
+              { tickvals: xTicks, range: xDomain, title: xTitleObj },
+              { range: [yMin, yMax], tickvals: yTicks, tickformat: "d", title: yTitleObj }
+            );
+            return (
+              <div key={t.sid} style={{ flex: "0 0 auto" }}>
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: t.color, marginBottom: 4, textAlign: "center" }}>
+                  {labels[t.sid] || t.sid}
+                </div>
+                <Plot
+                  data={[{ x: t.data.map(p => p.x), y: t.data.map(p => p.y), type: "scatter", mode: "lines", line: { color: t.color, width: ps.lineWidth }, showlegend: false, hovertemplate: "<extra></extra>" }]}
+                  layout={singleLayout} config={buildPlotConfig(`pe-${t.sid}`, ps)}
+                  style={{ width: panelW, height: panelH }} useResizeHandler />
+              </div>
+            );
+          })}
+        </div>
+      </>
+    );
+  }
+
+  // ── "each", tight: single Plotly figure with subplot grid ───────────────────
+  const cols    = Math.min(maxCols > 0 ? maxCols : traces.length, traces.length);
+  const rows    = Math.ceil(traces.length / cols);
+  const defPW   = 200, defPH = 230;
+  const figW    = ps.plotWidth  ? Math.round(ps.plotWidth  * 96) : defPW * cols;
+  const figH    = ps.plotHeight ? Math.round(ps.plotHeight * 96) : defPH * rows;
+
+  const gridDash  = { dotted: "dot", dashed: "dash", solid: "solid" }[ps.grid] || "dash";
+  const axisBase  = {
+    showgrid: ps.grid !== "off", gridcolor: T.border, griddash: gridDash,
+    color: T.textDim, tickfont: { size: (ps.fontSize || 11) - 1, family: ps.font, color: T.textDim },
+    zeroline: ps.zeroLines ?? true, zerolinecolor: T.borderBright, zerolinewidth: 1,
+    showline: false, ticks: "inside", ticklen: 4, mirror: "ticks",
+  };
+
+  const subTraces    = [];
+  const axesLayout   = {};
+  const annotations  = [];
+  const shapes       = [];
+
+  traces.forEach((t, idx) => {
+    const n        = idx + 1;
+    const xRef     = n === 1 ? "x"  : `x${n}`;
+    const yRef     = n === 1 ? "y"  : `y${n}`;
+    const xAxisKey = n === 1 ? "xaxis"  : `xaxis${n}`;
+    const yAxisKey = n === 1 ? "yaxis"  : `yaxis${n}`;
+    const col      = idx % cols;
+    const row      = Math.floor(idx / cols);
+    const isLeft   = col === 0;
+    const isBottom = row === rows - 1 || idx >= traces.length - ((traces.length % cols) || cols);
+
+    subTraces.push({
+      x: t.data.map(p => p.x), y: t.data.map(p => p.y),
+      type: "scatter", mode: "lines",
+      line: { color: t.color, width: ps.lineWidth },
+      showlegend: false, hovertemplate: "<extra></extra>",
+      xaxis: xRef, yaxis: yRef,
+    });
+
+    axesLayout[xAxisKey] = {
+      ...axisBase,
+      range: xDomain, ...(xTicks ? { tickvals: xTicks, tickmode: "array" } : {}),
+      showticklabels: isBottom,
+      title: isBottom ? xTitleObj : { text: "" },
+    };
+    axesLayout[yAxisKey] = {
+      ...axisBase,
+      range: [yMin, yMax], tickformat: "d",
+      ...(yTicks ? { tickvals: yTicks, tickmode: "array" } : {}),
+      showticklabels: isLeft, ticklabelstandoff: 4,
+      title: isLeft ? yTitleObj : { text: "" },
+    };
+
+    annotations.push({
+      text: `<b>${labels[t.sid] || t.sid}</b>`,
+      xref: `${xRef} domain`, yref: `${yRef} domain`,
+      x: 0.03, y: 0.97, xanchor: "left", yanchor: "top",
+      showarrow: false,
+      font: { size: ps.fontSize || 11, color: t.color, family: ps.font },
+    });
+
+    if (ps.box !== "off") {
+      shapes.push({
+        type: "rect", xref: `${xRef} domain`, yref: `${yRef} domain`,
+        x0: 0, y0: 0, x1: 1, y1: 1, layer: "above",
+        line: { color: ps.box === "solid" ? T.textPrimary : T.borderBright, width: ps.box === "solid" ? 1.5 : 1, dash: ps.box === "dashed" ? "dash" : "solid" },
+      });
+    }
+  });
+
+  const tightLayout = {
+    autosize: false, width: figW, height: figH,
+    paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
+    font: { family: ps.font, size: ps.fontSize, color: T.textPrimary },
+    margin: { t: 36, r: 14, b: 58, l: 64, pad: 0 },
+    grid: { rows, columns: cols, pattern: "independent", roworder: "top to bottom", xgap: 0, ygap: 0 },
+    annotations, shapes,
+    uirevision: "pe-grid",
+    hovermode: "closest",
+    modebar: { bgcolor: "transparent", color: T.textDim, activecolor: T.textPrimary },
+    ...axesLayout,
+  };
 
   return (
     <>
-      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
-        <LoopToggle value={peLoop} onChange={setPeLoop} />
-      </div>
-      <SciPlotWrap ps={ps} cursorLabel={x => `E = ${x.toFixed(3)} kV/cm`}>
-        {setCursor => (
-          <Plot data={plotlyTraces} layout={layout} config={buildPlotConfig("pe-hysteresis", ps)}
-            style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
-            onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
-        )}
-      </SciPlotWrap>
-      <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
+      {loopToggle}
+      <Plot data={subTraces} layout={tightLayout} config={buildPlotConfig("pe-hysteresis", ps)}
+        style={{ width: figW, height: figH }} useResizeHandler />
     </>
   );
 }
@@ -7920,7 +10440,7 @@ function AfmComparisonPanel({ sampleOrder, plotCache, labels = {}, plotStyle, co
 
 // ── Panel wrapper + add panel row ─────────────────────────────────────────────
 
-const PANEL_LABELS = { xrd: "XRD ω–2θ", pe: "P–E Hysteresis", rsm: "RSM", afm: "Scanning Probe", de: "εᵣ vs E", df: "εᵣ vs f", meta: "Meta-analysis", stats: "Statistical Analysis", parcoords: "Parallel Coordinates" };
+const PANEL_LABELS = { xrd: "XRD ω–2θ", xrr: "XRR", pe: "P–E Hysteresis", rsm: "RSM", afm: "Scanning Probe", de: "εᵣ vs E", df: "εᵣ vs f", meta: "Meta-analysis", stats: "Statistical Analysis", parcoords: "Parallel Coordinates", sputter: "Deposition Log", pund_a1: "PUND — A1 Imprint", pund_a2: "PUND — A2 Voltage", pund_a3: "PUND — A3 Speed", pund_a4: "PUND — A4 Delay" };
 function panelLabel(type, modules = []) {
   if (PANEL_LABELS[type]) return PANEL_LABELS[type];
   if (type.startsWith("mod:")) {
@@ -8255,7 +10775,9 @@ function metaYRange(allY, isPaired) {
   }
   const span = (hi - lo) || Math.abs(hi) * 0.5 || 1;
   const pad  = span * 0.20;
-  return [lo >= 0 ? 0 : lo - pad, hi + pad];
+  // Include zero for positive data, but float a small buffer below it too so the
+  // baseline isn't flush against the axis edge.
+  return [lo >= 0 ? -span * 0.06 : lo - pad, hi + pad];
 }
 
 function MetaScatterPlot({ points, y2Points = [], xLabel, yLabel, y2Label = "", ps = DEFAULT_PLOT_STYLE, pairedY = false, pairedY2 = false, xCategorical = false, sampleOrder = [], colors = [], labels = {}, yMarker = {}, y2Marker = {} }) {
@@ -8286,6 +10808,7 @@ function MetaScatterPlot({ points, y2Points = [], xLabel, yLabel, y2Label = "", 
       x: [pt.x], y: [pt.y], yaxis: "y",
       type: "scatter", mode: ps.metaLabels ? "markers+text" : "markers",
       marker: { color: yMarker.color ?? pt.color, size: yMarker.size ?? 9, symbol: yMarker.symbol ?? "circle", line: { color: T.bg0, width: 1.5 } },
+      ...(pt.ey != null ? { error_y: { type: "data", array: [pt.ey], visible: true, thickness: 1.2, width: 4, color: yMarker.color ?? pt.color } } : {}),
       text: ps.metaLabels ? [pt.label] : undefined,
       textposition: "top center",
       textfont: { size: (ps.fontSize || 11) - 1, family: ps.font, color: yMarker.color ?? pt.color },
@@ -8568,9 +11091,9 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
   const allParamGroups = useMemo(() => {
     // Inject custom growth params from settings into the Growth group
-    const customSputter = (settings?.custom_growth_params?.sputter || []).filter(p => p.name);
-    const customPld     = (settings?.custom_growth_params?.pld     || []).filter(p => p.name);
-    const customParams  = [...customSputter, ...customPld].map(p => ({
+    const customParams = (settings?.techniques || []).flatMap(tech =>
+      (tech.params || []).filter(p => p.scope === "layer" && !BUILTIN_LAYER_PARAM_IDS.has(p.id) && p.name && p.type !== "select")
+    ).map(p => ({
       id: `custom_growth_${p.id}`,
       label: p.name,
       unit: p.unit || "",
@@ -8592,7 +11115,7 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
         : g
     );
     return [...baseGroups, ...moduleGroups];
-  }, [moduleGroups, settings?.custom_growth_params]);
+  }, [moduleGroups, settings?.techniques]);
   const allParamsFlat  = useMemo(() => allParamGroups.flatMap(g => g.params.map(p => ({ ...p, group: g.group }))), [allParamGroups]);
 
   const xParam  = allParamsFlat.find(p => p.id === xParamId)  || null;
@@ -8761,6 +11284,347 @@ function MetaAnalysisPanel({ sampleOrder, samples, plotCache, colors, labels = {
           yMarker={{ color: config.y_color ?? null, symbol: config.y_symbol ?? "circle", size: config.y_size ?? 9 }}
           y2Marker={{ color: config.y2_color ?? null, symbol: config.y2_symbol ?? "diamond", size: config.y2_size ?? 9 }}
         />
+      )}
+    </div>
+  );
+}
+
+// ── Sputter deposition-log comparison panel ───────────────────────────────────
+// Meta-panel style: pick a channel (all selectable); the layer to compare follows
+// the book's Active Layer selection. Reads per-layer logs bound via
+// layer.sputter_log and fetches their parsed window stats on demand.
+
+function SputterComparisonPanel({ sampleOrder, samples, colors, labels = {}, config = {}, plotStyle, activeMaterial = null, onUpdate }) {
+  const ps = plotStyle || DEFAULT_PLOT_STYLE;
+  const sampleMap = useMemo(() => Object.fromEntries(samples.map(s => [s.id, s])), [samples]);
+  const channelKey = config.sputter_channel || "temp_pyro1";
+  const chan = SPUTTER_CHANNELS.find(c => c.key === channelKey) || SPUTTER_CHANNELS[0];
+
+  // All (sampleId, filename) pairs we need parsed data for.
+  const wantedFiles = useMemo(() => {
+    const out = [];
+    for (const sid of sampleOrder) {
+      const s = sampleMap[sid];
+      if (!s) continue;
+      for (const l of (s.layers || [])) if (l.sputter_log) out.push([sid, l.sputter_log]);
+    }
+    return out;
+  }, [sampleOrder, sampleMap]);
+
+  const [logCache, setLogCache] = useState({});  // `${sid}::${fn}` → data | "error"
+  const fetchingRef = useRef(new Set());
+  useEffect(() => {
+    // NB: no "cancelled" guard here — combining it with the persistent fetchingRef
+    // dedup deadlocks under React StrictMode's mount/cleanup/mount (the key gets
+    // added on the first pass, then the second pass skips it and nothing is stored).
+    (async () => {
+      for (const [sid, fn] of wantedFiles) {
+        const key = `${sid}::${fn}`;
+        if (fetchingRef.current.has(key)) continue;
+        fetchingRef.current.add(key);
+        const data = await fetchSputterLog(sid, fn);
+        setLogCache(c => ({ ...c, [key]: data || "error" }));
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wantedFiles.map(([s, f]) => `${s}::${f}`).join(",")]);
+
+  // Resolve the layer to compare for a sample by the book's Active Layer material.
+  // Falls back to the first logged layer when no active layer is set.
+  const pickLayer = (s) => {
+    const logged = (s.layers || []).filter(l => l.sputter_log);
+    if (activeMaterial) {
+      return logged.find(l => l.targets?.length === 1 && l.targets[0].material === activeMaterial)
+          || logged.find(l => sputterLayerMaterial(l) === activeMaterial)
+          || null;
+    }
+    return logged[0] || null;
+  };
+
+  const mode = config.sputter_mode || "trace";  // "trace" (param vs time) | "summary" (mean ± std)
+
+  // Resolve each sample's parsed log + deposition window once, in sample order.
+  const resolved = useMemo(() => sampleOrder.map((sid, i) => {
+    const s = sampleMap[sid];
+    const layer = s ? pickLayer(s) : null;
+    const data = layer ? logCache[`${sid}::${layer.sputter_log}`] : null;
+    return { sid, i, color: colors[i], label: labels[sid] || sid, data };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [sampleOrder, sampleMap, logCache, activeMaterial, colors.join(","), labels]);
+
+  // Trace mode: one line per film, channel vs deposition time (zeroed at shutter open).
+  const traceData = useMemo(() => resolved.flatMap(r => {
+    if (!r.data || r.data === "error") return [];
+    const { pts, win } = sputterViewPoints(r.data, channelKey);
+    if (!win || !pts.length) return [];  // only films with a deposition window
+    return [{ ...r, pts }];
+  }), [resolved, channelKey]);
+
+  // Summary mode: one point per film (window mean) with ±std error bars.
+  const summaryPoints = useMemo(() => resolved.flatMap(r => {
+    if (!r.data || r.data === "error") return [];
+    const y = sputterWindowValue(r.data, channelKey);
+    if (y == null || !isFinite(y)) return [];
+    const win = (r.data.deposition_windows || [])[0];
+    const std = channelKey === "__duration" ? null : win?.stats?.[channelKey]?.std;
+    return [{ sid: r.sid, x: r.label, y, ey: (std != null && isFinite(std)) ? std : null, color: r.color, label: r.label }];
+  }), [resolved, channelKey]);
+
+  const stillLoading = wantedFiles.some(([sid, fn]) => logCache[`${sid}::${fn}`] === undefined);
+  const hasAny = mode === "trace" ? traceData.length > 0 : summaryPoints.length > 0;
+  const yLabel = `${chan.label}${chan.unit ? ` (${chan.unit})` : ""}`;
+  const selectStyle = { background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "3px 8px", cursor: "pointer" };
+  const axisLabelStyle = { fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, flexShrink: 0 };
+
+  // Trace-mode Plotly figure (overlaid lines).
+  const traceFig = useMemo(() => {
+    if (mode !== "trace" || !traceData.length) return null;
+    const plotlyTraces = traceData.map(t => ({
+      x: t.pts.map(p => p.x), y: t.pts.map(p => p.y),
+      type: "scatter", mode: "lines",
+      line: { color: t.color, width: ps.lineWidth },
+      showlegend: false, hovertemplate: `<b>${t.label}</b><br>%{x:.0f} s<br>%{y:.4g}<extra></extra>`,
+    }));
+    // Axis ranges follow the app convention: include zero, pad the data end
+    // (metaYRange → [0, hi+pad] for positive data). Honor cog overrides.
+    const allY = traceData.flatMap(t => t.pts.map(p => p.y));
+    const allX = traceData.flatMap(t => t.pts.map(p => p.x));
+    const [yLoAuto, yHiAuto] = metaYRange(allY, false);
+    const xHi = arrMax(allX);
+    const yRange = [ps.yMin ?? yLoAuto, ps.yMax ?? yHiAuto];
+    const xRange = [ps.xMin ?? 0, ps.xMax ?? (xHi + (xHi || 1) * 0.03)];
+    const xTickExtra = ps.xTick ? { tickmode: "linear", tick0: 0, dtick: ps.xTick } : {};
+    const yTickExtra = ps.yTick ? { tickmode: "linear", tick0: 0, dtick: ps.yTick } : {};
+    const layout = buildPlotLayout(ps,
+      { range: xRange, ...xTickExtra, title: { text: "Deposition time (s)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+      { range: yRange, ...yTickExtra, title: { text: yLabel, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
+      [],
+      { uirevision: `sputter-${channelKey}`, dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 70, pad: 0 } }
+    );
+    return { plotlyTraces, layout };
+  }, [mode, traceData, channelKey, yLabel, ps]);
+
+  const modeBtn = (val, lbl) => (
+    <button key={val} onClick={() => onUpdate({ sputter_mode: val })}
+      style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: mode === val ? T.bg3 : T.bg0, border: "none", borderRight: val === "trace" ? `1px solid ${T.border}` : "none", color: mode === val ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+      {lbl}
+    </button>
+  );
+
+  return (
+    <div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <span style={axisLabelStyle}>Channel</span>
+          <select value={channelKey} onChange={e => onUpdate({ sputter_channel: e.target.value })} style={selectStyle}>
+            {SPUTTER_CHANNELS.map(c => <option key={c.key} value={c.key}>{c.label}{c.unit ? ` (${c.unit})` : ""}</option>)}
+          </select>
+          <span style={axisLabelStyle}>Layer</span>
+          {activeMaterial
+            ? <ChemName name={matDisplayName(activeMaterial, [])} />
+            : <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.amber }}>set Active Layer below</span>}
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.textDim }}>(from Active Layer)</span>
+          <div style={{ flex: 1 }} />
+          <span style={axisLabelStyle}>View</span>
+          <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+            {modeBtn("trace", "vs time")}
+            {modeBtn("summary", "mean")}
+          </div>
+        </div>
+      </div>
+      {!hasAny ? (
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "24px 0" }}>
+          {stillLoading ? "Loading deposition logs…"
+            : activeMaterial
+              ? `No deposition-log data for the "${activeMaterial}" layer on the included samples.`
+              : "Select an Active Layer below, or attach logs to layers on each sample's page."}
+        </div>
+      ) : mode === "trace" ? (
+        <>
+          <SciPlotWrap ps={ps} cursorLabel={x => `t = ${x.toFixed(0)} s`}>
+            {setCursor => (
+              <Plot data={traceFig.plotlyTraces} layout={traceFig.layout} config={buildPlotConfig("sputter", ps)}
+                style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
+                onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+            )}
+          </SciPlotWrap>
+          <BookColorLegend sampleOrder={traceData.map(t => t.sid)} colors={traceData.map(t => t.color)} labels={labels} ps={ps} />
+        </>
+      ) : (
+        <MetaScatterPlot
+          points={summaryPoints}
+          xLabel=""
+          yLabel={yLabel}
+          ps={ps}
+          xCategorical
+          sampleOrder={summaryPoints.map(p => p.sid)}
+          colors={summaryPoints.map(p => p.color)}
+          labels={labels}
+          yMarker={{ color: config.y_color ?? null, symbol: config.y_symbol ?? "circle", size: config.y_size ?? 9 }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── PUND comparison panel ─────────────────────────────────────────────────────
+// One panel per stage (types "pund_a1".."pund_a4"). Overlays every sample's
+// switched-ΔP sweep for that stage: color = sample (book palette), branch
+// distinguished by marker/line style (ΔP⁺ circles solid, ΔP⁻ squares dashed).
+// Branch selector persists in config.pund_branch; all normal cog styling applies.
+
+function PundComparisonPanel({ stage, sampleOrder, samples, colors, labels = {}, config = {}, plotStyle, onUpdate }) {
+  const ps = plotStyle || DEFAULT_PLOT_STYLE;
+  const stageDef = PUND_STAGES.find(s => s.id === stage) || PUND_STAGES[0];
+  const sampleMap = useMemo(() => Object.fromEntries(samples.map(s => [s.id, s])), [samples]);
+
+  // (sid, filename) pairs for this stage across the visible samples.
+  const wanted = useMemo(() => sampleOrder.flatMap(sid => {
+    const fn = sampleMap[sid]?.filenames?.[`pund_${stage}`];
+    return fn ? [[sid, fn]] : [];
+  }), [sampleOrder, sampleMap, stage]);
+
+  const [cache, setCache] = useState({});  // `${sid}::${fn}` → data | "error"
+  const fetchingRef = useRef(new Set());
+  useEffect(() => {
+    // NB: no cancelled-flag — combining it with the persistent fetchingRef dedup
+    // deadlocks under StrictMode (see SputterComparisonPanel).
+    (async () => {
+      for (const [sid, fn] of wanted) {
+        const key = `${sid}::${fn}`;
+        if (fetchingRef.current.has(key)) continue;
+        fetchingRef.current.add(key);
+        const d = await fetchPund(sid, fn);
+        setCache(c => ({ ...c, [key]: d || "error" }));
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wanted.map(([s, f]) => `${s}::${f}`).join(",")]);
+
+  const loaded = useMemo(() => sampleOrder.flatMap((sid, i) => {
+    const fn = sampleMap[sid]?.filenames?.[`pund_${stage}`];
+    if (!fn) return [];
+    const d = cache[`${sid}::${fn}`];
+    if (!d || d === "error") return [];
+    return [{ sid, color: colors[i], label: labels[sid] || sid, d }];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [sampleOrder, sampleMap, cache, stage, colors.join(","), labels]);
+
+  const anyPos = loaded.some(r => r.d.has_pos);
+  const anyNeg = loaded.some(r => r.d.has_neg);
+  const branch = config.pund_branch || "both";
+  const showPos = anyPos && branch !== "neg";
+  const showNeg = anyNeg && branch !== "pos";
+  const showErr = config.pund_err ?? true;
+
+  const fig = useMemo(() => {
+    if (!loaded.length) return null;
+    const first = loaded[0].d;
+    const logX = !!first.log_x;
+    const unit = first.swept_unit || "";
+    const err = stds => (stds || []).map(s => (s == null ? 0 : s));
+    const traces = [];
+    for (const r of loaded) {
+      if (showPos && r.d.has_pos) traces.push({
+        x: r.d.x, y: r.d.dP_pos, type: "scatter", mode: "lines+markers", name: `${r.label} ΔP⁺`,
+        marker: { color: r.color, size: 6, symbol: "circle" },
+        line: { color: r.color, width: ps.lineWidth },
+        ...(showErr ? { error_y: { type: "data", array: err(r.d.dP_pos_std), visible: true, thickness: 1, width: 3, color: r.color } } : {}),
+        showlegend: false, hovertemplate: `<b>${r.label}</b> ΔP⁺<br>%{x:g} ${unit}<br>%{y:.3g} µC/cm²<extra></extra>`,
+      });
+      if (showNeg && r.d.has_neg) traces.push({
+        x: r.d.x, y: r.d.dP_neg, type: "scatter", mode: "lines+markers", name: `${r.label} ΔP⁻`,
+        marker: { color: r.color, size: 6, symbol: "square" },
+        line: { color: r.color, width: ps.lineWidth, dash: "dot" },
+        ...(showErr ? { error_y: { type: "data", array: err(r.d.dP_neg_std), visible: true, thickness: 1, width: 3, color: r.color } } : {}),
+        showlegend: false, hovertemplate: `<b>${r.label}</b> ΔP⁻<br>%{x:g} ${unit}<br>%{y:.3g} µC/cm²<extra></extra>`,
+      });
+    }
+    if (!traces.length) return null;
+
+    // Y range: zero-anchored with buffer (app convention); honor cog overrides.
+    const allY = traces.flatMap(t => t.y).filter(v => v != null && isFinite(v));
+    const [yLoAuto, yHiAuto] = metaYRange(allY, false);
+    const yRange = [ps.yMin ?? yLoAuto, ps.yMax ?? yHiAuto];
+    const yTickExtra = ps.yTick ? { tickmode: "linear", tick0: 0, dtick: ps.yTick } : {};
+    // X: log stages autorange in log space (cog overrides converted); linear stages padded.
+    let xAxisExtra;
+    if (logX) {
+      xAxisExtra = { type: "log",
+        ...(ps.xMin != null && ps.xMax != null && ps.xMin > 0 && ps.xMax > 0
+          ? { range: [Math.log10(ps.xMin), Math.log10(ps.xMax)] } : {}) };
+    } else {
+      const allX = traces.flatMap(t => t.x).filter(v => v != null && isFinite(v));
+      const xLo = arrMin(allX), xHi = arrMax(allX);
+      const xPad = ((xHi - xLo) || Math.abs(xHi) || 1) * 0.05;
+      xAxisExtra = { range: [ps.xMin ?? (xLo - xPad), ps.xMax ?? (xHi + xPad)],
+        ...(ps.xTick ? { tickmode: "linear", tick0: 0, dtick: ps.xTick } : {}) };
+    }
+    const layout = buildPlotLayout(ps,
+      { ...xAxisExtra, title: { text: `${first.swept_label} (${unit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } },
+      { range: yRange, ...yTickExtra, title: { text: "Switched ΔP (µC/cm²)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
+      [],
+      { uirevision: `pund-${stage}-${branch}`, dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 68, pad: 0 } }
+    );
+    return { traces, layout, unit };
+  }, [loaded, showPos, showNeg, showErr, stage, branch, ps]);
+
+  const stillLoading = wanted.some(([sid, fn]) => cache[`${sid}::${fn}`] === undefined);
+  const axisLabelStyle = { fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, flexShrink: 0 };
+  const branchOpts = [];
+  if (anyPos) branchOpts.push(["pos", "ΔP⁺"]);
+  if (anyNeg) branchOpts.push(["neg", "ΔP⁻"]);
+  if (anyPos && anyNeg) branchOpts.push(["both", "both"]);
+
+  return (
+    <div>
+      {branchOpts.length > 1 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+          <span style={axisLabelStyle}>Branch</span>
+          <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+            {branchOpts.map(([val, lbl], i) => (
+              <button key={val} onClick={() => onUpdate({ pund_branch: val })}
+                style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: branch === val ? T.bg3 : T.bg0, border: "none", borderLeft: i ? `1px solid ${T.border}` : "none", color: branch === val ? T.textPrimary : T.textDim, cursor: "pointer" }}>
+                {lbl}
+              </button>
+            ))}
+          </div>
+          <span style={axisLabelStyle}>Error bars</span>
+          <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+            {[["on", true], ["off", false]].map(([lbl, val], i) => (
+              <button key={lbl} onClick={() => onUpdate({ pund_err: val })}
+                style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: showErr === val ? T.bg3 : T.bg0, border: "none", borderLeft: i ? `1px solid ${T.border}` : "none", color: showErr === val ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                {lbl}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      {!fig ? (
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "24px 0" }}>
+          {stillLoading ? "Loading PUND data…" : `No ${stageDef.label} data on the included samples — drop metadata.csv files on the PUND cards on each sample's page.`}
+        </div>
+      ) : (
+        <>
+          <SciPlotWrap ps={ps} cursorLabel={x => `${numFmt(x)} ${fig.unit}`}>
+            {setCursor => (
+              <Plot data={fig.traces} layout={fig.layout} config={buildPlotConfig(`pund-${stage}`, ps)}
+                style={{ width: ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%", height: ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "320px" }} useResizeHandler
+                onHover={e => { const x = e.xvals?.[0] ?? e.points?.[0]?.x; if (x != null) setCursor(x); }} />
+            )}
+          </SciPlotWrap>
+          <BookColorLegend sampleOrder={loaded.map(r => r.sid)} colors={loaded.map(r => r.color)} labels={labels} ps={ps} />
+          {showPos && showNeg && (
+            <div style={{ display: "flex", justifyContent: "center", gap: 20, marginTop: 4 }}>
+              {[["circle", "ΔP⁺"], ["square", "ΔP⁻"]].map(([symbol, lbl]) => (
+                <div key={lbl} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  <MarkerGlyph symbol={symbol} size={Math.max(7, ps.fontSize - 4)} color={T.textDim} />
+                  <span style={{ fontFamily: ps.font || "'DM Mono', monospace", fontSize: Math.max(7, ps.fontSize - 4), color: T.textDim }}>{lbl}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -9600,6 +12464,9 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
     yMin:           config.y_min  != null ? Number(config.y_min)  : null,
     yMax:           config.y_max  != null ? Number(config.y_max)  : null,
     peXAxis:        config.pe_x_axis      || "field",
+    peLayout:       config.pe_layout      || "one",
+    peTight:        config.pe_tight       ?? false,
+    peMaxCols:      config.pe_max_cols    != null ? Number(config.pe_max_cols) : null,
     deXAxis:        config.de_x_axis      || "field",
     metaLabels:     config.meta_labels    ?? false,
     y2Tick:         config.plot_y2_tick   || null,
@@ -9630,7 +12497,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
             style={{ ...btnStyle, color: cogOpen ? T.textSecondary : T.textDim }}>⚙</button>
           {cogOpen && (
             <div onClick={e => e.stopPropagation()}
-              style={{ position: "absolute", right: 0, top: "calc(100% + 6px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "14px 16px", zIndex: 200, boxShadow: "0 4px 20px rgba(0,0,0,.5)", minWidth: 260, display: "flex", flexDirection: "column", gap: 12 }}>
+              style={{ position: "absolute", right: 0, top: "calc(100% + 6px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "14px 16px", zIndex: 200, boxShadow: "0 4px 20px rgba(0,0,0,.5)", minWidth: 260, maxHeight: "min(520px, 80vh)", overflowY: "auto", display: "flex", flexDirection: "column", gap: 12 }}>
               {/* Font */}
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>FONT</span>
@@ -9697,7 +12564,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                 </div>
               </div>
               {/* Zero lines */}
-              {type !== "xrd" && type !== "afm" && (
+              {type !== "xrd" && type !== "xrr" && type !== "afm" && (
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>ZERO LINES</span>
                   <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
@@ -9711,7 +12578,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                 </div>
               )}
               {/* Tick spacing overrides */}
-              {type !== "xrd" && type !== "afm" && (
+              {type !== "xrd" && type !== "xrr" && type !== "afm" && (
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>TICK STEP</span>
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -9811,8 +12678,41 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                   </div>
                 </div>
               )}
-              {/* X/Y Range — for panels other than xrd/rsm/afm which have their own range controls */}
-              {type !== "xrd" && type !== "rsm" && type !== "afm" && <>
+              {/* PE layout controls */}
+              {type === "pe" && <>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>LAYOUT</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {[["one", "one"], ["each", "each"]].map(([val, lbl], idx) => (
+                      <button key={val} onClick={() => onUpdate({ pe_layout: val })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: ps.peLayout === val ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: ps.peLayout === val ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {ps.peLayout === "each" && <>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>TIGHT</span>
+                    <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                      {["off", "on"].map((opt, idx) => (
+                        <button key={opt} onClick={() => onUpdate({ pe_tight: opt === "on" })}
+                          style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (ps.peTight ? "on" : "off") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.peTight ? "on" : "off") === opt ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                          {opt}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>COLUMNS</span>
+                    <DeferredInput type="number" value={config.pe_max_cols ?? ""} onChange={v => onUpdate({ pe_max_cols: v === "" ? null : Math.max(1, Math.round(Number(v))) })}
+                      className="no-spin" min="1" placeholder="auto"
+                      style={{ width: 60, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px", outline: "none", textAlign: "center" }} />
+                  </div>
+                </>}
+              </>}
+              {/* X/Y Range — for panels other than xrd/xrr/rsm/afm which have their own range controls */}
+              {type !== "xrd" && type !== "xrr" && type !== "rsm" && type !== "afm" && <>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>X RANGE</span>
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -9870,7 +12770,7 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                 </div>
               </>}
               {/* XRD-specific */}
-              {type === "xrd" && <>
+              {(type === "xrd" || type === "xrr") && <>
                 <div style={{ borderTop: `1px solid ${T.border}`, margin: "2px 0" }} />
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>OFFSET</span>
@@ -9914,6 +12814,17 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                     <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>baseline</span>
                   </label>
                 </div>
+                {type === "xrd" && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>ZERO</span>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                      <input type="checkbox" checked={config.zero_substrate ?? false}
+                        onChange={e => onUpdate({ zero_substrate: e.target.checked })}
+                        style={{ accentColor: T.amber }} />
+                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>to substrate peak</span>
+                    </label>
+                  </div>
+                )}
               </>}
               {/* RSM-specific */}
               {type === "rsm" && <>
@@ -10053,7 +12964,8 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
         <button onClick={onRemove} title="Remove panel"
           style={btnStyle}>×</button>
       </div>
-      {type === "xrd"  && <XRDComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} structures={structures} config={config} plotStyle={ps} onUpdate={onUpdate} />}
+      {type === "xrd"  && <XRDComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} structures={structures} config={config} plotStyle={ps} onUpdate={onUpdate} samples={samples} />}
+      {type === "xrr"  && <XRRComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} />}
       {type === "pe"   && <PEComparisonPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
       {type === "rsm"  && <RSMComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} structures={structures} />}
       {type === "afm"  && <AfmComparisonPanel  sampleOrder={sampleOrder} plotCache={plotCache} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} />}
@@ -10062,6 +12974,8 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
       {type === "meta" && <MetaAnalysisPanel   sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} modules={modules} settings={settings} onUpdate={onUpdate} />}
       {type === "xrd_pos" && <XRDPeakPositionPanel sampleOrder={sampleOrder} samples={samples} colors={colors} labels={labels} config={config} plotStyle={ps} structures={structures} onUpdate={onUpdate} />}
       {type === "stats"      && <StatisticalAnalysisPanel  sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
+      {type === "sputter"    && <SputterComparisonPanel    sampleOrder={sampleOrder} samples={samples} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} onUpdate={onUpdate} />}
+      {type.startsWith("pund_") && <PundComparisonPanel stage={type.slice(5)} sampleOrder={sampleOrder} samples={samples} colors={colors} labels={labels} config={config} plotStyle={ps} onUpdate={onUpdate} />}
       {type === "parcoords"  && <ParallelCoordsPanel       sampleOrder={sampleOrder} samples={samples} plotCache={plotCache} colors={colors} labels={labels} config={config} plotStyle={ps} activeMaterial={activeMaterial} structures={structures} onUpdate={onUpdate} />}
       {type.startsWith("mod:") && <ModuleComparisonPanel moduleId={type.slice(4)} sampleOrder={sampleOrder} samples={samples} colors={colors} labels={labels} plotStyle={ps} config={config} onUpdate={onUpdate} modules={modules} />}
     </div>
@@ -10250,6 +13164,7 @@ function AddPanelRow({ onAdd, modules = [] }) {
   const mono = "'DM Mono', monospace";
   const PANEL_TYPES = [
     { type: "xrd",       label: "XRD ω–2θ"              },
+    { type: "xrr",       label: "XRR"                   },
     { type: "rsm",       label: "RSM"                   },
     { type: "afm",       label: "Scanning Probe"        },
     { type: "pe",        label: "P–E Hysteresis"        },
@@ -10258,6 +13173,7 @@ function AddPanelRow({ onAdd, modules = [] }) {
     { type: "meta",      label: "Meta-analysis"         },
     { type: "stats",     label: "Statistical Analysis"  },
     { type: "parcoords", label: "Parallel Coordinates"  },
+    { type: "sputter",   label: "Deposition Log"        },
   ];
   const toggle = () => {
     if (!open && btnRef.current) {
@@ -10282,11 +13198,18 @@ function AddPanelRow({ onAdd, modules = [] }) {
               {p.label}
             </button>
           ))}
-          {modules.length > 0 && (
+          <div style={{ borderTop: `1px solid ${T.border}`, margin: "4px 0" }} />
+          <div style={{ fontFamily: mono, fontSize: 9, color: T.textDim, padding: "2px 12px", textTransform: "uppercase", letterSpacing: 1 }}>PUND</div>
+          {PUND_STAGES.map(s => (
+            <button key={s.id} onMouseDown={() => { onAdd(`pund_${s.id}`); setOpen(false); }} style={btnItem}>
+              {s.label}
+            </button>
+          ))}
+          {modules.filter(m => m.id !== "pund").length > 0 && (
             <>
               <div style={{ borderTop: `1px solid ${T.border}`, margin: "4px 0" }} />
               <div style={{ fontFamily: mono, fontSize: 9, color: T.textDim, padding: "2px 12px", textTransform: "uppercase", letterSpacing: 1 }}>Modules</div>
-              {modules.map(m => (
+              {modules.filter(m => m.id !== "pund").map(m => (
                 <button key={m.id} onMouseDown={() => { onAdd(`mod:${m.id}`); setOpen(false); }} style={btnItem}>
                   {m.name}
                 </button>
@@ -10299,7 +13222,7 @@ function AddPanelRow({ onAdd, modules = [] }) {
   );
 }
 
-function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, modules = [] }) {
+function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, modules = [], structuresCompat = [] }) {
   const cfg            = book.config || {};
   const sampleOrder    = cfg.sample_order?.length ? cfg.sample_order : (book.sample_ids || []);
   const colorScale     = cfg.color_scale    || "viridis";
@@ -10308,6 +13231,19 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, 
   const labels         = cfg.labels         || {};
   const activeMaterial = cfg.active_material ?? null;
   const colors      = sampleColorScale(colorScale, sampleOrder.length, colorTrim);
+
+  // Colors are assigned over the FULL sample order, so each sample keeps its color
+  // regardless of visibility. Hidden samples drop out of plots but not the palette.
+  const hiddenSet    = new Set(cfg.hidden_samples || []);
+  const colorBySid   = Object.fromEntries(sampleOrder.map((id, i) => [id, colors[i]]));
+  const visibleOrder = sampleOrder.filter(id => !hiddenSet.has(id));
+  const visibleColors = visibleOrder.map(id => colorBySid[id]);
+
+  const toggleVisibility = (sid) => {
+    const hidden = new Set(cfg.hidden_samples || []);
+    if (hidden.has(sid)) hidden.delete(sid); else hidden.add(sid);
+    updateCfg({ hidden_samples: [...hidden] });
+  };
 
   const updateCfg = (patch) => {
     const newCfg = { ...cfg, ...patch };
@@ -10342,10 +13278,12 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, 
         colorScale={colorScale}
         colorTrim={colorTrim}
         labels={labels}
+        hidden={hiddenSet}
+        onToggleVisibility={toggleVisibility}
         activeMaterial={activeMaterial}
         onChangeActiveMaterial={m => updateCfg({ active_material: m })}
         onReorder={reorderSamples}
-        onRemove={id => updateCfg({ sample_order: sampleOrder.filter(s => s !== id) })}
+        onRemove={id => updateCfg({ sample_order: sampleOrder.filter(s => s !== id), hidden_samples: (cfg.hidden_samples || []).filter(s => s !== id) })}
         onAddSamples={ids => {
           const existing = new Set(sampleOrder);
           updateCfg({ sample_order: [...sampleOrder, ...ids.filter(id => !existing.has(id))] });
@@ -10358,13 +13296,13 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, 
         <AnalysisPanelBlock
           key={panel.id}
           panel={panel}
-          sampleOrder={sampleOrder}
+          sampleOrder={visibleOrder}
           samples={samples}
           plotCache={plotCache}
-          colors={colors}
+          colors={visibleColors}
           labels={labels}
           colorScale={colorScale}
-          structures={settings?.structures || []}
+          structures={structuresCompat}
           activeMaterial={activeMaterial}
           modules={modules}
           settings={settings}
@@ -10591,6 +13529,7 @@ function AnalysisBookTile({ book, onDelete, onEdit, onDuplicate, onClick, onDrag
 }
 
 function AddBookModal({ onSave, onClose, existing, samples, folders = [], bookFolders = [] }) {
+  useEscClose(onClose);
   const [name,     setName]     = useState(existing?.name || "");
   const [folderId, setFolderId] = useState(existing?.folder_id || "");
   const [selected, setSelected] = useState(new Set(existing?.sample_ids || []));
@@ -10692,12 +13631,18 @@ function buildFilterFields(settings) {
       { id: "thickness_nm",     label: "Thickness",     type: "numeric", unit: "nm" },
     ]},
   ];
-  const customSputter = (settings?.custom_growth_params?.sputter || []).filter(p => p.name);
-  const customPld     = (settings?.custom_growth_params?.pld     || []).filter(p => p.name);
-  if (customSputter.length) groups.push({ group: "Custom — Sputter",
-    fields: customSputter.map(p => ({ id: `custom_${p.id}`, label: p.name, type: "numeric", unit: p.unit || "" })) });
-  if (customPld.length) groups.push({ group: "Custom — PLD",
-    fields: customPld.map(p => ({ id: `custom_${p.id}`, label: p.name, type: "numeric", unit: p.unit || "" })) });
+  // User-added layer params from technique definitions (non-builtin)
+  for (const tech of (settings?.techniques || [])) {
+    const userParams = (tech.params || []).filter(p =>
+      p.scope === "layer" && !BUILTIN_LAYER_PARAM_IDS.has(p.id) && p.name && p.type !== "select"
+    );
+    if (userParams.length) {
+      groups.push({
+        group: `Custom — ${tech.name || tech.id}`,
+        fields: userParams.map(p => ({ id: `custom_${p.id}`, label: p.name, type: "numeric", unit: p.unit || "" })),
+      });
+    }
+  }
   return groups;
 }
 
@@ -10902,6 +13847,461 @@ function SampleFilter({ settings, samples = [], onFilterChange }) {
   );
 }
 
+// ── GlobalSearch ──────────────────────────────────────────────────────────────
+
+function GlobalSearch({ samples = [], materialsLib = [], books = [], modules = [], onClose, onOpenSample, onOpenBook, onOpenModule, onOpenMaterial }) {
+  useEscClose(onClose);
+  const [query, setQuery] = useState("");
+  const [cursor, setCursor] = useState(0);
+  const inputRef = useRef(null);
+  const listRef  = useRef(null);
+
+  useEffect(() => { inputRef.current?.focus(); }, []);
+
+  const q = query.trim().toLowerCase();
+
+  // ── Build result set ──────────────────────────────────────────────────────
+  const results = useMemo(() => {
+    if (!q) return [];
+    const out = [];
+
+    // Samples — search id, substrate, notes, lot, bin, material names
+    for (const s of samples) {
+      const mats = (s.layers || []).flatMap(l => (l.targets || []).map(t => t.material).filter(Boolean));
+      const haystack = [s.id, s.substrate, s.notes, s.lot, s.bin, ...mats].filter(Boolean).join(" ").toLowerCase();
+      if (haystack.includes(q)) {
+        const matStr = [...new Set(mats)].join(", ");
+        out.push({
+          id: `s-${s.id}`, kind: "sample", label: s.id,
+          sub: [s.substrate, matStr].filter(Boolean).join(" · "),
+          location: "Samples", action: () => onOpenSample(s.id),
+        });
+      }
+    }
+
+    // Materials Library — search name, formula from composition, parent
+    for (const m of materialsLib) {
+      const formula = Object.keys(m.composition || {}).length ? compToFormula(m.composition) : "";
+      const haystack = [m.name, formula, m.parent, m.notes].filter(Boolean).join(" ").toLowerCase();
+      if (haystack.includes(q)) {
+        out.push({
+          id: `m-${m.id}`, kind: "material", label: m.name,
+          sub: formula && formula !== m.name ? formula : (m.parent ? `▸ ${m.parent}` : ""),
+          location: "Materials", action: () => onOpenMaterial(m),
+        });
+      }
+    }
+
+    // Analysis Books — search name
+    for (const b of books) {
+      if (!b.name) continue;
+      if (b.name.toLowerCase().includes(q)) {
+        const n = (b.sample_ids || []).length;
+        out.push({
+          id: `b-${b.id}`, kind: "book", label: b.name,
+          sub: `${n} sample${n !== 1 ? "s" : ""}`,
+          location: "Analysis Books", action: () => onOpenBook(b.id),
+        });
+      }
+    }
+
+    // Modules — search name, description
+    for (const m of modules) {
+      const haystack = [m.name, m.description].filter(Boolean).join(" ").toLowerCase();
+      if (haystack.includes(q)) {
+        out.push({
+          id: `mod-${m.id}`, kind: "module", label: m.name,
+          sub: m.description || "",
+          location: "Modules", action: () => onOpenModule(m.id),
+        });
+      }
+    }
+
+    return out;
+  }, [q, samples, materialsLib, books, modules]);
+
+  // Reset cursor when results change
+  useEffect(() => { setCursor(0); }, [results.length]);
+
+  // Scroll highlighted row into view
+  useEffect(() => {
+    const el = listRef.current?.querySelector(`[data-idx="${cursor}"]`);
+    el?.scrollIntoView({ block: "nearest" });
+  }, [cursor]);
+
+  const handleKey = (e) => {
+    if (e.key === "ArrowDown") { e.preventDefault(); setCursor(c => Math.min(c + 1, results.length - 1)); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); setCursor(c => Math.max(c - 1, 0)); }
+    else if (e.key === "Enter" && results[cursor]) { results[cursor].action(); onClose(); }
+  };
+
+  const kindIcon = { sample: "◈", material: "◇", book: "▤", module: "⊞" };
+  const kindColor = { sample: T.amber, material: T.teal, book: T.blue, module: T.textSecondary };
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.65)", zIndex: 400, display: "flex", alignItems: "flex-start", justifyContent: "center", paddingTop: "12vh" }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: 580, maxWidth: "calc(100vw - 32px)", background: T.bg1, borderRadius: 12, border: `1px solid ${T.borderBright}`, boxShadow: "0 24px 64px rgba(0,0,0,.6)", overflow: "hidden", display: "flex", flexDirection: "column" }}>
+
+        {/* Input */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: `1px solid ${T.border}` }}>
+          <span style={{ color: T.textDim, fontSize: 18, lineHeight: 1 }}>⌕</span>
+          <input
+            ref={inputRef}
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            onKeyDown={handleKey}
+            placeholder="Search samples, materials, books, modules…"
+            style={{ flex: 1, background: "none", border: "none", outline: "none", color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 15 }}
+          />
+          {query && (
+            <button onClick={() => setQuery("")} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }}>×</button>
+          )}
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, background: T.bg3, border: `1px solid ${T.border}`, borderRadius: 4, padding: "2px 6px" }}>esc</span>
+        </div>
+
+        {/* Results */}
+        <div ref={listRef} style={{ maxHeight: 420, overflowY: "auto", padding: q ? "6px 0" : "0" }}>
+          {!q && (
+            <div style={{ padding: "28px 18px", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, textAlign: "center" }}>
+              Type to search across samples, materials, books, and modules
+            </div>
+          )}
+          {q && results.length === 0 && (
+            <div style={{ padding: "28px 18px", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, textAlign: "center" }}>
+              No results for <span style={{ color: T.textSecondary }}>"{query}"</span>
+            </div>
+          )}
+          {results.map((r, i) => (
+            <div key={r.id} data-idx={i}
+              onClick={() => { r.action(); onClose(); }}
+              onMouseEnter={() => setCursor(i)}
+              style={{ display: "flex", alignItems: "center", gap: 12, padding: "9px 18px", cursor: "pointer", background: i === cursor ? T.bg3 : "transparent", transition: "background .08s" }}>
+              {/* Kind icon */}
+              <span style={{ fontSize: 14, color: kindColor[r.kind], flexShrink: 0, width: 18, textAlign: "center" }}>{kindIcon[r.kind]}</span>
+              {/* Label + sub */}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, fontWeight: 700, color: T.textPrimary }}>{r.label}</span>
+                {r.sub && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, marginLeft: 8 }}>{r.sub}</span>}
+              </div>
+              {/* Location badge */}
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, flexShrink: 0 }}>{r.location}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* Footer hint */}
+        {results.length > 0 && (
+          <div style={{ borderTop: `1px solid ${T.border}`, padding: "7px 18px", display: "flex", gap: 16, fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>
+            <span>↑↓ navigate</span>
+            <span>↵ open</span>
+            <span>esc close</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── MatFolderTile ─────────────────────────────────────────────────────────────
+
+function MatFolderTile({ folder, mats, onOpenMat, onEdit, onDelete, onDropMat, onDragStartMat }) {
+  const lsKey = `matfolder-open-${folder.id}`;
+  const [open, setOpen] = useState(() => { try { const v = localStorage.getItem(lsKey); return v === null ? true : v === "1"; } catch { return true; } });
+  const toggleOpen = () => setOpen(v => { const next = !v; try { localStorage.setItem(lsKey, next ? "1" : "0"); } catch {} return next; });
+  const [dragOver, setDragOver] = useState(false);
+  const color = folder.color || T.borderBright;
+  return (
+    <div style={{ marginBottom: 8 }}
+      onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setDragOver(true); }}
+      onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false); }}
+      onDrop={e => { e.preventDefault(); const mid = e.dataTransfer.getData("text/x-mat"); if (mid) onDropMat?.(mid, folder.id); setDragOver(false); }}>
+      <div style={{ border: `2px solid ${dragOver ? T.amber : color}`, borderRadius: 10, overflow: "hidden", boxShadow: dragOver ? `0 0 0 3px ${T.amberGlow}` : "none", transition: "border-color .12s, box-shadow .12s" }}>
+        <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: dragOver ? T.bg3 : T.bg2, cursor: "pointer", userSelect: "none", transition: "background .12s" }}
+          onClick={toggleOpen}>
+          <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
+          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: T.textPrimary, flex: 1 }}>{folder.name}</span>
+          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}>{mats.length}</span>
+          <span style={{ color: T.textDim, fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+          <button onClick={e => { e.stopPropagation(); onEdit?.(); }} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 13, padding: "0 3px" }}>✎</button>
+          <button onClick={e => { e.stopPropagation(); if (window.confirm(`Delete folder "${folder.name}"? Materials will become ungrouped.`)) onDelete?.(); }} style={{ background: "none", border: "none", color: T.red, cursor: "pointer", fontSize: 16, padding: "0 3px" }}>×</button>
+        </div>
+        {open && (
+          <div style={{ padding: 12, background: T.bg0 }}>
+            {mats.length > 0
+              ? <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                  {mats.map(m => (
+                    <div key={m.id}
+                      draggable
+                      onDragStart={e => { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/x-mat", m.id); onDragStartMat?.(m.id); }}
+                      onClick={() => onOpenMat?.(m)}
+                      style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 8, padding: "10px 14px", cursor: "pointer", minWidth: 160, maxWidth: 220, display: "flex", flexDirection: "column", gap: 4, transition: "border-color .15s" }}
+                      onMouseEnter={e => e.currentTarget.style.borderColor = T.amber}
+                      onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+                      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, fontWeight: 700, color: T.textPrimary }}>{m.name}</div>
+                      {Object.keys(m.composition || {}).length > 0 && (
+                        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}><ChemName name={compToFormula(m.composition)} /></div>
+                      )}
+                      {m.parent && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.teal }}>▸ {m.parent}</div>}
+                      {Object.keys(m.growth_defaults || {}).length > 0 && (
+                        <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 2 }}>
+                          {Object.keys(m.growth_defaults).map(tid => (
+                            <span key={tid} style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.amber, background: T.amberGlow, border: `1px solid ${T.amber}`, borderRadius: 3, padding: "1px 5px", textTransform: "uppercase" }}>{tid}</span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              : <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: dragOver ? T.amber : T.textDim, padding: "8px 4px", transition: "color .12s" }}>{dragOver ? "Drop here" : "Empty folder"}</div>
+            }
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── MaterialsLibrarySection ───────────────────────────────────────────────────
+
+function MatImportModal({ onClose, onImported }) {
+  useEscClose(onClose);
+  const [preview, setPreview]       = useState(null); // {to_add, conflicts}
+  const [resolutions, setResolutions] = useState({}); // {name: "skip"|"overwrite"|"merge"}
+  const [importing, setImporting]   = useState(false);
+  const [rawMaterials, setRawMaterials] = useState([]);
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      setRawMaterials(arr);
+      const prev = await api("POST", "/materials-library/import-preview", arr);
+      const defaultRes = {};
+      for (const c of prev.conflicts) defaultRes[c.name] = "skip";
+      setResolutions(defaultRes);
+      setPreview(prev);
+    } catch (err) {
+      alert("Could not parse file: " + err.message);
+    }
+    e.target.value = "";
+  };
+
+  const handleImport = async () => {
+    setImporting(true);
+    try {
+      const result = await api("POST", "/materials-library/import", { materials: rawMaterials, resolutions });
+      onImported(result.materials);
+      onClose();
+    } catch (err) {
+      alert("Import failed: " + err.message);
+    }
+    setImporting(false);
+  };
+
+  const resBtn = (name, val, label) => (
+    <button onClick={() => setResolutions(r => ({ ...r, [name]: val }))}
+      style={{ padding: "2px 8px", fontFamily: "'DM Mono', monospace", fontSize: 10, cursor: "pointer", borderRadius: 3,
+        border: `1px solid ${resolutions[name] === val ? T.amber : T.border}`,
+        background: resolutions[name] === val ? T.amberGlow : "transparent",
+        color: resolutions[name] === val ? T.amber : T.textDim }}>
+      {label}
+    </button>
+  );
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 110 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, padding: "20px 24px", width: 520, display: "flex", flexDirection: "column", gap: 14 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", color: T.amber, fontSize: 20 }}>Import Materials</h2>
+
+        {!preview ? (
+          <>
+            <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>
+              Select a <code>.json</code> file previously exported from this app.
+            </div>
+            <label style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, background: T.bg0, border: `1px dashed ${T.border}`, borderRadius: 8, padding: "18px 0", cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary }}>
+              ↑ Choose materials-library.json
+              <input type="file" accept=".json" style={{ display: "none" }} onChange={handleFile} />
+            </label>
+          </>
+        ) : (
+          <>
+            {preview.to_add.length > 0 && (
+              <div>
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>
+                  New — {preview.to_add.length} material{preview.to_add.length !== 1 ? "s" : ""}
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {preview.to_add.map(m => (
+                    <span key={m.name} style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.teal, background: `${T.teal}18`, border: `1px solid ${T.teal}44`, borderRadius: 4, padding: "2px 8px" }}>{m.name}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+            {preview.conflicts.length > 0 && (
+              <div>
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>
+                  Conflicts — already in library
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {preview.conflicts.map(c => (
+                    <div key={c.name} style={{ display: "flex", alignItems: "center", gap: 10, background: T.bg2, borderRadius: 6, padding: "6px 10px" }}>
+                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textPrimary, flex: 1 }}>{c.name}</span>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        {resBtn(c.name, "skip",      "Skip")}
+                        {resBtn(c.name, "overwrite",  "Overwrite")}
+                        {resBtn(c.name, "merge",      "Merge")}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, marginTop: 6 }}>
+                  Merge keeps existing values and fills any blanks from the incoming entry.
+                </div>
+              </div>
+            )}
+            {preview.to_add.length === 0 && preview.conflicts.length === 0 && (
+              <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim }}>Nothing to import — file appears empty.</div>
+            )}
+          </>
+        )}
+
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          {preview && (preview.to_add.length > 0 || preview.conflicts.some(c => resolutions[c.name] !== "skip")) && (
+            <Btn onClick={handleImport} disabled={importing}>{importing ? "Importing…" : "Import"}</Btn>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MaterialsLibrarySection({ materialsLib, settings, onUpdate, onDelete, onReplaceAll, matFolders = [], onCreateMatFolder, onDeleteMatFolder, onEditMatFolder, onAssignMatFolder, openTarget = null, onClearTarget }) {
+  const [editorMat, setEditorMat] = useState(null); // null=closed, false=new, or material entry
+  const [importOpen, setImportOpen] = useState(false);
+  const [open, setOpen] = useState(true);
+  const [draggingMatId, setDraggingMatId] = useState(null);
+
+  // Open a material from an external trigger (e.g. global search)
+  useEffect(() => {
+    if (openTarget) { setOpen(true); setEditorMat(openTarget); onClearTarget?.(); }
+  }, [openTarget]);
+
+  const handleSave = (result) => {
+    onUpdate(result);
+    setEditorMat(null);
+  };
+  const handleDelete = (id) => {
+    onDelete(id);
+    setEditorMat(null);
+  };
+
+  const handleDropMat = async (matId, folderId) => {
+    await onAssignMatFolder?.(matId, folderId);
+    setDraggingMatId(null);
+  };
+
+  const MatCard = ({ m }) => (
+    <div
+      draggable={matFolders.length > 0}
+      onDragStart={matFolders.length > 0 ? e => { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/x-mat", m.id); setDraggingMatId(m.id); } : undefined}
+      onClick={() => setEditorMat(m)}
+      style={{ background: T.bg1, border: `1px solid ${T.border}`, borderRadius: 8, padding: "10px 14px", cursor: "pointer", minWidth: 160, maxWidth: 220, display: "flex", flexDirection: "column", gap: 4, transition: "border-color .15s" }}
+      onMouseEnter={e => e.currentTarget.style.borderColor = T.amber}
+      onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 13, fontWeight: 700, color: T.textPrimary }}>{m.name}</div>
+      {Object.keys(m.composition || {}).length > 0 && (
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim }}><ChemName name={compToFormula(m.composition)} /></div>
+      )}
+      {m.parent && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.teal }}>▸ {m.parent}</div>}
+      {Object.keys(m.growth_defaults || {}).length > 0 && (
+        <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 2 }}>
+          {Object.keys(m.growth_defaults).map(tid => (
+            <span key={tid} style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: T.amber, background: T.amberGlow, border: `1px solid ${T.amber}`, borderRadius: 3, padding: "1px 5px", textTransform: "uppercase" }}>{tid}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  const ungroupedMats = materialsLib.filter(m => !m.folder_id || !matFolders.find(f => f.id === m.folder_id));
+
+  return (
+    <div style={{ marginBottom: 32 }}>
+      {/* Section header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Playfair Display', serif", fontSize: 20, color: T.textPrimary, cursor: "pointer" }} onClick={() => setOpen(o => !o)}>
+          Materials Library
+        </h2>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>{open ? "▴" : "▾"}</span>
+        <div style={{ flex: 1 }} />
+        <Btn small variant="ghost" onClick={onCreateMatFolder}>+ Folder</Btn>
+        <Btn small variant="ghost" onClick={() => setImportOpen(true)}>Import</Btn>
+        <Btn small onClick={() => setEditorMat(false)}>+ New Material</Btn>
+      </div>
+
+      {open && (
+        <>
+          {/* Folder tiles */}
+          {matFolders.map(folder => (
+            <MatFolderTile key={folder.id}
+              folder={folder}
+              mats={materialsLib.filter(m => m.folder_id === folder.id)}
+              onOpenMat={setEditorMat}
+              onEdit={() => onEditMatFolder?.(folder)}
+              onDelete={() => onDeleteMatFolder?.(folder.id)}
+              onDropMat={handleDropMat}
+              onDragStartMat={setDraggingMatId} />
+          ))}
+
+          {/* Ungrouped */}
+          {(ungroupedMats.length > 0 || draggingMatId) && (
+            <div
+              onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
+              onDrop={e => { e.preventDefault(); const mid = e.dataTransfer.getData("text/x-mat"); if (mid) handleDropMat(mid, null); }}>
+              {matFolders.length > 0 && ungroupedMats.length > 0 && (
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>Ungrouped</div>
+              )}
+              {ungroupedMats.length === 0 && materialsLib.length === 0 && (
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "12px 0" }}>
+                  No materials yet. Add your first material to start building the library.
+                </div>
+              )}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                {ungroupedMats.map(m => <MatCard key={m.id} m={m} />)}
+              </div>
+            </div>
+          )}
+
+          {materialsLib.length === 0 && matFolders.length === 0 && (
+            <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textDim, padding: "12px 0" }}>
+              No materials yet. Add your first material to start building the library.
+            </div>
+          )}
+        </>
+      )}
+
+      {editorMat !== null && (
+        <MaterialEditorModal
+          material={editorMat || null}
+          settings={settings}
+          materialsLib={materialsLib}
+          onSave={handleSave}
+          onDelete={handleDelete}
+          onClose={() => setEditorMat(null)} />
+      )}
+      {importOpen && (
+        <MatImportModal
+          onClose={() => setImportOpen(false)}
+          onImported={mats => { onReplaceAll(mats); setImportOpen(false); }} />
+      )}
+    </div>
+  );
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -10928,6 +14328,9 @@ export default function App() {
   const [addingSampleFolder, setAddingSampleFolder] = useState(false);
   const [addingBookFolder,   setAddingBookFolder]   = useState(false);
   const [addingModuleFolder, setAddingModuleFolder] = useState(false);
+  const [addingMatFolder,    setAddingMatFolder]    = useState(false);
+  const [searchOpen,         setSearchOpen]         = useState(false);
+  const [matEditorTarget,    setMatEditorTarget]    = useState(null);
   const [editingFolder, setEditingFolder] = useState(null); // folder object being edited — type inferred from its flags
   const [importModalType, setImportModalType] = useState(null); // "sample"|"book"|"module"|null
   const [importing,       setImporting]       = useState(false);
@@ -10941,6 +14344,7 @@ export default function App() {
   const [settingsOpen,  setSettingsOpen]  = useState(false);
   const [exportOpen,    setExportOpen]    = useState(false);
   const [modules,       setModules]       = useState([]);
+  const [materialsLib,  setMaterialsLib]  = useState([]);
   const [activeModule,  setActiveModule]  = useState(null); // full module editor state: { id, name, builtin, source, mode, ... }
   const [viewDataOpen,  setViewDataOpen]  = useState(false);  // View Data modal
   const [viewDataFiles, setViewDataFiles] = useState([]);
@@ -10948,11 +14352,16 @@ export default function App() {
 
   const handleSaveSettings = (s) => {
     // Always deep-merge with current settings so partial updates (e.g. xrd_configs)
-    // never silently wipe other fields (structures, materials, etc.)
+    // never silently wipe other fields (techniques, etc.)
     const merged = mergeSettings({ ...settings, ...s });
     saveSettings(merged);
     setSettings(merged);
   };
+
+  const structuresCompat = useMemo(
+    () => materialsLib.map(m => ({ name: m.name, ...(m.crystal || {}) })),
+    [materialsLib]
+  );
 
   // Persist theme choice + sync body background
   useEffect(() => {
@@ -10969,11 +14378,43 @@ export default function App() {
       api("GET", "/analysis-books"),
       api("GET", "/settings"),
       api("GET", "/modules").catch(() => []),
-    ]).then(([s, f, b, cfg, mods]) => {
+      api("GET", "/materials-library").catch(() => []),
+    ]).then(([s, f, b, cfg, mods, mats]) => {
       setSamples(s); setFolders(f); setBooks(b);
       setSettings(mergeSettings(cfg || {}));
       setModules(mods || []);
+      setMaterialsLib(mats || []);
       setLoading(false);
+
+      // Auto-migrate old settings materials/structures into the library (runs once if library is empty)
+      const oldMats = mats || [];
+      const oldSMats = (cfg?.materials?.sputter || []).filter(m => m.name);
+      const oldPMats = (cfg?.materials?.pld     || []).filter(m => m.name);
+      const oldStructs = (cfg?.structures || []).filter(s => s.name);
+
+      if (oldMats.length === 0 && (oldSMats.length || oldPMats.length || oldStructs.length)) {
+        // Merge sputter and pld entries by name
+        const byName = {};
+        for (const m of oldSMats) {
+          byName[m.name] = byName[m.name] || { name: m.name, formula: "", composition: {}, parent: "", notes: "", crystal: {}, properties: {}, growth_defaults: {} };
+          const { name: _n, ...vals } = m;
+          byName[m.name].growth_defaults.sputter = vals;
+        }
+        for (const m of oldPMats) {
+          byName[m.name] = byName[m.name] || { name: m.name, formula: "", composition: {}, parent: "", notes: "", crystal: {}, properties: {}, growth_defaults: {} };
+          const { name: _n, ...vals } = m;
+          byName[m.name].growth_defaults.pld = vals;
+        }
+        for (const s of oldStructs) {
+          byName[s.name] = byName[s.name] || { name: s.name, formula: "", composition: {}, parent: "", notes: "", crystal: {}, properties: {}, growth_defaults: {} };
+          const { name: _n, cif_filename: _cf, cif_text: _ct, ...crystalFields } = s;
+          byName[s.name].crystal = crystalFields;
+        }
+        const toMigrate = Object.values(byName);
+        Promise.all(toMigrate.map(m => api("POST", "/materials-library", m)))
+          .then(results => setMaterialsLib(results))
+          .catch(() => {});
+      }
     }).catch(e => { setError(e.message); setLoading(false); });
   }, []);
 
@@ -11221,6 +14662,7 @@ export default function App() {
     setAddingSampleFolder(false);
     setAddingBookFolder(false);
     setAddingModuleFolder(false);
+    setAddingMatFolder(false);
   };
 
   const saveFolder = async (data) => {
@@ -11372,6 +14814,31 @@ export default function App() {
   // reset edit mode whenever the active sample changes
   useEffect(() => { setEditingMeta(false); }, [active]);
 
+  // ── Global hotkeys ───────────────────────────────────────────────────────
+  useEffect(() => {
+    const isTyping = t => t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable;
+    const handler = e => {
+      // Escape — pop the top registered close handler
+      if (e.key === "Escape") {
+        if (_escStack.length > 0) { _escStack[_escStack.length - 1](); return; }
+      }
+      // Cmd/Ctrl+K — open global search
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        setSearchOpen(true);
+        return;
+      }
+      // Back navigation (← or Backspace) when not typing
+      if (!isTyping(e.target) && (e.key === "ArrowLeft" || e.key === "Backspace")) {
+        if (active) { setActive(null); e.preventDefault(); }
+        else if (activeBook) { setActiveBook(null); e.preventDefault(); }
+        else if (activeModule) { setActiveModule(null); e.preventDefault(); }
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [active, activeBook, activeModule]);
+
   // ── Render ───────────────────────────────────────────────────────────────
 
   const activeSample  = samples.find(s => s.id === active);
@@ -11380,8 +14847,8 @@ export default function App() {
 
   const byId = (a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" });
   const sortedFolders = [...folders].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.name.localeCompare(b.name));
-  const getSiblings = (parentId, isBook) => sortedFolders.filter(f => !!f.book_folder === isBook && !f.module_folder && (f.parent_id ?? null) === parentId);
-  const allSampleFolders = folders.filter(f => !f.book_folder);
+  const getSiblings = (parentId, isBook) => sortedFolders.filter(f => !!f.book_folder === isBook && !f.module_folder && !f.mat_folder && (f.parent_id ?? null) === parentId);
+  const allSampleFolders = folders.filter(f => !f.book_folder && !f.module_folder && !f.mat_folder);
   const displaySamples = filteredSampleIds ? samples.filter(s => filteredSampleIds.has(s.id)) : samples;
   const ungrouped = displaySamples.filter(s => !s.folder_id || !allSampleFolders.find(f => f.id === s.folder_id)).sort(byId);
   const [ungroupedDragOver,     setUngroupedDragOver]     = useState(false);
@@ -11493,7 +14960,8 @@ export default function App() {
               setEditingMeta={setEditingMeta}
               settings={settings}
               onSaveSettings={handleSaveSettings}
-              modules={modules} />
+              modules={modules}
+              materialsLib={materialsLib} />
           ) : activeBook && activeBookObj ? (
             <AnalysisBookDetail
               book={activeBookObj}
@@ -11501,6 +14969,7 @@ export default function App() {
               plotCache={plotCache}
               settings={settings}
               modules={modules}
+              structuresCompat={structuresCompat}
               onUpdateBook={(updates) => updateBookInPlace(activeBook, updates)} />
           ) : activeModule ? (
             <ModuleEditorPage
@@ -11550,7 +15019,8 @@ export default function App() {
                         onDropSample={() => handleDropToFolder(folder.id)}
                         onDragStartSample={setDraggingSampleId}
                         onDragStartFolder={setDraggingFolderId}
-                        onDropFolder={handleFolderReorder} />
+                        onDropFolder={handleFolderReorder}
+                        materialsLib={materialsLib} />
                     ));
                   return renderSampleFolders(null);
                 })()}
@@ -11568,7 +15038,7 @@ export default function App() {
                       </div>
                     )}
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(310px,1fr))", gap: 12 }}>
-                      {ungrouped.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => openSample(s.id)} onDelete={deleteSample} onDuplicateTemplate={setTemplateSample} onDragStart={setDraggingSampleId} />)}
+                      {ungrouped.map(s => <SampleCard key={s.id} sample={s} plotData={plotCache[s.id]} onClick={() => openSample(s.id)} onDelete={deleteSample} onDuplicateTemplate={setTemplateSample} onDragStart={setDraggingSampleId} materialsLib={materialsLib} />)}
                     </div>
                   </div>
                 )}
@@ -11639,6 +15109,29 @@ export default function App() {
                 })()}
               </div>
 
+              {/* Materials Library section */}
+              <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 28, marginTop: 20 }}>
+                <MaterialsLibrarySection
+                  materialsLib={materialsLib}
+                  settings={settings}
+                  matFolders={folders.filter(f => f.mat_folder)}
+                  openTarget={matEditorTarget}
+                  onClearTarget={() => setMatEditorTarget(null)}
+                  onUpdate={mat => setMaterialsLib(prev => {
+                    const idx = prev.findIndex(m => m.id === mat.id);
+                    return idx >= 0 ? prev.map(m => m.id === mat.id ? mat : m) : [...prev, mat];
+                  })}
+                  onDelete={id => setMaterialsLib(prev => prev.filter(m => m.id !== id))}
+                  onReplaceAll={mats => setMaterialsLib(mats)}
+                  onCreateMatFolder={() => setAddingMatFolder(true)}
+                  onEditMatFolder={folder => setEditingFolder(folder)}
+                  onDeleteMatFolder={id => deleteFolder(id)}
+                  onAssignMatFolder={async (matId, folderId) => {
+                    await api("PATCH", `/materials-library/${matId}/folder`, { folder_id: folderId || null });
+                    setMaterialsLib(prev => prev.map(m => m.id === matId ? { ...m, folder_id: folderId || null } : m));
+                  }} />
+              </div>
+
               {/* Modules section */}
               <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 28, marginTop: 20 }}>
                 <div style={{ marginBottom: 14, display: "flex", alignItems: "baseline", gap: 12 }}>
@@ -11700,6 +15193,16 @@ export default function App() {
         </div>
       </div>
 
+      {searchOpen && (
+        <GlobalSearch
+          samples={samples} materialsLib={materialsLib} books={books} modules={modules}
+          onClose={() => setSearchOpen(false)}
+          onOpenSample={id => { setSearchOpen(false); openSample(id); }}
+          onOpenBook={id => { setSearchOpen(false); setActiveBook(id); }}
+          onOpenModule={id => { setSearchOpen(false); openModule(id); }}
+          onOpenMaterial={mat => { setSearchOpen(false); setMatEditorTarget(mat); }}
+        />
+      )}
       {adding && <AddSampleModal onAdd={addSample} onClose={() => setAdding(false)} folders={folders} settings={settings} />}
       {templateSample && <AddSampleModal onAdd={s => { addSample(s); setTemplateSample(null); }} onClose={() => setTemplateSample(null)} folders={folders} template={templateSample} settings={settings} />}
       {exportOpen   && <ExportModal samples={samples} onClose={() => setExportOpen(false)} />}
@@ -11712,14 +15215,17 @@ export default function App() {
           setSamples(p => p.map(s => s.id === active ? updated : s));
         }} />}
       {settingsOpen && <SettingsModal settings={settings} onSave={handleSaveSettings} onClose={() => setSettingsOpen(false)} />}
-      {(addingSampleFolder || (editingFolder && !editingFolder.book_folder && !editingFolder.module_folder)) && (
-        <AddSampleFolderModal onSave={saveFolder} onClose={() => { setAddingSampleFolder(false); setEditingFolder(null); }} existing={editingFolder && !editingFolder.book_folder && !editingFolder.module_folder ? editingFolder : null} allFolders={folders} />
+      {(addingSampleFolder || (editingFolder && !editingFolder.book_folder && !editingFolder.module_folder && !editingFolder.mat_folder)) && (
+        <AddSampleFolderModal onSave={saveFolder} onClose={() => { setAddingSampleFolder(false); setEditingFolder(null); }} existing={editingFolder && !editingFolder.book_folder && !editingFolder.module_folder && !editingFolder.mat_folder ? editingFolder : null} allFolders={folders} />
       )}
       {(addingBookFolder || (editingFolder?.book_folder)) && (
         <AddBookFolderModal onSave={saveFolder} onClose={() => { setAddingBookFolder(false); setEditingFolder(null); }} existing={editingFolder?.book_folder ? editingFolder : null} allFolders={folders} />
       )}
       {(addingModuleFolder || (editingFolder?.module_folder)) && (
         <AddModuleFolderModal onSave={saveFolder} onClose={() => { setAddingModuleFolder(false); setEditingFolder(null); }} existing={editingFolder?.module_folder ? editingFolder : null} />
+      )}
+      {(addingMatFolder || (editingFolder?.mat_folder)) && (
+        <AddMatFolderModal onSave={saveFolder} onClose={() => { setAddingMatFolder(false); setEditingFolder(null); }} existing={editingFolder?.mat_folder ? editingFolder : null} />
       )}
       {importModalType && (
         <ImportModal
