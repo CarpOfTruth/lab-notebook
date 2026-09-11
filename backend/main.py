@@ -909,6 +909,48 @@ def get_sputter_log(sample_id: str, filename: str):
     return {"ok": True, "filename": filename, "data": result}
 
 
+# ── PUND ferroelectric sweeps ─────────────────────────────────────────────────
+# One metadata.csv per stage (A1–A4). The stage is identified by the swept column
+# (files are all named "metadata.csv" and the runID varies), so each file is routed
+# to a stage and saved per-stage as pund_<stage>.csv regardless of which card it
+# was dropped on.
+
+@app.post("/api/samples/{sample_id}/pund")
+async def upload_pund(sample_id: str, file: UploadFile = File(...)):
+    from modules.pund import STAGE_BY_SWEPT
+    m = mod_registry.get("pund")
+    if not m:
+        raise HTTPException(500, "PUND module not loaded")
+    raw = await file.read()
+    result = m.parse(raw, file.filename, {})
+    if result is None:
+        raise HTTPException(422, "File is not a recognizable PUND metadata.csv")
+    stage_info = STAGE_BY_SWEPT.get(result.get("swept_key"))
+    if not stage_info:
+        raise HTTPException(422, f"Unrecognized swept parameter '{result.get('swept_key')}'")
+    stage_id, stage_label = stage_info
+
+    dest_dir = FILES_DIR / sample_id
+    dest_dir.mkdir(exist_ok=True)
+    fn = f"pund_{stage_id}.csv"
+    (dest_dir / fn).write_bytes(raw)
+    return {"ok": True, "stage": stage_id, "stage_label": stage_label, "filename": fn, "data": result}
+
+
+@app.get("/api/samples/{sample_id}/pund/{filename}")
+def get_pund(sample_id: str, filename: str):
+    m = mod_registry.get("pund")
+    if not m:
+        raise HTTPException(500, "PUND module not loaded")
+    path = FILES_DIR / sample_id / filename
+    if not path.exists():
+        raise HTTPException(404, "PUND file not found")
+    result = m.parse(path.read_bytes(), filename, {})
+    if result is None:
+        raise HTTPException(422, "Stored file could not be parsed")
+    return {"ok": True, "filename": filename, "data": result}
+
+
 @app.post("/api/samples/import-preview")
 async def import_sample_preview(file: UploadFile = File(...)):
     """Read a .zip sample export and return a conflict preview without writing anything."""
