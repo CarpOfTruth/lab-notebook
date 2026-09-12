@@ -501,17 +501,36 @@ async function validateXrayFile(file, type) {
 
 // Reload a stored file into plot data (used by loadSampleData and Reparse).
 // .rasx files come back parsed from the backend; everything else is text.
-async function loadStoredPlotData(sampleId, filename, measType, thicknessNm) {
+// `opts.detectorDistance` (mm) is the per-sample RSM override saved in
+// module_config.rsm.detector_distance_mm; the backend recomputes 2θ for it.
+// `meta` carries the recorded/applied distance and the flag note for the card.
+async function loadStoredPlotData(sampleId, filename, measType, thicknessNm, opts = {}) {
   if (isRasxFile(filename)) {
     try {
-      const r = await api("GET", `/samples/${sampleId}/xray/${encodeURIComponent(filename)}`);
-      return { parsed: xrayPayloadToPlotData(r.payload), text: null };
+      const dd = measType === "rsm" && opts.detectorDistance != null ? `?detector_distance=${encodeURIComponent(opts.detectorDistance)}` : "";
+      const r = await api("GET", `/samples/${sampleId}/xray/${encodeURIComponent(filename)}${dd}`);
+      return { parsed: xrayPayloadToPlotData(r.payload), text: null, meta: xrayPayloadMeta(r) };
     } catch { return { parsed: null, text: null }; }
   }
   const text = await fetchFile(sampleId, filename);
   if (!text) return { parsed: null, text: null };
   return { parsed: csvToPlotData(text, measType, thicknessNm), text };
 }
+
+// Detector-distance facts the RSM card shows: what the file recorded, what was
+// applied, and the backend's note when the recorded value looks like a fixed
+// nominal setting rather than a live reading.
+function xrayPayloadMeta(r) {
+  const p = r?.payload || {}, m = r?.meta || {};
+  return {
+    detector_distance_mm:         p.detector_distance_mm ?? m.detector_distance_mm ?? null,
+    detector_distance_applied_mm: p.detector_distance_applied_mm ?? null,
+    flagged: !!m.detector_distance_flagged,
+    note:    m.detector_distance_note || null,
+    warning: p.warning || null,
+  };
+}
+const RSM_DETECTOR_DISTANCE_MIN = 50, RSM_DETECTOR_DISTANCE_MAX = 1000;   // mm, mirrors backend/rasx.py
 
 // ── UI primitives ─────────────────────────────────────────────────────────────
 
@@ -2167,7 +2186,7 @@ function xrdSubstrateRef(substrate, structures) {
   return { label: def.label, twoTheta };
 }
 
-function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze, substrate, structures, uploadError }) {
+function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze, substrate, structures, uploadError, rsmMeta, rsmConfig, onRsmDistance }) {
   const cfg = MEAS_TYPES[type];
   const xrayAccepts = XRAY_ACCEPTS[type];
   const zoneProps = xrayAccepts ? { accept: xrayAccepts.join(","), label: "drop .rasx/.csv or click" } : {};
@@ -2178,6 +2197,39 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
   const [peLoop,        setPeLoop]        = useState("all"); // "all" | "second"
   const [rsmLog,        setRsmLog]        = useState(false); // lin by default
   const [xrdZero,       setXrdZero]       = useState(false);
+  // RSM detector-distance override popover (cog in the header)
+  const [ddOpen,        setDdOpen]        = useState(false);
+  const [ddInput,       setDdInput]       = useState("");
+  const [ddError,       setDdError]       = useState(null);
+  const [ddBusy,        setDdBusy]        = useState(false);
+  const ddRef = useRef(null);
+  const isRSM       = type === "rsm";
+  const ddOverride  = isRSM ? (rsmConfig?.detector_distance_mm ?? null) : null;
+  const ddRecorded  = rsmMeta?.detector_distance_mm ?? null;
+  const ddFlagged   = !!rsmMeta?.flagged;
+  const ddShowDot   = isRSM && ddFlagged && ddOverride == null && !rsmConfig?.detector_distance_ack;
+  useEffect(() => {
+    if (!ddOpen) return;
+    const onDoc = e => { if (ddRef.current && !ddRef.current.contains(e.target)) setDdOpen(false); };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [ddOpen]);
+  const openDd = () => { setDdInput(ddOverride != null ? String(ddOverride) : ""); setDdError(null); setDdOpen(v => !v); };
+  const applyDd = async () => {
+    const v = Number(String(ddInput).trim());
+    if (!ddInput.trim() || !isFinite(v) || v <= 0) { setDdError("Enter a positive number in mm."); return; }
+    if (v < RSM_DETECTOR_DISTANCE_MIN || v > RSM_DETECTOR_DISTANCE_MAX) { setDdError(`Must be between ${RSM_DETECTOR_DISTANCE_MIN} and ${RSM_DETECTOR_DISTANCE_MAX} mm.`); return; }
+    setDdBusy(true); setDdError(null);
+    try { await onRsmDistance?.(v); setDdOpen(false); }
+    catch (e) { setDdError(e.message || "Could not apply."); }
+    setDdBusy(false);
+  };
+  const clearDd = async () => {
+    setDdBusy(true); setDdError(null);
+    try { await onRsmDistance?.(null); setDdOpen(false); }
+    catch (e) { setDdError(e.message || "Could not clear."); }
+    setDdBusy(false);
+  };
 
   // XRD substrate zeroing (kept above the diel_b early return so hook order is stable)
   const isXRD = type === "xrd_ot";
@@ -2239,6 +2291,41 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
               </div>
             </div>
           )}
+          {isRSM && has && isRasxFile(filename) && (
+            <div ref={ddRef} style={{ position: "relative" }}>
+              <button onClick={openDd} title="Detector distance"
+                style={{ position: "relative", background: "none", border: "none", color: ddOverride != null ? T.amber : T.textDim, cursor: "pointer", fontSize: 13, lineHeight: 1, padding: "0 2px" }}>
+                ⚙
+                {ddShowDot && <span style={{ position: "absolute", top: -2, right: -3, width: 6, height: 6, borderRadius: "50%", background: T.amber, boxShadow: `0 0 0 1.5px ${T.bg2}` }} />}
+              </button>
+              {ddOpen && (
+                <div style={{ position: "absolute", right: 0, top: "calc(100% + 6px)", width: 250, background: T.bg3, border: `1px solid ${T.borderBright}`, borderRadius: 8, padding: "10px 12px", zIndex: 500, boxShadow: "0 4px 20px rgba(0,0,0,.3), 0 1px 4px rgba(0,0,0,.15)", fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textSecondary, textAlign: "left", cursor: "default" }}>
+                  <div style={{ fontSize: 11, color: T.textPrimary, marginBottom: 6 }}>Sample–detector distance</div>
+                  <div style={{ color: T.textDim, marginBottom: ddFlagged ? 4 : 8 }}>
+                    file: {ddRecorded != null ? `${ddRecorded} mm` : "not recorded"}
+                  </div>
+                  {ddFlagged && rsmMeta?.note && (
+                    <div style={{ color: T.amber, lineHeight: 1.4, marginBottom: 8 }}>⚠ {rsmMeta.note}</div>
+                  )}
+                  {rsmMeta?.warning && (
+                    <div style={{ color: T.amber, lineHeight: 1.4, marginBottom: 8 }}>⚠ {rsmMeta.warning}</div>
+                  )}
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <input type="number" step="0.001" min={RSM_DETECTOR_DISTANCE_MIN} max={RSM_DETECTOR_DISTANCE_MAX} value={ddInput} placeholder="true position"
+                      onChange={e => { setDdInput(e.target.value); setDdError(null); }}
+                      onKeyDown={e => { if (e.key === "Enter") applyDd(); if (e.key === "Escape") setDdOpen(false); }}
+                      style={{ flex: 1, minWidth: 0, background: T.bg0, border: `1px solid ${ddError ? T.red : T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 6px" }} />
+                    <span style={{ color: T.textDim }}>mm</span>
+                  </div>
+                  {ddError && <div style={{ color: T.red, marginTop: 4, lineHeight: 1.4 }}>{ddError}</div>}
+                  <div style={{ display: "flex", gap: 6, marginTop: 8, justifyContent: "flex-end" }}>
+                    <Btn variant="ghost" small disabled={ddBusy || ddOverride == null} onClick={clearDd}>Clear</Btn>
+                    <Btn variant="primary" small disabled={ddBusy} onClick={applyDd}>{ddBusy ? "…" : "Apply"}</Btn>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           {isXRD && has && subRef && (
             <button onClick={() => setXrdZero(v => !v)}
               title={`Zero to ${subRef.label} (${subRef.twoTheta.toFixed(2)}°)`}
@@ -2259,6 +2346,11 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
         {has ? (
           <>
             <MeasPlot data={isXRD ? xrdDisplayData : displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} logIntensity={rsmLog} />
+            {isRSM && rsmMeta?.detector_distance_applied_mm != null && (
+              <div style={{ marginTop: 4, fontSize: 10, color: T.amber, fontFamily: "'DM Mono', monospace", textAlign: "center" }}>
+                detector distance {rsmMeta.detector_distance_applied_mm} mm (file: {rsmMeta.detector_distance_mm ?? "—"} mm)
+              </div>
+            )}
             <div style={{ marginTop: 8 }}><UploadZone type={type} onFile={(file) => onFile(type, file)} hasData={true} thicknessNm={thicknessNm} {...zoneProps} /></div>
             {errorLine}
           </>
@@ -3379,7 +3471,7 @@ function AddDataModal({ onClose, moduleOptions = [], sampleId, sample, onModuleF
 
 // ── SampleDetail ──────────────────────────────────────────────────────────────
 
-function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [], materialsLib = [] }) {
+function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onRsmDistance, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [], materialsLib = [] }) {
   const [addingLayer, setAddingLayer]   = useState(false);
   const [meta, setMeta]                 = useState({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
   const [dragIdx, setDragIdx]           = useState(null);
@@ -3556,6 +3648,9 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
             <MeasCard key={t} type={t} plotData={pd[t]} filename={sample.filenames?.[t]}
               onFile={(measType, file) => handleFile(measType, file)}
               uploadError={uploadErrors[t]}
+              rsmMeta={t === "rsm" ? pd.rsm_meta : undefined}
+              rsmConfig={t === "rsm" ? sample.module_config?.rsm : undefined}
+              onRsmDistance={t === "rsm" ? mm => onRsmDistance?.(sample.id, mm) : undefined}
               substrate={t === "xrd_ot" ? sample.substrate : undefined}
               structures={t === "xrd_ot" ? structuresCompat : undefined}
               onAnalyze={t === "xrd_ot" ? () => setXrdAnalysisOpen(true) : undefined} />
@@ -14754,10 +14849,11 @@ export default function App() {
         try { newCache.afm = await api("GET", `/samples/${sample.id}/afm_data`); } catch {}
         continue;
       }
-      const { parsed, text } = await loadStoredPlotData(sample.id, filename, measType, thick);
+      const { parsed, text, meta } = await loadStoredPlotData(sample.id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample) });
       if (!parsed || !hasPlotData(parsed)) continue;
       if (measType === "pe" && !newArea && text) newArea = findAreaFromFile(text);
       newCache[measType] = parsed;
+      if (measType === "rsm") newCache.rsm_meta = meta || null;
     }
     setPlotCache(p => ({ ...p, [active]: { ...(p[active] || {}), ...newCache } }));
     if (newArea !== sample.area_m2) await updateSample({ ...sample, area_m2: newArea });
@@ -14778,10 +14874,34 @@ export default function App() {
         try { cache.afm = await api("GET", `/samples/${id}/afm_data`); } catch {}
         continue;
       }
-      const { parsed } = await loadStoredPlotData(id, filename, measType, thick);
-      if (parsed && hasPlotData(parsed)) cache[measType] = parsed;
+      const { parsed, meta } = await loadStoredPlotData(id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample) });
+      if (parsed && hasPlotData(parsed)) {
+        cache[measType] = parsed;
+        if (measType === "rsm") cache.rsm_meta = meta || null;
+      }
     }
     setPlotCache(p => ({ ...p, [id]: cache }));
+  };
+
+  // Saved RSM detector-distance override for a sample (module_config.rsm), or null.
+  const rsmDetectorDistance = sample => {
+    const v = sample?.module_config?.rsm?.detector_distance_mm;
+    return typeof v === "number" && isFinite(v) ? v : null;
+  };
+
+  // Persist an RSM detector-distance override (null clears it) and refetch the
+  // map so the card, comparison panels and analyses all see the corrected Q.
+  const handleRsmDistance = async (sampleId, mm) => {
+    const sample = samples.find(s => s.id === sampleId);
+    const filename = sample?.filenames?.rsm;
+    if (!sample || !filename) throw new Error("No RSM file on this sample");
+    if (!isRasxFile(filename)) throw new Error("Only .rasx maps can be corrected");
+    await api("PATCH", `/samples/${sampleId}/module-config/rsm`, { detector_distance_mm: mm, detector_distance_ack: true });
+    const updated = await api("GET", `/samples/${sampleId}`);
+    setSamples(p => p.map(s => s.id === sampleId ? { ...s, module_config: updated.module_config } : s));
+    const { parsed, meta } = await loadStoredPlotData(sampleId, filename, "rsm", sample.thickness_nm || 0, { detectorDistance: mm });
+    if (!parsed || !hasPlotData(parsed)) throw new Error("Could not reload the map");
+    setPlotCache(p => ({ ...p, [sampleId]: { ...(p[sampleId] || {}), rsm: parsed, rsm_meta: meta || null } }));
   };
 
   // Load plot data when opening a sample
@@ -15098,6 +15218,7 @@ export default function App() {
               onUpdate={updateSample}
               onUploadFile={handleUploadFile}
               onReparseFiles={handleReparseFiles}
+              onRsmDistance={handleRsmDistance}
               onBack={() => setActive(null)}
               onDelete={deleteSample}
               editingMeta={editingMeta}
