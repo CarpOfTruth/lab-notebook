@@ -24,12 +24,26 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-__all__ = ["read_rasx", "RasxScan", "classify", "XRR_MAX_2THETA"]
+__all__ = ["read_rasx", "RasxScan", "classify", "XRR_MAX_2THETA",
+           "check_detector_distance", "corrected_two_theta"]
 
 # A symmetric 2θ/θ scan whose stop angle is at or below this is treated as
 # reflectivity. Reflectivity on our films dies out well before 8–10°; a
 # diffraction scan starting near 10–20° always ends far above this.
 XRR_MAX_2THETA = 12.0
+
+# Sample-to-detector distance for 3D-Explore RSMs. Each frame's 2θ column is
+# detector pixel position divided by this distance, so it must be the real
+# position. When the measurement package reads the live position it lands on a
+# calibrated, non-round value (300.555, 299.957 ...). When the operator sets a
+# fixed nominal value the file records exactly 300 or 150, which may not be
+# where the detector was. Nothing else in the file records the position.
+DETECTOR_DISTANCE_KEY     = "*MEAS_COND_COUNTER_DISTANCE"
+DETECTOR_DISTANCE_NOMINAL = 300.0   # mm
+DETECTOR_DISTANCE_TOL     = 5.0     # mm: live readings fall within nominal ± tol
+DETECTOR_DISTANCE_MIN     = 50.0    # mm: sane override range
+DETECTOR_DISTANCE_MAX     = 1000.0
+DETECTOR_CENTER_TOL_DEG   = 0.02    # grid midpoint vs TwoTheta axis mismatch that triggers a fallback
 
 
 # --------------------------------------------------------------------------- helpers
@@ -214,6 +228,12 @@ class RasxScan:
             return X / 2 + rel[:, None], X.copy()
         raise NotImplementedError("inner scan axis %r" % inner)
 
+    @property
+    def detector_distance_mm(self) -> Optional[float]:
+        """Sample-to-detector distance recorded in the RAS header (mm), or None."""
+        v = _num(self.meta["ras_header"].get(DETECTOR_DISTANCE_KEY))
+        return v if isinstance(v, float) else None
+
     def frame_omegas(self) -> np.ndarray:
         """ω of each frame (deg) for a 3D-Explore map (inner axis TwoTheta)."""
         return np.array([f.axis("Omega") for f in self.frames], dtype=float)
@@ -276,7 +296,11 @@ class RasxScan:
             "slits": {k: label(k) for k in ("IS", "IL", "RS1", "RS2", "RS3", "LLS", "ULS") if k in m["axes_all"]},
             "sample_axes": {k: m["axes"].get(k, {}).get("position") for k in ("Chi", "Phi", "Z", "Omega", "TwoTheta") if k in m["axes"]},
             "attenuator_auto": s.get("AttenuatorAutoMode"),
+            "detector_distance_mm": self.detector_distance_mm,
         }
+        flagged, note = check_detector_distance(self.detector_distance_mm)
+        out["detector_distance_flagged"] = flagged
+        out["detector_distance_note"] = note
         if self.is_map:
             om = self.frame_omegas()
             out["omega_start"] = float(om.min())
@@ -343,20 +367,103 @@ def classify(scan: RasxScan) -> Tuple[Optional[str], str]:
     return None, "a %s scan — not supported yet" % (axis or "unknown")
 
 
-def to_payload(scan: RasxScan, kind: str) -> dict:
-    """Plot-ready payload for the frontend. 1D: {x, y}. RSM: compact grid."""
+# --------------------------------------------------------------------------- detector distance
+def check_detector_distance(d_mm: Optional[float]) -> Tuple[bool, Optional[str]]:
+    """
+    Does the recorded distance look like a fixed nominal setting rather than a
+    live reading? Returns (flagged, note). Flagged when the value is an exact
+    integer (what the fixed setting writes) or outside NOMINAL ± TOL.
+    """
+    if d_mm is None:
+        return True, "The file records no detector distance; check the detector's actual position."
+    if abs(d_mm - round(d_mm)) < 1e-6:
+        return True, ("recorded distance is exactly %d mm, which is the fixed setting; "
+                      "check the detector's actual position." % int(round(d_mm)))
+    if abs(d_mm - DETECTOR_DISTANCE_NOMINAL) > DETECTOR_DISTANCE_TOL:
+        return True, ("recorded distance %.3f mm is outside the usual %g ± %g mm; "
+                      "check the detector's actual position."
+                      % (d_mm, DETECTOR_DISTANCE_NOMINAL, DETECTOR_DISTANCE_TOL))
+    return False, None
+
+
+def detector_center_2theta(scan: RasxScan) -> Tuple[float, Optional[str]]:
+    """
+    2θ of the detector center for a 3D-Explore map: the midpoint of the stored
+    2θ grid (the grid is symmetric about the parked arm). Cross-checked against
+    the TwoTheta axis; a few frames can carry 0.01° of encoder jitter, so the
+    grid wins unless they disagree by more than DETECTOR_CENTER_TOL_DEG, in
+    which case the axis value is used and a warning returned.
+    """
+    x = scan.x
+    grid_mid = float((x[0] + x[-1]) / 2.0)
+    axis_val = scan.frames[0].meta["axes"].get("TwoTheta", {}).get("position")
+    if isinstance(axis_val, float) and abs(axis_val - grid_mid) > DETECTOR_CENTER_TOL_DEG:
+        return axis_val, ("2θ grid midpoint %.4f° disagrees with the TwoTheta axis %.4f°; "
+                          "using the axis value as the detector center." % (grid_mid, axis_val))
+    return grid_mid, None
+
+
+def corrected_two_theta(scan: RasxScan, d_true_mm: float) -> Tuple[np.ndarray, dict]:
+    """
+    Recompute a map's 2θ grid for the true sample-to-detector distance:
+        y       = D_recorded * tan(2θ_stored - 2θ_center)   # mm on the detector
+        2θ_true = 2θ_center + atan(y / D_true)
+    Returns (two_theta, info). ω is a goniometer axis and is unchanged.
+    """
+    d_rec = scan.detector_distance_mm
+    if d_rec is None:
+        raise ValueError("The file records no detector distance, so 2θ cannot be corrected")
+    if not (DETECTOR_DISTANCE_MIN <= d_true_mm <= DETECTOR_DISTANCE_MAX):
+        raise ValueError("detector distance must be between %g and %g mm"
+                         % (DETECTOR_DISTANCE_MIN, DETECTOR_DISTANCE_MAX))
+    center, warning = detector_center_2theta(scan)
+    y = d_rec * np.tan(np.deg2rad(scan.x - center))
+    tt = center + np.rad2deg(np.arctan(y / d_true_mm))
+    info = {"detector_center_2theta": center, "detector_distance_mm": d_rec,
+            "detector_distance_applied_mm": float(d_true_mm)}
+    if warning:
+        info["warning"] = warning
+    return tt, info
+
+
+def to_payload(scan: RasxScan, kind: str, detector_distance: Optional[float] = None) -> dict:
+    """
+    Plot-ready payload for the frontend. 1D: {x, y}. RSM: compact grid.
+    `detector_distance` (mm) overrides the recorded sample-to-detector distance
+    for maps; the stored .rasx is never modified. Ignored for 1D scans, whose
+    angle comes from the goniometer arm.
+    """
+    d_rec = scan.detector_distance_mm
     if kind == "rsm":
         om = scan.frame_omegas()
-        return {
+        applied = None
+        tt = scan.x
+        extra = {}
+        if detector_distance is not None:
+            tt, info = corrected_two_theta(scan, float(detector_distance))
+            applied = info["detector_distance_applied_mm"]
+            extra["detector_center_2theta"] = info["detector_center_2theta"]
+            if "warning" in info:
+                extra["warning"] = info["warning"]
+        out = {
             "omega":        [float(v) for v in om],
-            "two_theta":    [float(v) for v in scan.x],
+            "two_theta":    [float(v) for v in tt],
             "intensity":    scan.intensity.tolist(),
             "wavelength_A": float(scan.wavelength),
+            "detector_distance_mm": d_rec,
+            "detector_distance_applied_mm": applied,
         }
-    return {"x": scan.x.tolist(), "y": scan.intensity.tolist()}
+        out.update(extra)
+        return out
+    out = {"x": scan.x.tolist(), "y": scan.intensity.tolist(),
+           "detector_distance_mm": d_rec, "detector_distance_applied_mm": None}
+    if detector_distance is not None:
+        out["note"] = "detector distance override ignored: 1D scans take their angle from the goniometer arm"
+    return out
 
 
-def inspect_bytes(data: bytes, filename: Optional[str] = None) -> dict:
+def inspect_bytes(data: bytes, filename: Optional[str] = None,
+                  detector_distance: Optional[float] = None) -> dict:
     """Parse + classify + build payload. Raises ValueError for unreadable input."""
     try:
         scan = read_rasx(data, name=filename)
@@ -368,5 +475,9 @@ def inspect_bytes(data: bytes, filename: Optional[str] = None) -> dict:
         out["reason"] = "This is %s." % desc
         out["payload"] = None
     else:
-        out["payload"] = to_payload(scan, kind)
+        out["payload"] = to_payload(scan, kind, detector_distance)
+        if "warning" in out["payload"]:
+            out["meta"]["warning"] = out["payload"]["warning"]
+        if "note" in out["payload"]:
+            out["meta"]["note"] = out["payload"]["note"]
     return out
