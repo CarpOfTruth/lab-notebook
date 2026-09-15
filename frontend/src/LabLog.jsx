@@ -363,7 +363,7 @@ function splitPELoops(data) {
   return { first: data.slice(0, bestIdx), second: data.slice(bestIdx) };
 }
 
-function csvToPlotData(text, type, thicknessNm) {
+function csvToPlotData(text, type, thicknessNm, opts = {}) {
   const rows = parseCSV(text);
   if (!rows.length) return null;
   if (type === "rsm") return rows.map(r => ({ x: r[0], y: r[1], z: r[2] ?? 1 }));
@@ -376,16 +376,7 @@ function csvToPlotData(text, type, thicknessNm) {
     );
     return rows.map(r => ({ x: isOmegaCol ? r[0] * 2 : r[0], y: r[1] }));
   }
-  if (type === "pe") {
-    const { vCol, pCol } = findPECols(text);
-    let xs = rows.map(r => r[vCol] ?? r[0]);
-    let ys = rows.map(r => r[pCol] ?? r[1]);
-    const maxAbsX = xs.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
-    if (maxAbsX < 50 && thicknessNm > 0) xs = xs.map(v => v / (thicknessNm * 1e-4));
-    const maxAbsY = ys.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
-    if (maxAbsY > 0 && maxAbsY < 1e-3) ys = ys.map(p => p * 1e6);
-    return xs.map((x, i) => ({ x, y: ys[i] }));
-  }
+  if (type === "pe") return parsePEText(text, thicknessNm, opts.peXInput).points;
   if (type === "diel_b_up" || type === "diel_b_down") {
     let xs = rows.map(r => r[0]);
     const ys  = rows.map(r => r[1]);
@@ -395,6 +386,59 @@ function csvToPlotData(text, type, thicknessNm) {
     return xs.map((x, i) => ({ x, y: ys[i], y2: y2s[i] }));
   }
   return rows.map(r => ({ x: r[0], y: r[1] }));
+}
+
+// ── P–E Hysteresis x-axis (voltage vs field) ──────────────────────────────────
+// The x column of a P-E file is either the drive voltage (V) or a field already
+// in kV/cm. `xInput` is the per-sample setting saved in module_config.pe.x_input:
+// "voltage" | "field" | "auto" (absent). Auto trusts the file's column header
+// first ("voltage" / "field", "kv/cm") and only falls back to the old magnitude
+// rule (|x| < 50 → volts) when the header says nothing. Voltage is converted to
+// kV/cm with the sample thickness; without a thickness it stays in V and the
+// card says so. Returns { points, meta } so the card can show what was applied.
+const PE_X_INPUTS = ["auto", "voltage", "field"];
+
+function detectPEXInput(text, xs) {
+  for (const line of text.split(/\r?\n/).slice(0, 80)) {
+    const lower = line.toLowerCase();
+    if (!lower.includes("polariz")) continue;          // the column-header line
+    if (/field|kv\s*\/\s*cm/.test(lower)) return { mode: "field",   source: "header" };
+    if (/voltage/.test(lower))            return { mode: "voltage", source: "header" };
+    break;
+  }
+  const maxAbsX = xs.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  return { mode: maxAbsX < 50 ? "voltage" : "field", source: "magnitude" };
+}
+
+function parsePEText(text, thicknessNm = 0, xInput = "auto") {
+  const rows = parseCSV(text);
+  if (!rows.length) return { points: null, meta: null };
+  const { vCol, pCol } = findPECols(text);
+  let xs = rows.map(r => r[vCol] ?? r[0]);
+  let ys = rows.map(r => r[pCol] ?? r[1]);
+  const forced = xInput === "voltage" || xInput === "field";
+  const det = forced ? { mode: xInput, source: "user" } : detectPEXInput(text, xs);
+  const thick = Number(thicknessNm) || 0;
+  let unit = "kV/cm", converted = false;
+  if (det.mode === "voltage") {
+    if (thick > 0) { xs = xs.map(v => v / (thick * 1e-4)); converted = true; }   // V / (nm·1e-7 cm) / 1e3 = kV/cm
+    else unit = "V";
+  }
+  const maxAbsY = ys.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  if (maxAbsY > 0 && maxAbsY < 1e-3) ys = ys.map(p => p * 1e6);
+  return {
+    points: xs.map((x, i) => ({ x, y: ys[i] })),
+    meta: { x_input: forced ? xInput : "auto", mode: det.mode, source: det.source, unit, converted, thickness_nm: thick },
+  };
+}
+
+// One-line description of what the P-E parser did, for the card.
+function describePEX(meta) {
+  if (!meta) return null;
+  const how = meta.source === "user" ? "set on card" : meta.source === "header" ? "auto: file header" : "auto: value range";
+  if (meta.mode === "field") return { text: `x in kV/cm as in file (${how})`, warn: false };
+  if (meta.converted) return { text: `V ÷ ${meta.thickness_nm} nm → kV/cm (${how})`, warn: false };
+  return { text: `plotted in V — set a thickness to convert to kV/cm (${how})`, warn: true };
 }
 
 // ── X-ray file handling (.rasx + CSV) ─────────────────────────────────────────
@@ -514,6 +558,10 @@ async function loadStoredPlotData(sampleId, filename, measType, thicknessNm, opt
   }
   const text = await fetchFile(sampleId, filename);
   if (!text) return { parsed: null, text: null };
+  if (measType === "pe") {
+    const { points, meta } = parsePEText(text, thicknessNm, opts.peXInput);
+    return { parsed: points, text, meta };
+  }
   return { parsed: csvToPlotData(text, measType, thicknessNm), text };
 }
 
@@ -1272,8 +1320,8 @@ function RsmCanvasPlot({ data, logIntensity = false }) {
   );
 }
 
-function MeasPlot({ data, type, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, logIntensity = false }) {
-  const cfg = MEAS_TYPES[type];
+function MeasPlot({ data, type, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, logIntensity = false, xLabel }) {
+  const cfg = xLabel ? { ...MEAS_TYPES[type], xLabel } : MEAS_TYPES[type];
   if (!hasPlotData(data)) return null;
   if (type === "rsm") return <RsmCanvasPlot data={data} logIntensity={logIntensity} />;
   let plotData = data;
@@ -2186,7 +2234,7 @@ function xrdSubstrateRef(substrate, structures) {
   return { label: def.label, twoTheta };
 }
 
-function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze, substrate, structures, uploadError, rsmMeta, rsmConfig, onRsmDistance }) {
+function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze, substrate, structures, uploadError, rsmMeta, rsmConfig, onRsmDistance, peMeta, peConfig, onPeXInput }) {
   const cfg = MEAS_TYPES[type];
   const xrayAccepts = XRAY_ACCEPTS[type];
   const zoneProps = xrayAccepts ? { accept: xrayAccepts.join(","), label: "drop .rasx/.csv or click" } : {};
@@ -2270,6 +2318,9 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
   const has  = hasPlotData(plotData);
   const isPE = type === "pe";
   const isDiel = type === "diel_f";
+  const peXInput = isPE ? (PE_X_INPUTS.includes(peConfig?.x_input) ? peConfig.x_input : "auto") : null;
+  const peNote   = isPE ? describePEX(peMeta) : null;
+  const peXLabel = isPE && peMeta?.unit === "V" ? "V (V)" : undefined;
   const displayPEData = isPE && has ? (peLoop === "second" ? splitPELoops(plotData).second : plotData) : plotData;
 
   return (
@@ -2278,6 +2329,24 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
         <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: cfg.color, fontWeight: 600, whiteSpace: "nowrap" }}>{cfg.label}</span>
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
           {isPE && has && <LoopToggle value={peLoop} onChange={setPeLoop} />}
+          {isPE && has && (
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }} title="What the file's x column is: drive voltage (converted to kV/cm with the thickness) or a field already in kV/cm">
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>x</span>
+              <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 10, overflow: "hidden" }}>
+                {[["auto", "auto"], ["voltage", "V"], ["field", "kV/cm"]].map(([val, lbl]) => {
+                  const on = peXInput === val;
+                  const auto = val === "auto" && on && peMeta?.mode;
+                  return (
+                    <button key={val} onClick={() => val !== peXInput && onPeXInput?.(val)}
+                      title={auto ? `detected: ${peMeta.mode === "voltage" ? "voltage" : "field"} (${peMeta.source})` : undefined}
+                      style={{ background: on ? T.amber : "transparent", color: on ? "#0d1117" : T.textDim, border: "none", cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "2px 8px", transition: "all .15s", lineHeight: 1.6 }}>
+                      {lbl}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
           {type === "rsm" && has && (
             <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
               <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>intensity</span>
@@ -2345,7 +2414,12 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
       <div style={{ padding: "10px 12px" }}>
         {has ? (
           <>
-            <MeasPlot data={isXRD ? xrdDisplayData : displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} logIntensity={rsmLog} />
+            <MeasPlot data={isXRD ? xrdDisplayData : displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} logIntensity={rsmLog} xLabel={peXLabel} />
+            {isPE && peNote && (
+              <div style={{ marginTop: 4, fontSize: 10, color: peNote.warn ? T.amber : T.textDim, fontFamily: "'DM Mono', monospace", textAlign: "center" }}>
+                {peNote.warn ? "⚠ " : ""}{peNote.text}
+              </div>
+            )}
             {isRSM && rsmMeta?.detector_distance_applied_mm != null && (
               <div style={{ marginTop: 4, fontSize: 10, color: T.amber, fontFamily: "'DM Mono', monospace", textAlign: "center" }}>
                 detector distance {rsmMeta.detector_distance_applied_mm} mm (file: {rsmMeta.detector_distance_mm ?? "—"} mm)
@@ -3471,7 +3545,7 @@ function AddDataModal({ onClose, moduleOptions = [], sampleId, sample, onModuleF
 
 // ── SampleDetail ──────────────────────────────────────────────────────────────
 
-function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onRsmDistance, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [], materialsLib = [] }) {
+function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onRsmDistance, onPeXInput, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [], materialsLib = [] }) {
   const [addingLayer, setAddingLayer]   = useState(false);
   const [meta, setMeta]                 = useState({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
   const [dragIdx, setDragIdx]           = useState(null);
@@ -3549,8 +3623,16 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
   const handleFile = async (measType, file) => {
     if (!file) return;
     if (measType === "afm") { onUploadFile("afm", file, null, null); return; }
-    // Route PE through the server-side module
-    if (measType === "pe") { onUploadFile("pe", file, null, null, true); return; }
+    // P-E: parsed here with the sample's x-input setting so the card, reload and
+    // Reparse all go through parsePEText. The raw file is still stored.
+    if (measType === "pe") {
+      const text = await file.text();
+      const { points, meta } = parsePEText(text, sample.thickness_nm || 0, sample.module_config?.pe?.x_input);
+      if (!points || !hasPlotData(points)) { showUploadError("pe", "No numeric data found in this file."); return; }
+      clearUploadError("pe");
+      onUploadFile("pe", file, points, findAreaFromFile(text), false, meta);
+      return;
+    }
     // X-ray cards: validate (extension, content, .rasx kind) before anything is uploaded
     if (XRAY_ACCEPTS[measType]) {
       const r = await validateXrayFile(file, measType);
@@ -3694,6 +3776,9 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               filenames={sample.filenames}
               onFile={(measType, file) => handleFile(measType, file)}
               uploadError={uploadErrors[t] || uploadErrors[`${t}_up`] || uploadErrors[`${t}_down`]}
+              peMeta={t === "pe" ? pd.pe_meta : undefined}
+              peConfig={t === "pe" ? sample.module_config?.pe : undefined}
+              onPeXInput={t === "pe" ? mode => onPeXInput?.(sample.id, mode) : undefined}
               thicknessNm={sample.thickness_nm || 0}
               areaM2={sample.area_m2 ?? null}
               areaCorrFactor={sample.area_correction ?? 1.0}
@@ -14713,7 +14798,7 @@ export default function App() {
 
   // ── File upload + plotCache ──────────────────────────────────────────────
 
-  const handleUploadFile = async (measType, file, parsed, peArea, useModule = false) => {
+  const handleUploadFile = async (measType, file, parsed, peArea, useModule = false, parsedMeta = null) => {
     if (!active) return;
     const sample = samples.find(s => s.id === active);
     if (!sample) return;
@@ -14754,6 +14839,7 @@ export default function App() {
             const dir = measType === "diel_b_up" ? "up" : "down";
             return { ...p, [active]: { ...prev, [`diel_b_${dir}`]: parsed } };
           }
+          if (measType === "pe") return { ...p, [active]: { ...prev, pe: parsed, pe_meta: parsedMeta } };
           return { ...p, [active]: { ...prev, [measType]: parsed } };
         });
       }
@@ -14849,11 +14935,12 @@ export default function App() {
         try { newCache.afm = await api("GET", `/samples/${sample.id}/afm_data`); } catch {}
         continue;
       }
-      const { parsed, text, meta } = await loadStoredPlotData(sample.id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample) });
+      const { parsed, text, meta } = await loadStoredPlotData(sample.id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample), peXInput: peXInputOf(sample) });
       if (!parsed || !hasPlotData(parsed)) continue;
       if (measType === "pe" && !newArea && text) newArea = findAreaFromFile(text);
       newCache[measType] = parsed;
       if (measType === "rsm") newCache.rsm_meta = meta || null;
+      if (measType === "pe")  newCache.pe_meta  = meta || null;
     }
     setPlotCache(p => ({ ...p, [active]: { ...(p[active] || {}), ...newCache } }));
     if (newArea !== sample.area_m2) await updateSample({ ...sample, area_m2: newArea });
@@ -14874,13 +14961,33 @@ export default function App() {
         try { cache.afm = await api("GET", `/samples/${id}/afm_data`); } catch {}
         continue;
       }
-      const { parsed, meta } = await loadStoredPlotData(id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample) });
+      const { parsed, meta } = await loadStoredPlotData(id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample), peXInput: peXInputOf(sample) });
       if (parsed && hasPlotData(parsed)) {
         cache[measType] = parsed;
         if (measType === "rsm") cache.rsm_meta = meta || null;
+        if (measType === "pe")  cache.pe_meta  = meta || null;
       }
     }
     setPlotCache(p => ({ ...p, [id]: cache }));
+  };
+
+  // Saved P-E x-input setting for a sample (module_config.pe.x_input): "auto" | "voltage" | "field".
+  const peXInputOf = sample => {
+    const v = sample?.module_config?.pe?.x_input;
+    return PE_X_INPUTS.includes(v) ? v : "auto";
+  };
+
+  // Persist the P-E x-input choice and re-parse the stored file with it.
+  const handlePeXInput = async (sampleId, mode) => {
+    const sample = samples.find(s => s.id === sampleId);
+    const filename = sample?.filenames?.pe;
+    if (!sample || !filename) return;
+    await api("PATCH", `/samples/${sampleId}/module-config/pe`, { x_input: mode });
+    const updated = await api("GET", `/samples/${sampleId}`);
+    setSamples(p => p.map(s => s.id === sampleId ? { ...s, module_config: updated.module_config } : s));
+    const { parsed, meta } = await loadStoredPlotData(sampleId, filename, "pe", sample.thickness_nm || 0, { peXInput: mode });
+    if (!parsed || !hasPlotData(parsed)) return;
+    setPlotCache(p => ({ ...p, [sampleId]: { ...(p[sampleId] || {}), pe: parsed, pe_meta: meta || null } }));
   };
 
   // Saved RSM detector-distance override for a sample (module_config.rsm), or null.
@@ -15219,6 +15326,7 @@ export default function App() {
               onUploadFile={handleUploadFile}
               onReparseFiles={handleReparseFiles}
               onRsmDistance={handleRsmDistance}
+              onPeXInput={handlePeXInput}
               onBack={() => setActive(null)}
               onDelete={deleteSample}
               editingMeta={editingMeta}
