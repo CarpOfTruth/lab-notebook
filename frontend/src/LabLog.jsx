@@ -537,7 +537,7 @@ async function validateXrayFile(file, type) {
     }
     const parsed = xrayPayloadToPlotData(json.payload);
     if (!parsed || !hasPlotData(parsed)) return { error: "The .rasx contained no data points." };
-    return { parsed, meta: json.meta };
+    return { parsed, meta: xrayPayloadMeta(json) };
   }
   const text = await file.text();
   return xrayTextToPlotData(text, type);
@@ -551,8 +551,10 @@ async function validateXrayFile(file, type) {
 async function loadStoredPlotData(sampleId, filename, measType, thicknessNm, opts = {}) {
   if (isRasxFile(filename)) {
     try {
-      const dd = measType === "rsm" && opts.detectorDistance != null ? `?detector_distance=${encodeURIComponent(opts.detectorDistance)}` : "";
-      const r = await api("GET", `/samples/${sampleId}/xray/${encodeURIComponent(filename)}${dd}`);
+      const q = [];
+      if (measType === "rsm" && opts.detectorDistance != null) q.push(`detector_distance=${encodeURIComponent(opts.detectorDistance)}`);
+      if (measType !== "rsm" && opts.frame != null) q.push(`frame=${encodeURIComponent(opts.frame)}`);
+      const r = await api("GET", `/samples/${sampleId}/xray/${encodeURIComponent(filename)}${q.length ? "?" + q.join("&") : ""}`);
       return { parsed: xrayPayloadToPlotData(r.payload), text: null, meta: xrayPayloadMeta(r) };
     } catch { return { parsed: null, text: null }; }
   }
@@ -576,7 +578,19 @@ function xrayPayloadMeta(r) {
     flagged: !!m.detector_distance_flagged,
     note:    m.detector_distance_note || null,
     warning: p.warning || null,
+    // Files holding several 2θ/θ scans: which one is plotted, and all of them.
+    frames:        Array.isArray(p.frames) ? p.frames : null,
+    frame:         p.frame ?? null,
+    frame_default: p.frame_default ?? null,
   };
+}
+
+// Label for one scan of a multi-scan .rasx: "scan 2 · 0.01° · 16:45".
+function xrayFrameLabel(f) {
+  if (!f) return "";
+  const t = f.start_time ? new Date(f.start_time) : null;
+  const time = t && !isNaN(t) ? t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
+  return [`scan ${f.index + 1}`, f.step != null ? `${f.step}°` : null, time].filter(Boolean).join(" · ");
 }
 const RSM_DETECTOR_DISTANCE_MIN = 50, RSM_DETECTOR_DISTANCE_MAX = 1000;   // mm, mirrors backend/rasx.py
 
@@ -2061,7 +2075,8 @@ function ModuleCard({ mod, sample, modules = [], onRemoved, onSampleUpdate }) {
     setLoading(false);
   };
 
-  useEffect(() => { if (hasData) fetchPlot(); }, [mod.id, sample.id, hasData]);
+  const moduleConfigKey = JSON.stringify(sample.module_config || {});
+  useEffect(() => { if (hasData) fetchPlot(); }, [mod.id, sample.id, hasData, moduleConfigKey]);
 
   const handleControlChange = (name, val) => {
     const next = { ...controlState, [name]: val };
@@ -2234,7 +2249,7 @@ function xrdSubstrateRef(substrate, structures) {
   return { label: def.label, twoTheta };
 }
 
-function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze, substrate, structures, uploadError, rsmMeta, rsmConfig, onRsmDistance, peMeta, peConfig, onPeXInput }) {
+function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze, substrate, structures, uploadError, rsmMeta, rsmConfig, onRsmDistance, peMeta, peConfig, onPeXInput, xrayMeta, onXrayFrame }) {
   const cfg = MEAS_TYPES[type];
   const xrayAccepts = XRAY_ACCEPTS[type];
   const zoneProps = xrayAccepts ? { accept: xrayAccepts.join(","), label: "drop .rasx/.csv or click" } : {};
@@ -2321,6 +2336,9 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
   const peXInput = isPE ? (PE_X_INPUTS.includes(peConfig?.x_input) ? peConfig.x_input : "auto") : null;
   const peNote   = isPE ? describePEX(peMeta) : null;
   const peXLabel = isPE && peMeta?.unit === "V" ? "V (V)" : undefined;
+  // .rasx files holding several 2θ/θ scans: pick which one this card plots.
+  const xFrames   = type !== "rsm" && xrayMeta?.frames?.length > 1 ? xrayMeta.frames : null;
+  const xFrameCur = xFrames ? xFrames.find(f => f.index === xrayMeta.frame) : null;
   const displayPEData = isPE && has ? (peLoop === "second" ? splitPELoops(plotData).second : plotData) : plotData;
 
   return (
@@ -2395,6 +2413,15 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
               )}
             </div>
           )}
+          {xFrames && has && (
+            <select value={xrayMeta.frame ?? ""} onChange={e => onXrayFrame?.(Number(e.target.value))}
+              title="This file holds several scans. Pick the one to plot."
+              style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "1px 4px", cursor: "pointer" }}>
+              {xFrames.map(f => (
+                <option key={f.index} value={f.index}>{xrayFrameLabel(f)}{f.index === xrayMeta.frame_default ? " (latest)" : ""}</option>
+              ))}
+            </select>
+          )}
           {isXRD && has && subRef && (
             <button onClick={() => setXrdZero(v => !v)}
               title={`Zero to ${subRef.label} (${subRef.twoTheta.toFixed(2)}°)`}
@@ -2415,6 +2442,12 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
         {has ? (
           <>
             <MeasPlot data={isXRD ? xrdDisplayData : displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} logIntensity={rsmLog} xLabel={peXLabel} />
+            {xFrameCur && (
+              <div style={{ marginTop: 4, fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textAlign: "center" }}>
+                scan {xFrameCur.index + 1} of {xFrames.length} in file · step {xFrameCur.step}° · {xFrameCur.n_points} pts
+                {xFrameCur.start_time ? ` · ${new Date(xFrameCur.start_time).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}` : ""}
+              </div>
+            )}
             {isPE && peNote && (
               <div style={{ marginTop: 4, fontSize: 10, color: peNote.warn ? T.amber : T.textDim, fontFamily: "'DM Mono', monospace", textAlign: "center" }}>
                 {peNote.warn ? "⚠ " : ""}{peNote.text}
@@ -3545,7 +3578,7 @@ function AddDataModal({ onClose, moduleOptions = [], sampleId, sample, onModuleF
 
 // ── SampleDetail ──────────────────────────────────────────────────────────────
 
-function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onRsmDistance, onPeXInput, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [], materialsLib = [] }) {
+function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onRsmDistance, onPeXInput, onXrayFrame, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [], materialsLib = [] }) {
   const [addingLayer, setAddingLayer]   = useState(false);
   const [meta, setMeta]                 = useState({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
   const [dragIdx, setDragIdx]           = useState(null);
@@ -3638,7 +3671,7 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
       const r = await validateXrayFile(file, measType);
       if (r.error) { showUploadError(measType, r.error); return; }
       clearUploadError(measType);
-      onUploadFile(measType, file, r.parsed, null);
+      onUploadFile(measType, file, r.parsed, null, false, r.meta || null);
       return;
     }
     const text = await file.text();
@@ -3731,6 +3764,8 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               onFile={(measType, file) => handleFile(measType, file)}
               uploadError={uploadErrors[t]}
               rsmMeta={t === "rsm" ? pd.rsm_meta : undefined}
+              xrayMeta={t !== "rsm" ? pd[`${t}_meta`] : undefined}
+              onXrayFrame={t !== "rsm" ? idx => onXrayFrame?.(sample.id, t, idx) : undefined}
               rsmConfig={t === "rsm" ? sample.module_config?.rsm : undefined}
               onRsmDistance={t === "rsm" ? mm => onRsmDistance?.(sample.id, mm) : undefined}
               substrate={t === "xrd_ot" ? sample.substrate : undefined}
@@ -14839,9 +14874,14 @@ export default function App() {
             const dir = measType === "diel_b_up" ? "up" : "down";
             return { ...p, [active]: { ...prev, [`diel_b_${dir}`]: parsed } };
           }
-          if (measType === "pe") return { ...p, [active]: { ...prev, pe: parsed, pe_meta: parsedMeta } };
+          if (parsedMeta) return { ...p, [active]: { ...prev, [measType]: parsed, [`${measType}_meta`]: parsedMeta } };
           return { ...p, [active]: { ...prev, [measType]: parsed } };
         });
+      }
+      if ((measType === "xrd_ot" || measType === "xrr") && sample.module_config?.[measType]?.frame_file === filename) {
+        await api("PATCH", `/samples/${active}/module-config/${measType}`, { frame: null, frame_file: null });
+        const fresh = await api("GET", `/samples/${active}`);
+        sample.module_config = fresh.module_config;
       }
       // update sample filenames + area if PE
       const updatedSample = {
@@ -14935,12 +14975,11 @@ export default function App() {
         try { newCache.afm = await api("GET", `/samples/${sample.id}/afm_data`); } catch {}
         continue;
       }
-      const { parsed, text, meta } = await loadStoredPlotData(sample.id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample), peXInput: peXInputOf(sample) });
+      const { parsed, text, meta } = await loadStoredPlotData(sample.id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample), peXInput: peXInputOf(sample), frame: xrayFrameOf(sample, measType) });
       if (!parsed || !hasPlotData(parsed)) continue;
       if (measType === "pe" && !newArea && text) newArea = findAreaFromFile(text);
       newCache[measType] = parsed;
-      if (measType === "rsm") newCache.rsm_meta = meta || null;
-      if (measType === "pe")  newCache.pe_meta  = meta || null;
+      if (meta) newCache[`${measType}_meta`] = meta;
     }
     setPlotCache(p => ({ ...p, [active]: { ...(p[active] || {}), ...newCache } }));
     if (newArea !== sample.area_m2) await updateSample({ ...sample, area_m2: newArea });
@@ -14961,14 +15000,35 @@ export default function App() {
         try { cache.afm = await api("GET", `/samples/${id}/afm_data`); } catch {}
         continue;
       }
-      const { parsed, meta } = await loadStoredPlotData(id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample), peXInput: peXInputOf(sample) });
+      const { parsed, meta } = await loadStoredPlotData(id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample), peXInput: peXInputOf(sample), frame: xrayFrameOf(sample, measType) });
       if (parsed && hasPlotData(parsed)) {
         cache[measType] = parsed;
-        if (measType === "rsm") cache.rsm_meta = meta || null;
-        if (measType === "pe")  cache.pe_meta  = meta || null;
+        if (meta) cache[`${measType}_meta`] = meta;
       }
     }
     setPlotCache(p => ({ ...p, [id]: cache }));
+  };
+
+  // Saved scan choice for a multi-scan .rasx on the XRD / XRR card
+  // (module_config.<type>.frame). Only applies to the file it was chosen for.
+  const xrayFrameOf = (sample, measType) => {
+    if (measType !== "xrd_ot" && measType !== "xrr") return null;
+    const c = sample?.module_config?.[measType];
+    return c && Number.isInteger(c.frame) && c.frame_file === sample.filenames?.[measType] ? c.frame : null;
+  };
+
+  // Persist the scan choice and reload that scan into the plot cache, so the
+  // card, books, XRD analysis and the XRR module all use the same frame.
+  const handleXrayFrame = async (sampleId, measType, frame) => {
+    const sample = samples.find(s => s.id === sampleId);
+    const filename = sample?.filenames?.[measType];
+    if (!sample || !filename) return;
+    await api("PATCH", `/samples/${sampleId}/module-config/${measType}`, { frame, frame_file: filename });
+    const updated = await api("GET", `/samples/${sampleId}`);
+    setSamples(p => p.map(s => s.id === sampleId ? { ...s, module_config: updated.module_config } : s));
+    const { parsed, meta } = await loadStoredPlotData(sampleId, filename, measType, sample.thickness_nm || 0, { frame });
+    if (!parsed || !hasPlotData(parsed)) return;
+    setPlotCache(p => ({ ...p, [sampleId]: { ...(p[sampleId] || {}), [measType]: parsed, [`${measType}_meta`]: meta || null } }));
   };
 
   // Saved P-E x-input setting for a sample (module_config.pe.x_input): "auto" | "voltage" | "field".
@@ -15327,6 +15387,7 @@ export default function App() {
               onReparseFiles={handleReparseFiles}
               onRsmDistance={handleRsmDistance}
               onPeXInput={handlePeXInput}
+              onXrayFrame={handleXrayFrame}
               onBack={() => setActive(null)}
               onDelete={deleteSample}
               editingMeta={editingMeta}
