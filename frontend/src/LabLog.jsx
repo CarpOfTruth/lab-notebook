@@ -2925,25 +2925,33 @@ function afmColorTicks(lo, hi) {
   return { ticks: out, decimals };
 }
 
+// Vertical color scale with nice ticks, for placing beside a map.
+function AfmColorBar({ vmin, vmax, cmap = cmAfm, unit = "", font = "'DM Mono', monospace", fontSize = 9, color, border = null }) {
+  const { ticks, decimals } = afmColorTicks(vmin, vmax);
+  const fmt = v => (Math.abs(v) < 1e-12 ? 0 : v).toFixed(decimals);
+  const pos = v => (1 - (v - vmin) / (vmax - vmin)) * 100;
+  const c = color || T.textDim;
+  return (
+    <div style={{ position: "relative", width: 16 + fontSize * 3.2, flexShrink: 0 }}>
+      <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: 9, borderRadius: border ? 0 : 1, background: afmGradient(cmap, "to top"), ...(border ? { border, boxSizing: "border-box" } : {}) }} />
+      {ticks.map(v => (
+        <div key={v} style={{ position: "absolute", left: 9, top: `${pos(v)}%`, transform: "translateY(-50%)", display: "flex", alignItems: "center", gap: 2 }}>
+          <div style={{ width: 3, height: 1, background: c }} />
+          <span style={{ fontSize, color: c, fontFamily: font, whiteSpace: "nowrap" }}>{fmt(v)}</span>
+        </div>
+      ))}
+      <span style={{ position: "absolute", left: 13, bottom: -fontSize - 4, fontSize, color: c, fontFamily: font }}>{unit}</span>
+    </div>
+  );
+}
+
 // Map plus, when `colorbar` is given (the unit), a vertical color scale on its right.
 function AfmChannelMap({ grid, scanSizeUm, vmin, vmax, colorbar = null, cmap = cmAfm }) {
   if (colorbar != null && vmin != null && vmax != null && vmax > vmin) {
-    const { ticks, decimals } = afmColorTicks(vmin, vmax);
-    const fmt = v => (Math.abs(v) < 1e-12 ? 0 : v).toFixed(decimals);
-    const pos = v => (1 - (v - vmin) / (vmax - vmin)) * 100;
     return (
       <div style={{ display: "flex", alignItems: "stretch", gap: 6 }}>
         <div style={{ flex: 1, minWidth: 0 }}><AfmChannelMapCanvas grid={grid} scanSizeUm={scanSizeUm} vmin={vmin} vmax={vmax} cmap={cmap} /></div>
-        <div style={{ position: "relative", width: 44, flexShrink: 0 }}>
-          <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: 9, borderRadius: 2, background: afmGradient(cmap, "to top") }} />
-          {ticks.map(v => (
-            <div key={v} style={{ position: "absolute", left: 9, top: `${pos(v)}%`, transform: "translateY(-50%)", display: "flex", alignItems: "center", gap: 2 }}>
-              <div style={{ width: 3, height: 1, background: T.textDim }} />
-              <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", whiteSpace: "nowrap" }}>{fmt(v)}</span>
-            </div>
-          ))}
-          <span style={{ position: "absolute", left: 13, bottom: -13, fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>{colorbar}</span>
-        </div>
+        <AfmColorBar vmin={vmin} vmax={vmax} cmap={cmap} unit={colorbar} />
       </div>
     );
   }
@@ -3018,6 +3026,7 @@ const AFM_ZERO_OPTS    = [["none", "none"], ["mean", "mean"], ["median", "median
 // One line describing a non-default flatten, e.g. "line offset · surface plane · 2 regions".
 function afmProcessingSummary(proc) {
   if (!proc || proc.default) return null;
+  if (Array.isArray(proc.chain)) return proc.chain.length ? proc.chain.map(afmStepText).join(" → ") : "raw scan (empty chain)";
   const st = proc.settings || {};
   const surf = { off: "off", plane: "plane", poly2: "2nd order", poly3: "3rd order" }[st.surface] || st.surface;
   const parts = [`line ${st.line}`, `surface ${surf}`];
@@ -3039,11 +3048,11 @@ function AfmStats({ stats, compact = false }) {
   if (compact) {
     return (
       <div style={{ fontSize: 10, color: T.textDim, fontFamily: mono, lineHeight: 1.5 }}>
-        Rq {f(stats.full.rq_nm)} nm{stats.region ? ` · region ${f(stats.region.rq_nm)} nm` : ""}
+        Rq {f(stats.full.rq_nm)} nm{stats.region ? ` · masked region ${f(stats.region.rq_nm)} nm` : ""}
       </div>
     );
   }
-  const rows = [["full map", stats.full], ...(stats.region ? [["region", stats.region]] : [])];
+  const rows = [["full map", stats.full], ...(stats.region ? [["masked region", stats.region]] : [])];
   const cell = { padding: "1px 6px", textAlign: "right" };
   return (
     <table style={{ borderCollapse: "collapse", fontSize: 10, fontFamily: mono, color: T.textSecondary, marginTop: 6 }}>
@@ -3078,10 +3087,75 @@ function AfmSegmented({ options, value, onChange }) {
   );
 }
 
-// Editor: draw include/exclude rectangles on the height map, choose the flatten steps,
-// preview live (POST /afm_preview, nothing saved), then Apply to save for this sample.
-function AfmFlattenModal({ sampleId, afmData, initial, onClose, onApply }) {
-  const [draft, setDraft]       = useState(() => ({ ...AFM_FLATTEN_DEFAULTS, ...(initial || {}), regions: [...(initial?.regions || [])] }));
+// ── AFM processing chain editor ────────────────────────────────────────────────
+// Steps run in order on the height map and share one mask of excluded pixels
+// (backend/afm.py run_chain). Build the chain one step at a time: pick a step,
+// preview it live, Apply it, continue. Click an earlier step to go back to that
+// point; applying there replaces the later steps. Save stores the chain up to the
+// selected step for this sample; nothing is saved until then.
+const AFM_STEP_LABELS = { particles: "Particles", regions: "Regions", lines: "Lines", surface: "Surface", scars: "Scars", zero: "Zero" };
+const AFM_STEP_DEFAULTS = {
+  particles: { type: "particles", k: 5, grow: 2, min_px: 4, passes: 3, polarity: "up" },
+  regions:   { type: "regions", regions: [] },
+  lines:     { type: "lines", mode: "linear" },
+  surface:   { type: "surface", order: "poly2" },
+  scars:     { type: "scars", k: 4, min_len: 8 },
+  zero:      { type: "zero", mode: "median" },
+};
+const AFM_RECOMMENDED_CHAIN = [AFM_STEP_DEFAULTS.particles, AFM_STEP_DEFAULTS.lines, AFM_STEP_DEFAULTS.surface, AFM_STEP_DEFAULTS.zero];
+
+function afmStepText(st) {
+  if (!st) return "";
+  switch (st.type) {
+    case "particles": return `particles · ${st.k}×σ ${st.polarity === "both" ? "±" : "above"} · grow ${st.grow} px · ${st.passes} pass${st.passes === 1 ? "" : "es"}`;
+    case "regions": {
+      const inc = (st.regions || []).filter(r => r.mode === "include").length, exc = (st.regions || []).length - inc;
+      return `regions · ${[inc && `${inc} include`, exc && `${exc} exclude`].filter(Boolean).join(" + ") || "none"}`;
+    }
+    case "lines":   return `lines · ${{ offset: "offset", linear: "linear", quadratic: "quadratic", mdiff: "median of differences" }[st.mode]}`;
+    case "surface": return `surface · ${{ plane: "plane", poly2: "2nd order", poly3: "3rd order" }[st.order]}`;
+    case "scars":   return `scars · ${st.k}×σ · ≥ ${st.min_len} px`;
+    case "zero":    return `zero · ${st.mode}`;
+    default:        return st.type;
+  }
+}
+function afmStepResult(info) {
+  if (!info) return "";
+  if (info.skipped) return `skipped: ${info.skipped}`;
+  if (info.type === "particles") return `${info.found} found · ${(info.coverage * 100).toFixed(1)}% masked`;
+  if (info.type === "regions") return `${(info.kept * 100).toFixed(0)}% of map kept`;
+  if (info.type === "lines" && info.fallback_lines) return `${info.fallback_lines} lines used the whole line`;
+  if (info.type === "scars") return `${info.fixed_lines} line${info.fixed_lines === 1 ? "" : "s"} repaired`;
+  return "";
+}
+
+// Semi-transparent red overlay of the excluded pixels (bit-packed mask from the preview).
+function AfmMaskOverlay({ b64, shape }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!b64 || !shape || !ref.current) return;
+    const [H, W] = shape;
+    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const c = ref.current; c.width = W; c.height = H;
+    const ctx = c.getContext("2d"); const img = ctx.createImageData(W, H);
+    for (let i = 0; i < H * W; i++) {
+      if ((bytes[i >> 3] >> (7 - (i & 7))) & 1) { const o = i * 4; img.data[o] = 255; img.data[o + 1] = 60; img.data[o + 2] = 60; img.data[o + 3] = 105; }
+    }
+    ctx.putImageData(img, 0, 0);
+  }, [b64, shape]);
+  return <canvas ref={ref} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", imageRendering: "pixelated", pointerEvents: "none", borderRadius: 4 }} />;
+}
+
+function AfmFlattenModal({ sampleId, afmData, initial, legacyCustom = false, onClose, onApply }) {
+  const legacy = !Array.isArray(initial?.steps);
+  const [steps, setSteps]   = useState(() => (Array.isArray(initial?.steps) ? initial.steps.map(s => ({ ...s })) : []));
+  const [cursor, setCursor] = useState(() => (Array.isArray(initial?.steps) ? initial.steps.length : 0));
+  const [draft, setDraft]   = useState(null);
+  const [display, setDisplay] = useState(() => ({
+    range_min: initial?.range_min ?? null, range_max: initial?.range_max ?? null,
+    colormap: initial?.colormap || "afm", color_trim: initial?.color_trim ?? 0,
+  }));
+  const [showMask, setShowMask] = useState(true);
   const [drawMode, setDrawMode] = useState("include");
   const [dragRect, setDragRect] = useState(null);
   const [preview, setPreview]   = useState(null);
@@ -3090,16 +3164,21 @@ function AfmFlattenModal({ sampleId, afmData, initial, onClose, onApply }) {
   const [saving, setSaving]     = useState(false);
   const overlayRef = useRef(null);
   const reqId = useRef(0);
-  const set = (k, v) => setDraft(d => ({ ...d, [k]: v }));
+  const mono = "'DM Mono', monospace";
+  const setD = (k, v) => setDisplay(d => ({ ...d, [k]: v }));
+  const setP = (k, v) => setDraft(d => ({ ...d, [k]: v }));
 
-  const draftKey = JSON.stringify(draft);
+  const active = steps.slice(0, cursor);
+  const running = draft ? [...active, draft] : active;
+  const reqKey = JSON.stringify({ running, display });
   useEffect(() => {
     const id = ++reqId.current;
     setBusy(true);
     const t = setTimeout(async () => {
       try {
         const res = await fetch(`${API_BASE}/samples/${encodeURIComponent(sampleId)}/afm_preview`, {
-          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settings: draft }),
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ settings: { ...display, steps: running.map(s => s.type === "regions" ? { ...s, file: afmData?.filename } : s) } }),
         });
         const json = await res.json();
         if (id !== reqId.current) return;
@@ -3110,61 +3189,88 @@ function AfmFlattenModal({ sampleId, afmData, initial, onClose, onApply }) {
     }, 300);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draftKey, sampleId]);
+  }, [reqKey, sampleId]);
 
   const heightName = preview?.channel_names?.[0];
   const grid  = preview?.channels?.[heightName] ?? null;
   const range = preview?.channel_ranges?.[heightName] ?? [null, null];
   const stats = preview?.stats?.[heightName];
   const proc  = preview?.processing;
-  const rangeBad = draft.range_min != null && draft.range_max != null && draft.range_min >= draft.range_max;
-  const draftCmap = useMemo(() => afmColormap(draft.colormap, draft.color_trim), [draft.colormap, draft.color_trim]);
+  const infos = proc?.step_infos || [];
+  const cmap  = useMemo(() => afmColormap(display.colormap, display.color_trim), [display.colormap, display.color_trim]);
+  const rangeBad = display.range_min != null && display.range_max != null && display.range_min >= display.range_max;
   const numOrNull = v => (v === "" || v == null || !isFinite(Number(v))) ? null : Number(v);
 
+  // rectangle drawing (only while a Regions step is being built)
+  const drawing = draft?.type === "regions";
   const frac = e => {
     const r = overlayRef.current.getBoundingClientRect();
     return { x: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)), y: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)) };
   };
-  const onDown = e => { if (e.button !== 0) return; const p = frac(e); setDragRect({ x0: p.x, y0: p.y, x1: p.x, y1: p.y }); };
+  const onDown = e => { if (!drawing || e.button !== 0) return; const p = frac(e); setDragRect({ x0: p.x, y0: p.y, x1: p.x, y1: p.y }); };
   const onMove = e => { if (!dragRect) return; const p = frac(e); setDragRect(r => ({ ...r, x1: p.x, y1: p.y })); };
   const onUp = () => {
     if (!dragRect) return;
     const r = { x0: Math.min(dragRect.x0, dragRect.x1), y0: Math.min(dragRect.y0, dragRect.y1), x1: Math.max(dragRect.x0, dragRect.x1), y1: Math.max(dragRect.y0, dragRect.y1), mode: drawMode };
     setDragRect(null);
-    if (r.x1 - r.x0 > 0.01 && r.y1 - r.y0 > 0.01) set("regions", [...draft.regions, r]);
+    if (r.x1 - r.x0 > 0.01 && r.y1 - r.y0 > 0.01) setDraft(d => ({ ...d, regions: [...(d.regions || []), r] }));
   };
   const rectStyle = (r, mode, dashed) => ({
     position: "absolute", left: `${r.x0 * 100}%`, top: `${r.y0 * 100}%`, width: `${(r.x1 - r.x0) * 100}%`, height: `${(r.y1 - r.y0) * 100}%`,
-    border: `1.5px ${dashed ? "dashed" : "solid"} ${mode === "exclude" ? T.red : T.teal}`,
-    background: mode === "exclude" ? "rgba(248,113,113,0.12)" : "rgba(45,212,191,0.10)", boxSizing: "border-box",
+    border: `1.5px ${dashed ? "dashed" : "solid"} ${mode === "exclude" ? T.red : T.teal}`, boxSizing: "border-box",
   });
-  const mono = "'DM Mono', monospace";
-  const label = txt => <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, width: 70, flexShrink: 0 }}>{txt}</span>;
 
-  const apply = async () => {
+  const applyDraft = () => {
+    if (!draft || (draft.type === "regions" && !(draft.regions || []).length)) return;
+    const next = [...active, { ...draft }];
+    setSteps(next); setCursor(next.length); setDraft(null);
+  };
+  const removeStep = i => {
+    const next = steps.filter((_, j) => j !== i);
+    setSteps(next); setCursor(c => (i < c ? c - 1 : Math.min(c, next.length))); setDraft(null);
+  };
+  const save = async (useStandard = false) => {
     setSaving(true); setError(null);
-    try { await onApply({ ...draft, regions_file: afmData?.filename || null }); onClose(); }
-    catch (e) { setError(e.message || "Could not save"); }
+    try {
+      const chain = active.map(s => s.type === "regions" ? { ...s, file: afmData?.filename || null } : s);
+      await onApply(useStandard
+        ? { ...AFM_FLATTEN_DEFAULTS, ...display, steps: null }
+        : { ...display, steps: chain });
+      onClose();
+    } catch (e) { setError(e.message || "Could not save"); }
     setSaving(false);
   };
 
+  const label = txt => <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, width: 64, flexShrink: 0 }}>{txt}</span>;
+  const numInput = (value, onChange, width = 52, props = {}) => (
+    <DeferredInput type="number" value={value ?? ""} onChange={onChange} className="no-spin" step="any" {...props}
+      style={{ width, background: T.bg0, border: `1px solid ${props.bad ? T.red : T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "3px 6px", outline: "none", textAlign: "center" }} />
+  );
+  const later = steps.length - cursor;
+
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}>
-      <div onClick={e => e.stopPropagation()} style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 10, padding: 18, width: "min(860px, 94vw)", maxHeight: "92vh", overflow: "auto", boxShadow: "0 10px 40px rgba(0,0,0,.4)" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 10, padding: 18, width: "min(1000px, 96vw)", maxHeight: "94vh", overflow: "auto", boxShadow: "0 10px 40px rgba(0,0,0,.4)" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.textPrimary }}>Height flattening · {sampleId}</span>
+          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.textPrimary }}>Height processing · {sampleId}</span>
           <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, fontSize: 18, cursor: "pointer" }}>✕</button>
         </div>
+        {legacy && (
+          <div style={{ fontFamily: mono, fontSize: 10, color: T.amber, marginBottom: 10, lineHeight: 1.5 }}>
+            This sample uses the standard single-pass flatten{legacyCustom ? " with its own settings" : ""}. It stays that way unless you save a chain.
+          </div>
+        )}
         <div style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
-          <div style={{ width: 420, maxWidth: "100%" }}>
+          {/* map */}
+          <div style={{ width: 440, maxWidth: "100%" }}>
             <div style={{ position: "relative", width: "100%", aspectRatio: "1 / 1", background: T.bg3, borderRadius: 4 }}>
-              {grid && <AfmChannelMapCanvas grid={grid} scanSizeUm={preview.scan_size_um} vmin={range[0]} vmax={range[1]} cmap={draftCmap} />}
+              {grid && <AfmChannelMapCanvas grid={grid} scanSizeUm={preview.scan_size_um} vmin={range[0]} vmax={range[1]} cmap={cmap} />}
+              {showMask && proc?.mask && <AfmMaskOverlay b64={proc.mask} shape={proc.mask_shape} />}
               <div ref={overlayRef} onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
-                style={{ position: "absolute", inset: 0, cursor: "crosshair" }}>
-                {draft.regions.map((r, i) => (
+                style={{ position: "absolute", inset: 0, cursor: drawing ? "crosshair" : "default" }}>
+                {drawing && (draft.regions || []).map((r, i) => (
                   <div key={i} style={rectStyle(r, r.mode, false)}>
-                    <button onMouseDown={e => e.stopPropagation()} onClick={() => set("regions", draft.regions.filter((_, j) => j !== i))}
-                      title="Remove region"
+                    <button onMouseDown={e => e.stopPropagation()} onClick={() => setP("regions", draft.regions.filter((_, j) => j !== i))} title="Remove rectangle"
                       style={{ position: "absolute", top: -1, right: -1, width: 16, height: 16, lineHeight: "14px", padding: 0, fontSize: 11, border: "none", borderRadius: 2, cursor: "pointer", background: r.mode === "exclude" ? T.red : T.teal, color: T.bg0 }}>×</button>
                   </div>
                 ))}
@@ -3172,68 +3278,144 @@ function AfmFlattenModal({ sampleId, afmData, initial, onClose, onApply }) {
               </div>
               {busy && <div style={{ position: "absolute", top: 6, left: 8, fontSize: 10, fontFamily: mono, color: T.textDim, pointerEvents: "none" }}>updating…</div>}
             </div>
-            <div style={{ fontSize: 10, fontFamily: mono, color: T.textDim, marginTop: 6, lineHeight: 1.5 }}>
-              Drag on the map to add a rectangle. Regions choose the pixels the fits and region statistics use; the flatten is applied to the whole map.
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, fontSize: 10, fontFamily: mono, color: T.textDim }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                <input type="checkbox" checked={showMask} onChange={e => setShowMask(e.target.checked)} /> show mask
+              </label>
+              {stats?.mask_fraction > 0 && <span>{(stats.mask_fraction * 100).toFixed(1)}% of pixels masked</span>}
+              <span style={{ marginLeft: "auto" }}>{range[0]} to {range[1]} nm</span>
             </div>
+            <AfmStats stats={stats} />
           </div>
-          <div style={{ flex: 1, minWidth: 280, display: "flex", flexDirection: "column", gap: 10 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("DRAW")}
-              <AfmSegmented options={[["include", "include"], ["exclude", "exclude"]]} value={drawMode} onChange={setDrawMode} />
-              {draft.regions.length > 0 && <button onClick={() => set("regions", [])} style={{ background: "none", border: "none", color: T.textDim, fontFamily: mono, fontSize: 10, cursor: "pointer", textDecoration: "underline" }}>clear {draft.regions.length}</button>}
+
+          {/* chain + next step + display */}
+          <div style={{ flex: 1, minWidth: 320, display: "flex", flexDirection: "column", gap: 10 }}>
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textSecondary, letterSpacing: 1 }}>CHAIN</span>
+                <div style={{ flex: 1 }} />
+                <Btn variant="ghost" small disabled={cursor === 0} onClick={() => { setCursor(c => Math.max(0, c - 1)); setDraft(null); }}>◀ step back</Btn>
+                <Btn variant="ghost" small disabled={!steps.length} onClick={() => { setSteps([]); setCursor(0); setDraft(null); }}>reset</Btn>
+                <Btn variant="ghost" small onClick={() => { setSteps(AFM_RECOMMENDED_CHAIN.map(s => ({ ...s }))); setCursor(AFM_RECOMMENDED_CHAIN.length); setDraft(null); }}>recommended</Btn>
+              </div>
+              {[{ key: "raw", text: "raw scan", idx: 0 }, ...steps.map((st, i) => ({ key: i, text: afmStepText(st), idx: i + 1, i }))].map(row => {
+                const current = row.idx === cursor && !draft;
+                const dimmed = row.idx > cursor;
+                const info = row.i != null && row.i < cursor ? afmStepResult(infos[row.i]) : "";
+                return (
+                  <div key={row.key} onClick={() => { setCursor(row.idx); setDraft(null); }}
+                    style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 8px", marginBottom: 2, borderRadius: 4, cursor: "pointer",
+                      background: current ? T.bg3 : "transparent", border: `1px solid ${current ? T.borderBright : "transparent"}`, opacity: dimmed ? 0.45 : 1 }}>
+                    <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, width: 14 }}>{row.idx}</span>
+                    <span style={{ fontFamily: mono, fontSize: 11, color: T.textPrimary }}>{row.text}</span>
+                    {info && <span style={{ fontFamily: mono, fontSize: 10, color: /skipped/.test(info) ? T.amber : T.textDim }}>{info}</span>}
+                    {row.i != null && (
+                      <button onClick={e => { e.stopPropagation(); removeStep(row.i); }} title="Remove step"
+                        style={{ marginLeft: "auto", background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 12 }}>×</button>
+                    )}
+                  </div>
+                );
+              })}
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("LINES")}<AfmSegmented options={AFM_LINE_OPTS} value={draft.line} onChange={v => set("line", v)} /></div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("SURFACE")}<AfmSegmented options={AFM_SURFACE_OPTS} value={draft.surface} onChange={v => set("surface", v)} /></div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("OUTLIERS")}
-              <DeferredInput type="number" value={draft.outlier_iqr} onChange={v => set("outlier_iqr", Math.max(0, Math.min(100, Number(v) || 0)))}
-                className="no-spin" min="0" step="0.5"
-                style={{ width: 52, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "3px 6px", outline: "none", textAlign: "center" }} />
-              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>× IQR left out of fits (0 = keep all)</span>
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("ZERO")}<AfmSegmented options={AFM_ZERO_OPTS} value={draft.zero} onChange={v => set("zero", v)} /></div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("COLOR")}
-              {[["range_min", "min"], ["range_max", "max"]].map(([k, ph]) => (
-                <DeferredInput key={k} type="number" value={draft[k] ?? ""} onChange={v => set(k, numOrNull(v))}
-                  className="no-spin" step="any" placeholder={`${ph} auto`}
-                  style={{ width: 70, background: T.bg0, border: `1px solid ${rangeBad ? T.red : T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "3px 6px", outline: "none", textAlign: "center" }} />
-              ))}
-              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>nm · blank = auto from {draft.regions.length ? "region" : "full map"}</span>
-            </div>
-            {rangeBad && <div style={{ fontSize: 10, fontFamily: mono, color: T.red }}>min must be below max; using the automatic scale until fixed</div>}
-            <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>{label("PALETTE")}
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 4, maxWidth: 300 }}>
-                {AFM_COLORMAP_OPTS.map(name => (
-                  <button key={name} onClick={() => set("colormap", name)} title={name}
-                    style={{ display: "flex", flexDirection: "column", gap: 3, padding: "3px 5px", borderRadius: 4, cursor: "pointer", background: draft.colormap === name ? T.bg3 : "none", border: `1px solid ${draft.colormap === name ? T.borderBright : T.border}` }}>
-                    <span style={{ fontFamily: mono, fontSize: 9, color: draft.colormap === name ? T.textPrimary : T.textDim, textAlign: "left" }}>{name === "afm" ? "AFM" : name}</span>
-                    <div style={{ width: 56, height: 7, borderRadius: 2, background: afmGradient(afmColormap(name, draft.color_trim)) }} />
+
+            <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap", marginBottom: 8 }}>
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textSecondary, letterSpacing: 1, marginRight: 4 }}>NEXT STEP</span>
+                {Object.keys(AFM_STEP_LABELS).map(t => (
+                  <button key={t} onClick={() => setDraft(draft?.type === t ? null : { ...AFM_STEP_DEFAULTS[t], ...(t === "regions" ? { regions: [] } : {}) })}
+                    style={{ fontFamily: mono, fontSize: 10, padding: "3px 8px", borderRadius: 4, cursor: "pointer",
+                      background: draft?.type === t ? T.bg3 : T.bg0, color: draft?.type === t ? T.textPrimary : T.textDim, border: `1px solid ${draft?.type === t ? T.borderBright : T.border}` }}>
+                    + {AFM_STEP_LABELS[t]}
                   </button>
                 ))}
               </div>
+              {draft && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, padding: 10 }}>
+                  {draft.type === "particles" && <>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("THRESHOLD")}
+                      {numInput(draft.k, v => setP("k", Math.max(1, Math.min(50, Number(v) || 5))))}
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>× robust σ from the background</span></div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("DIRECTION")}
+                      <AfmSegmented options={[["up", "above (particles)"], ["both", "above + below"]]} value={draft.polarity} onChange={v => setP("polarity", v)} /></div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("GROW")}
+                      {numInput(draft.grow, v => setP("grow", Math.max(0, Math.min(20, Math.round(Number(v) || 0)))))}
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>px around each particle</span></div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("MIN SIZE")}
+                      {numInput(draft.min_px, v => setP("min_px", Math.max(1, Math.round(Number(v) || 1))))}
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>px; smaller specks ignored</span></div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("PASSES")}
+                      <AfmSegmented options={[[1, "1"], [2, "2"], [3, "3"], [4, "4"]]} value={draft.passes} onChange={v => setP("passes", v)} />
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>re-level without particles, detect again</span></div>
+                  </>}
+                  {draft.type === "regions" && <>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("DRAW")}
+                      <AfmSegmented options={[["include", "include"], ["exclude", "exclude"]]} value={drawMode} onChange={setDrawMode} />
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>drag on the map · {(draft.regions || []).length} drawn</span></div>
+                    <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, lineHeight: 1.5 }}>Include keeps only the rectangles; exclude masks them. The flatten still acts on the whole map.</div>
+                  </>}
+                  {draft.type === "lines" && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("MODE")}
+                      <AfmSegmented options={[["offset", "offset"], ["linear", "linear"], ["quadratic", "quad"], ["mdiff", "median diff"]]} value={draft.mode} onChange={v => setP("mode", v)} /></div>
+                  )}
+                  {draft.type === "surface" && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("ORDER")}
+                      <AfmSegmented options={[["plane", "plane"], ["poly2", "2nd"], ["poly3", "3rd"]]} value={draft.order} onChange={v => setP("order", v)} /></div>
+                  )}
+                  {draft.type === "scars" && <>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("THRESHOLD")}
+                      {numInput(draft.k, v => setP("k", Math.max(1, Math.min(50, Number(v) || 4))))}
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>× σ above or below both neighbouring lines</span></div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("MIN LENGTH")}
+                      {numInput(draft.min_len, v => setP("min_len", Math.max(2, Math.round(Number(v) || 8))))}
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>px along the line</span></div>
+                  </>}
+                  {draft.type === "zero" && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("SET 0 AT")}
+                      <AfmSegmented options={[["median", "median"], ["mean", "mean"], ["min", "min"]]} value={draft.mode} onChange={v => setP("mode", v)} />
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>of unmasked pixels</span></div>
+                  )}
+                  {infos[cursor] && <div style={{ fontFamily: mono, fontSize: 10, color: T.teal }}>preview: {afmStepResult(infos[cursor]) || "applied"}</div>}
+                  {later > 0 && <div style={{ fontFamily: mono, fontSize: 10, color: T.amber }}>Applying here replaces the {later} later step{later === 1 ? "" : "s"}.</div>}
+                  <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                    <Btn variant="ghost" small onClick={() => setDraft(null)}>discard</Btn>
+                    <Btn variant="teal" small disabled={draft.type === "regions" && !(draft.regions || []).length} onClick={applyDraft}>apply step</Btn>
+                  </div>
+                </div>
+              )}
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("TRIM %")}
-              <DeferredInput type="number" value={draft.color_trim} onChange={v => set("color_trim", Math.max(0, Math.min(49, Number(v) || 0)))}
-                className="no-spin" min="0" max="49" step="1"
-                style={{ width: 52, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "3px 6px", outline: "none", textAlign: "center" }} />
-              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>cut from each end of the palette</span>
+
+            <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 8, display: "flex", flexDirection: "column", gap: 8 }}>
+              <span style={{ fontFamily: mono, fontSize: 10, color: T.textSecondary, letterSpacing: 1 }}>DISPLAY</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("COLOR")}
+                {numInput(display.range_min, v => setD("range_min", numOrNull(v)), 68, { placeholder: "min auto", bad: rangeBad })}
+                {numInput(display.range_max, v => setD("range_max", numOrNull(v)), 68, { placeholder: "max auto", bad: rangeBad })}
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>nm · blank = auto from the unmasked pixels</span>
+              </div>
+              {rangeBad && <div style={{ fontSize: 10, fontFamily: mono, color: T.red }}>min must be below max; using the automatic scale until fixed</div>}
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>{label("PALETTE")}
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                  {AFM_COLORMAP_OPTS.map(name => (
+                    <button key={name} onClick={() => setD("colormap", name)} title={name}
+                      style={{ display: "flex", flexDirection: "column", gap: 3, padding: "3px 5px", borderRadius: 4, cursor: "pointer", background: display.colormap === name ? T.bg3 : "none", border: `1px solid ${display.colormap === name ? T.borderBright : T.border}` }}>
+                      <span style={{ fontFamily: mono, fontSize: 9, color: display.colormap === name ? T.textPrimary : T.textDim, textAlign: "left" }}>{name === "afm" ? "AFM" : name}</span>
+                      <div style={{ width: 52, height: 7, borderRadius: 2, background: afmGradient(afmColormap(name, display.color_trim)) }} />
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("TRIM %")}
+                {numInput(display.color_trim, v => setD("color_trim", Math.max(0, Math.min(49, Number(v) || 0))))}
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>cut from each end of the palette</span>
+              </div>
             </div>
-            {grid && (
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("SCALE")}
-                <div style={{ flex: 1, maxWidth: 220, height: 8, borderRadius: 2, background: afmGradient(draftCmap) }} />
-                <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>{range[0]} to {range[1]} nm</span>
-              </div>
-            )}
-            <AfmStats stats={stats} />
-            {proc?.fallback_lines > 0 && (
-              <div style={{ fontSize: 10, fontFamily: mono, color: T.amber, lineHeight: 1.5 }}>
-                ⚠ {proc.fallback_lines} scan lines have too few region pixels; their line fit uses the whole line.
-              </div>
-            )}
-            {(proc?.warnings || []).map(w => <div key={w} style={{ fontSize: 10, fontFamily: mono, color: T.amber }}>⚠ {w}</div>)}
+
             {error && <div style={{ fontSize: 10, fontFamily: mono, color: T.red }}>{error}</div>}
-            <div style={{ display: "flex", gap: 8, marginTop: "auto", justifyContent: "flex-end" }}>
-              <Btn variant="ghost" small onClick={() => setDraft({ ...AFM_FLATTEN_DEFAULTS, regions: [] })}>Reset to default</Btn>
-              <Btn variant="ghost" small onClick={onClose}>Cancel</Btn>
-              <Btn variant="primary" small disabled={saving} onClick={apply}>{saving ? "Saving…" : "Apply"}</Btn>
+            <div style={{ display: "flex", gap: 8, marginTop: "auto", justifyContent: "flex-end", flexWrap: "wrap" }}>
+              <Btn variant="ghost" small disabled={saving} onClick={() => save(true)}>use standard flatten</Btn>
+              <Btn variant="ghost" small onClick={onClose}>cancel</Btn>
+              <Btn variant="primary" small disabled={saving || !!draft} onClick={() => save(false)}>
+                {saving ? "saving…" : draft ? "apply or discard the step first" : `save chain (${cursor} step${cursor === 1 ? "" : "s"})`}
+              </Btn>
             </div>
           </div>
         </div>
@@ -3304,6 +3486,7 @@ function AfmCard({ afmData, filename, onFile, sampleId, afmConfig, onAfmSettings
       {flattenOpen && (
         <AfmFlattenModal sampleId={sampleId} afmData={afmData}
           initial={proc?.settings ? { ...afmConfig, ...proc.settings } : afmConfig}
+          legacyCustom={!!proc && !proc.default && !Array.isArray(proc.chain)}
           onClose={() => setFlattenOpen(false)} onApply={onAfmSettings} />
       )}
       <div style={{ padding: "10px 12px" }}>
@@ -11077,6 +11260,63 @@ function DfComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
 // ── AFM Comparison Panel ───────────────────────────────────────────────────────
 
+// RMS in pm below 1 nm, nm above — the same switch the scale bar makes between nm and µm.
+function fmtAfmRms(nm) {
+  if (nm == null || !isFinite(nm)) return "—";
+  if (nm < 1) return `${Math.round(nm * 1000)} pm`;
+  return `${nm >= 10 ? nm.toFixed(1) : nm.toFixed(2)} nm`;
+}
+
+// Notebook AFM map: solid box, scan-area axes in µm with ticks and labels, side color bar,
+// optional RMS (masked region) in the top-right corner.
+function AfmFramedMap({ grid, scanSizeUm, vmin, vmax, cmap, unit, rmsNm = null, font, fontSize = 11, width = 240 }) {
+  const f = font || "'DM Mono', monospace";
+  const fs = Math.max(8, fontSize - 1);
+  const size = Number(scanSizeUm) || 0;
+  const { ticks, decimals } = afmColorTicks(0, size);
+  const fmt = v => v.toFixed(decimals);
+  const yAxisW = fs * 3 + 10;
+  const box = `1.5px solid ${T.textPrimary}`;
+  const hasBar = vmin != null && vmax != null && vmax > vmin;
+  const barW = hasBar ? 16 + fs * 3.2 + 6 : 0;
+  return (
+    <div style={{ width: width + yAxisW + barW }}>
+      <div style={{ display: "flex", alignItems: "stretch" }}>
+        {/* y axis: 0 at the bottom */}
+        <div style={{ position: "relative", width: yAxisW, flexShrink: 0 }}>
+          {size > 0 && ticks.map(v => (
+            <div key={v} style={{ position: "absolute", right: 0, top: `${(1 - v / size) * 100}%`, transform: "translateY(-50%)", display: "flex", alignItems: "center", gap: 2 }}>
+              <span style={{ fontSize: fs, color: T.textSecondary, fontFamily: f }}>{fmt(v)}</span>
+              <div style={{ width: 4, height: 1.5, background: T.textPrimary }} />
+            </div>
+          ))}
+        </div>
+        <div style={{ position: "relative", width, border: box, boxSizing: "content-box", lineHeight: 0 }}>
+          <AfmChannelMapCanvas grid={grid} scanSizeUm={scanSizeUm} vmin={vmin} vmax={vmax} cmap={cmap} />
+          {rmsNm != null && (
+            <div style={{ position: "absolute", top: 4, right: 6, fontFamily: f, fontSize: fs + 1, fontWeight: 700, color: "#fff", lineHeight: 1.2,
+              textShadow: "0 0 3px rgba(0,0,0,.9), 0 0 2px rgba(0,0,0,.9)" }}>
+              RMS {fmtAfmRms(rmsNm)}
+            </div>
+          )}
+        </div>
+        {hasBar && <div style={{ width: 6 }} />}
+        {hasBar && <AfmColorBar vmin={vmin} vmax={vmax} cmap={cmap} unit={unit} font={f} fontSize={fs} color={T.textSecondary} border={box} />}
+      </div>
+      {/* x axis */}
+      <div style={{ position: "relative", marginLeft: yAxisW, width: width + 3, height: fs + 8 }}>
+        {size > 0 && ticks.map(v => (
+          <div key={v} style={{ position: "absolute", left: `${(v / size) * 100}%`, top: 0, transform: "translateX(-50%)", display: "flex", flexDirection: "column", alignItems: "center" }}>
+            <div style={{ width: 1.5, height: 4, background: T.textPrimary }} />
+            <span style={{ fontSize: fs, color: T.textSecondary, fontFamily: f, lineHeight: 1.1 }}>{fmt(v)}</span>
+          </div>
+        ))}
+      </div>
+      <div style={{ marginLeft: yAxisW, width, textAlign: "center", fontSize: fs, color: T.textSecondary, fontFamily: f, marginTop: 2 }}>µm</div>
+    </div>
+  );
+}
+
 function AfmComparisonPanel({ sampleOrder, plotCache, labels = {}, plotStyle, config = {}, onUpdate }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
 
@@ -11112,11 +11352,14 @@ function AfmComparisonPanel({ sampleOrder, plotCache, labels = {}, plotStyle, co
           const vmax = chOverride[1] != null ? chOverride[1] : perSample[1];
           return (
             <div key={sid} style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
-              <div style={{ width: mapPx }}>
+              <div>
                 {grid ? (
-                  <AfmChannelMap grid={grid} scanSizeUm={afmData.scan_size_um} vmin={vmin} vmax={vmax}
+                  <AfmFramedMap grid={grid} scanSizeUm={afmData.scan_size_um} vmin={vmin} vmax={vmax} width={mapPx}
                     cmap={afmColormap(afmData.processing?.settings?.colormap, afmData.processing?.settings?.color_trim)}
-                    colorbar={afmData.channel_units?.[activeChannel] ?? (activeChannel?.toLowerCase().includes("height") ? "nm" : activeChannel?.toLowerCase().includes("phase") ? "°" : "")} />
+                    unit={afmData.channel_units?.[activeChannel] ?? (activeChannel?.toLowerCase().includes("height") ? "nm" : activeChannel?.toLowerCase().includes("phase") ? "°" : "")}
+                    font={ps.font} fontSize={ps.fontSize || 11}
+                    rmsNm={config.afm_show_rms && afmData.stats?.[activeChannel]
+                      ? (afmData.stats[activeChannel].region?.rq_nm ?? afmData.stats[activeChannel].full?.rq_nm) : null} />
                 ) : (
                   <div style={{ width: mapPx, height: mapPx, background: T.bg3, borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center" }}>
                     <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>no data</span>
@@ -13346,6 +13589,20 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                   </div>
                 ) : null;
               })()}
+              {type === "afm" && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }} title="RMS roughness of the masked region (the pixels the fits use), shown in each map's top-right corner">
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>RMS</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {["off", "on"].map((opt, idx) => (
+                      <button key={opt} onClick={() => onUpdate({ afm_show_rms: opt === "on" })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (config.afm_show_rms ? "on" : "off") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (config.afm_show_rms ? "on" : "off") === opt ? T.textPrimary : T.textDim, cursor: "pointer" }}>
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>masked region, top right</span>
+                </div>
+              )}
               {/* Color range — AFM only, keyed per channel */}
               {type === "afm" && (() => {
                 const afmChannelNames = sampleOrder.map(sid => plotCache[sid]?.afm?.channel_names).find(Boolean) || [];
