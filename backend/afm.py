@@ -23,6 +23,8 @@ import numpy as np
 LINE_MODES = ("off", "offset", "linear", "quadratic")
 SURFACE_MODES = ("off", "plane", "poly2", "poly3")
 ZERO_MODES = ("none", "mean", "median", "min")
+# Display-only colormap choice; "afm" is LabLog's original AFM palette, the rest match the notebooks.
+COLORMAPS = ("afm", "viridis", "cividis", "inferno", "magma", "plasma", "coolwarm")
 MIN_REGION_PIXELS = 16
 
 DEFAULT_SETTINGS = {
@@ -32,6 +34,10 @@ DEFAULT_SETTINGS = {
     "zero": "none",
     "regions": [],             # [{x0, y0, x1, y1, mode: include|exclude}], fractions of the displayed map
     "regions_file": None,      # stored filename the regions were drawn on
+    "range_min": None,         # height color scale limits in nm (None = automatic 0.5–99.5 %)
+    "range_max": None,
+    "colormap": "afm",         # display palette
+    "color_trim": 0.0,         # % cut from each end of the palette (as in the notebooks' Trim %)
 }
 
 
@@ -65,6 +71,21 @@ def normalize_settings(raw: Optional[dict]) -> dict:
                         "mode": "exclude" if r.get("mode") == "exclude" else "include"})
     s["regions"] = regions
     s["regions_file"] = raw.get("regions_file") or None
+    for k in ("range_min", "range_max"):
+        try:
+            v = raw.get(k)
+            s[k] = float(v) if v is not None and v != "" and np.isfinite(float(v)) else None
+        except (TypeError, ValueError):
+            s[k] = None
+    if raw.get("colormap") in COLORMAPS:
+        s["colormap"] = raw["colormap"]
+    try:
+        t = float(raw.get("color_trim", 0) or 0)
+        s["color_trim"] = t if 0 <= t <= 49 else 0.0
+    except (TypeError, ValueError):
+        s["color_trim"] = 0.0
+    if s["range_min"] is not None and s["range_max"] is not None and s["range_min"] >= s["range_max"]:
+        s["range_min"] = s["range_max"] = None      # inverted limits: fall back to automatic
     return s
 
 

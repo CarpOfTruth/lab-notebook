@@ -1361,13 +1361,22 @@ def _afm_payload(sample_id: str, override: Optional[dict] = None, preview: bool 
             channel_units[ch_label] = "nm"
             stats[ch_label] = {"full": roughness(ch), "region": roughness(ch, mask) if regions_active else None}
 
-        # Percentile-clipped display range (robust against outliers for all channels)
-        ch_flat = ch.ravel()
+        # Percentile-clipped display range (robust against outliers for all channels).
+        # For the height map, the automatic range comes from the region mask when regions
+        # are set, so the colors follow the part of the scan the analysis uses.
+        range_src = ch[mask] if (processed and regions_active and mask is not None) else ch
+        ch_flat = range_src.ravel()
         ch_ok = np.isfinite(ch_flat)
         if ch_ok.any():
             vmin, vmax = np.percentile(ch_flat[ch_ok], [0.5, 99.5])
         else:
             vmin, vmax = 0.0, 1.0
+        if processed:
+            # Height color scale limits set on the card (either side may stay automatic)
+            if settings["range_min"] is not None:
+                vmin = settings["range_min"]
+            if settings["range_max"] is not None:
+                vmax = settings["range_max"]
         channel_ranges[ch_label] = [round(float(vmin), 4), round(float(vmax), 4)]
 
         channels[ch_label] = np.round(ch, 4).tolist() if preview else ch.tolist()
@@ -1390,6 +1399,8 @@ def _afm_payload(sample_id: str, override: Optional[dict] = None, preview: bool 
         "processing": {
             "settings":        shown,
             "default":         is_default(settings, regions_active),
+            "range_manual":    [settings["range_min"] is not None, settings["range_max"] is not None],
+            "range_basis":     "region" if regions_active else "full map",
             "regions_active":  regions_active,
             "regions_ignored": regions_ignored,
             "region_pixels":   int(mask.sum()) if mask is not None else None,
