@@ -1278,21 +1278,35 @@ def delete_file(sample_id: str, filename: str):
     return {"ok": True}
 
 
-@app.get("/api/samples/{sample_id}/afm_data")
-def get_afm_data(sample_id: str):
-    """Read the stored .ibw file, process each channel, and return display-ready JSON."""
+def _afm_payload(sample_id: str, override: Optional[dict] = None, preview: bool = False) -> dict:
+    """Read the stored .ibw, flatten its height channel with the sample's saved
+    AFM settings (module_config.afm) or `override`, and return display-ready JSON plus
+    roughness for the full map and for the region mask. See backend/afm.py."""
     try:
         import numpy as np
         import igor2.binarywave as bw
     except ImportError:
         raise HTTPException(500, "igor2 / numpy not installed — run: pip install igor2 numpy")
+    from afm import normalize_settings, region_mask, process_topography, roughness, is_default
 
     dest_dir = FILES_DIR / sample_id
     afm_files = sorted(dest_dir.glob("afm_*.ibw"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not afm_files:
         raise HTTPException(404, "No AFM file found for this sample")
-
     path = afm_files[0]
+
+    if override is not None:
+        settings = normalize_settings(override)
+        regions_active = bool(settings["regions"])          # drawn on the file being previewed
+    else:
+        with get_db() as conn:
+            row = conn.execute("SELECT module_config FROM samples WHERE id=?", (sample_id,)).fetchone()
+        saved = (json.loads(row["module_config"] or "{}") if row else {}).get("afm") or {}
+        settings = normalize_settings(saved)
+        # Regions belong to the file they were drawn on; a new upload keeps the options only.
+        regions_active = bool(settings["regions"]) and settings["regions_file"] == path.name
+    regions_ignored = bool(settings["regions"]) and not regions_active
+
     wave = bw.load(str(path))
     wdata = wave["wave"]["wData"]          # (H, W, C) float32, values already in SI units
     note_raw = wave["wave"].get("note", b"")
@@ -1309,10 +1323,10 @@ def get_afm_data(sample_id: str):
     # Channel labels: dim2 of labels list; index 0 is always an empty placeholder in Igor
     raw_labels = wave["wave"].get("labels", [])
     dim2 = raw_labels[2] if len(raw_labels) > 2 else []
-    labels: list[str] = []
+    labels: list = []
     for lbl in dim2:
-        s = (lbl.decode("latin-1") if isinstance(lbl, bytes) else lbl).rstrip("\x00").strip()
-        labels.append(s)
+        s_ = (lbl.decode("latin-1") if isinstance(lbl, bytes) else lbl).rstrip("\x00").strip()
+        labels.append(s_)
     # Drop the leading empty placeholder so index i matches channel i
     while labels and not labels[0]:
         labels.pop(0)
@@ -1324,49 +1338,28 @@ def get_afm_data(sample_id: str):
 
     channels: dict = {}
     channel_ranges: dict = {}
+    channel_units: dict = {}
+    stats: dict = {}
+    info_all = {"fallback_lines": 0, "warnings": []}
+    mask = None
     for i in range(C):
         ch = np.rot90(wdata[:, :, i].astype(np.float64), k=1)  # 90° CCW before processing
-        Hr, Wr = ch.shape
         ch_label = labels[i] if i < len(labels) else f"Ch{i}"
-
-        # Height channel: linewise (row-by-row) flatten to remove scan-line Z-drift,
-        # followed by a global plane tilt removal, then m → nm.
-        if "height" in ch_label.lower() or i == 0:
-            xs_row = np.arange(Wr, dtype=np.float64)
-
-            # Global IQR mask: exclude large features/outliers from all fits
-            flat_g = ch.ravel()
-            ok_g   = np.isfinite(flat_g)
-            q1g, q3g = np.percentile(flat_g[ok_g], [25, 75])
-            iqr_g    = q3g - q1g
-            global_mask = (np.isfinite(ch)
-                           & (ch >= q1g - 3.0 * iqr_g)
-                           & (ch <= q3g + 3.0 * iqr_g))
-
-            # Row-by-row 1st-order (linear) flatten — removes per-line Z drift
-            for r in range(Hr):
-                mask = global_mask[r]
-                if mask.sum() < 2:          # fallback if most of row is masked
-                    mask = np.isfinite(ch[r])
-                if mask.sum() < 2:
-                    continue
-                c = np.polyfit(xs_row[mask], ch[r, mask], 1)
-                ch[r] -= np.polyval(c, xs_row)
-
-            # Global 2nd-order polynomial flatten on post-linewise residuals
-            ys2, xs2 = np.mgrid[0:Hr, 0:Wr]
-            flat2 = ch.ravel()
-            ok2   = np.isfinite(flat2)
-            q1b, q3b = np.percentile(flat2[ok2], [25, 75])
-            iqr_b    = q3b - q1b
-            ok2 &= (flat2 >= q1b - 3.0 * iqr_b) & (flat2 <= q3b + 3.0 * iqr_b)
-            xf2, yf2 = xs2.ravel()[ok2], ys2.ravel()[ok2]
-            A2 = np.stack([np.ones(ok2.sum()), xf2, yf2, xf2**2, xf2*yf2, yf2**2], axis=1)
-            c2, *_ = np.linalg.lstsq(A2, flat2[ok2], rcond=None)
-            ch -= (c2[0] + c2[1]*xs2 + c2[2]*ys2
-                   + c2[3]*xs2**2 + c2[4]*xs2*ys2 + c2[5]*ys2**2)
-
-            ch *= 1e9  # m → nm
+        lower = ch_label.lower()
+        processed = "height" in lower or i == 0      # height is the only flattened channel
+        if preview and not processed:
+            continue
+        if processed:
+            if mask is None and regions_active:
+                mask = region_mask(ch.shape, settings["regions"] if regions_active else [])
+                if int(mask.sum()) < 16:
+                    info_all["warnings"].append("the region covers fewer than 16 pixels; regions ignored")
+                    mask, regions_active = None, False
+            ch, info = process_topography(ch, settings, mask if regions_active else None)
+            info_all["fallback_lines"] = max(info_all["fallback_lines"], info["fallback_lines"])
+            info_all["warnings"] += [w for w in info["warnings"] if w not in info_all["warnings"]]
+            channel_units[ch_label] = "nm"
+            stats[ch_label] = {"full": roughness(ch), "region": roughness(ch, mask) if regions_active else None}
 
         # Percentile-clipped display range (robust against outliers for all channels)
         ch_flat = ch.ravel()
@@ -1377,19 +1370,46 @@ def get_afm_data(sample_id: str):
             vmin, vmax = 0.0, 1.0
         channel_ranges[ch_label] = [round(float(vmin), 4), round(float(vmax), 4)]
 
-        channels[ch_label] = ch.tolist()
+        channels[ch_label] = np.round(ch, 4).tolist() if preview else ch.tolist()
 
     first = next(iter(channels.values())) if channels else [[]]
     out_h, out_w = len(first), len(first[0]) if first else 0
 
+    shown = dict(settings)
+    if not regions_active:
+        shown["regions"] = []
     return {
         "channels":       channels,
         "channel_names":  list(channels.keys()),
         "channel_ranges": channel_ranges,
+        "channel_units":  channel_units,
         "scan_size_um":   round(scan_size_m * 1e6, 3),
         "pixels":         [out_h, out_w],
         "filename":       path.name,
+        "stats":          stats,
+        "processing": {
+            "settings":        shown,
+            "default":         is_default(settings, regions_active),
+            "regions_active":  regions_active,
+            "regions_ignored": regions_ignored,
+            "region_pixels":   int(mask.sum()) if mask is not None else None,
+            "fallback_lines":  info_all["fallback_lines"],
+            "warnings":        info_all["warnings"],
+        },
     }
+
+
+@app.get("/api/samples/{sample_id}/afm_data")
+def get_afm_data(sample_id: str):
+    """Processed AFM channels using the sample's saved flatten settings (module_config.afm)."""
+    return _afm_payload(sample_id)
+
+
+@app.post("/api/samples/{sample_id}/afm_preview")
+def preview_afm(sample_id: str, body: dict = Body(...)):
+    """Process the sample's AFM file with unsaved settings (the card editor's live preview).
+    Returns only the processed height channel; nothing is stored."""
+    return _afm_payload(sample_id, override=body.get("settings") or {}, preview=True)
 
 
 # ── Analysis Books (stub) ─────────────────────────────────────────────────────
