@@ -2953,7 +2953,205 @@ function AfmChannelMap({ grid, scanSizeUm, vmin, vmax }) {
   return <canvas ref={canvasRef} style={{ width: "100%", height: "auto", imageRendering: "pixelated", display: "block", borderRadius: 4 }} />;
 }
 
-function AfmCard({ afmData, filename, onFile }) {
+// ── AFM height flattening (settings in module_config.afm, processing in backend/afm.py) ──
+const AFM_FLATTEN_DEFAULTS = { line: "linear", surface: "poly2", outlier_iqr: 3, zero: "none", regions: [] };
+const AFM_LINE_OPTS    = [["off", "off"], ["offset", "offset"], ["linear", "linear"], ["quadratic", "quad"]];
+const AFM_SURFACE_OPTS = [["off", "off"], ["plane", "plane"], ["poly2", "2nd"], ["poly3", "3rd"]];
+const AFM_ZERO_OPTS    = [["none", "none"], ["mean", "mean"], ["median", "median"], ["min", "min"]];
+
+// One line describing a non-default flatten, e.g. "line offset · surface plane · 2 regions".
+function afmProcessingSummary(proc) {
+  if (!proc || proc.default) return null;
+  const st = proc.settings || {};
+  const surf = { off: "off", plane: "plane", poly2: "2nd order", poly3: "3rd order" }[st.surface] || st.surface;
+  const parts = [`line ${st.line}`, `surface ${surf}`];
+  if (st.outlier_iqr !== 3) parts.push(st.outlier_iqr > 0 ? `outliers ${st.outlier_iqr}·IQR` : "outliers kept");
+  if (st.zero && st.zero !== "none") parts.push(`zero ${st.zero}`);
+  const regs = st.regions || [];
+  if (regs.length) {
+    const inc = regs.filter(r => r.mode === "include").length, exc = regs.length - inc;
+    parts.push([inc && `${inc} include`, exc && `${exc} exclude`].filter(Boolean).join(" + ") + (regs.length === 1 ? " region" : " regions"));
+  }
+  return parts.join(" · ");
+}
+
+// Roughness of the processed height map: full map and, when regions are set, the region mask.
+function AfmStats({ stats, compact = false }) {
+  if (!stats?.full) return null;
+  const f = v => v == null ? "—" : v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
+  const mono = "'DM Mono', monospace";
+  if (compact) {
+    return (
+      <div style={{ fontSize: 10, color: T.textDim, fontFamily: mono, lineHeight: 1.5 }}>
+        Rq {f(stats.full.rq_nm)} nm{stats.region ? ` · region ${f(stats.region.rq_nm)} nm` : ""}
+      </div>
+    );
+  }
+  const rows = [["full map", stats.full], ...(stats.region ? [["region", stats.region]] : [])];
+  const cell = { padding: "1px 6px", textAlign: "right" };
+  return (
+    <table style={{ borderCollapse: "collapse", fontSize: 10, fontFamily: mono, color: T.textSecondary, marginTop: 6 }}>
+      <thead><tr style={{ color: T.textDim }}>
+        <td style={{ padding: "1px 6px 1px 0" }}></td><td style={cell}>Rq</td><td style={cell}>Ra</td><td style={cell}>P–V</td><td style={cell}>px</td>
+      </tr></thead>
+      <tbody>{rows.map(([name, r]) => (
+        <tr key={name}>
+          <td style={{ padding: "1px 6px 1px 0", color: T.textDim }}>{name}</td>
+          <td style={cell}>{f(r.rq_nm)}</td><td style={cell}>{f(r.ra_nm)}</td><td style={cell}>{f(r.pv_nm)}</td>
+          <td style={{ ...cell, color: T.textDim }}>{r.pixels.toLocaleString()}</td>
+        </tr>
+      ))}
+      <tr><td colSpan={5} style={{ padding: "2px 0 0", color: T.textDim }}>nm, after flattening</td></tr>
+      </tbody>
+    </table>
+  );
+}
+
+function AfmSegmented({ options, value, onChange }) {
+  return (
+    <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 4, overflow: "hidden" }}>
+      {options.map(([val, label], idx) => (
+        <button key={val} onClick={() => onChange(val)}
+          style={{ padding: "3px 8px", fontSize: 10, fontFamily: "'DM Mono', monospace", border: "none", cursor: "pointer",
+            borderRight: idx < options.length - 1 ? `1px solid ${T.border}` : "none",
+            background: value === val ? T.bg3 : T.bg0, color: value === val ? T.textPrimary : T.textDim }}>
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// Editor: draw include/exclude rectangles on the height map, choose the flatten steps,
+// preview live (POST /afm_preview, nothing saved), then Apply to save for this sample.
+function AfmFlattenModal({ sampleId, afmData, initial, onClose, onApply }) {
+  const [draft, setDraft]       = useState(() => ({ ...AFM_FLATTEN_DEFAULTS, ...(initial || {}), regions: [...(initial?.regions || [])] }));
+  const [drawMode, setDrawMode] = useState("include");
+  const [dragRect, setDragRect] = useState(null);
+  const [preview, setPreview]   = useState(null);
+  const [busy, setBusy]         = useState(false);
+  const [error, setError]       = useState(null);
+  const [saving, setSaving]     = useState(false);
+  const overlayRef = useRef(null);
+  const reqId = useRef(0);
+  const set = (k, v) => setDraft(d => ({ ...d, [k]: v }));
+
+  const draftKey = JSON.stringify(draft);
+  useEffect(() => {
+    const id = ++reqId.current;
+    setBusy(true);
+    const t = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/samples/${encodeURIComponent(sampleId)}/afm_preview`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settings: draft }),
+        });
+        const json = await res.json();
+        if (id !== reqId.current) return;
+        if (!res.ok) throw new Error(json.detail || `preview failed (${res.status})`);
+        setPreview(json); setError(null);
+      } catch (e) { if (id === reqId.current) setError(e.message); }
+      if (id === reqId.current) setBusy(false);
+    }, 300);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftKey, sampleId]);
+
+  const heightName = preview?.channel_names?.[0];
+  const grid  = preview?.channels?.[heightName] ?? null;
+  const range = preview?.channel_ranges?.[heightName] ?? [null, null];
+  const stats = preview?.stats?.[heightName];
+  const proc  = preview?.processing;
+
+  const frac = e => {
+    const r = overlayRef.current.getBoundingClientRect();
+    return { x: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)), y: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)) };
+  };
+  const onDown = e => { if (e.button !== 0) return; const p = frac(e); setDragRect({ x0: p.x, y0: p.y, x1: p.x, y1: p.y }); };
+  const onMove = e => { if (!dragRect) return; const p = frac(e); setDragRect(r => ({ ...r, x1: p.x, y1: p.y })); };
+  const onUp = () => {
+    if (!dragRect) return;
+    const r = { x0: Math.min(dragRect.x0, dragRect.x1), y0: Math.min(dragRect.y0, dragRect.y1), x1: Math.max(dragRect.x0, dragRect.x1), y1: Math.max(dragRect.y0, dragRect.y1), mode: drawMode };
+    setDragRect(null);
+    if (r.x1 - r.x0 > 0.01 && r.y1 - r.y0 > 0.01) set("regions", [...draft.regions, r]);
+  };
+  const rectStyle = (r, mode, dashed) => ({
+    position: "absolute", left: `${r.x0 * 100}%`, top: `${r.y0 * 100}%`, width: `${(r.x1 - r.x0) * 100}%`, height: `${(r.y1 - r.y0) * 100}%`,
+    border: `1.5px ${dashed ? "dashed" : "solid"} ${mode === "exclude" ? T.red : T.teal}`,
+    background: mode === "exclude" ? "rgba(248,113,113,0.12)" : "rgba(45,212,191,0.10)", boxSizing: "border-box",
+  });
+  const mono = "'DM Mono', monospace";
+  const label = txt => <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, width: 70, flexShrink: 0 }}>{txt}</span>;
+
+  const apply = async () => {
+    setSaving(true); setError(null);
+    try { await onApply({ ...draft, regions_file: afmData?.filename || null }); onClose(); }
+    catch (e) { setError(e.message || "Could not save"); }
+    setSaving(false);
+  };
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 10, padding: 18, width: "min(860px, 94vw)", maxHeight: "92vh", overflow: "auto", boxShadow: "0 10px 40px rgba(0,0,0,.4)" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.textPrimary }}>Height flattening · {sampleId}</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, fontSize: 18, cursor: "pointer" }}>✕</button>
+        </div>
+        <div style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
+          <div style={{ width: 420, maxWidth: "100%" }}>
+            <div style={{ position: "relative", width: "100%", aspectRatio: "1 / 1", background: T.bg3, borderRadius: 4 }}>
+              {grid && <AfmChannelMap grid={grid} scanSizeUm={preview.scan_size_um} vmin={range[0]} vmax={range[1]} />}
+              <div ref={overlayRef} onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
+                style={{ position: "absolute", inset: 0, cursor: "crosshair" }}>
+                {draft.regions.map((r, i) => (
+                  <div key={i} style={rectStyle(r, r.mode, false)}>
+                    <button onMouseDown={e => e.stopPropagation()} onClick={() => set("regions", draft.regions.filter((_, j) => j !== i))}
+                      title="Remove region"
+                      style={{ position: "absolute", top: -1, right: -1, width: 16, height: 16, lineHeight: "14px", padding: 0, fontSize: 11, border: "none", borderRadius: 2, cursor: "pointer", background: r.mode === "exclude" ? T.red : T.teal, color: T.bg0 }}>×</button>
+                  </div>
+                ))}
+                {dragRect && <div style={rectStyle({ x0: Math.min(dragRect.x0, dragRect.x1), y0: Math.min(dragRect.y0, dragRect.y1), x1: Math.max(dragRect.x0, dragRect.x1), y1: Math.max(dragRect.y0, dragRect.y1) }, drawMode, true)} />}
+              </div>
+              {busy && <div style={{ position: "absolute", top: 6, left: 8, fontSize: 10, fontFamily: mono, color: T.textDim, pointerEvents: "none" }}>updating…</div>}
+            </div>
+            <div style={{ fontSize: 10, fontFamily: mono, color: T.textDim, marginTop: 6, lineHeight: 1.5 }}>
+              Drag on the map to add a rectangle. Regions choose the pixels the fits and region statistics use; the flatten is applied to the whole map.
+            </div>
+          </div>
+          <div style={{ flex: 1, minWidth: 280, display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("DRAW")}
+              <AfmSegmented options={[["include", "include"], ["exclude", "exclude"]]} value={drawMode} onChange={setDrawMode} />
+              {draft.regions.length > 0 && <button onClick={() => set("regions", [])} style={{ background: "none", border: "none", color: T.textDim, fontFamily: mono, fontSize: 10, cursor: "pointer", textDecoration: "underline" }}>clear {draft.regions.length}</button>}
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("LINES")}<AfmSegmented options={AFM_LINE_OPTS} value={draft.line} onChange={v => set("line", v)} /></div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("SURFACE")}<AfmSegmented options={AFM_SURFACE_OPTS} value={draft.surface} onChange={v => set("surface", v)} /></div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("OUTLIERS")}
+              <DeferredInput type="number" value={draft.outlier_iqr} onChange={v => set("outlier_iqr", Math.max(0, Math.min(100, Number(v) || 0)))}
+                className="no-spin" min="0" step="0.5"
+                style={{ width: 52, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "3px 6px", outline: "none", textAlign: "center" }} />
+              <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>× IQR left out of fits (0 = keep all)</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("ZERO")}<AfmSegmented options={AFM_ZERO_OPTS} value={draft.zero} onChange={v => set("zero", v)} /></div>
+            <AfmStats stats={stats} />
+            {proc?.fallback_lines > 0 && (
+              <div style={{ fontSize: 10, fontFamily: mono, color: T.amber, lineHeight: 1.5 }}>
+                ⚠ {proc.fallback_lines} scan lines have too few region pixels; their line fit uses the whole line.
+              </div>
+            )}
+            {(proc?.warnings || []).map(w => <div key={w} style={{ fontSize: 10, fontFamily: mono, color: T.amber }}>⚠ {w}</div>)}
+            {error && <div style={{ fontSize: 10, fontFamily: mono, color: T.red }}>{error}</div>}
+            <div style={{ display: "flex", gap: 8, marginTop: "auto", justifyContent: "flex-end" }}>
+              <Btn variant="ghost" small onClick={() => setDraft({ ...AFM_FLATTEN_DEFAULTS, regions: [] })}>Reset to default</Btn>
+              <Btn variant="ghost" small onClick={onClose}>Cancel</Btn>
+              <Btn variant="primary" small disabled={saving} onClick={apply}>{saving ? "Saving…" : "Apply"}</Btn>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AfmCard({ afmData, filename, onFile, sampleId, afmConfig, onAfmSettings }) {
   const inputRef = useRef();
   const channels = afmData?.channel_names || [];
   const [channel, setChannel] = useState(null);
@@ -2969,7 +3167,11 @@ function AfmCard({ afmData, filename, onFile }) {
   const [mn, mx] = range ?? [null, null];
 
   const isHeight = channel?.toLowerCase().includes("height");
-  const unit = isHeight ? "nm" : channel?.toLowerCase().includes("phase") ? "°" : "V";
+  const unit = afmData?.channel_units?.[channel] ?? (isHeight ? "nm" : channel?.toLowerCase().includes("phase") ? "°" : "V");
+  const [flattenOpen, setFlattenOpen] = useState(false);
+  const proc = afmData?.processing;
+  const procSummary = afmProcessingSummary(proc);
+  const chStats = afmData?.stats?.[channel];
   const cmGrad = AFM_CM.map(([t,[r,g,b]]) => `rgb(${r},${g},${b}) ${(t*100).toFixed(0)}%`).join(", ");
 
   const dropZone = (children) => (
@@ -3002,8 +3204,17 @@ function AfmCard({ afmData, filename, onFile }) {
             ))}
           </div>
         )}
+        {has && onAfmSettings && (
+          <button onClick={() => setFlattenOpen(true)} title="Height flattening and roughness"
+            style={{ background: "none", border: "none", color: procSummary ? T.amber : T.textDim, cursor: "pointer", fontSize: 13, lineHeight: 1, padding: "0 2px" }}>⚙</button>
+        )}
         {filename && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filename}</span>}
       </div>
+      {flattenOpen && (
+        <AfmFlattenModal sampleId={sampleId} afmData={afmData}
+          initial={proc?.settings ? { ...afmConfig, ...proc.settings } : afmConfig}
+          onClose={() => setFlattenOpen(false)} onApply={onAfmSettings} />
+      )}
       <div style={{ padding: "10px 12px" }}>
         {has ? (
           <>
@@ -3020,6 +3231,13 @@ function AfmCard({ afmData, filename, onFile }) {
                 {afmData.scan_size_um} µm · {afmData.pixels?.[0]}×{afmData.pixels?.[1]} px
               </div>
             )}
+            {chStats && procSummary && (
+              <div style={{ marginTop: 4, fontSize: 10, color: T.amber, fontFamily: "'DM Mono', monospace", lineHeight: 1.5 }}>flattened: {procSummary}</div>
+            )}
+            {chStats && proc?.regions_ignored && (
+              <div style={{ marginTop: 4, fontSize: 10, color: T.amber, fontFamily: "'DM Mono', monospace", lineHeight: 1.5 }}>⚠ saved regions were drawn on a different file and are not applied</div>
+            )}
+            {chStats && <AfmStats stats={chStats} />}
             <div style={{ marginTop: 8 }}>{dropZone("↑ replace file")}</div>
           </>
         ) : (
@@ -3578,7 +3796,7 @@ function AddDataModal({ onClose, moduleOptions = [], sampleId, sample, onModuleF
 
 // ── SampleDetail ──────────────────────────────────────────────────────────────
 
-function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onRsmDistance, onPeXInput, onXrayFrame, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [], materialsLib = [] }) {
+function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onRsmDistance, onPeXInput, onXrayFrame, onAfmSettings, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [], materialsLib = [] }) {
   const [addingLayer, setAddingLayer]   = useState(false);
   const [meta, setMeta]                 = useState({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
   const [dragIdx, setDragIdx]           = useState(null);
@@ -3791,7 +4009,9 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
       <section>
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Scanning Probe</div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
-          <AfmCard afmData={pd.afm} filename={sample.filenames?.afm} onFile={file => handleFile("afm", file)} />
+          <AfmCard afmData={pd.afm} filename={sample.filenames?.afm} onFile={file => handleFile("afm", file)}
+            sampleId={sample.id} afmConfig={sample.module_config?.afm}
+            onAfmSettings={settings => onAfmSettings?.(sample.id, settings)} />
           {modulesForSection("scanning_probe").map(m => (
             <ModuleCard key={m.id} mod={m} sample={sample} modules={modules} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
           ))}
@@ -10814,6 +11034,14 @@ function AfmComparisonPanel({ sampleOrder, plotCache, labels = {}, plotStyle, co
               <div style={{ marginTop: 5, fontSize: (ps.fontSize || 11) - 1, color: T.textDim, fontFamily: ps.font || "'DM Mono', monospace" }}>
                 {label}
               </div>
+              {afmData?.stats?.[activeChannel] && (
+                <div style={{ textAlign: "center", maxWidth: mapPx }}>
+                  <AfmStats stats={afmData.stats[activeChannel]} compact />
+                  {afmProcessingSummary(afmData.processing) && (
+                    <div style={{ fontSize: 9, color: T.amber, fontFamily: "'DM Mono', monospace", lineHeight: 1.4 }}>{afmProcessingSummary(afmData.processing)}</div>
+                  )}
+                </div>
+              )}
             </div>
           );
         })}
@@ -15044,6 +15272,16 @@ export default function App() {
     setPlotCache(p => ({ ...p, [id]: cache }));
   };
 
+  // Save AFM height-flatten settings (module_config.afm) and reload the processed map,
+  // so the card, the book panels and exports all show the same processed data.
+  const handleAfmSettings = async (sampleId, settings) => {
+    await api("PATCH", `/samples/${encodeURIComponent(sampleId)}/module-config/afm`, settings);
+    const updated = await api("GET", `/samples/${encodeURIComponent(sampleId)}`);
+    setSamples(p => p.map(s => s.id === sampleId ? { ...s, module_config: updated.module_config } : s));
+    const afm = await api("GET", `/samples/${encodeURIComponent(sampleId)}/afm_data`);
+    setPlotCache(p => ({ ...p, [sampleId]: { ...(p[sampleId] || {}), afm } }));
+  };
+
   // Saved scan choice for a multi-scan .rasx on the XRD / XRR card
   // (module_config.<type>.frame). Only applies to the file it was chosen for.
   const xrayFrameOf = (sample, measType) => {
@@ -15423,6 +15661,7 @@ export default function App() {
               onRsmDistance={handleRsmDistance}
               onPeXInput={handlePeXInput}
               onXrayFrame={handleXrayFrame}
+              onAfmSettings={handleAfmSettings}
               onBack={() => setActive(null)}
               onDelete={deleteSample}
               editingMeta={editingMeta}
