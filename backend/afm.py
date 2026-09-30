@@ -38,6 +38,7 @@ DEFAULT_SETTINGS = {
     "range_max": None,
     "colormap": "afm",         # display palette
     "color_trim": 0.0,         # % cut from each end of the palette (as in the notebooks' Trim %)
+    "steps": None,             # processing chain (see run_chain); None = the single-pass flatten
 }
 
 
@@ -86,6 +87,7 @@ def normalize_settings(raw: Optional[dict]) -> dict:
         s["color_trim"] = 0.0
     if s["range_min"] is not None and s["range_max"] is not None and s["range_min"] >= s["range_max"]:
         s["range_min"] = s["range_max"] = None      # inverted limits: fall back to automatic
+    s["steps"] = normalize_steps(raw.get("steps"))  # processing chain; None = single-pass flatten
     return s
 
 
@@ -200,3 +202,223 @@ def roughness(ch_nm: np.ndarray, mask: Optional[np.ndarray] = None) -> Optional[
     d = v - v.mean()
     return {"rq_nm": float(np.sqrt(np.mean(d * d))), "ra_nm": float(np.mean(np.abs(d))),
             "pv_nm": float(v.max() - v.min()), "mean_nm": float(v.mean()), "pixels": int(v.size)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Processing chain
+# ══════════════════════════════════════════════════════════════════════════════
+# A saved chain (settings["steps"]) replaces the single-pass flatten above. Steps run
+# in order on the height map (nm) and share one mask of EXCLUDED pixels: mask steps
+# add to it; fit steps (lines, surface, zero) use only pixels outside it; the flatten
+# itself always acts on the whole map. Samples without a chain keep the flatten above.
+#
+#   particles  auto-detect features: coarse level → |Δ| > k·MAD (robust σ) → drop specks
+#              → grow by `grow` px; repeated `passes` times, each pass re-levelling the
+#              background without the features found so far.
+#   regions    user rectangles: include (only these pixels) / exclude.
+#   lines      per scan line: offset (median) | linear | quadratic | mdiff (median of
+#              differences to the previous line).
+#   surface    plane | poly2 | poly3 over the whole map.
+#   scars      single-line glitches (a line that sits above or below BOTH neighbours by
+#              > k·MAD over ≥ min_len px) replaced by the mean of the neighbours.
+#   zero       mean | median | min of the unmasked pixels set to 0.
+
+STEP_TYPES = ("particles", "regions", "lines", "surface", "scars", "zero")
+
+
+def _num(v, default, lo, hi, cast=float):
+    try:
+        v = cast(v)
+    except (TypeError, ValueError):
+        return default
+    return v if lo <= v <= hi else default
+
+
+def normalize_steps(raw) -> Optional[List[dict]]:
+    """Validated chain, or None when the sample has no chain saved."""
+    if raw is None:
+        return None
+    steps = []
+    for st in raw if isinstance(raw, list) else []:
+        t = (st or {}).get("type")
+        if t == "particles":
+            steps.append({"type": t, "k": _num(st.get("k"), 5.0, 1, 50), "grow": _num(st.get("grow"), 2, 0, 20, int),
+                          "min_px": _num(st.get("min_px"), 4, 1, 10000, int), "passes": _num(st.get("passes"), 3, 1, 6, int),
+                          "polarity": "both" if st.get("polarity") == "both" else "up"})
+        elif t == "regions":
+            regs = normalize_settings({"regions": st.get("regions")})["regions"]
+            if regs:
+                steps.append({"type": t, "regions": regs, "file": st.get("file") or None})
+        elif t == "lines":
+            steps.append({"type": t, "mode": st.get("mode") if st.get("mode") in ("offset", "linear", "quadratic", "mdiff") else "linear"})
+        elif t == "surface":
+            steps.append({"type": t, "order": st.get("order") if st.get("order") in ("plane", "poly2", "poly3") else "poly2"})
+        elif t == "scars":
+            steps.append({"type": t, "k": _num(st.get("k"), 4.0, 1, 50), "min_len": _num(st.get("min_len"), 8, 2, 4096, int)})
+        elif t == "zero":
+            steps.append({"type": t, "mode": st.get("mode") if st.get("mode") in ("mean", "median", "min") else "median"})
+    return steps
+
+
+def _robust_sigma(v: np.ndarray) -> float:
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return 0.0
+    return float(1.4826 * np.median(np.abs(v - np.median(v))))
+
+
+def _fit_surface(z: np.ndarray, use: np.ndarray, order: str) -> Optional[np.ndarray]:
+    H, W = z.shape
+    y, x = np.mgrid[0:H, 0:W].astype(np.float64)
+    x = x / max(W - 1, 1) * 2 - 1
+    y = y / max(H - 1, 1) * 2 - 1
+    terms = _surface_terms(x, y, order)
+    fit = use & np.isfinite(z)
+    if fit.sum() < len(terms):
+        return None
+    A = np.stack([t[fit] for t in terms], axis=1)
+    c, *_ = np.linalg.lstsq(A, z[fit], rcond=None)
+    return sum(ci * t for ci, t in zip(c, terms))
+
+
+def _level_lines(z: np.ndarray, use: np.ndarray, mode: str) -> Tuple[np.ndarray, int]:
+    """Per-line correction on unmasked pixels; lines with too few fall back to the whole line."""
+    out = z.copy()
+    H, W = z.shape
+    fallback = 0
+    if mode == "mdiff":
+        for r in range(1, H):
+            d = out[r] - out[r - 1]
+            m = use[r] & use[r - 1] & np.isfinite(d)
+            if m.sum() < 5:
+                m = np.isfinite(d)
+                fallback += 1
+            if m.any():
+                out[r] -= np.median(d[m])
+        return out, fallback
+    deg = {"offset": 0, "linear": 1, "quadratic": 2}[mode]
+    xs = np.arange(W, dtype=np.float64)
+    need = max(deg + 1, W // 20)
+    for r in range(H):
+        m = use[r] & np.isfinite(z[r])
+        if m.sum() < need:
+            m = np.isfinite(z[r])
+            fallback += 1
+        if m.sum() < deg + 1:
+            continue
+        if deg == 0:
+            out[r] -= np.median(z[r, m])
+        else:
+            out[r] -= np.polyval(np.polyfit(xs[m], z[r, m], deg), xs)
+    return out, fallback
+
+
+def _detect_particles(z: np.ndarray, excl: np.ndarray, st: dict) -> Tuple[np.ndarray, int]:
+    from scipy import ndimage as ndi
+    base = ~excl
+    tmp, _ = _level_lines(z, base, "offset")                 # coarse, robust first level
+    s = _fit_surface(tmp, base, "poly2")
+    tmp = tmp - s if s is not None else tmp
+    found = np.zeros_like(excl)
+    n_found = 0
+    for _ in range(st["passes"]):
+        bg = base & ~found
+        ref = tmp[bg & np.isfinite(tmp)]
+        if ref.size < 16:
+            break
+        med, sig = np.median(ref), _robust_sigma(ref)
+        dev = tmp - med
+        core = (dev > st["k"] * sig) if st["polarity"] == "up" else (np.abs(dev) > st["k"] * sig)
+        core &= base
+        lab, n = ndi.label(core)
+        if n:
+            sizes = ndi.sum(core, lab, range(1, n + 1))
+            keep = np.nonzero(sizes >= st["min_px"])[0] + 1
+            core = np.isin(lab, keep)
+            n_found = int(keep.size)
+        else:
+            n_found = 0
+        found = ndi.binary_dilation(core, structure=ndi.generate_binary_structure(2, 1), iterations=st["grow"]) if st["grow"] else core
+        found &= base
+        # re-level the raw input on the background without the features, for the next pass
+        bg = base & ~found
+        tmp, _ = _level_lines(z, bg, "linear")
+        s = _fit_surface(tmp, bg, "poly2")
+        tmp = tmp - s if s is not None else tmp
+    return found, n_found
+
+
+def _remove_scars(z: np.ndarray, excl: np.ndarray, st: dict) -> Tuple[np.ndarray, int]:
+    out = z.copy()
+    H, W = z.shape
+    if H < 3:
+        return out, 0
+    up = out[1:-1] - out[:-2]
+    dn = out[1:-1] - out[2:]
+    ok = ~excl[1:-1] & ~excl[:-2] & ~excl[2:]
+    sig = _robust_sigma(np.concatenate([up[ok], dn[ok]])) if ok.any() else 0.0
+    if sig <= 0:
+        return out, 0
+    thr = st["k"] * sig
+    cand = ok & (((up > thr) & (dn > thr)) | ((up < -thr) & (dn < -thr)))
+    fixed_lines = 0
+    for i in range(cand.shape[0]):
+        row = cand[i]
+        if not row.any():
+            continue
+        # runs of at least min_len consecutive pixels along the line
+        edges = np.diff(np.concatenate([[0], row.view(np.int8), [0]]))
+        starts, ends = np.nonzero(edges == 1)[0], np.nonzero(edges == -1)[0]
+        hit = False
+        for a, b in zip(starts, ends):
+            if b - a >= st["min_len"]:
+                r = i + 1
+                out[r, a:b] = (out[r - 1, a:b] + out[r + 1, a:b]) / 2
+                hit = True
+        fixed_lines += int(hit)
+    return out, fixed_lines
+
+
+def run_chain(z_m: np.ndarray, steps: List[dict], filename: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray, List[dict]]:
+    """Run the chain on a height map in metres. Returns (height nm, excluded mask, per-step info)."""
+    z = z_m.astype(np.float64) * 1e9
+    excl = ~np.isfinite(z)
+    infos = []
+    for st in steps:
+        info: dict = {"type": st["type"]}
+        t = st["type"]
+        if t == "particles":
+            found, n = _detect_particles(z, excl, st)
+            excl = excl | found
+            info.update(found=n, coverage=float(found.mean()))
+        elif t == "regions":
+            if st.get("file") and filename and st["file"] != filename:
+                info["skipped"] = "drawn on a different file"
+            else:
+                rm = region_mask(z.shape, st["regions"])
+                excl = excl | ~rm
+                info["kept"] = float(rm.mean())
+        elif t == "lines":
+            z, fb = _level_lines(z, ~excl, st["mode"])
+            info["fallback_lines"] = fb
+        elif t == "surface":
+            s = _fit_surface(z, ~excl, st["order"])
+            if s is None:
+                info["skipped"] = "too few unmasked pixels"
+            else:
+                z = z - s
+        elif t == "scars":
+            z, n = _remove_scars(z, excl, st)
+            info["fixed_lines"] = n
+        elif t == "zero":
+            v = z[~excl & np.isfinite(z)]
+            if v.size:
+                z = z - {"mean": np.mean, "median": np.median, "min": np.min}[st["mode"]](v)
+        infos.append(info)
+    return z, excl, infos
+
+
+def pack_mask(mask: np.ndarray) -> str:
+    """Row-major bit-packed mask, base64 (for the editor's overlay)."""
+    import base64
+    return base64.b64encode(np.packbits(mask.astype(np.uint8).ravel()).tobytes()).decode("ascii")

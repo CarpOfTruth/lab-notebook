@@ -1287,7 +1287,7 @@ def _afm_payload(sample_id: str, override: Optional[dict] = None, preview: bool 
         import igor2.binarywave as bw
     except ImportError:
         raise HTTPException(500, "igor2 / numpy not installed — run: pip install igor2 numpy")
-    from afm import normalize_settings, region_mask, process_topography, roughness, is_default
+    from afm import normalize_settings, region_mask, process_topography, roughness, is_default, run_chain, pack_mask
 
     dest_dir = FILES_DIR / sample_id
     afm_files = sorted(dest_dir.glob("afm_*.ibw"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -1305,7 +1305,12 @@ def _afm_payload(sample_id: str, override: Optional[dict] = None, preview: bool 
         settings = normalize_settings(saved)
         # Regions belong to the file they were drawn on; a new upload keeps the options only.
         regions_active = bool(settings["regions"]) and settings["regions_file"] == path.name
-    regions_ignored = bool(settings["regions"]) and not regions_active
+    chain = settings["steps"]                      # None = single-pass flatten (legacy settings)
+    if chain is not None:
+        regions_active = False                     # a chain carries its own region steps
+    regions_ignored = bool(settings["regions"]) and not regions_active and chain is None
+    step_infos: list = []
+    chain_excl = None
 
     wave = bw.load(str(path))
     wdata = wave["wave"]["wData"]          # (H, W, C) float32, values already in SI units
@@ -1349,7 +1354,14 @@ def _afm_payload(sample_id: str, override: Optional[dict] = None, preview: bool 
         processed = "height" in lower or i == 0      # height is the only flattened channel
         if preview and not processed:
             continue
-        if processed:
+        if processed and chain is not None:
+            ch, chain_excl, step_infos = run_chain(ch, chain, path.name)
+            channel_units[ch_label] = "nm"
+            mask = ~chain_excl if chain_excl.any() else None
+            # "region" = the pixels the fits and statistics use (everything not masked)
+            stats[ch_label] = {"full": roughness(ch), "region": roughness(ch, mask) if mask is not None else None,
+                               "mask_fraction": float(chain_excl.mean())}
+        elif processed:
             if mask is None and regions_active:
                 mask = region_mask(ch.shape, settings["regions"] if regions_active else [])
                 if int(mask.sum()) < 16:
@@ -1364,7 +1376,7 @@ def _afm_payload(sample_id: str, override: Optional[dict] = None, preview: bool 
         # Percentile-clipped display range (robust against outliers for all channels).
         # For the height map, the automatic range comes from the region mask when regions
         # are set, so the colors follow the part of the scan the analysis uses.
-        range_src = ch[mask] if (processed and regions_active and mask is not None) else ch
+        range_src = ch[mask] if (processed and mask is not None and (regions_active or chain is not None)) else ch
         ch_flat = range_src.ravel()
         ch_ok = np.isfinite(ch_flat)
         if ch_ok.any():
@@ -1398,7 +1410,10 @@ def _afm_payload(sample_id: str, override: Optional[dict] = None, preview: bool 
         "stats":          stats,
         "processing": {
             "settings":        shown,
-            "default":         is_default(settings, regions_active),
+            "default":         chain is None and is_default(settings, regions_active),
+            "chain":           chain,
+            "step_infos":      step_infos,
+            **({"mask": pack_mask(chain_excl), "mask_shape": list(chain_excl.shape)} if preview and chain_excl is not None else {}),
             "range_manual":    [settings["range_min"] is not None, settings["range_max"] is not None],
             "range_basis":     "region" if regions_active else "full map",
             "regions_active":  regions_active,
