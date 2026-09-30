@@ -11317,6 +11317,121 @@ function AfmFramedMap({ grid, scanSizeUm, vmin, vmax, cmap, unit, rmsNm = null, 
   );
 }
 
+// ── Per-scan export of a notebook AFM map ─────────────────────────────────────
+// Builds an SVG of exactly what AfmFramedMap shows (map pixels embedded as an image,
+// box, µm axes, bordered color bar, scale bar, RMS) and offers it as SVG, PNG (4×)
+// or a clipboard PNG, like the Plotly panels' export buttons.
+function afmMapDataUrl(grid, vmin, vmax, cmap) {
+  const H = grid.length, W = grid[0].length;
+  const c = document.createElement("canvas"); c.width = W; c.height = H;
+  const ctx = c.getContext("2d"); const img = ctx.createImageData(W, H);
+  const rng = (vmax - vmin) || 1;
+  for (let r = 0; r < H; r++) for (let q = 0; q < W; q++) {
+    const [rv, gv, bv] = cmap(Math.max(0, Math.min(1, (grid[r][q] - vmin) / rng)));
+    const o = (r * W + q) * 4; img.data[o] = rv; img.data[o + 1] = gv; img.data[o + 2] = bv; img.data[o + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return c.toDataURL("image/png");
+}
+
+function buildAfmMapSvg({ grid, scanSizeUm, vmin, vmax, cmap, unit, rmsNm, font, fontSize = 11, width = 240, title = "" }) {
+  const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const f = (font || "Arial, sans-serif").replace(/"/g, "'");
+  const fs = Math.max(8, fontSize - 1);
+  const size = Number(scanSizeUm) || 0;
+  const { ticks, decimals } = afmColorTicks(0, size);
+  const yAxisW = fs * 3 + 10, pad = 6;
+  const hasBar = vmin != null && vmax != null && vmax > vmin;
+  const barX = yAxisW + width + 6 + 1.5, barW = 9;
+  const cb = hasBar ? afmColorTicks(vmin, vmax) : { ticks: [], decimals: 0 };
+  const W = yAxisW + width + (hasBar ? 6 + 16 + fs * 3.2 : 0) + pad * 2;
+  const Hm = width;                                        // square scan
+  const top = hasBar ? fs + 6 : 0;                         // room for the color-bar unit above the bar
+  const H = top + Hm + fs + 8 + fs + 10 + pad * 2;
+  const x0 = pad + yAxisW, y0 = pad + top;
+  // Exports are for slides and papers: dark lines and text on a transparent background,
+  // whatever the app theme.
+  const tp = "#111111", ts = "#333333";
+  const out = [];
+  out.push(`<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="${f}">`);
+  if (title) out.push(`<title>${esc(title)}</title>`);
+  out.push(`<image x="${x0}" y="${y0}" width="${width}" height="${Hm}" preserveAspectRatio="none" style="image-rendering:pixelated" href="${afmMapDataUrl(grid, vmin, vmax, cmap)}" xlink:href="${afmMapDataUrl(grid, vmin, vmax, cmap)}"/>`);
+  out.push(`<rect x="${x0}" y="${y0}" width="${width}" height="${Hm}" fill="none" stroke="${tp}" stroke-width="1.5"/>`);
+  if (size > 0) {
+    for (const v of ticks) {
+      const px = x0 + (v / size) * width, py = y0 + (1 - v / size) * Hm;
+      out.push(`<line x1="${px}" y1="${y0 + Hm}" x2="${px}" y2="${y0 + Hm + 4}" stroke="${tp}" stroke-width="1.5"/>`);
+      out.push(`<text x="${px}" y="${y0 + Hm + 5 + fs}" font-size="${fs}" fill="${ts}" text-anchor="middle">${v.toFixed(decimals)}</text>`);
+      out.push(`<line x1="${x0 - 4}" y1="${py}" x2="${x0}" y2="${py}" stroke="${tp}" stroke-width="1.5"/>`);
+      out.push(`<text x="${x0 - 6}" y="${py + fs * 0.35}" font-size="${fs}" fill="${ts}" text-anchor="end">${v.toFixed(decimals)}</text>`);
+    }
+    out.push(`<text x="${x0 + width / 2}" y="${y0 + Hm + 8 + fs * 2 + 2}" font-size="${fs}" fill="${ts}" text-anchor="middle">µm</text>`);
+    // scale bar, as drawn on the card
+    const stops = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100];
+    const barUm = stops.reduce((a, b) => Math.abs(b - size / 5) < Math.abs(a - size / 5) ? b : a);
+    const bpx = barUm / size * width, bx = x0 + width - bpx - width * 0.04, by = y0 + Hm - Hm * 0.07, bh = Math.max(3, Hm * 0.025);
+    const bfs = Math.max(11, width / 16);
+    out.push(`<rect x="${bx}" y="${by}" width="${bpx}" height="${bh}" fill="#fff"/>`);
+    out.push(`<text x="${bx + bpx / 2}" y="${by - bfs * 0.3}" font-size="${bfs}" font-weight="700" fill="#fff" stroke="rgba(0,0,0,0.7)" stroke-width="3" paint-order="stroke" text-anchor="middle">${barUm >= 1 ? `${barUm} µm` : `${barUm * 1000} nm`}</text>`);
+  }
+  if (rmsNm != null) {
+    out.push(`<text x="${x0 + width - 6}" y="${y0 + 4 + fs + 1}" font-size="${fs + 1}" font-weight="700" fill="#fff" stroke="rgba(0,0,0,0.85)" stroke-width="3" paint-order="stroke" text-anchor="end">RMS ${esc(fmtAfmRms(rmsNm))}</text>`);
+  }
+  if (hasBar) {
+    const gid = "g" + Math.random().toString(36).slice(2, 8);
+    out.push(`<defs><linearGradient id="${gid}" x1="0" y1="1" x2="0" y2="0">${Array.from({ length: 21 }, (_, i) => { const [r, g, b] = cmap(i / 20); return `<stop offset="${i * 5}%" stop-color="rgb(${r},${g},${b})"/>`; }).join("")}</linearGradient></defs>`);
+    out.push(`<rect x="${barX}" y="${y0}" width="${barW}" height="${Hm}" fill="url(#${gid})" stroke="${tp}" stroke-width="1.5"/>`);
+    for (const v of cb.ticks) {
+      const py = y0 + (1 - (v - vmin) / (vmax - vmin)) * Hm;
+      out.push(`<line x1="${barX + barW}" y1="${py}" x2="${barX + barW + 3}" y2="${py}" stroke="${ts}" stroke-width="1"/>`);
+      out.push(`<text x="${barX + barW + 5}" y="${py + fs * 0.35}" font-size="${fs}" fill="${ts}">${(Math.abs(v) < 1e-12 ? 0 : v).toFixed(cb.decimals)}</text>`);
+    }
+    out.push(`<text x="${barX}" y="${y0 - 4}" font-size="${fs}" fill="${ts}">${esc(unit || "")}</text>`);
+  }
+  out.push(`</svg>`);
+  return { svg: out.join(""), width: W, height: H };
+}
+
+async function afmSvgToPngBlob({ svg, width, height }, scale = 4) {
+  const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
+  try {
+    const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
+    const c = document.createElement("canvas"); c.width = Math.round(width * scale); c.height = Math.round(height * scale);
+    const ctx = c.getContext("2d"); ctx.imageSmoothingEnabled = false; ctx.drawImage(img, 0, 0, c.width, c.height);
+    return await new Promise(res => c.toBlob(res, "image/png"));
+  } finally { URL.revokeObjectURL(url); }
+}
+
+function AfmExportButtons({ build, filename }) {
+  const [msg, setMsg] = useState(null);
+  const flash = t => { setMsg(t); setTimeout(() => setMsg(null), 1800); };
+  const save = (blob, ext) => {
+    const url = URL.createObjectURL(blob); const a = document.createElement("a");
+    a.href = url; a.download = `${filename}.${ext}`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  const run = async kind => {
+    try {
+      const svg = build();
+      if (kind === "svg") save(new Blob([svg.svg], { type: "image/svg+xml" }), "svg");
+      else {
+        const png = await afmSvgToPngBlob(svg, 4);
+        if (kind === "png") save(png, "png");
+        else { await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]); flash("copied"); }
+      }
+    } catch (e) { console.error("AFM export failed", e); flash("export failed"); }
+  };
+  const b = { fontFamily: "'DM Mono', monospace", fontSize: 9, padding: "1px 6px", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 3, color: T.textDim, cursor: "pointer" };
+  return (
+    <div style={{ display: "flex", gap: 4, justifyContent: "center", alignItems: "center", marginTop: 4 }}>
+      <button style={b} title="Download SVG (map embedded, axes and text editable)" onClick={() => run("svg")}>SVG</button>
+      <button style={b} title="Download PNG at 4×" onClick={() => run("png")}>PNG</button>
+      <button style={b} title="Copy PNG to clipboard" onClick={() => run("copy")}>copy</button>
+      {msg && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: msg === "copied" ? T.teal : T.red }}>{msg}</span>}
+    </div>
+  );
+}
+
 function AfmComparisonPanel({ sampleOrder, plotCache, labels = {}, plotStyle, config = {}, onUpdate }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
 
@@ -11353,14 +11468,23 @@ function AfmComparisonPanel({ sampleOrder, plotCache, labels = {}, plotStyle, co
           return (
             <div key={sid} style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
               <div>
-                {grid ? (
-                  <AfmFramedMap grid={grid} scanSizeUm={afmData.scan_size_um} vmin={vmin} vmax={vmax} width={mapPx}
-                    cmap={afmColormap(afmData.processing?.settings?.colormap, afmData.processing?.settings?.color_trim)}
-                    unit={afmData.channel_units?.[activeChannel] ?? (activeChannel?.toLowerCase().includes("height") ? "nm" : activeChannel?.toLowerCase().includes("phase") ? "°" : "")}
-                    font={ps.font} fontSize={ps.fontSize || 11}
-                    rmsNm={config.afm_show_rms && afmData.stats?.[activeChannel]
-                      ? (afmData.stats[activeChannel].region?.rq_nm ?? afmData.stats[activeChannel].full?.rq_nm) : null} />
-                ) : (
+                {grid ? (() => {
+                  const mapProps = {
+                    grid, scanSizeUm: afmData.scan_size_um, vmin, vmax, width: mapPx,
+                    cmap: afmColormap(afmData.processing?.settings?.colormap, afmData.processing?.settings?.color_trim),
+                    unit: afmData.channel_units?.[activeChannel] ?? (activeChannel?.toLowerCase().includes("height") ? "nm" : activeChannel?.toLowerCase().includes("phase") ? "°" : ""),
+                    font: ps.font, fontSize: ps.fontSize || 11,
+                    rmsNm: config.afm_show_rms && afmData.stats?.[activeChannel]
+                      ? (afmData.stats[activeChannel].region?.rq_nm ?? afmData.stats[activeChannel].full?.rq_nm) : null,
+                  };
+                  const fname = `${String(label).replace(/[^\w.-]+/g, "_")}_${afmShortLabel(activeChannel || "map")}`;
+                  return (
+                    <>
+                      <AfmFramedMap {...mapProps} />
+                      <AfmExportButtons filename={fname} build={() => buildAfmMapSvg({ ...mapProps, title: `${label} ${activeChannel || ""}` })} />
+                    </>
+                  );
+                })() : (
                   <div style={{ width: mapPx, height: mapPx, background: T.bg3, borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center" }}>
                     <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>no data</span>
                   </div>
