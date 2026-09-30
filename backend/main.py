@@ -882,10 +882,12 @@ async def inspect_xray_file(file: UploadFile = File(...)):
 
 
 @app.get("/api/samples/{sample_id}/xray/{filename}")
-def get_xray_file(sample_id: str, filename: str, detector_distance: Optional[float] = Query(None)):
+def get_xray_file(sample_id: str, filename: str, detector_distance: Optional[float] = Query(None),
+                  frame: Optional[int] = Query(None)):
     """Parse a stored .rasx and return the same payload as /api/xray/inspect.
     `detector_distance` (mm) overrides the recorded sample-to-detector distance
-    for RSMs (2θ recomputed on read; the file is untouched). Ignored for 1D scans."""
+    for RSMs (2θ recomputed on read; the file is untouched). Ignored for 1D scans.
+    `frame` picks one scan from a file holding several 2θ/θ scans (default: last)."""
     from rasx import inspect_bytes, DETECTOR_DISTANCE_MIN, DETECTOR_DISTANCE_MAX
     if detector_distance is not None and not (DETECTOR_DISTANCE_MIN <= detector_distance <= DETECTOR_DISTANCE_MAX):
         raise HTTPException(422, f"detector_distance must be between {DETECTOR_DISTANCE_MIN:g} and {DETECTOR_DISTANCE_MAX:g} mm")
@@ -893,7 +895,7 @@ def get_xray_file(sample_id: str, filename: str, detector_distance: Optional[flo
     if not path.exists():
         raise HTTPException(404, "File not found")
     try:
-        return inspect_bytes(path.read_bytes(), filename, detector_distance)
+        return inspect_bytes(path.read_bytes(), filename, detector_distance, frame)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:

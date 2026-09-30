@@ -301,7 +301,7 @@ class RasxScan:
         flagged, note = check_detector_distance(self.detector_distance_mm)
         out["detector_distance_flagged"] = flagged
         out["detector_distance_note"] = note
-        if self.is_map:
+        if self.is_map and not is_line_scan_set(self):
             om = self.frame_omegas()
             out["omega_start"] = float(om.min())
             out["omega_stop"] = float(om.max())
@@ -343,6 +343,53 @@ def read_rasx(source, name: Optional[str] = None) -> RasxScan:
 SYMMETRIC_AXES = ("TwoThetaTheta", "TwoThetaOmega")
 
 
+def is_line_scan_set(scan: RasxScan) -> bool:
+    """
+    Several complete symmetric scans stored as frames of one file, as opposed to
+    an RSM. True when there is more than one frame, the file is not tagged as an
+    RSM, and every frame is itself a symmetric 2θ/θ (or 2θ/ω) scan.
+    """
+    if not scan.is_map or "RSM" in str(scan.data_type or "").upper():
+        return False
+    return all(str(f.meta["scan"].get("AxisName") or "") in SYMMETRIC_AXES for f in scan.frames)
+
+
+def frame_summary(f: Frame) -> dict:
+    """What distinguishes one frame of a scan set: range, step, timing, alignment."""
+    sc, ax = f.meta["scan"], f.meta["axes"]
+    t = None
+    try:
+        if str(sc.get("Mode")).upper() == "CONTINUOUS":
+            t = sc["Step"] / sc["Speed"] * 60.0
+        else:
+            t = float(sc["Speed"])
+    except (KeyError, TypeError, ZeroDivisionError):
+        pass
+    return {
+        "index":      f.index,
+        "n_points":   int(len(f.x)),
+        "start":      float(f.x[0]),
+        "stop":       float(f.x[-1]),
+        "step":       sc.get("Step"),
+        "mode":       sc.get("Mode"),
+        "time_per_point_s": t,
+        "start_time": sc.get("StartTime"),
+        "end_time":   sc.get("EndTime"),
+        "omega":      ax.get("Omega", {}).get("position"),
+        "two_theta":  ax.get("TwoTheta", {}).get("position"),
+    }
+
+
+def resolve_frame(scan: RasxScan, frame: Optional[int]) -> int:
+    """Frame index to use for a scan set: the requested one, else the last (latest) frame."""
+    n = len(scan.frames)
+    if frame is None:
+        return n - 1
+    if not (0 <= int(frame) < n):
+        raise ValueError("frame %s out of range: this file has %d frames (0–%d)" % (frame, n, n - 1))
+    return int(frame)
+
+
 def classify(scan: RasxScan) -> Tuple[Optional[str], str]:
     """
     Decide which LabLog card a scan belongs on.
@@ -351,6 +398,16 @@ def classify(scan: RasxScan) -> Tuple[Optional[str], str]:
     """
     axis = str(scan.scan.get("AxisName") or "")
     dtype = str(scan.data_type or "")
+    if is_line_scan_set(scan):
+        # Several independent 2θ/θ scans saved in one file (e.g. a re-run after
+        # realignment). Each frame is a complete scan; the card picks one.
+        kinds = {"xrr" if isinstance(f.meta["scan"].get("Stop"), float) and f.meta["scan"]["Stop"] <= XRR_MAX_2THETA
+                 else "xrd_ot" for f in scan.frames}
+        n = len(scan.frames)
+        if len(kinds) > 1:
+            return None, "a set of %d 2θ/θ scans that mixes XRR and diffraction ranges — not supported yet" % n
+        kind = kinds.pop()
+        return kind, "%s (%d scans in one file)" % ("an XRR scan set" if kind == "xrr" else "a 2θ/θ scan set", n)
     if scan.is_map or "RSM" in dtype.upper():
         if scan.is_map and axis != "TwoTheta":
             # Multi-frame data we have not verified (e.g. 2θ/ω scans stepped in ω)
@@ -426,12 +483,15 @@ def corrected_two_theta(scan: RasxScan, d_true_mm: float) -> Tuple[np.ndarray, d
     return tt, info
 
 
-def to_payload(scan: RasxScan, kind: str, detector_distance: Optional[float] = None) -> dict:
+def to_payload(scan: RasxScan, kind: str, detector_distance: Optional[float] = None,
+               frame: Optional[int] = None) -> dict:
     """
     Plot-ready payload for the frontend. 1D: {x, y}. RSM: compact grid.
     `detector_distance` (mm) overrides the recorded sample-to-detector distance
     for maps; the stored .rasx is never modified. Ignored for 1D scans, whose
     angle comes from the goniometer arm.
+    `frame` picks one scan from a file holding several 2θ/θ scans (default: the
+    last one); the payload then lists every frame so the card can offer a choice.
     """
     d_rec = scan.detector_distance_mm
     if kind == "rsm":
@@ -455,15 +515,26 @@ def to_payload(scan: RasxScan, kind: str, detector_distance: Optional[float] = N
         }
         out.update(extra)
         return out
-    out = {"x": scan.x.tolist(), "y": scan.intensity.tolist(),
-           "detector_distance_mm": d_rec, "detector_distance_applied_mm": None}
+    if is_line_scan_set(scan):
+        idx = resolve_frame(scan, frame)
+        f = scan.frames[idx]
+        out = {"x": f.x.tolist(), "y": f.intensity.tolist(),
+               "detector_distance_mm": d_rec, "detector_distance_applied_mm": None,
+               "frame": idx, "frame_default": len(scan.frames) - 1,
+               "frames": [frame_summary(fr) for fr in scan.frames]}
+    else:
+        if frame is not None and frame != 0:
+            raise ValueError("this file holds a single scan; frame must be 0")
+        out = {"x": scan.x.tolist(), "y": scan.intensity.tolist(),
+               "detector_distance_mm": d_rec, "detector_distance_applied_mm": None}
     if detector_distance is not None:
         out["note"] = "detector distance override ignored: 1D scans take their angle from the goniometer arm"
     return out
 
 
 def inspect_bytes(data: bytes, filename: Optional[str] = None,
-                  detector_distance: Optional[float] = None) -> dict:
+                  detector_distance: Optional[float] = None,
+                  frame: Optional[int] = None) -> dict:
     """Parse + classify + build payload. Raises ValueError for unreadable input."""
     try:
         scan = read_rasx(data, name=filename)
@@ -475,7 +546,7 @@ def inspect_bytes(data: bytes, filename: Optional[str] = None,
         out["reason"] = "This is %s." % desc
         out["payload"] = None
     else:
-        out["payload"] = to_payload(scan, kind, detector_distance)
+        out["payload"] = to_payload(scan, kind, detector_distance, frame)
         if "warning" in out["payload"]:
             out["meta"]["warning"] = out["payload"]["warning"]
         if "note" in out["payload"]:
