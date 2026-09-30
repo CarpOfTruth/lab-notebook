@@ -1014,7 +1014,7 @@ function LinePlot({ data, cfg }) {
   );
 }
 
-function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain, plotStyle, showColorbar = false, points = [], hideXLabels = false, hideYLabels = false, overridePxW = null, overridePxH = null }) {
+function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain, plotStyle, showColorbar = false, points = [], hideXLabels = false, hideYLabels = false, overridePxW = null, overridePxH = null, zRange = null }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const bins = ps.rsmBins || 256;
   const logIntensity = ps.rsmLogIntensity ?? true;
@@ -1036,7 +1036,7 @@ function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain, plotStyle, showColor
     type: "heatmap", x: binned.x, y: binned.y, z: binned.z,
     colorscale, showscale: showColorbar,
     connectgaps: false, zsmooth: false,
-    zauto: false, zmin: binned.zmin, zmax: binned.zmax,
+    zauto: false, zmin: zRange?.[0] ?? binned.zmin, zmax: zRange?.[1] ?? binned.zmax,
     hovertemplate: `Qₓ: %{x:.4f}<br>Qz: %{y:.4f}<br>${zLabel}: %{z:.2f}<extra></extra>`,
   };
   const pointTraces = points.map(pt => ({
@@ -9222,7 +9222,7 @@ const DEFAULT_PLOT_STYLE = {
   rsmBins: 256, rsmColorbar: false, rsmLogIntensity: true,
   rsmXMin: null, rsmXMax: null, rsmYMin: null, rsmYMax: null,
   rsmBgMethod: "percentile", rsmBgPct: 5, rsmWhiteFade: 0.15, rsmQ2pi: false,
-  rsmMaxCols: null, rsmTight: false, rsmLabelColor: "sample",
+  rsmMaxCols: null, rsmTight: false, rsmLabelColor: "sample", rsmColorScale: "per_scan",
   colorScale: "viridis", colorTrim: 5,
 };
 
@@ -10450,6 +10450,13 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
         const rows       = Math.ceil(entries.length / cols);
         const labelStyle = ps.rsmLabelColor ?? "sample";
 
+        // Color range: each map uses its own robust range unless the book asks for one shared range.
+        const sharedScale = ps.rsmColorScale === "shared";
+        const validBinned = allBinned.filter(Boolean);
+        const zMins = validBinned.map(b => b.zmin).filter(v => v != null);
+        const zMaxs = validBinned.map(b => b.zmax).filter(v => v != null);
+        const sharedZ = sharedScale && zMins.length && zMaxs.length ? [Math.min(...zMins), Math.max(...zMaxs)] : null;
+
         // ── non-tight: individual RSMPlot components (original layout) ────────
         if (!tight) {
           const panelW = ps.plotWidth ? Math.round(ps.plotWidth * 96) : 280;
@@ -10458,7 +10465,7 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
               {entries.map(e => (
                 <div key={e.sid} style={{ flex: "0 0 auto", width: panelW }}>
                   {labelStyle !== "off" && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: labelStyle === "sample" ? e.color : T.textPrimary, marginBottom: 4, textAlign: "center" }}>{labels[e.sid] || e.sid}</div>}
-                  <RSMPlot data={e.data} cfg={rsmCfg} forcedXDomain={forcedXDomain} forcedYDomain={forcedYDomain} plotStyle={ps} showColorbar={ps.rsmColorbar} points={resolvedPoints} />
+                  <RSMPlot data={e.data} cfg={rsmCfg} forcedXDomain={forcedXDomain} forcedYDomain={forcedYDomain} plotStyle={ps} showColorbar={ps.rsmColorbar} points={resolvedPoints} zRange={sharedZ} />
                 </div>
               ))}
             </div>
@@ -10472,10 +10479,6 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
         const zLabel   = logIntensity ? "log I" : "I";
         const colorscale = makeHeatmapColorscale(ps.colorScale || "viridis", ps.rsmWhiteFade ?? 0);
 
-        // Global robust color range — shared across all panels for direct comparison
-        const validBinned = allBinned.filter(Boolean);
-        const globalZmin = validBinned.length ? Math.min(...validBinned.map(b => b.zmin).filter(v => v != null)) : null;
-        const globalZmax = validBinned.length ? Math.max(...validBinned.map(b => b.zmax).filter(v => v != null)) : null;
 
         // Figure pixel dimensions (W × H = whole collection)
         const defPW = 280, defPH = 280;
@@ -10496,6 +10499,16 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
         const annotations  = [];
         const shapes       = [];
 
+        // Per-scan colorbars: each map has its own range, so each gets its own bar.
+        // The maps normally touch; open a gap between columns to hold the bars.
+        const perScanBar = !sharedScale && !!ps.rsmColorbar;
+        const marginL = 68, marginR = perScanBar ? 44 : 14;
+        const barGapPx = 44;
+        const plotAreaW = Math.max(1, figW - marginL - marginR);
+        const gapFrac = perScanBar && cols > 1 ? barGapPx / plotAreaW : 0;
+        const cellW = (1 - gapFrac * (cols - 1)) / cols;
+        const colDomain = c => [c * (cellW + gapFrac), c * (cellW + gapFrac) + cellW];
+
         entries.forEach((e, idx) => {
           const binned = allBinned[idx];
           if (!binned) return;
@@ -10511,15 +10524,22 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
           const xTicks   = makeTicks(binned.xDomain[0], binned.xDomain[1], ps.xTick);
           const yTicks   = makeTicks(binned.yDomain[0], binned.yDomain[1], ps.yTick);
 
-          // Heatmap
+          // Heatmap. Shared scale: one colorbar on the last map. Per-scan scale: a
+          // bar per map, placed in the gap just right of it.
           plotlyTraces.push({
             type: "heatmap", x: binned.x, y: binned.y, z: binned.z,
             xaxis: xRef, yaxis: yRef,
-            colorscale, showscale: !!(ps.rsmColorbar && idx === entries.length - 1),
+            colorscale, showscale: perScanBar || !!(ps.rsmColorbar && idx === entries.length - 1),
+            ...(perScanBar ? { colorbar: {
+              x: colDomain(col)[1] + 0.004, xanchor: "left", xref: "paper",
+              y: 1 - (row + 0.5) / rows, yanchor: "middle", yref: "paper",
+              len: 0.8 / rows, thickness: 7, outlinewidth: 0, xpad: 2,
+              tickfont: { size: Math.max(8, (ps.fontSize || 12) - 5), family: ps.font, color: T.textDim },
+            } } : {}),
             connectgaps: false, zsmooth: false,
             zauto: false,
-            zmin: globalZmin != null ? globalZmin : binned.zmin,
-            zmax: globalZmax != null ? globalZmax : binned.zmax,
+            zmin: sharedZ ? sharedZ[0] : binned.zmin,
+            zmax: sharedZ ? sharedZ[1] : binned.zmax,
             hovertemplate: `Qₓ: %{x:.4f}<br>Qz: %{y:.4f}<br>${zLabel}: %{z:.2f}<extra></extra>`,
           });
 
@@ -10537,6 +10557,7 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
           // Axes — labels only on outer edges
           axesLayout[xAxisKey] = {
             ...axisBase, ...spikeProps,
+            ...(perScanBar ? { domain: colDomain(col) } : {}),
             range: [binned.xDomain[0], binned.xDomain[1]],
             ...(xTicks ? { tickvals: xTicks, tickmode: "array" } : {}),
             showticklabels: isBottom,
@@ -10580,7 +10601,7 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
           autosize: false, width: figW, height: figH,
           paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
           font: { family: ps.font, size: ps.fontSize, color: T.textPrimary },
-          margin: { t: 40, r: 14, b: 58, l: 68, pad: 0 },
+          margin: { t: 40, r: marginR, b: 58, l: marginL, pad: 0 },
           grid: {
             rows, columns: cols,
             pattern: "independent",
@@ -12820,6 +12841,9 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
     rsmMaxCols:     config.rsm_max_cols      != null ? Number(config.rsm_max_cols) : null,
     rsmTight:       config.rsm_tight         ?? false,
     rsmLabelColor:  config.rsm_label_color   ?? "sample",
+    // Color range of each map: "per_scan" (each map's own robust 2–99.5% range after
+    // its own background subtraction) or "shared" (one range across all maps).
+    rsmColorScale:  config.rsm_color_scale   === "shared" ? "shared" : "per_scan",
     colorScale:     bookColorScale,
     colorTrim:      config.color_trim        ?? 5,
     xMin:           config.x_min  != null ? Number(config.x_min)  : null,
@@ -13217,6 +13241,17 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                       <button key={opt} onClick={() => onUpdate({ rsm_log_intensity: opt === "log" })}
                         style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (ps.rsmLogIntensity ? "log" : "linear") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.rsmLogIntensity ? "log" : "linear") === opt ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
                         {opt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }} title="Per scan: each map's colors span its own intensity range. Shared: one range across all maps, for comparing absolute intensity.">
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>SCALE</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {[["per scan", "per_scan"], ["shared", "shared"]].map(([label, val], idx) => (
+                      <button key={val} onClick={() => onUpdate({ rsm_color_scale: val })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: ps.rsmColorScale === val ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: ps.rsmColorScale === val ? T.textPrimary : T.textDim, cursor: "pointer" }}>
+                        {label}
                       </button>
                     ))}
                   </div>
