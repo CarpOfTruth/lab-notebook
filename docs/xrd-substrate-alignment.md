@@ -539,7 +539,11 @@ above; each was agreed before it was applied.
    peak in the cropped view onto a substrate position, which this design forbids on both
    counts. Books that had it on now read as "align". The sample card's "zeroed" button
    still uses the old largest-peak shift and is out of scope here.
-9. **Text exports carry no wavelength**: Cu Kalpha1 is assumed and recorded as assumed in
+9. **No in-figure statement; details collapsed** (owner's call, 15 Oct 2026). The plot no
+   longer carries an "aligned / as measured" annotation, so an exported figure does not
+   say whether the offset was applied: the panel option and the per-sample table are the
+   record. The table sits behind "substrate alignment details", closed by default.
+10. **Text exports carry no wavelength**: Cu Kalpha1 is assumed and recorded as assumed in
    `conditions.wavelength_source`; `.rasx` files supply their own.
 
 Data fixes applied with this work: 24 substrate strings repointed (the 19 in Step 0 plus

@@ -10071,6 +10071,7 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
     setAlignBusy(b => ({ ...b, [sid]: false }));
   };
   const appliedOf = sid => (alignOn ? alignments[sid]?.alignment : null);
+  const [alignDetailsOpen, setAlignDetailsOpen] = useState(false);
 
   const { traces, yDomMin, yDomMax, xTicks, xDomain } = useMemo(() => {
     const traces = sampleOrder.map((sid, i) => {
@@ -10180,17 +10181,7 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
       showticklabels: false, showgrid: false,
       title: { text: "Intensity (arb.)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
     lineShapes,
-    { uirevision: `xrd-${thetaMin ?? "a"}-${thetaMax ?? "a"}`, dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 },
-      annotations: [{ xref: "paper", yref: "paper", x: 0.01, y: 0.99, xanchor: "left", yanchor: "top", showarrow: false,
-        font: { size: Math.max(8, (ps.fontSize || 12) - 3), family: ps.font, color: T.textDim },
-        text: (() => {
-          if (!alignOn) return "2θ as measured (not aligned)";
-          const shown = traces.map(t => t.sid);
-          const done = shown.filter(sid => appliedOf(sid)?.value != null);
-          if (!done.length) return "2θ as measured (alignment found no reference)";
-          const missing = shown.filter(sid => !done.includes(sid)).map(sid => labels[sid] || sid);
-          return `2θ aligned to substrate` + (missing.length ? `; not aligned: ${missing.join(", ")}` : "");
-        })() }] }
+    { uirevision: `xrd-${thetaMin ?? "a"}-${thetaMax ?? "a"}`, dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 } }
   );
 
   return (
@@ -10208,7 +10199,13 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
           </SciPlotWrap>
           <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
           {alignOn && (
-            <div style={{ marginTop: 10, overflowX: "auto" }}>
+            <button onClick={() => setAlignDetailsOpen(v => !v)}
+              style={{ marginTop: 8, background: "none", border: "none", padding: 0, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>
+              {alignDetailsOpen ? "▾" : "▸"} substrate alignment details
+            </button>
+          )}
+          {alignOn && alignDetailsOpen && (
+            <div style={{ marginTop: 6, overflowX: "auto" }}>
               <table style={{ borderCollapse: "collapse", fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textSecondary, width: "100%" }}>
                 <thead><tr style={{ color: T.textDim, textAlign: "left" }}>
                   {["sample", "status", "reference", "expected → measured", "Δ2θ applied", "model", "notes", ""].map(h => <th key={h} style={{ padding: "2px 8px", fontWeight: 400 }}>{h}</th>)}
