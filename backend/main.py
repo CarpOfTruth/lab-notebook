@@ -169,6 +169,12 @@ def init_db():
         except sqlite3.OperationalError:
             pass
         try:
+            # The substrate's cut, e.g. "(001)". The cell belongs to the material, the cut to the
+            # sample; NULL means "use the material's default_orientation". See docs/xrd-substrate-alignment.md.
+            conn.execute("ALTER TABLE samples ADD COLUMN substrate_orientation TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
             conn.execute("ALTER TABLE samples ADD COLUMN lot TEXT")
         except sqlite3.OperationalError:
             pass
@@ -501,12 +507,13 @@ def create_sample(sample: dict):
         conn.execute("""
             INSERT INTO samples
               (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
-               technique, folder_id, layers, filenames, xrd_peaks, lot, bin)
+               technique, folder_id, layers, filenames, xrd_peaks, lot, bin, substrate_orientation)
             VALUES
               (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
-               :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin)
+               :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin, :substrate_orientation)
         """, {
             **sample,
+            "substrate_orientation": sample.get("substrate_orientation") or None,
             "technique":  sample.get("technique", "sputter"),
             "folder_id":  sample.get("folder_id"),
             "layers":     layers_json,
@@ -520,10 +527,34 @@ def create_sample(sample: dict):
         conn.commit()
     return {"ok": True, "id": sample["id"]}
 
+def _merge_xrd_peaks(incoming, stored_json):
+    """The substrate alignment in xrd_peaks.alignment is written only by the alignment
+    endpoints. A whole-sample save (or the XRD analysis view saving its fit state)
+    must never drop it, so carry the stored alignment over when the payload lacks it.
+    The old array format is wrapped as {"lines": [...]}, which every reader accepts."""
+    try:
+        stored = json.loads(stored_json or "[]")
+    except (TypeError, ValueError):
+        stored = []
+    alignment = stored.get("alignment") if isinstance(stored, dict) else None
+    if incoming is None:
+        incoming = []
+    if alignment is None or (isinstance(incoming, dict) and "alignment" in incoming):
+        return incoming
+    if isinstance(incoming, list):
+        incoming = {"lines": incoming}
+    return {**incoming, "alignment": alignment}
+
+
 @app.put("/api/samples/{sample_id}")
 def update_sample(sample_id: str, sample: dict):
     with get_db() as conn:
         layers_json = json.dumps(sample.get("layers", []))
+        prev = conn.execute("SELECT xrd_peaks FROM samples WHERE id=?", (sample_id,)).fetchone()
+        xrd_peaks = _merge_xrd_peaks(sample.get("xrd_peaks", []), prev["xrd_peaks"] if prev else None)
+        if "substrate_orientation" in sample:      # only when sent: a caller that omits it keeps the stored cut
+            conn.execute("UPDATE samples SET substrate_orientation=? WHERE id=?",
+                         ((sample.get("substrate_orientation") or "").strip() or None, sample_id))
         conn.execute("""
             UPDATE samples SET
               date=:date, substrate=:substrate, notes=:notes,
@@ -544,7 +575,7 @@ def update_sample(sample_id: str, sample: dict):
             "folder_id":  sample.get("folder_id"),
             "layers":     layers_json,
             "filenames":  json.dumps(sample.get("filenames", {})),
-            "xrd_peaks":  json.dumps(sample.get("xrd_peaks", [])),
+            "xrd_peaks":  json.dumps(xrd_peaks),
             "lot":        sample.get("lot"),
             "bin":        sample.get("bin"),
         })
@@ -900,6 +931,183 @@ def get_xray_file(sample_id: str, filename: str, detector_distance: Optional[flo
         raise HTTPException(422, str(e))
     except Exception as e:
         raise HTTPException(422, f"Could not read .rasx: {e}")
+
+
+# ── XRD substrate alignment ──────────────────────────────────────────────────
+# Physics in xrdref.py (pure); design in docs/xrd-substrate-alignment.md. The offset is
+# computed once and stored as metadata in samples.xrd_peaks.alignment; the stored scan is
+# never modified. A notebook panel option decides whether it is applied at plot time.
+
+def _xrd_text_to_xy(text: str):
+    """Same rules as the frontend's csvToPlotData for xrd_ot: comment lines skipped,
+    comma/semicolon/tab split (whitespace when that yields one column), and x doubled
+    when the header names ω without 2θ."""
+    def num(c):
+        c = c.strip().strip("\"'")
+        if c == "":
+            return 0.0
+        try:
+            return float(c)
+        except ValueError:
+            return float("nan")
+    xs, ys = [], []
+    for line in text.strip().splitlines():
+        t = line.strip()
+        if not t or t[0] in "#;!":
+            continue
+        cols = re.split(r"[,;\t]", t)
+        cells = cols if len(cols) >= 2 else t.split()
+        if len(cells) < 2:
+            continue
+        a, b = num(cells[0]), num(cells[1])
+        if a == a and b == b and abs(a) != float("inf") and abs(b) != float("inf"):
+            xs.append(a); ys.append(b)
+    head = text.splitlines()[:8]
+    omega = any(re.search("ω", l, re.I) and not re.search(r"2\s*[θtT°]", l) and not re.search("2theta", l, re.I)
+                for l in head)
+    if omega:
+        xs = [2 * v for v in xs]
+    return xs, ys
+
+
+def _load_xrd_scan(conn, sample_id: str, filename: str):
+    """(two_theta, intensity, wavelength_A, source) for the sample's stored xrd_ot scan.
+    .rasx: the frame chosen on the card (module_config.xrd_ot.frame for this file), else the
+    latest; wavelength read from the file. Text: Cu Kα1 assumed and recorded as assumed."""
+    import hashlib
+    from xrdref import CU_KA1_A
+    path = FILES_DIR / sample_id / filename
+    if not path.exists():
+        raise HTTPException(404, f"XRD file not found: {filename}")
+    raw = path.read_bytes()
+    src = {"file": filename, "sha256": hashlib.sha256(raw).hexdigest(), "frame": None, "wavelength_source": "file"}
+    if filename.lower().endswith(".rasx"):
+        from rasx import read_rasx, is_line_scan_set, resolve_frame
+        scan = read_rasx(raw, filename)
+        row = conn.execute("SELECT module_config FROM samples WHERE id=?", (sample_id,)).fetchone()
+        cfg = (json.loads(row["module_config"] or "{}") if row else {}).get("xrd_ot") or {}
+        if is_line_scan_set(scan):
+            want = cfg.get("frame") if cfg.get("frame_file") == filename else None
+            idx = resolve_frame(scan, want)
+            f = scan.frames[idx]
+            src["frame"] = idx
+            return f.x.tolist(), f.intensity.tolist(), float(scan.wavelength), src
+        if scan.is_map:
+            raise HTTPException(422, "the XRD slot holds a map, not a 2θ/θ scan")
+        return scan.x.tolist(), scan.intensity.tolist(), float(scan.wavelength), src
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+    xs, ys = _xrd_text_to_xy(text)
+    src["wavelength_source"] = "assumed Cu Kα1 (text export carries no wavelength)"
+    return xs, ys, CU_KA1_A, src
+
+
+def _alignment_inputs(conn, sample_id: str):
+    """Everything the alignment depends on. Returns (inputs, scan) or raises HTTPException."""
+    from xrdref import EXTRACTOR_VERSION
+    row = conn.execute("SELECT substrate, substrate_orientation, filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, f"Sample '{sample_id}' not found")
+    filename = json.loads(row["filenames"] or "{}").get("xrd_ot")
+    if not filename:
+        raise HTTPException(404, "no XRD ω–2θ scan on this sample")
+    x, y, lam, src = _load_xrd_scan(conn, sample_id, filename)
+    lib = {r["name"]: {"crystal": json.loads(r["crystal"] or "{}")}
+           for r in conn.execute("SELECT name, crystal FROM materials_library").fetchall()}
+    sub = row["substrate"] or ""
+    ref_name = (lib.get(sub, {}).get("crystal") or {}).get("reference_component") or sub
+    inputs = {**src, "substrate": sub, "orientation": row["substrate_orientation"],
+              "wavelength_A": lam, "extractor_version": EXTRACTOR_VERSION,
+              "cells": {n: lib[n]["crystal"] for n in {sub, ref_name} if n in lib}}
+    return inputs, (x, y, lib)
+
+
+def _compute_alignment(inputs: dict, scan) -> dict:
+    import xrdref
+    from datetime import datetime, timezone
+    x, y, lib = scan
+    if not x:
+        env = {"value": None, "sigma": None, "unit": "deg", "status": "failed_measurement", "censored": None,
+               "conditions": None, "note": "the scan file has no data points"}
+    else:
+        rng = (min(x), max(x))
+        res = xrdref.references_for_sample(lib, inputs["substrate"], inputs["orientation"], inputs["wavelength_A"], rng)
+        if res["status"] != "ok":
+            env = {"value": None, "sigma": None, "unit": "deg", "status": "not_applicable", "censored": None,
+                   "conditions": {"substrate": inputs["substrate"], "orientation": inputs["orientation"]}, "note": res["note"]}
+        else:
+            env = xrdref.alignment_offset(x, y, res["references"], inputs["wavelength_A"], res["reference_material"],
+                                          tracked=res["tracked"])
+            env["conditions"]["orientation"] = res["orientation"]
+    env["conditions"] = {**(env.get("conditions") or {}), "wavelength_source": inputs["wavelength_source"],
+                         "file": inputs["file"], "frame": inputs["frame"]}
+    env["inputs"] = inputs
+    env["computed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return env
+
+
+def _store_alignment(conn, sample_id: str, env: Optional[dict]):
+    row = conn.execute("SELECT xrd_peaks FROM samples WHERE id=?", (sample_id,)).fetchone()
+    try:
+        peaks = json.loads(row["xrd_peaks"] or "[]")
+    except (TypeError, ValueError):
+        peaks = []
+    if isinstance(peaks, list):
+        peaks = {"lines": peaks}
+    if env is None:
+        peaks.pop("alignment", None)
+    else:
+        peaks["alignment"] = env
+    conn.execute("UPDATE samples SET xrd_peaks=? WHERE id=?", (json.dumps(peaks), sample_id))
+    conn.commit()
+
+
+def _stored_alignment(conn, sample_id: str) -> Optional[dict]:
+    row = conn.execute("SELECT xrd_peaks FROM samples WHERE id=?", (sample_id,)).fetchone()
+    try:
+        peaks = json.loads(row["xrd_peaks"] or "[]") if row else []
+    except (TypeError, ValueError):
+        return None
+    return peaks.get("alignment") if isinstance(peaks, dict) else None
+
+
+@app.get("/api/samples/{sample_id}/xrd-alignment")
+def get_xrd_alignment(sample_id: str, ensure: bool = Query(False)):
+    """The stored alignment plus whether it is stale (its inputs no longer match the
+    sample: different scan, frame, substrate, cut, wavelength, reference cell or extractor).
+    ensure=1 computes and stores it when missing or stale: the notebook panel option."""
+    with get_db() as conn:
+        stored = _stored_alignment(conn, sample_id)
+        try:
+            inputs, scan = _alignment_inputs(conn, sample_id)
+        except HTTPException as e:
+            return {"alignment": stored, "stale": None, "available": False, "reason": e.detail}
+        stale = stored is None or stored.get("inputs") != json.loads(json.dumps(inputs))
+        if ensure and stale:
+            stored = _compute_alignment(inputs, scan)
+            _store_alignment(conn, sample_id, stored)
+            stale = False
+    return {"alignment": stored, "stale": stale, "available": True, "reason": None}
+
+
+@app.post("/api/samples/{sample_id}/xrd-alignment")
+def compute_xrd_alignment(sample_id: str, store: bool = Query(True)):
+    """Recompute now. store=0 is a dry run: nothing is written."""
+    with get_db() as conn:
+        inputs, scan = _alignment_inputs(conn, sample_id)
+        env = _compute_alignment(inputs, scan)
+        if store:
+            _store_alignment(conn, sample_id, env)
+    return {"alignment": env, "stored": store}
+
+
+@app.delete("/api/samples/{sample_id}/xrd-alignment")
+def delete_xrd_alignment(sample_id: str):
+    with get_db() as conn:
+        _store_alignment(conn, sample_id, None)
+    return {"ok": True}
 
 
 # ── Sputter deposition logs ───────────────────────────────────────────────────
