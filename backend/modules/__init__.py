@@ -12,13 +12,15 @@ class found in the file is registered.
 import importlib.util
 import inspect
 import sys
+import os
 from pathlib import Path
 from typing import Optional
 from .base import LabModule
 
-# Directories
+# Directories (LABLOG_DATA_DIR relocates the data root, matching main.py)
 _BUILTIN_DIR  = Path(__file__).parent
-_USER_DIR     = Path(__file__).parent.parent / "data" / "user_modules"
+_DATA_DIR     = Path(os.environ["LABLOG_DATA_DIR"]).resolve() if os.environ.get("LABLOG_DATA_DIR") else Path(__file__).parent.parent / "data"
+_USER_DIR     = _DATA_DIR / "user_modules"
 _USER_DIR.mkdir(parents=True, exist_ok=True)
 
 # Built-in module filenames (order = display order in the UI)

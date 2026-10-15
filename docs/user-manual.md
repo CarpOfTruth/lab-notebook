@@ -319,6 +319,44 @@ From the module card, click the delete (×) control. Deleting a module does not 
 
 **Import**: click **Import** in the Samples section header and select a `.zip` file. If a sample with the same ID already exists, you are given merge options.
 
+### Import from Obsidian (create-only)
+
+**This import creates missing samples only. It does not update existing samples or write back to Obsidian.**
+
+Use it to turn grown sample notes from an Obsidian research vault into normal LabLog samples without retyping the growth record.
+
+1. Click **Import from Obsidian** in the Samples section header.
+2. Enter the vault root folder (the folder that contains `Samples/`). The path is on the computer running the LabLog backend. **Save path** remembers it; opening the dialog never scans by itself.
+3. Click **Scan**. Scanning only reads `Samples/*.md` (plus `Materials/` notes needed to resolve names). Folders starting with `_` or `.` and symbolic links are skipped. Records are grouped as:
+   - **Ready** — valid grown notes (`lablog_status: draft` or `synced`) whose ID is not in LabLog.
+   - **Needs review** — importable, but with conversion warnings (ramps, placeholders, unresolved materials, focal position with no configured parameter, reconstructed stacks, unparsed stack syntax) or with a missing/unknown `lablog_status`. Expand the record, read the warnings, and tick the acknowledgement (and "physically grown" confirmation where asked) before it can be selected.
+   - **Already in LabLog** — skipped entirely. Nothing is merged, appended, re-indexed or moved, even if the vault disagrees.
+   - **Planned — not imported** — stays in the vault.
+   - **Invalid** — unsafe or mismatched IDs, duplicate/case-colliding IDs, malformed YAML, duplicate keys, unknown technique, oversized notes. One bad note never hides the others.
+4. Select records (or **Select ready**) and click **Import selected**. The footer lists exactly which samples will be created.
+5. The result lists **Created**, **Already in LabLog**, **Source changed** (the note, a material note, technique settings or vault identities changed after the scan — rescan to review), **Skipped** and **Failed**. A SQLite backup of the database is written to `backups/` in the data folder before the first sample is created.
+
+Imported notes keep `lablog_status: draft` in the vault — that is expected. Later scans decide what exists by checking the database, not that label.
+
+**What a new sample gets**
+
+| Vault | LabLog |
+|---|---|
+| `id` (must equal the filename) | sample ID, exactly |
+| `date` | growth date, or empty — never `planned_date` or today |
+| `technique` | technique ID; must match a technique in Settings |
+| `substrate` | library name, resolved by exact library name or by the linked material note's `lablog_id`; otherwise the text is kept with a warning |
+| `lot`, `bin` | lot, bin (exact spelling) |
+| `description` | brief note (empty if absent) |
+| `stack` | layers, bottom to top |
+| everything else | kept in the sample's **Vault record** |
+
+Folder is always unset (uncategorized); thickness, device area, measurement files and analysis state are empty.
+
+Stack terms: `T` → temperature, `P` → pressure, `O2` → O₂ %, `t` → time, `f` → rep rate, `MATERIAL@…W` → target power, `…mJ/…p` → energy and pulses, `L` → the technique's single Focal Position (mm) parameter if one is configured. `RF`/`DC`/`pDC` map to power type `RF`/`DC`/`Pulsed DC`; with no mode written, power type is `RF` and marked as the vault convention. Missing values stay missing — no PLD oxygen, derived deposition time or growth defaults are added. Ramps (`P=50>90`, `BTO@125>175W`) and placeholders (`Ti@W`, `O2=`) leave that field unset; those layers show a **PARTIAL** badge. If any stack line cannot be parsed, no layers are created and the whole stack is kept as text. Role, role label (`film:lower`) and primary marker (`film*`) are kept on each layer.
+
+**Vault record** — imported samples show a read-only **Vault Record** section on the sample page: source path and hash, conversion notes, the stack as recorded, all frontmatter, the Markdown body as plain text, and the original note text. Links and embeds are shown as text; nothing is fetched or rendered as HTML. The record survives ordinary edits and sample/book export and import; it stores only the vault-relative path, not a connection to the vault.
+
 ### Analysis Books
 
 **Export**: click **Export** in the Analysis Books section header. Choose whether to include sample data.

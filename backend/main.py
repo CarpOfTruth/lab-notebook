@@ -4,6 +4,7 @@ from typing import Optional
 import sqlite3, json, os, shutil, re, importlib.util, subprocess, sys, uuid
 from pathlib import Path
 import modules as mod_registry
+import vault_import
 
 # ── Dependency blacklist ───────────────────────────────────────────────────────
 # Packages that are never permitted to be pip-installed by user modules.
@@ -31,15 +32,19 @@ _DEP_BLACKLIST = {
 app = FastAPI(title="LabLog API")
 
 BASE_DIR    = Path(__file__).parent
-DATA_DIR    = BASE_DIR / "data"
+# LABLOG_DATA_DIR points the whole app (database, files, user modules, backups) at another
+# data root — used by tests and isolated preview servers so they never touch the daily data.
+DATA_DIR    = Path(os.environ["LABLOG_DATA_DIR"]).resolve() if os.environ.get("LABLOG_DATA_DIR") else BASE_DIR / "data"
 FILES_DIR   = DATA_DIR / "files"
 DB_PATH     = DATA_DIR / "lablog.db"
+BACKUPS_DIR = DATA_DIR / "backups"
+USER_MODULES_DIR = DATA_DIR / "user_modules"
 EXAMPLES_DIR         = DATA_DIR / "module_examples"          # user-uploaded (gitignored)
 BUILTIN_EXAMPLES_DIR = BASE_DIR / "modules" / "examples"     # shipped with code (tracked)
 SCHEMAS_DIR          = DATA_DIR / "module_schemas"            # user-saved (gitignored)
 BUILTIN_SCHEMAS_DIR  = BASE_DIR / "modules" / "schemas"      # shipped with code (tracked)
 
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 FILES_DIR.mkdir(exist_ok=True)
 EXAMPLES_DIR.mkdir(exist_ok=True)
 SCHEMAS_DIR.mkdir(exist_ok=True)
@@ -184,6 +189,12 @@ def init_db():
             pass
         try:
             conn.execute("ALTER TABLE samples ADD COLUMN module_config TEXT DEFAULT '{}'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            # JSON provenance for samples created from an external record (Obsidian vault import).
+            # Never written by the ordinary sample update route.
+            conn.execute("ALTER TABLE samples ADD COLUMN source_record TEXT")
         except sqlite3.OperationalError:
             pass
         conn.execute("""
@@ -356,8 +367,16 @@ def row_to_sample(row):
     d["filenames"]          = json.loads(d.get("filenames")     or "{}")
     d["xrd_peaks"]          = json.loads(d.get("xrd_peaks")     or "[]")
     d["module_config"]      = json.loads(d.get("module_config") or "{}")
+    d["source_record"]      = json.loads(d["source_record"]) if d.get("source_record") else None
     d["module_file_counts"] = {}   # enriched separately by callers that hold a conn
     return d
+
+
+def _light_sample(sample: dict) -> dict:
+    """Replace the (large) source record with a flag for list/detail responses.
+    The full record is served by /api/samples/{id}/source-record and carried by exports."""
+    sample["has_source_record"] = bool(sample.pop("source_record", None))
+    return sample
 
 
 def _enrich_sample_counts(conn, sample: dict) -> dict:
@@ -484,7 +503,7 @@ async def reorder_folders(request: Request):
 def list_samples():
     with get_db() as conn:
         rows = conn.execute("SELECT * FROM samples ORDER BY date DESC, created_at DESC").fetchall()
-        samples = [row_to_sample(r) for r in rows]
+        samples = [_light_sample(row_to_sample(r)) for r in rows]
         _enrich_samples_counts(conn, samples)
     return samples
 
@@ -494,9 +513,19 @@ def get_sample(sample_id: str):
         row = conn.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Sample not found")
-        sample = row_to_sample(row)
+        sample = _light_sample(row_to_sample(row))
         _enrich_sample_counts(conn, sample)
     return sample
+
+@app.get("/api/samples/{sample_id}/source-record")
+def get_sample_source_record(sample_id: str):
+    with get_db() as conn:
+        row = conn.execute("SELECT source_record FROM samples WHERE id=?", (sample_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Sample not found")
+    if not row["source_record"]:
+        raise HTTPException(404, "Sample has no source record")
+    return json.loads(row["source_record"])
 
 @app.post("/api/samples")
 def create_sample(sample: dict):
@@ -669,6 +698,200 @@ def reindex_filter():
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────
+
+# ── Obsidian vault import (create-only) ──────────────────────────────────────
+# Parsing and conversion live in vault_import.py (read-only, DB-free). Previews are
+# held in memory; apply accepts only selections from a server-generated preview,
+# revalidates them against a fresh scan, and inserts each new sample in its own
+# transaction. Existing samples and the vault are never modified.
+
+_VAULT_PREVIEWS: dict = {}
+_VAULT_PREVIEW_LIMIT = 8
+
+
+def _sample_ids(conn) -> list:
+    return [r[0] for r in conn.execute("SELECT id FROM samples").fetchall()]
+
+
+def _vault_scan(root) -> dict:
+    with get_db() as conn:
+        library = [{"id": r["id"], "name": r["name"]}
+                   for r in conn.execute("SELECT id, name FROM materials_library").fetchall()]
+        row = conn.execute("SELECT value FROM settings WHERE key='main'").fetchone()
+        techniques = (json.loads(row["value"]) if row else {}).get("techniques") or []
+        existing = _sample_ids(conn)
+    try:
+        return vault_import.scan_vault(root, library, techniques, existing)
+    except vault_import.VaultError as e:
+        raise HTTPException(400, str(e))
+
+
+def _backup_database(label: str) -> Path:
+    """Consistent copy of the live database using SQLite's backup API (safe with WAL)."""
+    from datetime import datetime
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = BACKUPS_DIR / f"lablog-{label}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.db"
+    src, dst = sqlite3.connect(DB_PATH), sqlite3.connect(dest)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    return dest
+
+
+def _insert_vault_sample(sample: dict, source_record: dict):
+    """Insert one new sample, its source record and filter-index rows in one transaction.
+    Insert-only: returns ("created", None), ("already_exists", msg) or ("blocked", msg)."""
+    conn = sqlite3.connect(DB_PATH, isolation_level=None, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            ids = _sample_ids(conn)
+            if sample["id"] in ids:
+                conn.execute("ROLLBACK")
+                return "already_exists", "Already in LabLog; left untouched"
+            folded = [i for i in ids if vault_import.fold_id(i) == vault_import.fold_id(sample["id"])]
+            if folded:
+                conn.execute("ROLLBACK")
+                return "blocked", f"ID differs only in letter case from existing sample {', '.join(folded)}"
+            layers_json = json.dumps(sample["layers"])
+            conn.execute("""
+                INSERT INTO samples
+                  (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
+                   technique, folder_id, layers, filenames, xrd_peaks, lot, bin, module_config, source_record,
+                   substrate_orientation)
+                VALUES
+                  (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
+                   :technique, NULL, :layers, :filenames, :xrd_peaks, :lot, :bin, :module_config, :source_record,
+                   :substrate_orientation)
+            """, {
+                "id": sample["id"], "date": sample["date"], "substrate": sample["substrate"],
+                "notes": sample["notes"], "thickness_nm": None, "area_m2": None, "area_correction": 1.0,
+                "technique": sample["technique"], "layers": layers_json,
+                "filenames": "{}", "xrd_peaks": "[]", "lot": sample["lot"], "bin": sample["bin"],
+                "module_config": "{}", "source_record": json.dumps(source_record, ensure_ascii=False),
+                "substrate_orientation": sample.get("substrate_orientation"),
+            })
+            _index_sample(conn, sample["id"], layers_json, sample["technique"], sample["substrate"], sample["lot"])
+            conn.execute("COMMIT")
+            return "created", None
+        except sqlite3.IntegrityError:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            return "already_exists", "Created by another action after the preview; left untouched"
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+
+
+@app.get("/api/vault-import/root")
+def get_vault_import_root():
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key='vault_import_root'").fetchone()
+    return {"root": json.loads(row["value"]) if row else ""}
+
+
+@app.put("/api/vault-import/root")
+def put_vault_import_root(body: dict):
+    root = body.get("root") or ""
+    if not isinstance(root, str):
+        raise HTTPException(400, "root must be text")
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('vault_import_root', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (json.dumps(root.strip()),))
+        conn.commit()
+    return {"root": root.strip()}
+
+
+@app.post("/api/vault-import/preview")
+def vault_import_preview(body: dict):
+    """Read-only scan. Writes nothing to the database, the data folder or the vault."""
+    scan = _vault_scan(body.get("root"))
+    preview_id = uuid.uuid4().hex
+    _VAULT_PREVIEWS[preview_id] = {"root": scan["root"], "records": {r["key"]: r for r in scan["records"]}}
+    while len(_VAULT_PREVIEWS) > _VAULT_PREVIEW_LIMIT:
+        _VAULT_PREVIEWS.pop(next(iter(_VAULT_PREVIEWS)))
+    return {"preview_id": preview_id, "root": scan["root"], "counts": scan["counts"], "ignored": scan["ignored"],
+            "records": [vault_import.public_record(r) for r in scan["records"]]}
+
+
+@app.post("/api/vault-import/apply")
+def vault_import_apply(body: dict):
+    """Create the selected, still-valid records from a preview. Never updates an existing sample.
+
+    body: { preview_id, selections: [{ key, acknowledged, confirmed_physical }] }
+    outcome per record: created | already_exists | source_changed | skipped | failed
+    """
+    from datetime import datetime, timezone
+    preview = _VAULT_PREVIEWS.get(body.get("preview_id") or "")
+    if not preview:
+        raise HTTPException(409, "This preview has expired. Scan the vault again.")
+    selections = body.get("selections")
+    if not isinstance(selections, list):
+        raise HTTPException(400, "selections must be a list")
+
+    current = {r["key"]: r for r in _vault_scan(preview["root"])["records"]}
+    results, to_create, seen = [], [], set()
+
+    def report(key, sid, outcome, message):
+        results.append({"key": key, "id": sid, "outcome": outcome, "message": message})
+
+    for sel in selections:
+        key = sel.get("key") if isinstance(sel, dict) else None
+        if not isinstance(key, str) or key in seen:
+            continue
+        seen.add(key)
+        old = preview["records"].get(key)
+        if old is None:
+            report(key, None, "skipped", "Not part of this preview")
+            continue
+        if old["category"] not in ("ready", "review"):
+            report(key, old["id"], "skipped", f"Not importable ({old['category']})")
+            continue
+        new = current.get(key)
+        if new is None:
+            report(key, old["id"], "source_changed", "The note is no longer in the vault")
+        elif new["category"] == "existing":
+            report(key, old["id"], "already_exists", "Already in LabLog; left untouched")
+        elif new["sha256"] != old["sha256"]:
+            report(key, old["id"], "source_changed", "The note changed after the preview; scan again to review it")
+        elif new["fingerprint"] != old["fingerprint"]:
+            report(key, old["id"], "source_changed",
+                   "Materials, technique settings or vault identities changed after the preview; scan again")
+        elif any(w["ack"] for w in old["warnings"]) and sel.get("acknowledged") is not True:
+            report(key, old["id"], "skipped", "Conversion warnings were not acknowledged")
+        elif old["needs_confirmation"] and sel.get("confirmed_physical") is not True:
+            report(key, old["id"], "skipped", "Not confirmed as an existing physical sample")
+        else:
+            to_create.append((new, sel))
+
+    backup = _backup_database("before-vault-import") if to_create else None
+    imported_at = datetime.now(timezone.utc).isoformat()
+    for rec, sel in to_create:
+        sample = json.loads(json.dumps(rec["sample"]))
+        for layer in sample["layers"]:
+            layer["id"] = str(uuid.uuid4())
+        choices = {
+            "acknowledged_warnings": [w["code"] for w in rec["warnings"] if w["ack"]],
+            "confirmed_physical_sample": bool(rec["needs_confirmation"]),
+        }
+        try:
+            outcome, message = _insert_vault_sample(sample, vault_import.build_source_record(rec, imported_at, choices))
+        except Exception as e:
+            report(rec["key"], rec["id"], "failed", f"{type(e).__name__}: {e}")
+            continue
+        report(rec["key"], rec["id"], "skipped" if outcome == "blocked" else outcome, message or "Created")
+
+    counts = {o: sum(1 for r in results if r["outcome"] == o)
+              for o in ("created", "already_exists", "source_changed", "skipped", "failed")}
+    return {"results": results, "counts": counts, "backup": backup.name if backup else None}
+
 
 @app.get("/api/settings")
 def get_settings():
@@ -1313,6 +1536,10 @@ async def import_sample(file: UploadFile = File(...), merge: bool = False, confi
         "xrd_peaks":     json.dumps(sample_data.get("xrd_peaks", [])),
         "lot":           sample_data.get("lot"),
         "bin":           sample_data.get("bin"),
+        # Older archives have no source record; overwrite then keeps the existing one.
+        "source_record": json.dumps(sample_data["source_record"]) if isinstance(sample_data.get("source_record"), dict) else None,
+        # Older archives have no substrate cut; overwrite then keeps the existing one.
+        "substrate_orientation": sample_data.get("substrate_orientation") or None,
     }
 
     with get_db() as conn:
@@ -1326,7 +1553,9 @@ async def import_sample(file: UploadFile = File(...), merge: bool = False, confi
                   date=:date, substrate=:substrate, notes=:notes,
                   thickness_nm=:thickness_nm, area_m2=:area_m2, area_correction=:area_correction,
                   technique=:technique, layers=:layers, filenames=:filenames,
-                  xrd_peaks=:xrd_peaks, lot=:lot, bin=:bin
+                  xrd_peaks=:xrd_peaks, lot=:lot, bin=:bin,
+                  source_record=COALESCE(:source_record, source_record),
+                  substrate_orientation=COALESCE(:substrate_orientation, substrate_orientation)
                 WHERE id=:id
             """, params)
         else:
@@ -1334,10 +1563,10 @@ async def import_sample(file: UploadFile = File(...), merge: bool = False, confi
             conn.execute("""
                 INSERT INTO samples
                   (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
-                   technique, folder_id, layers, filenames, xrd_peaks, lot, bin)
+                   technique, folder_id, layers, filenames, xrd_peaks, lot, bin, source_record, substrate_orientation)
                 VALUES
                   (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
-                   :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin)
+                   :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin, :source_record, :substrate_orientation)
             """, params)
         conn.commit()
 
@@ -1723,7 +1952,7 @@ def get_module_source(module_id: str):
         raise HTTPException(404, f"Module '{module_id}' not found")
     # Determine built-in by file location, not author field — so imported
     # copies of built-in modules are correctly treated as user-editable.
-    user_path = BASE_DIR / "data" / "user_modules" / f"{module_id}.py"
+    user_path = USER_MODULES_DIR / f"{module_id}.py"
     return {
         "id":      module_id,
         "builtin": not user_path.exists(),
@@ -2053,7 +2282,7 @@ async def import_module_preview(file: UploadFile = File(...)):
         source_code = zf.read("source.py").decode("utf-8")
 
     # Check if module already exists (user module or built-in)
-    user_path    = BASE_DIR / "data" / "user_modules" / f"{module_id}.py"
+    user_path    = USER_MODULES_DIR / f"{module_id}.py"
     builtin_path = BASE_DIR / "modules" / f"{module_id}.py"
     exists = user_path.exists() or builtin_path.exists()
 
@@ -2392,11 +2621,13 @@ async def import_book(file: UploadFile = File(...), config: str = "{}"):
             conn.execute("""
                 INSERT OR IGNORE INTO samples
                   (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
-                   technique, folder_id, layers, filenames, xrd_peaks, lot, bin)
+                   technique, folder_id, layers, filenames, xrd_peaks, lot, bin, source_record, substrate_orientation)
                 VALUES
                   (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
-                   :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin)
+                   :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin, :source_record, :substrate_orientation)
             """, {
+                "source_record": json.dumps(meta["source_record"]) if isinstance(meta.get("source_record"), dict) else None,
+                "substrate_orientation": meta.get("substrate_orientation") or None,
                 "id": new_id,
                 "date": meta.get("date"),
                 "substrate": meta.get("substrate"),

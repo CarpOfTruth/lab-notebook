@@ -9,9 +9,10 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url))
 export default defineConfig({
   plugins: [react()],
   server: {
-    open: true,
+    open: !process.env.LABLOG_API_TARGET,
     proxy: {
-      '/api': { target: 'http://localhost:8000', changeOrigin: true },
+      // LABLOG_API_TARGET points an isolated preview frontend at an isolated backend
+      '/api': { target: process.env.LABLOG_API_TARGET || 'http://localhost:8000', changeOrigin: true },
     },
   },
   resolve: {

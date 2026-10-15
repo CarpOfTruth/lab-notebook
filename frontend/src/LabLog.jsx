@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect, useMemo, lazy, Suspense } from "react";
+import { Fragment, useState, useCallback, useRef, useEffect, useMemo, lazy, Suspense } from "react";
 import { LineChart, ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer, Customized } from "recharts";
 const Plot = lazy(() => import("react-plotly.js").then(m => {
   // Vite pre-bundles CJS modules; react-plotly.js default export may be
@@ -3865,6 +3865,10 @@ function LayerEditor({ layer, technique: sampleTechnique, onRemove, onDuplicate,
           {layer.role === "buffer" && (
             <span style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", fontWeight: 600, color: T.teal, background: `${T.teal}22`, border: `1px solid ${T.teal}66`, borderRadius: 3, padding: "1px 5px", letterSpacing: 0.5 }}>BUF</span>
           )}
+          {layer.vault_source?.mapping === "partial" && (
+            <span title={`Partially mapped from the vault — left unset: ${(layer.vault_source.unmapped || []).map(u => `${u.term} (${u.reason})`).join("; ")}`}
+              style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", fontWeight: 600, color: T.amber, background: `${T.amber}22`, border: `1px solid ${T.amber}66`, borderRadius: 3, padding: "1px 5px", letterSpacing: 0.5, cursor: "help" }}>PARTIAL</span>
+          )}
         </div>
         {layer.thickness_nm != null && (
           <div style={{ textAlign: "center" }}>
@@ -4240,6 +4244,8 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         )}
       </section>
 
+      {sample.has_source_record && <VaultRecordSection key={sample.id} sampleId={sample.id} layers={sample.layers} />}
+
       {isSputter && sample.layers.some(l => l.sputter_log) && (
         <section>
           <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Deposition Log</div>
@@ -4360,6 +4366,69 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 }
 
 // ── AddLayerModal ─────────────────────────────────────────────────────────────
+
+// Read-only view of the original vault note a sample was created from.
+// Note content is shown as text only — never rendered as HTML, fetched, or followed.
+// Rendered with key={sample.id} so switching samples resets its state.
+function VaultRecordSection({ sampleId, layers = [] }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  const [open, setOpen] = useState(false);
+  const [rec,  setRec]  = useState(null);
+  const [err,  setErr]  = useState(null);
+
+  const toggle = async () => {
+    const next = !open;
+    setOpen(next);
+    if (next && !rec) {
+      try { setRec(await apiDetail("GET", `/samples/${encodeURIComponent(sampleId)}/source-record`)); }
+      catch (e) { setErr(e.message); }
+    }
+  };
+
+  const sub = (label) => <div style={{ ...mono, fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, margin: "12px 0 4px" }}>{label}</div>;
+  const pre = { ...mono, fontSize: 11, color: T.textSecondary, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, padding: 8, margin: 0, maxHeight: 320, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word" };
+  const src = rec?.source || {};
+  const nativeMark = { id: "→ ID", date: "→ date", technique: "→ technique", substrate: "→ substrate", lot: "→ lot", bin: "→ bin", description: "→ notes", stack: "→ layers" };
+
+  return (
+    <section>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <span style={{ ...mono, fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2 }}>
+          Vault Record <span style={{ fontSize: 10, color: T.textDim, textTransform: "none", letterSpacing: 0 }}>· read-only, imported from Obsidian</span>
+        </span>
+        <Btn variant="ghost" small onClick={toggle}>{open ? "Hide" : "Show"}</Btn>
+      </div>
+      {open && (
+        <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "10px 14px" }}>
+          {err && <div style={{ ...mono, fontSize: 11, color: T.red }}>{err}</div>}
+          {!rec && !err && <div style={{ ...mono, fontSize: 11, color: T.textDim }}>Loading…</div>}
+          {rec && <>
+            <VaultKeyValues values={{
+              "Source note": src.relative_path,
+              "SHA-256": src.sha256,
+              "Imported": rec.imported_at,
+              "Evidence": rec.evidence,
+              "Acknowledged": (rec.import_choices?.acknowledged_warnings || []).join(", ") || null,
+              "Confirmed grown": rec.import_choices?.confirmed_physical_sample ? "yes" : null,
+            }} />
+            {rec.warnings?.length > 0 && sub("Conversion notes")}
+            {(rec.warnings || []).map((w, i) => <div key={i} style={{ ...mono, fontSize: 11, color: w.ack ? T.amber : T.textDim, marginBottom: 2 }}>{w.ack ? "⚠" : "·"} {w.message}</div>)}
+            {sub("Stack as recorded")}
+            <VaultStackTable lines={rec.stack || []} layers={layers} />
+            {sub("Frontmatter")}
+            <VaultKeyValues values={src.frontmatter || {}} mark={nativeMark} />
+            {sub("Notes")}
+            <pre style={pre}>{src.body || "(empty)"}</pre>
+            <details style={{ marginTop: 10 }}>
+              <summary style={{ ...mono, fontSize: 11, color: T.textDim, cursor: "pointer" }}>Original note text</summary>
+              <pre style={{ ...pre, marginTop: 6 }}>{src.text}</pre>
+            </details>
+          </>}
+        </div>
+      )}
+    </section>
+  );
+}
 
 function AddLayerModal({ technique: sampleTechnique, knownMaterials, settings, materialsLib = [], onAdd, onClose }) {
   useEscClose(onClose);
@@ -8280,6 +8349,373 @@ function ImportModal({ type, onConfirm, onClose }) {
 }
 
 // ── SettingsModal ─────────────────────────────────────────────────────────────
+
+// ── Obsidian vault import (create-only) ───────────────────────────────────────
+// Scans are read-only on the backend; apply creates only the selected, still-valid
+// records and never updates an existing sample or writes to the vault.
+
+const VAULT_CATEGORIES = [
+  ["ready",    "Ready"],
+  ["review",   "Needs review"],
+  ["existing", "Already in LabLog"],
+  ["planned",  "Planned — not imported"],
+  ["invalid",  "Invalid"],
+];
+const VAULT_OUTCOMES = [
+  ["created",        "Created"],
+  ["already_exists", "Already in LabLog"],
+  ["source_changed", "Source changed"],
+  ["skipped",        "Skipped"],
+  ["failed",         "Failed"],
+];
+const VAULT_CONDITION_LABELS = [["temp", "T", "°C"], ["pressure", "P", "mTorr"], ["oxygen_pct", "O₂", "%"], ["time_s", "t", "s"], ["frequency_hz", "f", "Hz"]];
+
+// Like api(), but surfaces the backend's error detail.
+async function apiDetail(method, path, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  const res  = await fetch(`${API_BASE}${path}`, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `${method} ${path} → ${res.status}`);
+  return data;
+}
+
+function vaultValue(v) {
+  if (v === null || v === undefined || v === "") return "—";
+  return typeof v === "object" ? JSON.stringify(v) : String(v);
+}
+
+// One-line native summary of an imported layer: targets, then set conditions only.
+function vaultLayerSummary(layer) {
+  const targets = (layer.targets || []).map(t => {
+    const parts = [t.material || "?"];
+    if (t.power_W   != null) parts.push(`${t.power_W} W`);
+    if (t.energy_mJ != null) parts.push(`${t.energy_mJ} mJ`);
+    if (t.pulses    != null) parts.push(`${t.pulses} p`);
+    if (t.power_type) parts.push(t.power_type_basis === "explicit" ? t.power_type : `${t.power_type} (convention)`);
+    return parts.join(" ");
+  }).join(" + ") || "no target";
+  const conds = VAULT_CONDITION_LABELS.filter(([k]) => layer[k] != null).map(([k, l, u]) => `${l} ${layer[k]} ${u}`);
+  Object.entries(layer.custom || {}).forEach(([k, v]) => conds.push(`${k} ${v}`));
+  return [targets, ...conds].join(" · ");
+}
+
+function VaultStackTable({ lines = [], layers = [] }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  if (!lines.length) return <div style={{ ...mono, fontSize: 11, color: T.textDim }}>No stack entries — no layers.</div>;
+  const byIndex = Object.fromEntries(layers.map(l => [l.vault_source?.index, l]));
+  const statusColor = { full: T.teal, partial: T.amber, unparsed: T.red, "not created": T.textDim };
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <table style={{ borderCollapse: "collapse", width: "100%", ...mono, fontSize: 11 }}>
+        <thead>
+          <tr style={{ color: T.textDim, textAlign: "left" }}>
+            {["#", "Role", "Vault stack line (bottom → top)", "LabLog layer", "Mapping"].map(h => <th key={h} style={{ padding: "3px 6px", fontWeight: 400, borderBottom: `1px solid ${T.border}` }}>{h}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {lines.map(line => {
+            const layer = byIndex[line.index];
+            return (
+              <tr key={line.index} style={{ verticalAlign: "top" }}>
+                <td style={{ padding: "3px 6px", color: T.textDim }}>{line.index + 1}</td>
+                <td style={{ padding: "3px 6px", color: T.textSecondary, whiteSpace: "nowrap" }}>
+                  {line.role || "—"}{line.role_label ? `:${line.role_label}` : ""}{line.primary ? " ★" : ""}
+                </td>
+                <td style={{ padding: "3px 6px", color: T.textPrimary, wordBreak: "break-word" }}>{vaultValue(line.raw)}</td>
+                <td style={{ padding: "3px 6px", color: T.textSecondary }}>
+                  {layer ? vaultLayerSummary(layer) : "—"}
+                  {(line.unmapped || []).map((u, i) => <div key={i} style={{ color: T.amber }}>unset: {u.term} — {u.reason}</div>)}
+                  {(line.problems || []).map((p, i) => <div key={i} style={{ color: T.red }}>{p}</div>)}
+                </td>
+                <td style={{ padding: "3px 6px", color: statusColor[line.status] || T.textDim, whiteSpace: "nowrap" }}>{line.status}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function VaultKeyValues({ values = {}, mark = {} }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  const keys = Object.keys(values);
+  if (!keys.length) return <div style={{ ...mono, fontSize: 11, color: T.textDim }}>None.</div>;
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "max-content 1fr", gap: "2px 12px", ...mono, fontSize: 11 }}>
+      {keys.map(k => (
+        <Fragment key={k}>
+          <span style={{ color: T.textDim }}>{k}{mark[k] ? <span style={{ color: T.teal }}> {mark[k]}</span> : null}</span>
+          <span style={{ color: T.textPrimary, wordBreak: "break-word" }}>{vaultValue(values[k])}</span>
+        </Fragment>
+      ))}
+    </div>
+  );
+}
+
+function VaultImportModal({ onClose, onImported }) {
+  useEscClose(onClose);
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  const [root,      setRoot]      = useState("");
+  const [savedRoot, setSavedRoot] = useState("");
+  const [scanning,  setScanning]  = useState(false);
+  const [error,     setError]     = useState(null);
+  const [preview,   setPreview]   = useState(null);
+  const [tab,       setTab]       = useState("ready");
+  const [expanded,  setExpanded]  = useState(null);
+  const [choices,   setChoices]   = useState({});   // key → { selected, acknowledged, confirmed_physical }
+  const [applying,  setApplying]  = useState(false);
+  const [result,    setResult]    = useState(null);
+
+  // Loading the saved path is not a scan; nothing is read from disk until Scan is clicked.
+  useEffect(() => {
+    api("GET", "/vault-import/root").then(r => { setRoot(r.root || ""); setSavedRoot(r.root || ""); }).catch(() => {});
+  }, []);
+
+  const records   = preview?.records || [];
+  const needsAck  = r => r.warnings.some(w => w.ack);
+  const choiceOf  = r => choices[r.key] || {};
+  const reviewed  = (r, c) => (!needsAck(r) || c.acknowledged) && (!r.needs_confirmation || c.confirmed_physical);
+  const importable = r => r.category === "ready" || r.category === "review";
+  const selectable = r => importable(r) && reviewed(r, choiceOf(r));
+  const selected  = records.filter(r => choiceOf(r).selected && selectable(r));
+
+  const setChoice = (r, patch) => setChoices(p => {
+    const next = { ...(p[r.key] || {}), ...patch };
+    if (!reviewed(r, next)) next.selected = false;
+    return { ...p, [r.key]: next };
+  });
+  const selectReady = () => setChoices(p => {
+    const n = { ...p };
+    records.filter(r => r.category === "ready").forEach(r => { n[r.key] = { ...(n[r.key] || {}), selected: true }; });
+    return n;
+  });
+  const clearSelection = () => setChoices(p => Object.fromEntries(Object.entries(p).map(([k, v]) => [k, { ...v, selected: false }])));
+
+  const scan = async () => {
+    setScanning(true); setError(null); setResult(null);
+    try {
+      const data = await apiDetail("POST", "/vault-import/preview", { root });
+      setPreview(data); setChoices({}); setExpanded(null);
+      setTab(data.counts.ready ? "ready" : data.counts.review ? "review" : "existing");
+    } catch (e) { setError(e.message); setPreview(null); }
+    setScanning(false);
+  };
+
+  const saveRoot = async () => {
+    try { const r = await apiDetail("PUT", "/vault-import/root", { root }); setSavedRoot(r.root); }
+    catch (e) { setError(e.message); }
+  };
+
+  const applySelected = async () => {
+    setApplying(true); setError(null);
+    try {
+      const res = await apiDetail("POST", "/vault-import/apply", {
+        preview_id: preview.preview_id,
+        selections: selected.map(r => ({ key: r.key, acknowledged: !!choiceOf(r).acknowledged, confirmed_physical: !!choiceOf(r).confirmed_physical })),
+      });
+      setResult(res);
+      onImported?.();
+    } catch (e) { setError(e.message); }
+    setApplying(false);
+  };
+
+  const inputStyle = { ...mono, fontSize: 12, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, padding: "6px 10px", color: T.textPrimary, outline: "none", flex: 1, minWidth: 0, boxSizing: "border-box" };
+  const sub = (label) => <div style={{ ...mono, fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, margin: "10px 0 4px" }}>{label}</div>;
+  const rowSummary = r => {
+    if (r.category === "existing") return "Already in LabLog — skipped entirely";
+    if (r.category === "planned")  return "Planned — stays in Obsidian";
+    if (r.category === "invalid")  return r.errors[0];
+    const s = r.sample;
+    return [s.date || "no date", s.technique, s.substrate || "no substrate", `${s.layers.length} layer${s.layers.length === 1 ? "" : "s"}`].join(" · ");
+  };
+
+  const renderDetail = r => {
+    const s = r.sample;
+    const c = choiceOf(r);
+    const ackWarnings  = r.warnings.filter(w => w.ack);
+    const infoWarnings = r.warnings.filter(w => !w.ack);
+    const sub_ = r.substrate;
+    return (
+      <div style={{ padding: "4px 14px 14px 36px", borderTop: `1px solid ${T.border}` }}>
+        <div style={{ ...mono, fontSize: 10, color: T.textDim, marginTop: 8 }}>{r.path}{r.status != null ? ` · lablog_status: ${vaultValue(r.status)}` : ""}</div>
+        {r.errors.map((e, i) => <div key={i} style={{ ...mono, fontSize: 11, color: T.red, marginTop: 6 }}>✕ {e}</div>)}
+        {s && <>
+          {sub("Proposed new sample")}
+          <VaultKeyValues values={{
+            "ID": s.id,
+            "Growth date": s.date,
+            "Technique": s.technique,
+            "Substrate": s.substrate ? (sub_?.original && sub_.original !== s.substrate ? `${s.substrate}   ← ${sub_.original}` : s.substrate) : null,
+            "Lot": s.lot,
+            "Bin": s.bin,
+            "Brief note": s.notes,
+            "Folder": "Uncategorized",
+            "Thickness / device area": "not set",
+            "Measurements": "none",
+          }} />
+          {sub("Layers")}
+          <VaultStackTable lines={r.stack} layers={s.layers} />
+          {(ackWarnings.length > 0 || infoWarnings.length > 0) && sub("Conversion notes")}
+          {ackWarnings.map((w, i) => <div key={i} style={{ ...mono, fontSize: 11, color: T.amber, marginBottom: 2 }}>⚠ {w.message}</div>)}
+          {infoWarnings.map((w, i) => <div key={i} style={{ ...mono, fontSize: 11, color: T.textDim, marginBottom: 2 }}>· {w.message}</div>)}
+          {(needsAck(r) || r.needs_confirmation) && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8, padding: "8px 10px", background: T.bg1, border: `1px solid ${T.amber}55`, borderRadius: 6 }}>
+              {needsAck(r) && (
+                <label style={{ ...mono, fontSize: 11, color: T.textPrimary, display: "flex", gap: 6, alignItems: "center", cursor: "pointer" }}>
+                  <input type="checkbox" checked={!!c.acknowledged} onChange={e => setChoice(r, { acknowledged: e.target.checked })} style={{ accentColor: T.amber }} />
+                  I have reviewed the warnings above; unset values stay unset
+                </label>
+              )}
+              {r.needs_confirmation && (
+                <label style={{ ...mono, fontSize: 11, color: T.textPrimary, display: "flex", gap: 6, alignItems: "center", cursor: "pointer" }}>
+                  <input type="checkbox" checked={!!c.confirmed_physical} onChange={e => setChoice(r, { confirmed_physical: e.target.checked })} style={{ accentColor: T.amber }} />
+                  This is an existing, physically grown sample
+                </label>
+              )}
+            </div>
+          )}
+          {sub("Retained, not mapped to LabLog fields")}
+          <VaultKeyValues values={r.retained} />
+          {sub("Markdown body (kept intact in the sample's Vault record)")}
+          <pre style={{ ...mono, fontSize: 11, color: T.textSecondary, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, padding: 8, margin: 0, maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{r.body || "(empty)"}</pre>
+        </>}
+      </div>
+    );
+  };
+
+  return (
+    <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, width: "min(1000px, 94vw)", display: "flex", flexDirection: "column", maxHeight: "90vh", overflow: "hidden" }}>
+
+        <div style={{ padding: "16px 22px", borderBottom: `1px solid ${T.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+          <span style={{ ...mono, fontSize: 14, color: T.amber, fontWeight: 600 }}>Import from Obsidian</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1 }}>✕</button>
+        </div>
+
+        <div style={{ padding: "16px 22px", display: "flex", flexDirection: "column", gap: 12, overflowY: "auto" }}>
+          <div style={{ ...mono, fontSize: 12, color: T.textPrimary, fontWeight: 600, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 12px" }}>
+            This import creates missing samples only. It does not update existing samples or write back to Obsidian.
+          </div>
+
+          <div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input value={root} onChange={e => setRoot(e.target.value)} placeholder="/path/to/vault" style={inputStyle}
+                onKeyDown={e => { if (e.key === "Enter" && root.trim() && !scanning) scan(); }} />
+              <Btn small onClick={scan} disabled={!root.trim() || scanning || applying}>{scanning ? "Scanning…" : preview ? "Rescan" : "Scan"}</Btn>
+              <Btn variant="ghost" small onClick={saveRoot} disabled={!root.trim() || root.trim() === savedRoot}>Save path</Btn>
+            </div>
+            <div style={{ ...mono, fontSize: 10, color: T.textDim, marginTop: 5 }}>
+              Vault root folder containing <b>Samples/</b>, as a path on the computer running the LabLog backend. Scanning only reads notes.
+            </div>
+            {error && <div style={{ ...mono, fontSize: 11, color: T.red, marginTop: 8 }}>{error}</div>}
+          </div>
+
+          {result ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {VAULT_OUTCOMES.map(([k, label]) => (
+                  <span key={k} style={{ ...mono, fontSize: 11, color: k === "created" ? T.teal : k === "failed" ? T.red : T.textSecondary, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "3px 8px" }}>
+                    {label}: {result.counts[k] || 0}
+                  </span>
+                ))}
+              </div>
+              {VAULT_OUTCOMES.map(([k, label]) => {
+                const rows = result.results.filter(x => x.outcome === k);
+                if (!rows.length) return null;
+                return (
+                  <div key={k}>
+                    {sub(label)}
+                    {rows.map(x => (
+                      <div key={x.key} style={{ ...mono, fontSize: 11, color: T.textPrimary }}>
+                        {x.id ?? x.key} <span style={{ color: T.textDim }}>— {x.message}</span>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+              <div style={{ ...mono, fontSize: 11, color: T.textSecondary, lineHeight: 1.6 }}>
+                New samples are uncategorized. Nothing in the vault was changed, so imported notes may still say <b>lablog_status: draft</b> — that is expected: later scans check this database, not that label.
+                {result.backup && <> A database backup was taken first ({result.backup}, in the LabLog data folder under backups/).</>}
+              </div>
+            </div>
+          ) : preview && (
+            <>
+              <div style={{ ...mono, fontSize: 10, color: T.textDim }}>
+                {preview.root} · {records.length} sample notes{preview.counts.ignored ? ` · ${preview.counts.ignored} other notes ignored` : ""}
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {VAULT_CATEGORIES.map(([k, label]) => (
+                  <button key={k} onClick={() => setTab(k)}
+                    style={{ ...mono, fontSize: 11, cursor: "pointer", borderRadius: 4, padding: "4px 10px", border: `1px solid ${tab === k ? T.amber : T.border}`, background: tab === k ? T.amberGlow : "transparent", color: tab === k ? T.amber : T.textSecondary }}>
+                    {label} · {preview.counts[k]}
+                  </button>
+                ))}
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {records.filter(r => r.category === tab).map(r => {
+                  const c = choiceOf(r);
+                  const ackCount = r.warnings.filter(w => w.ack).length;
+                  const open = expanded === r.key;
+                  return (
+                    <div key={r.key} style={{ border: `1px solid ${open ? T.borderBright : T.border}`, borderRadius: 7, background: T.bg2 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 12px", cursor: "pointer" }} onClick={() => setExpanded(open ? null : r.key)}>
+                        {importable(r) ? (
+                          <input type="checkbox" checked={!!c.selected && selectable(r)} disabled={!selectable(r)}
+                            title={selectable(r) ? "Select for import" : "Review the record and acknowledge its warnings first"}
+                            onClick={e => e.stopPropagation()} onChange={e => setChoice(r, { selected: e.target.checked })} style={{ accentColor: T.amber, cursor: "pointer" }} />
+                        ) : <span style={{ width: 13 }} />}
+                        <span style={{ ...mono, fontSize: 13, fontWeight: 600, color: T.textPrimary, whiteSpace: "nowrap" }}>{r.id}</span>
+                        <span style={{ ...mono, fontSize: 11, color: r.category === "invalid" ? T.red : T.textDim, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{rowSummary(r)}</span>
+                        {importable(r) && ackCount > 0 && (
+                          <span style={{ ...mono, fontSize: 10, color: c.acknowledged ? T.teal : T.amber, border: `1px solid ${c.acknowledged ? T.teal : T.amber}66`, borderRadius: 3, padding: "1px 6px", whiteSpace: "nowrap" }}>
+                            {c.acknowledged ? "reviewed" : `${ackCount} warning${ackCount === 1 ? "" : "s"}`}
+                          </span>
+                        )}
+                        {r.needs_confirmation && !c.confirmed_physical && (
+                          <span style={{ ...mono, fontSize: 10, color: T.amber, border: `1px solid ${T.amber}66`, borderRadius: 3, padding: "1px 6px", whiteSpace: "nowrap" }}>confirm grown</span>
+                        )}
+                        <span style={{ color: T.textDim, fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+                      </div>
+                      {open && renderDetail(r)}
+                    </div>
+                  );
+                })}
+                {!records.some(r => r.category === tab) && <div style={{ ...mono, fontSize: 11, color: T.textDim }}>No records in this group.</div>}
+              </div>
+            </>
+          )}
+        </div>
+
+        {preview && (
+          <div style={{ padding: "12px 22px", borderTop: `1px solid ${T.border}`, display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+            {result ? (
+              <>
+                <div style={{ flex: 1 }} />
+                <Btn variant="ghost" small onClick={scan} disabled={scanning}>Scan again</Btn>
+                <Btn small onClick={onClose}>Done</Btn>
+              </>
+            ) : (
+              <>
+                <Btn variant="ghost" small onClick={selectReady} disabled={!preview.counts.ready}>Select ready</Btn>
+                <Btn variant="ghost" small onClick={clearSelection} disabled={!selected.length}>Clear</Btn>
+                <span style={{ ...mono, fontSize: 11, color: T.textSecondary, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                  title={selected.map(r => r.id).join(", ")}>
+                  {selected.length ? `Will create ${selected.length} uncategorized sample${selected.length === 1 ? "" : "s"}: ${selected.map(r => r.id).join(", ")}` : "Nothing selected"}
+                </span>
+                <Btn small onClick={applySelected} disabled={!selected.length || applying || scanning}>
+                  {applying ? "Importing…" : `Import selected (${selected.length})`}
+                </Btn>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function MaterialEditorModal({ material, settings, onSave, onDelete, onClose, materialsLib = [] }) {
   useEscClose(onClose);
@@ -15521,6 +15957,7 @@ export default function App() {
   const [editingFolder, setEditingFolder] = useState(null); // folder object being edited — type inferred from its flags
   const [importModalType, setImportModalType] = useState(null); // "sample"|"book"|"module"|null
   const [importing,       setImporting]       = useState(false);
+  const [vaultImportOpen, setVaultImportOpen] = useState(false);
   const [sampleFilterConds, setSampleFilterConds] = useState([]);
   const [filteredSampleIds,  setFilteredSampleIds]  = useState(null); // null = no filter active
   const [addingBook,    setAddingBook]    = useState(false);
@@ -16263,6 +16700,11 @@ export default function App() {
                   <Btn variant="ghost" small onClick={() => setImportModalType("sample")} disabled={importing}>
                     {importing ? "Importing…" : "Import"}
                   </Btn>
+                  <Btn variant="ghost" small onClick={() => setVaultImportOpen(true)}>Import from Obsidian</Btn>
+                  {vaultImportOpen && (
+                    <VaultImportModal onClose={() => setVaultImportOpen(false)}
+                      onImported={() => api("GET", "/samples").then(setSamples).catch(() => {})} />
+                  )}
                   {/* Export hidden for now — keep for future reintroduction */}
                   {false && <Btn variant="ghost" small onClick={() => setExportOpen(true)}>Export</Btn>}
                   <Btn variant="primary" small onClick={() => setAdding(true)}>+ New Sample</Btn>

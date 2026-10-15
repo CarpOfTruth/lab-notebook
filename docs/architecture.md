@@ -142,6 +142,19 @@ Books bundle samples and their module outputs into a shareable/archivable unit.
 
 ---
 
+## Obsidian Vault Import
+
+One-way, create-only import of grown sample notes (user guide: `user-manual.md` §9).
+
+- **`backend/vault_import.py`** — read-only, database-free scanning, strict YAML frontmatter parsing (safe loader; duplicate keys, aliases, merge keys, non-finite numbers rejected), ID validation, material resolution and stack → layer conversion. Inputs are plain data (library `[{id, name}]`, technique definitions, existing IDs) so the logic can be reused outside LabLog.
+- **Endpoints** (`main.py`): `GET/PUT /api/vault-import/root` (saved path, `settings` key `vault_import_root`), `POST /api/vault-import/preview` (scan; preview held in memory), `POST /api/vault-import/apply` (selections from a preview only). Apply rescans, rejects records whose note hash or conversion fingerprint (material notes, library, technique settings, identities) changed, enforces acknowledgements, backs up the DB with SQLite's backup API, then inserts each sample + source record + filter-index rows in one `BEGIN IMMEDIATE` transaction. Insert-only: an ID that exists at insert time (including a primary-key race) is reported and left untouched.
+- **Persistence:** additive `samples.source_record` JSON column (format `lablog-vault-source` v1: exact note text + sha256, relative path, parsed frontmatter, body, stack lines, warnings, dependencies, import choices). Not written by `PUT /api/samples/{id}`; carried by sample and book export/import (old archives without it still import). List/detail responses replace it with `has_source_record`; the full record is `GET /api/samples/{id}/source-record`. Imported layers carry `vault_source` (raw line, mapping full/partial, unmapped terms) plus `role`, `role_label`, `primary`.
+- **Frontend:** `VaultImportModal` (Samples header) and `VaultRecordSection` (sample page).
+- **Tests:** `backend/.venv/bin/python3.11 -m unittest discover -s backend/tests` — synthetic vault, isolated `LABLOG_DATA_DIR`.
+- **Isolated data root:** `LABLOG_DATA_DIR` relocates the database, files, user modules and backups; `LABLOG_API_TARGET` points the Vite proxy at another backend.
+
+---
+
 ## Design Principles
 
 - **Reuse shared primitives.** Before adding a new component or pattern, check whether an existing one covers the case.
