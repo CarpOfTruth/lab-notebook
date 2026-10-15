@@ -478,6 +478,7 @@ function xrayPayloadToPlotData(payload) {
         out[k++] = { x: (Math.cos(tt[j] - om) - cosOm) / lamNm, y: (sinOm + Math.sin(tt[j] - om)) / lamNm, z: row[j] };
       }
     }
+    rsmMeshShapes.set(out, { rows: payload.omega.length, cols: payload.two_theta.length });
     return out;
   }
   if (Array.isArray(payload.x) && Array.isArray(payload.y)) return payload.x.map((x, i) => ({ x, y: payload.y[i] }));
@@ -1020,10 +1021,13 @@ function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain, plotStyle, showColor
   const logIntensity = ps.rsmLogIntensity ?? true;
   const bgMethod = ps.rsmBgMethod ?? null;
   const bgPct = ps.rsmBgPct ?? 5;
+  const viewport = useRsmViewport(forcedXDomain, forcedYDomain);
   const binned = useMemo(
-    () => binRSM(data, bins, bins, forcedXDomain || null, forcedYDomain || null, logIntensity, bgMethod, bgPct),
+    () => viewport.x && viewport.y
+      ? resampleRSM(data, bins, bins, viewport.x, viewport.y, logIntensity, bgMethod, bgPct)
+      : binRSM(data, bins, bins, null, null, logIntensity, bgMethod, bgPct),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [data, bins, forcedXDomain?.[0], forcedXDomain?.[1], forcedYDomain?.[0], forcedYDomain?.[1], logIntensity, bgMethod, bgPct]
+    [data, bins, viewport.x?.[0], viewport.x?.[1], viewport.y?.[0], viewport.y?.[1], logIntensity, bgMethod, bgPct]
   );
   if (!binned) return null;
   const xTicks = makeTicks(binned.xDomain[0], binned.xDomain[1], ps.xTick);
@@ -1051,24 +1055,24 @@ function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain, plotStyle, showColor
     margin: { t: 4, r: 4, b: hideXLabels ? 4 : 50, l: hideYLabels ? 4 : 58, pad: 0 }
   } : {};
   const layout = buildPlotLayout(ps,
-    { showgrid: false, ...spikeProps,
+    { showgrid: false, ...spikeProps, range: [...binned.xDomain], autorange: false,
       ...(xTicks ? { tickvals: xTicks, tickmode: "array" } : {}),
       ...(hideXLabels ? { showticklabels: false, ticklen: 0, title: { text: "" } }
         : { title: { text: `Qₓ (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 10 } }) },
-    { showgrid: false, ...spikeProps,
+    { showgrid: false, ...spikeProps, range: [...binned.yDomain], autorange: false,
       ...(yTicks ? { tickvals: yTicks, tickmode: "array" } : {}),
       ...(hideYLabels ? { showticklabels: false, ticklen: 0, title: { text: "" } }
         : { title: { text: `Qz (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } }) },
     [],
-    { uirevision: "rsm", hovermode: "closest", ...tightMargin }
+    { uirevision: viewport.revision, hovermode: "closest", ...tightMargin }
   );
   const plotW = overridePxW != null ? `${overridePxW}px` : (ps.plotWidth ? `${Math.round(ps.plotWidth * 96)}px` : "100%");
   const plotH = overridePxH != null ? `${overridePxH}px` : (ps.plotHeight ? `${Math.round(ps.plotHeight * 96)}px` : "280px");
   return (
     <SciPlotWrap ps={ps} cursorLabel={c => `Qₓ=${c.x.toFixed(4)}, Qz=${c.y.toFixed(4)}`}>
       {setCursor => (
-        <Plot data={[heatTrace, ...pointTraces]} layout={layout} config={buildPlotConfig("rsm", ps)}
-          style={{ width: plotW, height: plotH }} useResizeHandler
+        <Plot data={[heatTrace, ...pointTraces]} layout={layout} config={buildRsmPlotConfig("rsm", ps, viewport.reset)}
+          style={{ width: plotW, height: plotH }} useResizeHandler onRelayout={viewport.onRelayout}
           onHover={e => { const pt = e.points?.[0]; if (pt) setCursor({ x: pt.x, y: pt.y }); }} />
       )}
     </SciPlotWrap>
@@ -10166,6 +10170,137 @@ function makeHeatmapColorscale(scaleName, bgFade = 0) {
   return [[0, T.bg0], ...compressed];
 }
 
+// Keep acquisition connectivity beside the flat points used by analyses. No raw
+// data is changed: notebook heatmaps alone resample this mesh for their viewport.
+const rsmMeshShapes = new WeakMap();
+
+function rsmMeshShape(data) {
+  if (rsmMeshShapes.has(data)) return rsmMeshShapes.get(data);
+  // SmartLab CSV exports preserve frame-major order. Recognize a repeated row
+  // reset, rather than assuming arbitrary scattered points form a scan grid.
+  const steps = [];
+  for (let i = 1; i < Math.min(data.length, 1024); i++) {
+    const d = Math.hypot(data[i].x - data[i - 1].x, data[i].y - data[i - 1].y);
+    if (Number.isFinite(d) && d > 0) steps.push(d);
+  }
+  steps.sort((a, b) => a - b);
+  const typical = steps[Math.floor(steps.length / 2)];
+  const resets = [];
+  for (let i = 1; typical && i < data.length; i++) {
+    if (Math.hypot(data[i].x - data[i - 1].x, data[i].y - data[i - 1].y) > 20 * typical) resets.push(i);
+  }
+  const cols = resets[0];
+  const shape = cols >= 2 && data.length % cols === 0 && resets.length === data.length / cols - 1
+    && resets.every((v, i) => v === (i + 1) * cols) ? { cols, rows: data.length / cols } : null;
+  rsmMeshShapes.set(data, shape);
+  return shape;
+}
+
+function sampleRsmMesh(data, nx, ny, xRange, yRange) {
+  const shape = rsmMeshShape(data);
+  // Unordered legacy exports retain average-per-cell binning: do not invent
+  // connectivity across missing scans. Ordered CSVs use the same mesh as rasx.
+  if (!shape || shape.rows < 2) return null;
+  const [xMin, xMax] = xRange, [yMin, yMax] = yRange;
+  if (!(xMax > xMin && yMax > yMin)) return null;
+  nx = Math.max(2, Math.round(nx)); ny = Math.max(2, Math.round(ny));
+  const dx = (xMax - xMin)/nx, dy = (yMax - yMin)/ny;
+  const x = Array.from({ length: nx }, (_, i) => xMin + (i + 0.5)*dx);
+  const y = Array.from({ length: ny }, (_, i) => yMin + (i + 0.5)*dy);
+  const z = Array.from({ length: ny }, () => Array(nx).fill(null));
+  const triangle = (a, b, c) => {
+    if (![a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z].every(Number.isFinite)) return;
+    const loX = Math.max(0, Math.ceil((Math.min(a.x, b.x, c.x) - xMin)/dx - 0.5));
+    const hiX = Math.min(nx - 1, Math.floor((Math.max(a.x, b.x, c.x) - xMin)/dx - 0.5));
+    const loY = Math.max(0, Math.ceil((Math.min(a.y, b.y, c.y) - yMin)/dy - 0.5));
+    const hiY = Math.min(ny - 1, Math.floor((Math.max(a.y, b.y, c.y) - yMin)/dy - 0.5));
+    if (loX > hiX || loY > hiY) return;
+    const det = (b.y - c.y)*(a.x - c.x) + (c.x - b.x)*(a.y - c.y);
+    if (Math.abs(det) < 1e-20) return;
+    for (let j = loY; j <= hiY; j++) for (let i = loX; i <= hiX; i++) {
+      const u = ((b.y - c.y)*(x[i] - c.x) + (c.x - b.x)*(y[j] - c.y))/det;
+      const v = ((c.y - a.y)*(x[i] - c.x) + (a.x - c.x)*(y[j] - c.y))/det;
+      const w = 1 - u - v;
+      if (u >= -1e-9 && v >= -1e-9 && w >= -1e-9) {
+        // Interpolate counts first, then transform for display (no log-space
+        // interpolation, overshoot, or extrapolation outside a measured cell).
+        const intensity = Math.max(Math.min(a.z, b.z, c.z), Math.min(Math.max(a.z, b.z, c.z), u*a.z + v*b.z + w*c.z));
+        z[j][i] = intensity;
+      }
+    }
+  };
+  for (let r = 0; r < shape.rows - 1; r++) for (let col = 0; col < shape.cols - 1; col++) {
+    const k = r*shape.cols + col;
+    const a = data[k], b = data[k + 1], c = data[k + shape.cols], d = data[k + shape.cols + 1];
+    // Keep cells crossing the crop boundary: their surrounding measurements
+    // are needed to interpolate the first/last visible pixels correctly.
+    if (Math.max(a.x, b.x, c.x, d.x) < xMin || Math.min(a.x, b.x, c.x, d.x) > xMax
+      || Math.max(a.y, b.y, c.y, d.y) < yMin || Math.min(a.y, b.y, c.y, d.y) > yMax) continue;
+    triangle(a, b, d); triangle(a, d, c);
+  }
+  return z;
+}
+
+function resampleRSM(data, nx, ny, xRange, yRange, logIntensity, bgMethod, bgPct) {
+  return binRSM(data, nx, ny, xRange, yRange, logIntensity, bgMethod, bgPct, true);
+}
+
+// Zoom is transient; notebook limits remain the saved starting window. Any
+// subplot in the tight gallery drives the same Q window for every scan.
+function rsmRelayoutWindow(event, current) {
+  if (Object.entries(event).some(([k, v]) => /^([xy]axis\d*)\.autorange$/.test(k) && v)) return null;
+  const next = { ...current };
+  let changed = false;
+  for (const axis of ["x", "y"]) {
+    const prefix = Object.keys(event).map(k => k.match(new RegExp(`^(${axis}axis\\d*)\\.range(?:\\[\\d\\])?$`))?.[1]).find(Boolean);
+    if (!prefix) continue;
+    const range = event[`${prefix}.range`] || [event[`${prefix}.range[0]`], event[`${prefix}.range[1]`]];
+    if (range.length === 2 && range.every(Number.isFinite) && range[1] > range[0]
+      && !range.every((v, i) => Math.abs(v - (current?.[axis]?.[i] ?? Infinity)) < 1e-12)) {
+      next[axis] = range; changed = true;
+    }
+  }
+  return changed ? next : current;
+}
+
+function useRsmViewport(xDomain, yDomain) {
+  const key = JSON.stringify([xDomain, yDomain]);
+  const [saved, setSaved] = useState(null);
+  const timer = useRef(null);
+  const pending = useRef(null);
+  const view = saved?.key === key ? saved.view : null;
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const onRelayout = event => {
+    const current = pending.current?.key === key ? pending.current.view : view;
+    const next = rsmRelayoutWindow(event, current);
+    if (next === current) return;
+    pending.current = { key, view: next };
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => setSaved(p => ({ key, view: next, revision: (p?.revision || 0) + 1 })), 120);
+  };
+  const reset = () => {
+    clearTimeout(timer.current);
+    pending.current = { key, view: null };
+    setSaved(p => ({ key, view: null, revision: (p?.revision || 0) + 1 }));
+  };
+  return { x: view?.x || xDomain, y: view?.y || yDomain, onRelayout, reset, revision: `${key}:${saved?.revision || 0}` };
+}
+
+// Plotly otherwise remembers the most recently resampled range as its reset
+// target. Reset explicitly to the notebook's saved window instead.
+function buildRsmPlotConfig(filename, ps, reset) {
+  const config = buildPlotConfig(filename, ps);
+  return {
+    ...config,
+    modeBarButtonsToRemove: [...config.modeBarButtonsToRemove, "resetScale2d"],
+    modeBarButtonsToAdd: [...config.modeBarButtonsToAdd, {
+      name: "resetRsmWindow", title: "Reset axes",
+      icon: { width: 24, height: 24, path: "M12 3L2 12h3v9h5v-6h4v6h5v-9h3z" },
+      click: reset,
+    }],
+  };
+}
+
 // Bin raw RSM points into an nx×ny grid using average intensity per cell.
 // bgMethod: null | "percentile" | "median" | "plane"
 //   Linear mode  — additive subtraction in intensity space
@@ -10173,7 +10308,7 @@ function makeHeatmapColorscale(scaleName, bgFade = 0) {
 //                  log-floor; plane fits and subtracts a multiplicative trend (log-plane)
 // Returns { x, y, z, zmin, zmax, xDomain, yDomain } where zmin/zmax are
 // robust 2nd–99.5th percentile bounds for colorscale clipping.
-function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true, bgMethod = null, bgPct = 5) {
+function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true, bgMethod = null, bgPct = 5, fillSamplingGaps = false) {
   if (!data.length) return null;
   let xMin, xMax, yMin, yMax;
   if (xRange) { [xMin, xMax] = xRange; } else {
@@ -10198,6 +10333,16 @@ function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true,
     const idx = yi * nx + xi;
     sumG[idx] += d.z; cntG[idx]++;
   }
+  // Keep a separate mask of actual measurements. Interpolated bins must not
+  // influence background fitting/thresholds or the original robust color range.
+  const measuredG = cntG.slice();
+  if (fillSamplingGaps) {
+    const sampled = sampleRsmMesh(data, nx, ny, [xMin, xMax], [yMin, yMax]);
+    if (sampled) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+      const k = j*nx + i;
+      if (!cntG[k] && sampled[j][i] != null) { sumG[k] = sampled[j][i]; cntG[k] = 1; }
+    }
+  }
   const grid = new Float64Array(nx * ny);
   for (let i = 0; i < nx * ny; i++) grid[i] = cntG[i] > 0 ? sumG[i] / cntG[i] : 0;
 
@@ -10206,7 +10351,7 @@ function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true,
     // vals[i] is the value to fit; mask[i] truthy = cell participates
     let sx = 0, sy = 0, sz = 0, sxx = 0, sxy = 0, syy = 0, sxz = 0, syz = 0, n = 0;
     for (let i = 0; i < nx * ny; i++) {
-      if (!mask[i]) continue;
+      if (!mask[i] || !measuredG[i]) continue;
       const xn = (i % nx) / nx, yn = Math.floor(i / nx) / ny, z = vals[i];
       sx += xn; sy += yn; sz += z; sxx += xn*xn; sxy += xn*yn; syy += yn*yn;
       sxz += xn*z; syz += yn*z; n++;
@@ -10246,7 +10391,7 @@ function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true,
       if (bgMethod === "percentile" || bgMethod === "median") {
         const pct = bgMethod === "median" ? 50 : bgPct;
         const occ = [];
-        for (let i = 0; i < grid.length; i++) { if (cntG[i] > 0) occ.push(grid[i]); }
+        for (let i = 0; i < grid.length; i++) { if (measuredG[i] > 0) occ.push(grid[i]); }
         if (occ.length) {
           occ.sort((a, b) => a - b);
           const bg = occ[Math.min(Math.floor(occ.length * pct / 100), occ.length - 1)];
@@ -10268,7 +10413,7 @@ function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true,
         // Find percentile in log space; mask cells at or below the log floor
         const pct = bgMethod === "median" ? 50 : bgPct;
         const logOcc = [];
-        for (let i = 0; i < nx * ny; i++) { if (logMask[i]) logOcc.push(logGrid[i]); }
+        for (let i = 0; i < nx * ny; i++) { if (logMask[i] && measuredG[i]) logOcc.push(logGrid[i]); }
         if (logOcc.length) {
           logOcc.sort((a, b) => a - b);
           const logFloor = logOcc[Math.min(Math.floor(logOcc.length * pct / 100), logOcc.length - 1)];
@@ -10296,7 +10441,7 @@ function binRSM(data, nx, ny, xRange = null, yRange = null, logIntensity = true,
       const v = grid[j * nx + i];
       if (v <= 0) return null;
       const out = logIntensity ? Math.log10(v) : v;
-      occVals.push(out);
+      if (measuredG[j * nx + i]) occVals.push(out);
       return out;
     })
   );
@@ -11442,18 +11587,16 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
       </div>
     );
 
-  // Memoize binning for all entries together so a single Plot can be built.
-  const entryKey = entries.map(e => `${e.sid}:${e.data.length}`).join(",");
+  const viewport = useRsmViewport(forcedXDomain, forcedYDomain);
   const allBinned = useMemo(() => {
+    if (!ps.rsmTight && ps.rsmColorScale !== "shared") return [];
     const bins = ps.rsmBins || 256;
-    const logIntensity = ps.rsmLogIntensity ?? true;
-    const bgMethod = ps.rsmBgMethod ?? null;
-    const bgPct = ps.rsmBgPct ?? 5;
-    return entries.map(e =>
-      binRSM(e.data, bins, bins, forcedXDomain || null, forcedYDomain || null, logIntensity, bgMethod, bgPct)
-    );
+    return entries.map(e => resampleRSM(e.data, bins, bins, viewport.x, viewport.y,
+      ps.rsmLogIntensity ?? true, ps.rsmBgMethod ?? null, ps.rsmBgPct ?? 5));
+    // Depend on the original arrays: a detector correction preserves point counts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entryKey, ps.rsmBins, forcedXDomain?.[0], forcedXDomain?.[1], forcedYDomain?.[0], forcedYDomain?.[1], ps.rsmLogIntensity, ps.rsmBgMethod, ps.rsmBgPct]);
+  }, [plotCache, sampleOrder, viewport.x?.[0], viewport.x?.[1], viewport.y?.[0], viewport.y?.[1],
+    ps.rsmBins, ps.rsmLogIntensity, ps.rsmBgMethod, ps.rsmBgPct, ps.rsmTight, ps.rsmColorScale]);
 
   return (
     <div>
@@ -11574,14 +11717,14 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
           axesLayout[xAxisKey] = {
             ...axisBase, ...spikeProps,
             ...(perScanBar ? { domain: colDomain(col) } : {}),
-            range: [binned.xDomain[0], binned.xDomain[1]],
+            range: [binned.xDomain[0], binned.xDomain[1]], autorange: false,
             ...(xTicks ? { tickvals: xTicks, tickmode: "array" } : {}),
             showticklabels: isBottom,
             ...(isBottom ? { title: { text: `Qₓ (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } } : { title: { text: "" } }),
           };
           axesLayout[yAxisKey] = {
             ...axisBase, ...spikeProps,
-            range: [binned.yDomain[0], binned.yDomain[1]],
+            range: [binned.yDomain[0], binned.yDomain[1]], autorange: false,
             ...(yTicks ? { tickvals: yTicks, tickmode: "array" } : {}),
             showticklabels: isLeft, ticklabelstandoff: 4,
             ...(isLeft ? { title: { text: `Qz (${qUnit})`, font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 6 } } : { title: { text: "" } }),
@@ -11625,7 +11768,7 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
             xgap: 0, ygap: 0,
           },
           annotations, shapes,
-          uirevision: "rsm-grid",
+          uirevision: viewport.revision,
           hovermode: "closest",
           ...axesLayout,
         };
@@ -11635,8 +11778,9 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
             <Plot
               data={plotlyTraces}
               layout={plotLayout}
-              config={{ ...buildPlotConfig("rsm-comparison", ps), responsive: false }}
+              config={{ ...buildRsmPlotConfig("rsm-comparison", ps, viewport.reset), responsive: false }}
               style={{ width: `${figW}px`, height: `${figH}px` }}
+              onRelayout={viewport.onRelayout}
             />
           </div>
         );
