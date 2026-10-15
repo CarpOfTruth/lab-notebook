@@ -4,6 +4,7 @@ from typing import Optional
 import sqlite3, json, os, shutil, re, importlib.util, subprocess, sys, uuid
 from pathlib import Path
 import modules as mod_registry
+import vault_import
 
 # ── Dependency blacklist ───────────────────────────────────────────────────────
 # Packages that are never permitted to be pip-installed by user modules.
@@ -31,15 +32,19 @@ _DEP_BLACKLIST = {
 app = FastAPI(title="LabLog API")
 
 BASE_DIR    = Path(__file__).parent
-DATA_DIR    = BASE_DIR / "data"
+# LABLOG_DATA_DIR points the whole app (database, files, user modules, backups) at another
+# data root — used by tests and isolated preview servers so they never touch the daily data.
+DATA_DIR    = Path(os.environ["LABLOG_DATA_DIR"]).resolve() if os.environ.get("LABLOG_DATA_DIR") else BASE_DIR / "data"
 FILES_DIR   = DATA_DIR / "files"
 DB_PATH     = DATA_DIR / "lablog.db"
+BACKUPS_DIR = DATA_DIR / "backups"
+USER_MODULES_DIR = DATA_DIR / "user_modules"
 EXAMPLES_DIR         = DATA_DIR / "module_examples"          # user-uploaded (gitignored)
 BUILTIN_EXAMPLES_DIR = BASE_DIR / "modules" / "examples"     # shipped with code (tracked)
 SCHEMAS_DIR          = DATA_DIR / "module_schemas"            # user-saved (gitignored)
 BUILTIN_SCHEMAS_DIR  = BASE_DIR / "modules" / "schemas"      # shipped with code (tracked)
 
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 FILES_DIR.mkdir(exist_ok=True)
 EXAMPLES_DIR.mkdir(exist_ok=True)
 SCHEMAS_DIR.mkdir(exist_ok=True)
@@ -169,6 +174,12 @@ def init_db():
         except sqlite3.OperationalError:
             pass
         try:
+            # The substrate's cut, e.g. "(001)". The cell belongs to the material, the cut to the
+            # sample; NULL means "use the material's default_orientation". See docs/xrd-substrate-alignment.md.
+            conn.execute("ALTER TABLE samples ADD COLUMN substrate_orientation TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
             conn.execute("ALTER TABLE samples ADD COLUMN lot TEXT")
         except sqlite3.OperationalError:
             pass
@@ -178,6 +189,12 @@ def init_db():
             pass
         try:
             conn.execute("ALTER TABLE samples ADD COLUMN module_config TEXT DEFAULT '{}'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            # JSON provenance for samples created from an external record (Obsidian vault import).
+            # Never written by the ordinary sample update route.
+            conn.execute("ALTER TABLE samples ADD COLUMN source_record TEXT")
         except sqlite3.OperationalError:
             pass
         conn.execute("""
@@ -350,8 +367,16 @@ def row_to_sample(row):
     d["filenames"]          = json.loads(d.get("filenames")     or "{}")
     d["xrd_peaks"]          = json.loads(d.get("xrd_peaks")     or "[]")
     d["module_config"]      = json.loads(d.get("module_config") or "{}")
+    d["source_record"]      = json.loads(d["source_record"]) if d.get("source_record") else None
     d["module_file_counts"] = {}   # enriched separately by callers that hold a conn
     return d
+
+
+def _light_sample(sample: dict) -> dict:
+    """Replace the (large) source record with a flag for list/detail responses.
+    The full record is served by /api/samples/{id}/source-record and carried by exports."""
+    sample["has_source_record"] = bool(sample.pop("source_record", None))
+    return sample
 
 
 def _enrich_sample_counts(conn, sample: dict) -> dict:
@@ -478,7 +503,7 @@ async def reorder_folders(request: Request):
 def list_samples():
     with get_db() as conn:
         rows = conn.execute("SELECT * FROM samples ORDER BY date DESC, created_at DESC").fetchall()
-        samples = [row_to_sample(r) for r in rows]
+        samples = [_light_sample(row_to_sample(r)) for r in rows]
         _enrich_samples_counts(conn, samples)
     return samples
 
@@ -488,9 +513,19 @@ def get_sample(sample_id: str):
         row = conn.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Sample not found")
-        sample = row_to_sample(row)
+        sample = _light_sample(row_to_sample(row))
         _enrich_sample_counts(conn, sample)
     return sample
+
+@app.get("/api/samples/{sample_id}/source-record")
+def get_sample_source_record(sample_id: str):
+    with get_db() as conn:
+        row = conn.execute("SELECT source_record FROM samples WHERE id=?", (sample_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Sample not found")
+    if not row["source_record"]:
+        raise HTTPException(404, "Sample has no source record")
+    return json.loads(row["source_record"])
 
 @app.post("/api/samples")
 def create_sample(sample: dict):
@@ -501,12 +536,13 @@ def create_sample(sample: dict):
         conn.execute("""
             INSERT INTO samples
               (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
-               technique, folder_id, layers, filenames, xrd_peaks, lot, bin)
+               technique, folder_id, layers, filenames, xrd_peaks, lot, bin, substrate_orientation)
             VALUES
               (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
-               :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin)
+               :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin, :substrate_orientation)
         """, {
             **sample,
+            "substrate_orientation": sample.get("substrate_orientation") or None,
             "technique":  sample.get("technique", "sputter"),
             "folder_id":  sample.get("folder_id"),
             "layers":     layers_json,
@@ -520,10 +556,34 @@ def create_sample(sample: dict):
         conn.commit()
     return {"ok": True, "id": sample["id"]}
 
+def _merge_xrd_peaks(incoming, stored_json):
+    """The substrate alignment in xrd_peaks.alignment is written only by the alignment
+    endpoints. A whole-sample save (or the XRD analysis view saving its fit state)
+    must never drop it, so carry the stored alignment over when the payload lacks it.
+    The old array format is wrapped as {"lines": [...]}, which every reader accepts."""
+    try:
+        stored = json.loads(stored_json or "[]")
+    except (TypeError, ValueError):
+        stored = []
+    alignment = stored.get("alignment") if isinstance(stored, dict) else None
+    if incoming is None:
+        incoming = []
+    if alignment is None or (isinstance(incoming, dict) and "alignment" in incoming):
+        return incoming
+    if isinstance(incoming, list):
+        incoming = {"lines": incoming}
+    return {**incoming, "alignment": alignment}
+
+
 @app.put("/api/samples/{sample_id}")
 def update_sample(sample_id: str, sample: dict):
     with get_db() as conn:
         layers_json = json.dumps(sample.get("layers", []))
+        prev = conn.execute("SELECT xrd_peaks FROM samples WHERE id=?", (sample_id,)).fetchone()
+        xrd_peaks = _merge_xrd_peaks(sample.get("xrd_peaks", []), prev["xrd_peaks"] if prev else None)
+        if "substrate_orientation" in sample:      # only when sent: a caller that omits it keeps the stored cut
+            conn.execute("UPDATE samples SET substrate_orientation=? WHERE id=?",
+                         ((sample.get("substrate_orientation") or "").strip() or None, sample_id))
         conn.execute("""
             UPDATE samples SET
               date=:date, substrate=:substrate, notes=:notes,
@@ -544,7 +604,7 @@ def update_sample(sample_id: str, sample: dict):
             "folder_id":  sample.get("folder_id"),
             "layers":     layers_json,
             "filenames":  json.dumps(sample.get("filenames", {})),
-            "xrd_peaks":  json.dumps(sample.get("xrd_peaks", [])),
+            "xrd_peaks":  json.dumps(xrd_peaks),
             "lot":        sample.get("lot"),
             "bin":        sample.get("bin"),
         })
@@ -638,6 +698,200 @@ def reindex_filter():
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────
+
+# ── Obsidian vault import (create-only) ──────────────────────────────────────
+# Parsing and conversion live in vault_import.py (read-only, DB-free). Previews are
+# held in memory; apply accepts only selections from a server-generated preview,
+# revalidates them against a fresh scan, and inserts each new sample in its own
+# transaction. Existing samples and the vault are never modified.
+
+_VAULT_PREVIEWS: dict = {}
+_VAULT_PREVIEW_LIMIT = 8
+
+
+def _sample_ids(conn) -> list:
+    return [r[0] for r in conn.execute("SELECT id FROM samples").fetchall()]
+
+
+def _vault_scan(root) -> dict:
+    with get_db() as conn:
+        library = [{"id": r["id"], "name": r["name"]}
+                   for r in conn.execute("SELECT id, name FROM materials_library").fetchall()]
+        row = conn.execute("SELECT value FROM settings WHERE key='main'").fetchone()
+        techniques = (json.loads(row["value"]) if row else {}).get("techniques") or []
+        existing = _sample_ids(conn)
+    try:
+        return vault_import.scan_vault(root, library, techniques, existing)
+    except vault_import.VaultError as e:
+        raise HTTPException(400, str(e))
+
+
+def _backup_database(label: str) -> Path:
+    """Consistent copy of the live database using SQLite's backup API (safe with WAL)."""
+    from datetime import datetime
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = BACKUPS_DIR / f"lablog-{label}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.db"
+    src, dst = sqlite3.connect(DB_PATH), sqlite3.connect(dest)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    return dest
+
+
+def _insert_vault_sample(sample: dict, source_record: dict):
+    """Insert one new sample, its source record and filter-index rows in one transaction.
+    Insert-only: returns ("created", None), ("already_exists", msg) or ("blocked", msg)."""
+    conn = sqlite3.connect(DB_PATH, isolation_level=None, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            ids = _sample_ids(conn)
+            if sample["id"] in ids:
+                conn.execute("ROLLBACK")
+                return "already_exists", "Already in LabLog; left untouched"
+            folded = [i for i in ids if vault_import.fold_id(i) == vault_import.fold_id(sample["id"])]
+            if folded:
+                conn.execute("ROLLBACK")
+                return "blocked", f"ID differs only in letter case from existing sample {', '.join(folded)}"
+            layers_json = json.dumps(sample["layers"])
+            conn.execute("""
+                INSERT INTO samples
+                  (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
+                   technique, folder_id, layers, filenames, xrd_peaks, lot, bin, module_config, source_record,
+                   substrate_orientation)
+                VALUES
+                  (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
+                   :technique, NULL, :layers, :filenames, :xrd_peaks, :lot, :bin, :module_config, :source_record,
+                   :substrate_orientation)
+            """, {
+                "id": sample["id"], "date": sample["date"], "substrate": sample["substrate"],
+                "notes": sample["notes"], "thickness_nm": None, "area_m2": None, "area_correction": 1.0,
+                "technique": sample["technique"], "layers": layers_json,
+                "filenames": "{}", "xrd_peaks": "[]", "lot": sample["lot"], "bin": sample["bin"],
+                "module_config": "{}", "source_record": json.dumps(source_record, ensure_ascii=False),
+                "substrate_orientation": sample.get("substrate_orientation"),
+            })
+            _index_sample(conn, sample["id"], layers_json, sample["technique"], sample["substrate"], sample["lot"])
+            conn.execute("COMMIT")
+            return "created", None
+        except sqlite3.IntegrityError:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            return "already_exists", "Created by another action after the preview; left untouched"
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+
+
+@app.get("/api/vault-import/root")
+def get_vault_import_root():
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key='vault_import_root'").fetchone()
+    return {"root": json.loads(row["value"]) if row else ""}
+
+
+@app.put("/api/vault-import/root")
+def put_vault_import_root(body: dict):
+    root = body.get("root") or ""
+    if not isinstance(root, str):
+        raise HTTPException(400, "root must be text")
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('vault_import_root', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (json.dumps(root.strip()),))
+        conn.commit()
+    return {"root": root.strip()}
+
+
+@app.post("/api/vault-import/preview")
+def vault_import_preview(body: dict):
+    """Read-only scan. Writes nothing to the database, the data folder or the vault."""
+    scan = _vault_scan(body.get("root"))
+    preview_id = uuid.uuid4().hex
+    _VAULT_PREVIEWS[preview_id] = {"root": scan["root"], "records": {r["key"]: r for r in scan["records"]}}
+    while len(_VAULT_PREVIEWS) > _VAULT_PREVIEW_LIMIT:
+        _VAULT_PREVIEWS.pop(next(iter(_VAULT_PREVIEWS)))
+    return {"preview_id": preview_id, "root": scan["root"], "counts": scan["counts"], "ignored": scan["ignored"],
+            "records": [vault_import.public_record(r) for r in scan["records"]]}
+
+
+@app.post("/api/vault-import/apply")
+def vault_import_apply(body: dict):
+    """Create the selected, still-valid records from a preview. Never updates an existing sample.
+
+    body: { preview_id, selections: [{ key, acknowledged, confirmed_physical }] }
+    outcome per record: created | already_exists | source_changed | skipped | failed
+    """
+    from datetime import datetime, timezone
+    preview = _VAULT_PREVIEWS.get(body.get("preview_id") or "")
+    if not preview:
+        raise HTTPException(409, "This preview has expired. Scan the vault again.")
+    selections = body.get("selections")
+    if not isinstance(selections, list):
+        raise HTTPException(400, "selections must be a list")
+
+    current = {r["key"]: r for r in _vault_scan(preview["root"])["records"]}
+    results, to_create, seen = [], [], set()
+
+    def report(key, sid, outcome, message):
+        results.append({"key": key, "id": sid, "outcome": outcome, "message": message})
+
+    for sel in selections:
+        key = sel.get("key") if isinstance(sel, dict) else None
+        if not isinstance(key, str) or key in seen:
+            continue
+        seen.add(key)
+        old = preview["records"].get(key)
+        if old is None:
+            report(key, None, "skipped", "Not part of this preview")
+            continue
+        if old["category"] not in ("ready", "review"):
+            report(key, old["id"], "skipped", f"Not importable ({old['category']})")
+            continue
+        new = current.get(key)
+        if new is None:
+            report(key, old["id"], "source_changed", "The note is no longer in the vault")
+        elif new["category"] == "existing":
+            report(key, old["id"], "already_exists", "Already in LabLog; left untouched")
+        elif new["sha256"] != old["sha256"]:
+            report(key, old["id"], "source_changed", "The note changed after the preview; scan again to review it")
+        elif new["fingerprint"] != old["fingerprint"]:
+            report(key, old["id"], "source_changed",
+                   "Materials, technique settings or vault identities changed after the preview; scan again")
+        elif any(w["ack"] for w in old["warnings"]) and sel.get("acknowledged") is not True:
+            report(key, old["id"], "skipped", "Conversion warnings were not acknowledged")
+        elif old["needs_confirmation"] and sel.get("confirmed_physical") is not True:
+            report(key, old["id"], "skipped", "Not confirmed as an existing physical sample")
+        else:
+            to_create.append((new, sel))
+
+    backup = _backup_database("before-vault-import") if to_create else None
+    imported_at = datetime.now(timezone.utc).isoformat()
+    for rec, sel in to_create:
+        sample = json.loads(json.dumps(rec["sample"]))
+        for layer in sample["layers"]:
+            layer["id"] = str(uuid.uuid4())
+        choices = {
+            "acknowledged_warnings": [w["code"] for w in rec["warnings"] if w["ack"]],
+            "confirmed_physical_sample": bool(rec["needs_confirmation"]),
+        }
+        try:
+            outcome, message = _insert_vault_sample(sample, vault_import.build_source_record(rec, imported_at, choices))
+        except Exception as e:
+            report(rec["key"], rec["id"], "failed", f"{type(e).__name__}: {e}")
+            continue
+        report(rec["key"], rec["id"], "skipped" if outcome == "blocked" else outcome, message or "Created")
+
+    counts = {o: sum(1 for r in results if r["outcome"] == o)
+              for o in ("created", "already_exists", "source_changed", "skipped", "failed")}
+    return {"results": results, "counts": counts, "backup": backup.name if backup else None}
+
 
 @app.get("/api/settings")
 def get_settings():
@@ -882,10 +1136,12 @@ async def inspect_xray_file(file: UploadFile = File(...)):
 
 
 @app.get("/api/samples/{sample_id}/xray/{filename}")
-def get_xray_file(sample_id: str, filename: str, detector_distance: Optional[float] = Query(None)):
+def get_xray_file(sample_id: str, filename: str, detector_distance: Optional[float] = Query(None),
+                  frame: Optional[int] = Query(None)):
     """Parse a stored .rasx and return the same payload as /api/xray/inspect.
     `detector_distance` (mm) overrides the recorded sample-to-detector distance
-    for RSMs (2θ recomputed on read; the file is untouched). Ignored for 1D scans."""
+    for RSMs (2θ recomputed on read; the file is untouched). Ignored for 1D scans.
+    `frame` picks one scan from a file holding several 2θ/θ scans (default: last)."""
     from rasx import inspect_bytes, DETECTOR_DISTANCE_MIN, DETECTOR_DISTANCE_MAX
     if detector_distance is not None and not (DETECTOR_DISTANCE_MIN <= detector_distance <= DETECTOR_DISTANCE_MAX):
         raise HTTPException(422, f"detector_distance must be between {DETECTOR_DISTANCE_MIN:g} and {DETECTOR_DISTANCE_MAX:g} mm")
@@ -893,11 +1149,188 @@ def get_xray_file(sample_id: str, filename: str, detector_distance: Optional[flo
     if not path.exists():
         raise HTTPException(404, "File not found")
     try:
-        return inspect_bytes(path.read_bytes(), filename, detector_distance)
+        return inspect_bytes(path.read_bytes(), filename, detector_distance, frame)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
         raise HTTPException(422, f"Could not read .rasx: {e}")
+
+
+# ── XRD substrate alignment ──────────────────────────────────────────────────
+# Physics in xrdref.py (pure); design in docs/xrd-substrate-alignment.md. The offset is
+# computed once and stored as metadata in samples.xrd_peaks.alignment; the stored scan is
+# never modified. A notebook panel option decides whether it is applied at plot time.
+
+def _xrd_text_to_xy(text: str):
+    """Same rules as the frontend's csvToPlotData for xrd_ot: comment lines skipped,
+    comma/semicolon/tab split (whitespace when that yields one column), and x doubled
+    when the header names ω without 2θ."""
+    def num(c):
+        c = c.strip().strip("\"'")
+        if c == "":
+            return 0.0
+        try:
+            return float(c)
+        except ValueError:
+            return float("nan")
+    xs, ys = [], []
+    for line in text.strip().splitlines():
+        t = line.strip()
+        if not t or t[0] in "#;!":
+            continue
+        cols = re.split(r"[,;\t]", t)
+        cells = cols if len(cols) >= 2 else t.split()
+        if len(cells) < 2:
+            continue
+        a, b = num(cells[0]), num(cells[1])
+        if a == a and b == b and abs(a) != float("inf") and abs(b) != float("inf"):
+            xs.append(a); ys.append(b)
+    head = text.splitlines()[:8]
+    omega = any(re.search("ω", l, re.I) and not re.search(r"2\s*[θtT°]", l) and not re.search("2theta", l, re.I)
+                for l in head)
+    if omega:
+        xs = [2 * v for v in xs]
+    return xs, ys
+
+
+def _load_xrd_scan(conn, sample_id: str, filename: str):
+    """(two_theta, intensity, wavelength_A, source) for the sample's stored xrd_ot scan.
+    .rasx: the frame chosen on the card (module_config.xrd_ot.frame for this file), else the
+    latest; wavelength read from the file. Text: Cu Kα1 assumed and recorded as assumed."""
+    import hashlib
+    from xrdref import CU_KA1_A
+    path = FILES_DIR / sample_id / filename
+    if not path.exists():
+        raise HTTPException(404, f"XRD file not found: {filename}")
+    raw = path.read_bytes()
+    src = {"file": filename, "sha256": hashlib.sha256(raw).hexdigest(), "frame": None, "wavelength_source": "file"}
+    if filename.lower().endswith(".rasx"):
+        from rasx import read_rasx, is_line_scan_set, resolve_frame
+        scan = read_rasx(raw, filename)
+        row = conn.execute("SELECT module_config FROM samples WHERE id=?", (sample_id,)).fetchone()
+        cfg = (json.loads(row["module_config"] or "{}") if row else {}).get("xrd_ot") or {}
+        if is_line_scan_set(scan):
+            want = cfg.get("frame") if cfg.get("frame_file") == filename else None
+            idx = resolve_frame(scan, want)
+            f = scan.frames[idx]
+            src["frame"] = idx
+            return f.x.tolist(), f.intensity.tolist(), float(scan.wavelength), src
+        if scan.is_map:
+            raise HTTPException(422, "the XRD slot holds a map, not a 2θ/θ scan")
+        return scan.x.tolist(), scan.intensity.tolist(), float(scan.wavelength), src
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+    xs, ys = _xrd_text_to_xy(text)
+    src["wavelength_source"] = "assumed Cu Kα1 (text export carries no wavelength)"
+    return xs, ys, CU_KA1_A, src
+
+
+def _alignment_inputs(conn, sample_id: str):
+    """Everything the alignment depends on. Returns (inputs, scan) or raises HTTPException."""
+    from xrdref import EXTRACTOR_VERSION
+    row = conn.execute("SELECT substrate, substrate_orientation, filenames FROM samples WHERE id=?", (sample_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, f"Sample '{sample_id}' not found")
+    filename = json.loads(row["filenames"] or "{}").get("xrd_ot")
+    if not filename:
+        raise HTTPException(404, "no XRD ω–2θ scan on this sample")
+    x, y, lam, src = _load_xrd_scan(conn, sample_id, filename)
+    lib = {r["name"]: {"crystal": json.loads(r["crystal"] or "{}")}
+           for r in conn.execute("SELECT name, crystal FROM materials_library").fetchall()}
+    sub = row["substrate"] or ""
+    ref_name = (lib.get(sub, {}).get("crystal") or {}).get("reference_component") or sub
+    inputs = {**src, "substrate": sub, "orientation": row["substrate_orientation"],
+              "wavelength_A": lam, "extractor_version": EXTRACTOR_VERSION,
+              "cells": {n: lib[n]["crystal"] for n in {sub, ref_name} if n in lib}}
+    return inputs, (x, y, lib)
+
+
+def _compute_alignment(inputs: dict, scan) -> dict:
+    import xrdref
+    from datetime import datetime, timezone
+    x, y, lib = scan
+    if not x:
+        env = {"value": None, "sigma": None, "unit": "deg", "status": "failed_measurement", "censored": None,
+               "conditions": None, "note": "the scan file has no data points"}
+    else:
+        rng = (min(x), max(x))
+        res = xrdref.references_for_sample(lib, inputs["substrate"], inputs["orientation"], inputs["wavelength_A"], rng)
+        if res["status"] != "ok":
+            env = {"value": None, "sigma": None, "unit": "deg", "status": "not_applicable", "censored": None,
+                   "conditions": {"substrate": inputs["substrate"], "orientation": inputs["orientation"]}, "note": res["note"]}
+        else:
+            env = xrdref.alignment_offset(x, y, res["references"], inputs["wavelength_A"], res["reference_material"],
+                                          tracked=res["tracked"])
+            env["conditions"]["orientation"] = res["orientation"]
+    env["conditions"] = {**(env.get("conditions") or {}), "wavelength_source": inputs["wavelength_source"],
+                         "file": inputs["file"], "frame": inputs["frame"]}
+    env["inputs"] = inputs
+    env["computed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return env
+
+
+def _store_alignment(conn, sample_id: str, env: Optional[dict]):
+    row = conn.execute("SELECT xrd_peaks FROM samples WHERE id=?", (sample_id,)).fetchone()
+    try:
+        peaks = json.loads(row["xrd_peaks"] or "[]")
+    except (TypeError, ValueError):
+        peaks = []
+    if isinstance(peaks, list):
+        peaks = {"lines": peaks}
+    if env is None:
+        peaks.pop("alignment", None)
+    else:
+        peaks["alignment"] = env
+    conn.execute("UPDATE samples SET xrd_peaks=? WHERE id=?", (json.dumps(peaks), sample_id))
+    conn.commit()
+
+
+def _stored_alignment(conn, sample_id: str) -> Optional[dict]:
+    row = conn.execute("SELECT xrd_peaks FROM samples WHERE id=?", (sample_id,)).fetchone()
+    try:
+        peaks = json.loads(row["xrd_peaks"] or "[]") if row else []
+    except (TypeError, ValueError):
+        return None
+    return peaks.get("alignment") if isinstance(peaks, dict) else None
+
+
+@app.get("/api/samples/{sample_id}/xrd-alignment")
+def get_xrd_alignment(sample_id: str, ensure: bool = Query(False)):
+    """The stored alignment plus whether it is stale (its inputs no longer match the
+    sample: different scan, frame, substrate, cut, wavelength, reference cell or extractor).
+    ensure=1 computes and stores it when missing or stale: the notebook panel option."""
+    with get_db() as conn:
+        stored = _stored_alignment(conn, sample_id)
+        try:
+            inputs, scan = _alignment_inputs(conn, sample_id)
+        except HTTPException as e:
+            return {"alignment": stored, "stale": None, "available": False, "reason": e.detail}
+        stale = stored is None or stored.get("inputs") != json.loads(json.dumps(inputs))
+        if ensure and stale:
+            stored = _compute_alignment(inputs, scan)
+            _store_alignment(conn, sample_id, stored)
+            stale = False
+    return {"alignment": stored, "stale": stale, "available": True, "reason": None}
+
+
+@app.post("/api/samples/{sample_id}/xrd-alignment")
+def compute_xrd_alignment(sample_id: str, store: bool = Query(True)):
+    """Recompute now. store=0 is a dry run: nothing is written."""
+    with get_db() as conn:
+        inputs, scan = _alignment_inputs(conn, sample_id)
+        env = _compute_alignment(inputs, scan)
+        if store:
+            _store_alignment(conn, sample_id, env)
+    return {"alignment": env, "stored": store}
+
+
+@app.delete("/api/samples/{sample_id}/xrd-alignment")
+def delete_xrd_alignment(sample_id: str):
+    with get_db() as conn:
+        _store_alignment(conn, sample_id, None)
+    return {"ok": True}
 
 
 # ── Sputter deposition logs ───────────────────────────────────────────────────
@@ -1103,6 +1536,10 @@ async def import_sample(file: UploadFile = File(...), merge: bool = False, confi
         "xrd_peaks":     json.dumps(sample_data.get("xrd_peaks", [])),
         "lot":           sample_data.get("lot"),
         "bin":           sample_data.get("bin"),
+        # Older archives have no source record; overwrite then keeps the existing one.
+        "source_record": json.dumps(sample_data["source_record"]) if isinstance(sample_data.get("source_record"), dict) else None,
+        # Older archives have no substrate cut; overwrite then keeps the existing one.
+        "substrate_orientation": sample_data.get("substrate_orientation") or None,
     }
 
     with get_db() as conn:
@@ -1116,7 +1553,9 @@ async def import_sample(file: UploadFile = File(...), merge: bool = False, confi
                   date=:date, substrate=:substrate, notes=:notes,
                   thickness_nm=:thickness_nm, area_m2=:area_m2, area_correction=:area_correction,
                   technique=:technique, layers=:layers, filenames=:filenames,
-                  xrd_peaks=:xrd_peaks, lot=:lot, bin=:bin
+                  xrd_peaks=:xrd_peaks, lot=:lot, bin=:bin,
+                  source_record=COALESCE(:source_record, source_record),
+                  substrate_orientation=COALESCE(:substrate_orientation, substrate_orientation)
                 WHERE id=:id
             """, params)
         else:
@@ -1124,10 +1563,10 @@ async def import_sample(file: UploadFile = File(...), merge: bool = False, confi
             conn.execute("""
                 INSERT INTO samples
                   (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
-                   technique, folder_id, layers, filenames, xrd_peaks, lot, bin)
+                   technique, folder_id, layers, filenames, xrd_peaks, lot, bin, source_record, substrate_orientation)
                 VALUES
                   (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
-                   :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin)
+                   :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin, :source_record, :substrate_orientation)
             """, params)
         conn.commit()
 
@@ -1276,21 +1715,40 @@ def delete_file(sample_id: str, filename: str):
     return {"ok": True}
 
 
-@app.get("/api/samples/{sample_id}/afm_data")
-def get_afm_data(sample_id: str):
-    """Read the stored .ibw file, process each channel, and return display-ready JSON."""
+def _afm_payload(sample_id: str, override: Optional[dict] = None, preview: bool = False) -> dict:
+    """Read the stored .ibw, flatten its height channel with the sample's saved
+    AFM settings (module_config.afm) or `override`, and return display-ready JSON plus
+    roughness for the full map and for the region mask. See backend/afm.py."""
     try:
         import numpy as np
         import igor2.binarywave as bw
     except ImportError:
         raise HTTPException(500, "igor2 / numpy not installed — run: pip install igor2 numpy")
+    from afm import normalize_settings, region_mask, process_topography, roughness, is_default, run_chain, pack_mask
 
     dest_dir = FILES_DIR / sample_id
     afm_files = sorted(dest_dir.glob("afm_*.ibw"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not afm_files:
         raise HTTPException(404, "No AFM file found for this sample")
-
     path = afm_files[0]
+
+    if override is not None:
+        settings = normalize_settings(override)
+        regions_active = bool(settings["regions"])          # drawn on the file being previewed
+    else:
+        with get_db() as conn:
+            row = conn.execute("SELECT module_config FROM samples WHERE id=?", (sample_id,)).fetchone()
+        saved = (json.loads(row["module_config"] or "{}") if row else {}).get("afm") or {}
+        settings = normalize_settings(saved)
+        # Regions belong to the file they were drawn on; a new upload keeps the options only.
+        regions_active = bool(settings["regions"]) and settings["regions_file"] == path.name
+    chain = settings["steps"]                      # None = single-pass flatten (legacy settings)
+    if chain is not None:
+        regions_active = False                     # a chain carries its own region steps
+    regions_ignored = bool(settings["regions"]) and not regions_active and chain is None
+    step_infos: list = []
+    chain_excl = None
+
     wave = bw.load(str(path))
     wdata = wave["wave"]["wData"]          # (H, W, C) float32, values already in SI units
     note_raw = wave["wave"].get("note", b"")
@@ -1307,10 +1765,10 @@ def get_afm_data(sample_id: str):
     # Channel labels: dim2 of labels list; index 0 is always an empty placeholder in Igor
     raw_labels = wave["wave"].get("labels", [])
     dim2 = raw_labels[2] if len(raw_labels) > 2 else []
-    labels: list[str] = []
+    labels: list = []
     for lbl in dim2:
-        s = (lbl.decode("latin-1") if isinstance(lbl, bytes) else lbl).rstrip("\x00").strip()
-        labels.append(s)
+        s_ = (lbl.decode("latin-1") if isinstance(lbl, bytes) else lbl).rstrip("\x00").strip()
+        labels.append(s_)
     # Drop the leading empty placeholder so index i matches channel i
     while labels and not labels[0]:
         labels.pop(0)
@@ -1322,72 +1780,99 @@ def get_afm_data(sample_id: str):
 
     channels: dict = {}
     channel_ranges: dict = {}
+    channel_units: dict = {}
+    stats: dict = {}
+    info_all = {"fallback_lines": 0, "warnings": []}
+    mask = None
     for i in range(C):
         ch = np.rot90(wdata[:, :, i].astype(np.float64), k=1)  # 90° CCW before processing
-        Hr, Wr = ch.shape
         ch_label = labels[i] if i < len(labels) else f"Ch{i}"
+        lower = ch_label.lower()
+        processed = "height" in lower or i == 0      # height is the only flattened channel
+        if preview and not processed:
+            continue
+        if processed and chain is not None:
+            ch, chain_excl, step_infos = run_chain(ch, chain, path.name)
+            channel_units[ch_label] = "nm"
+            mask = ~chain_excl if chain_excl.any() else None
+            # "region" = the pixels the fits and statistics use (everything not masked)
+            stats[ch_label] = {"full": roughness(ch), "region": roughness(ch, mask) if mask is not None else None,
+                               "mask_fraction": float(chain_excl.mean())}
+        elif processed:
+            if mask is None and regions_active:
+                mask = region_mask(ch.shape, settings["regions"] if regions_active else [])
+                if int(mask.sum()) < 16:
+                    info_all["warnings"].append("the region covers fewer than 16 pixels; regions ignored")
+                    mask, regions_active = None, False
+            ch, info = process_topography(ch, settings, mask if regions_active else None)
+            info_all["fallback_lines"] = max(info_all["fallback_lines"], info["fallback_lines"])
+            info_all["warnings"] += [w for w in info["warnings"] if w not in info_all["warnings"]]
+            channel_units[ch_label] = "nm"
+            stats[ch_label] = {"full": roughness(ch), "region": roughness(ch, mask) if regions_active else None}
 
-        # Height channel: linewise (row-by-row) flatten to remove scan-line Z-drift,
-        # followed by a global plane tilt removal, then m → nm.
-        if "height" in ch_label.lower() or i == 0:
-            xs_row = np.arange(Wr, dtype=np.float64)
-
-            # Global IQR mask: exclude large features/outliers from all fits
-            flat_g = ch.ravel()
-            ok_g   = np.isfinite(flat_g)
-            q1g, q3g = np.percentile(flat_g[ok_g], [25, 75])
-            iqr_g    = q3g - q1g
-            global_mask = (np.isfinite(ch)
-                           & (ch >= q1g - 3.0 * iqr_g)
-                           & (ch <= q3g + 3.0 * iqr_g))
-
-            # Row-by-row 1st-order (linear) flatten — removes per-line Z drift
-            for r in range(Hr):
-                mask = global_mask[r]
-                if mask.sum() < 2:          # fallback if most of row is masked
-                    mask = np.isfinite(ch[r])
-                if mask.sum() < 2:
-                    continue
-                c = np.polyfit(xs_row[mask], ch[r, mask], 1)
-                ch[r] -= np.polyval(c, xs_row)
-
-            # Global 2nd-order polynomial flatten on post-linewise residuals
-            ys2, xs2 = np.mgrid[0:Hr, 0:Wr]
-            flat2 = ch.ravel()
-            ok2   = np.isfinite(flat2)
-            q1b, q3b = np.percentile(flat2[ok2], [25, 75])
-            iqr_b    = q3b - q1b
-            ok2 &= (flat2 >= q1b - 3.0 * iqr_b) & (flat2 <= q3b + 3.0 * iqr_b)
-            xf2, yf2 = xs2.ravel()[ok2], ys2.ravel()[ok2]
-            A2 = np.stack([np.ones(ok2.sum()), xf2, yf2, xf2**2, xf2*yf2, yf2**2], axis=1)
-            c2, *_ = np.linalg.lstsq(A2, flat2[ok2], rcond=None)
-            ch -= (c2[0] + c2[1]*xs2 + c2[2]*ys2
-                   + c2[3]*xs2**2 + c2[4]*xs2*ys2 + c2[5]*ys2**2)
-
-            ch *= 1e9  # m → nm
-
-        # Percentile-clipped display range (robust against outliers for all channels)
-        ch_flat = ch.ravel()
+        # Percentile-clipped display range (robust against outliers for all channels).
+        # For the height map, the automatic range comes from the region mask when regions
+        # are set, so the colors follow the part of the scan the analysis uses.
+        range_src = ch[mask] if (processed and mask is not None and (regions_active or chain is not None)) else ch
+        ch_flat = range_src.ravel()
         ch_ok = np.isfinite(ch_flat)
         if ch_ok.any():
             vmin, vmax = np.percentile(ch_flat[ch_ok], [0.5, 99.5])
         else:
             vmin, vmax = 0.0, 1.0
+        if processed:
+            # Height color scale limits set on the card (either side may stay automatic)
+            if settings["range_min"] is not None:
+                vmin = settings["range_min"]
+            if settings["range_max"] is not None:
+                vmax = settings["range_max"]
         channel_ranges[ch_label] = [round(float(vmin), 4), round(float(vmax), 4)]
 
-        channels[ch_label] = ch.tolist()
+        channels[ch_label] = np.round(ch, 4).tolist() if preview else ch.tolist()
 
     first = next(iter(channels.values())) if channels else [[]]
     out_h, out_w = len(first), len(first[0]) if first else 0
 
+    shown = dict(settings)
+    if not regions_active:
+        shown["regions"] = []
     return {
         "channels":       channels,
         "channel_names":  list(channels.keys()),
         "channel_ranges": channel_ranges,
+        "channel_units":  channel_units,
         "scan_size_um":   round(scan_size_m * 1e6, 3),
         "pixels":         [out_h, out_w],
         "filename":       path.name,
+        "stats":          stats,
+        "processing": {
+            "settings":        shown,
+            "default":         chain is None and is_default(settings, regions_active),
+            "chain":           chain,
+            "step_infos":      step_infos,
+            **({"mask": pack_mask(chain_excl), "mask_shape": list(chain_excl.shape)} if preview and chain_excl is not None else {}),
+            "range_manual":    [settings["range_min"] is not None, settings["range_max"] is not None],
+            "range_basis":     "region" if regions_active else "full map",
+            "regions_active":  regions_active,
+            "regions_ignored": regions_ignored,
+            "region_pixels":   int(mask.sum()) if mask is not None else None,
+            "fallback_lines":  info_all["fallback_lines"],
+            "warnings":        info_all["warnings"],
+        },
     }
+
+
+@app.get("/api/samples/{sample_id}/afm_data")
+def get_afm_data(sample_id: str):
+    """Processed AFM channels using the sample's saved flatten settings (module_config.afm)."""
+    return _afm_payload(sample_id)
+
+
+@app.post("/api/samples/{sample_id}/afm_preview")
+def preview_afm(sample_id: str, body: dict = Body(...)):
+    """Process the sample's AFM file with unsaved settings (the card editor's live preview).
+    Returns only the processed height channel; nothing is stored."""
+    return _afm_payload(sample_id, override=body.get("settings") or {}, preview=True)
 
 
 # ── Analysis Books (stub) ─────────────────────────────────────────────────────
@@ -1467,7 +1952,7 @@ def get_module_source(module_id: str):
         raise HTTPException(404, f"Module '{module_id}' not found")
     # Determine built-in by file location, not author field — so imported
     # copies of built-in modules are correctly treated as user-editable.
-    user_path = BASE_DIR / "data" / "user_modules" / f"{module_id}.py"
+    user_path = USER_MODULES_DIR / f"{module_id}.py"
     return {
         "id":      module_id,
         "builtin": not user_path.exists(),
@@ -1797,7 +2282,7 @@ async def import_module_preview(file: UploadFile = File(...)):
         source_code = zf.read("source.py").decode("utf-8")
 
     # Check if module already exists (user module or built-in)
-    user_path    = BASE_DIR / "data" / "user_modules" / f"{module_id}.py"
+    user_path    = USER_MODULES_DIR / f"{module_id}.py"
     builtin_path = BASE_DIR / "modules" / f"{module_id}.py"
     exists = user_path.exists() or builtin_path.exists()
 
@@ -2136,11 +2621,13 @@ async def import_book(file: UploadFile = File(...), config: str = "{}"):
             conn.execute("""
                 INSERT OR IGNORE INTO samples
                   (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
-                   technique, folder_id, layers, filenames, xrd_peaks, lot, bin)
+                   technique, folder_id, layers, filenames, xrd_peaks, lot, bin, source_record, substrate_orientation)
                 VALUES
                   (:id, :date, :substrate, :notes, :thickness_nm, :area_m2, :area_correction,
-                   :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin)
+                   :technique, :folder_id, :layers, :filenames, :xrd_peaks, :lot, :bin, :source_record, :substrate_orientation)
             """, {
+                "source_record": json.dumps(meta["source_record"]) if isinstance(meta.get("source_record"), dict) else None,
+                "substrate_orientation": meta.get("substrate_orientation") or None,
                 "id": new_id,
                 "date": meta.get("date"),
                 "substrate": meta.get("substrate"),

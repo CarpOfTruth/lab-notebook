@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect, useMemo, lazy, Suspense } from "react";
+import { Fragment, useState, useCallback, useRef, useEffect, useMemo, lazy, Suspense } from "react";
 import { LineChart, ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer, Customized } from "recharts";
 const Plot = lazy(() => import("react-plotly.js").then(m => {
   // Vite pre-bundles CJS modules; react-plotly.js default export may be
@@ -363,7 +363,7 @@ function splitPELoops(data) {
   return { first: data.slice(0, bestIdx), second: data.slice(bestIdx) };
 }
 
-function csvToPlotData(text, type, thicknessNm) {
+function csvToPlotData(text, type, thicknessNm, opts = {}) {
   const rows = parseCSV(text);
   if (!rows.length) return null;
   if (type === "rsm") return rows.map(r => ({ x: r[0], y: r[1], z: r[2] ?? 1 }));
@@ -376,16 +376,7 @@ function csvToPlotData(text, type, thicknessNm) {
     );
     return rows.map(r => ({ x: isOmegaCol ? r[0] * 2 : r[0], y: r[1] }));
   }
-  if (type === "pe") {
-    const { vCol, pCol } = findPECols(text);
-    let xs = rows.map(r => r[vCol] ?? r[0]);
-    let ys = rows.map(r => r[pCol] ?? r[1]);
-    const maxAbsX = xs.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
-    if (maxAbsX < 50 && thicknessNm > 0) xs = xs.map(v => v / (thicknessNm * 1e-4));
-    const maxAbsY = ys.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
-    if (maxAbsY > 0 && maxAbsY < 1e-3) ys = ys.map(p => p * 1e6);
-    return xs.map((x, i) => ({ x, y: ys[i] }));
-  }
+  if (type === "pe") return parsePEText(text, thicknessNm, opts.peXInput).points;
   if (type === "diel_b_up" || type === "diel_b_down") {
     let xs = rows.map(r => r[0]);
     const ys  = rows.map(r => r[1]);
@@ -395,6 +386,59 @@ function csvToPlotData(text, type, thicknessNm) {
     return xs.map((x, i) => ({ x, y: ys[i], y2: y2s[i] }));
   }
   return rows.map(r => ({ x: r[0], y: r[1] }));
+}
+
+// ── P–E Hysteresis x-axis (voltage vs field) ──────────────────────────────────
+// The x column of a P-E file is either the drive voltage (V) or a field already
+// in kV/cm. `xInput` is the per-sample setting saved in module_config.pe.x_input:
+// "voltage" | "field" | "auto" (absent). Auto trusts the file's column header
+// first ("voltage" / "field", "kv/cm") and only falls back to the old magnitude
+// rule (|x| < 50 → volts) when the header says nothing. Voltage is converted to
+// kV/cm with the sample thickness; without a thickness it stays in V and the
+// card says so. Returns { points, meta } so the card can show what was applied.
+const PE_X_INPUTS = ["auto", "voltage", "field"];
+
+function detectPEXInput(text, xs) {
+  for (const line of text.split(/\r?\n/).slice(0, 80)) {
+    const lower = line.toLowerCase();
+    if (!lower.includes("polariz")) continue;          // the column-header line
+    if (/field|kv\s*\/\s*cm/.test(lower)) return { mode: "field",   source: "header" };
+    if (/voltage/.test(lower))            return { mode: "voltage", source: "header" };
+    break;
+  }
+  const maxAbsX = xs.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  return { mode: maxAbsX < 50 ? "voltage" : "field", source: "magnitude" };
+}
+
+function parsePEText(text, thicknessNm = 0, xInput = "auto") {
+  const rows = parseCSV(text);
+  if (!rows.length) return { points: null, meta: null };
+  const { vCol, pCol } = findPECols(text);
+  let xs = rows.map(r => r[vCol] ?? r[0]);
+  let ys = rows.map(r => r[pCol] ?? r[1]);
+  const forced = xInput === "voltage" || xInput === "field";
+  const det = forced ? { mode: xInput, source: "user" } : detectPEXInput(text, xs);
+  const thick = Number(thicknessNm) || 0;
+  let unit = "kV/cm", converted = false;
+  if (det.mode === "voltage") {
+    if (thick > 0) { xs = xs.map(v => v / (thick * 1e-4)); converted = true; }   // V / (nm·1e-7 cm) / 1e3 = kV/cm
+    else unit = "V";
+  }
+  const maxAbsY = ys.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  if (maxAbsY > 0 && maxAbsY < 1e-3) ys = ys.map(p => p * 1e6);
+  return {
+    points: xs.map((x, i) => ({ x, y: ys[i] })),
+    meta: { x_input: forced ? xInput : "auto", mode: det.mode, source: det.source, unit, converted, thickness_nm: thick },
+  };
+}
+
+// One-line description of what the P-E parser did, for the card.
+function describePEX(meta) {
+  if (!meta) return null;
+  const how = meta.source === "user" ? "set on card" : meta.source === "header" ? "auto: file header" : "auto: value range";
+  if (meta.mode === "field") return { text: `x in kV/cm as in file (${how})`, warn: false };
+  if (meta.converted) return { text: `V ÷ ${meta.thickness_nm} nm → kV/cm (${how})`, warn: false };
+  return { text: `plotted in V — set a thickness to convert to kV/cm (${how})`, warn: true };
 }
 
 // ── X-ray file handling (.rasx + CSV) ─────────────────────────────────────────
@@ -493,7 +537,7 @@ async function validateXrayFile(file, type) {
     }
     const parsed = xrayPayloadToPlotData(json.payload);
     if (!parsed || !hasPlotData(parsed)) return { error: "The .rasx contained no data points." };
-    return { parsed, meta: json.meta };
+    return { parsed, meta: xrayPayloadMeta(json) };
   }
   const text = await file.text();
   return xrayTextToPlotData(text, type);
@@ -507,13 +551,19 @@ async function validateXrayFile(file, type) {
 async function loadStoredPlotData(sampleId, filename, measType, thicknessNm, opts = {}) {
   if (isRasxFile(filename)) {
     try {
-      const dd = measType === "rsm" && opts.detectorDistance != null ? `?detector_distance=${encodeURIComponent(opts.detectorDistance)}` : "";
-      const r = await api("GET", `/samples/${sampleId}/xray/${encodeURIComponent(filename)}${dd}`);
+      const q = [];
+      if (measType === "rsm" && opts.detectorDistance != null) q.push(`detector_distance=${encodeURIComponent(opts.detectorDistance)}`);
+      if (measType !== "rsm" && opts.frame != null) q.push(`frame=${encodeURIComponent(opts.frame)}`);
+      const r = await api("GET", `/samples/${sampleId}/xray/${encodeURIComponent(filename)}${q.length ? "?" + q.join("&") : ""}`);
       return { parsed: xrayPayloadToPlotData(r.payload), text: null, meta: xrayPayloadMeta(r) };
     } catch { return { parsed: null, text: null }; }
   }
   const text = await fetchFile(sampleId, filename);
   if (!text) return { parsed: null, text: null };
+  if (measType === "pe") {
+    const { points, meta } = parsePEText(text, thicknessNm, opts.peXInput);
+    return { parsed: points, text, meta };
+  }
   return { parsed: csvToPlotData(text, measType, thicknessNm), text };
 }
 
@@ -528,7 +578,19 @@ function xrayPayloadMeta(r) {
     flagged: !!m.detector_distance_flagged,
     note:    m.detector_distance_note || null,
     warning: p.warning || null,
+    // Files holding several 2θ/θ scans: which one is plotted, and all of them.
+    frames:        Array.isArray(p.frames) ? p.frames : null,
+    frame:         p.frame ?? null,
+    frame_default: p.frame_default ?? null,
   };
+}
+
+// Label for one scan of a multi-scan .rasx: "scan 2 · 0.01° · 16:45".
+function xrayFrameLabel(f) {
+  if (!f) return "";
+  const t = f.start_time ? new Date(f.start_time) : null;
+  const time = t && !isNaN(t) ? t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
+  return [`scan ${f.index + 1}`, f.step != null ? `${f.step}°` : null, time].filter(Boolean).join(" · ");
 }
 const RSM_DETECTOR_DISTANCE_MIN = 50, RSM_DETECTOR_DISTANCE_MAX = 1000;   // mm, mirrors backend/rasx.py
 
@@ -952,7 +1014,7 @@ function LinePlot({ data, cfg }) {
   );
 }
 
-function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain, plotStyle, showColorbar = false, points = [], hideXLabels = false, hideYLabels = false, overridePxW = null, overridePxH = null }) {
+function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain, plotStyle, showColorbar = false, points = [], hideXLabels = false, hideYLabels = false, overridePxW = null, overridePxH = null, zRange = null }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const bins = ps.rsmBins || 256;
   const logIntensity = ps.rsmLogIntensity ?? true;
@@ -974,7 +1036,7 @@ function RSMPlot({ data, cfg, forcedXDomain, forcedYDomain, plotStyle, showColor
     type: "heatmap", x: binned.x, y: binned.y, z: binned.z,
     colorscale, showscale: showColorbar,
     connectgaps: false, zsmooth: false,
-    zauto: false, zmin: binned.zmin, zmax: binned.zmax,
+    zauto: false, zmin: zRange?.[0] ?? binned.zmin, zmax: zRange?.[1] ?? binned.zmax,
     hovertemplate: `Qₓ: %{x:.4f}<br>Qz: %{y:.4f}<br>${zLabel}: %{z:.2f}<extra></extra>`,
   };
   const pointTraces = points.map(pt => ({
@@ -1272,8 +1334,8 @@ function RsmCanvasPlot({ data, logIntensity = false }) {
   );
 }
 
-function MeasPlot({ data, type, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, logIntensity = false }) {
-  const cfg = MEAS_TYPES[type];
+function MeasPlot({ data, type, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, logIntensity = false, xLabel }) {
+  const cfg = xLabel ? { ...MEAS_TYPES[type], xLabel } : MEAS_TYPES[type];
   if (!hasPlotData(data)) return null;
   if (type === "rsm") return <RsmCanvasPlot data={data} logIntensity={logIntensity} />;
   let plotData = data;
@@ -2013,7 +2075,8 @@ function ModuleCard({ mod, sample, modules = [], onRemoved, onSampleUpdate }) {
     setLoading(false);
   };
 
-  useEffect(() => { if (hasData) fetchPlot(); }, [mod.id, sample.id, hasData]);
+  const moduleConfigKey = JSON.stringify(sample.module_config || {});
+  useEffect(() => { if (hasData) fetchPlot(); }, [mod.id, sample.id, hasData, moduleConfigKey]);
 
   const handleControlChange = (name, val) => {
     const next = { ...controlState, [name]: val };
@@ -2186,7 +2249,7 @@ function xrdSubstrateRef(substrate, structures) {
   return { label: def.label, twoTheta };
 }
 
-function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze, substrate, structures, uploadError, rsmMeta, rsmConfig, onRsmDistance }) {
+function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0, areaM2, areaCorrFactor = 1.0, onAreaChange, onAnalyze, substrate, structures, uploadError, rsmMeta, rsmConfig, onRsmDistance, peMeta, peConfig, onPeXInput, xrayMeta, onXrayFrame }) {
   const cfg = MEAS_TYPES[type];
   const xrayAccepts = XRAY_ACCEPTS[type];
   const zoneProps = xrayAccepts ? { accept: xrayAccepts.join(","), label: "drop .rasx/.csv or click" } : {};
@@ -2270,6 +2333,12 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
   const has  = hasPlotData(plotData);
   const isPE = type === "pe";
   const isDiel = type === "diel_f";
+  const peXInput = isPE ? (PE_X_INPUTS.includes(peConfig?.x_input) ? peConfig.x_input : "auto") : null;
+  const peNote   = isPE ? describePEX(peMeta) : null;
+  const peXLabel = isPE && peMeta?.unit === "V" ? "V (V)" : undefined;
+  // .rasx files holding several 2θ/θ scans: pick which one this card plots.
+  const xFrames   = type !== "rsm" && xrayMeta?.frames?.length > 1 ? xrayMeta.frames : null;
+  const xFrameCur = xFrames ? xFrames.find(f => f.index === xrayMeta.frame) : null;
   const displayPEData = isPE && has ? (peLoop === "second" ? splitPELoops(plotData).second : plotData) : plotData;
 
   return (
@@ -2278,6 +2347,24 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
         <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: cfg.color, fontWeight: 600, whiteSpace: "nowrap" }}>{cfg.label}</span>
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
           {isPE && has && <LoopToggle value={peLoop} onChange={setPeLoop} />}
+          {isPE && has && (
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }} title="What the file's x column is: drive voltage (converted to kV/cm with the thickness) or a field already in kV/cm">
+              <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>x</span>
+              <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 10, overflow: "hidden" }}>
+                {[["auto", "auto"], ["voltage", "V"], ["field", "kV/cm"]].map(([val, lbl]) => {
+                  const on = peXInput === val;
+                  const auto = val === "auto" && on && peMeta?.mode;
+                  return (
+                    <button key={val} onClick={() => val !== peXInput && onPeXInput?.(val)}
+                      title={auto ? `detected: ${peMeta.mode === "voltage" ? "voltage" : "field"} (${peMeta.source})` : undefined}
+                      style={{ background: on ? T.amber : "transparent", color: on ? "#0d1117" : T.textDim, border: "none", cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "2px 8px", transition: "all .15s", lineHeight: 1.6 }}>
+                      {lbl}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
           {type === "rsm" && has && (
             <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
               <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>intensity</span>
@@ -2326,6 +2413,15 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
               )}
             </div>
           )}
+          {xFrames && has && (
+            <select value={xrayMeta.frame ?? ""} onChange={e => onXrayFrame?.(Number(e.target.value))}
+              title="This file holds several scans. Pick the one to plot."
+              style={{ background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "1px 4px", cursor: "pointer" }}>
+              {xFrames.map(f => (
+                <option key={f.index} value={f.index}>{xrayFrameLabel(f)}{f.index === xrayMeta.frame_default ? " (latest)" : ""}</option>
+              ))}
+            </select>
+          )}
           {isXRD && has && subRef && (
             <button onClick={() => setXrdZero(v => !v)}
               title={`Zero to ${subRef.label} (${subRef.twoTheta.toFixed(2)}°)`}
@@ -2345,7 +2441,18 @@ function MeasCard({ type, plotData, filename, filenames, onFile, thicknessNm = 0
       <div style={{ padding: "10px 12px" }}>
         {has ? (
           <>
-            <MeasPlot data={isXRD ? xrdDisplayData : displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} logIntensity={rsmLog} />
+            <MeasPlot data={isXRD ? xrdDisplayData : displayPEData} type={type} thicknessNm={thicknessNm} areaM2={areaM2} areaCorrFactor={areaCorrFactor} logIntensity={rsmLog} xLabel={peXLabel} />
+            {xFrameCur && (
+              <div style={{ marginTop: 4, fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", textAlign: "center" }}>
+                scan {xFrameCur.index + 1} of {xFrames.length} in file · step {xFrameCur.step}° · {xFrameCur.n_points} pts
+                {xFrameCur.start_time ? ` · ${new Date(xFrameCur.start_time).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}` : ""}
+              </div>
+            )}
+            {isPE && peNote && (
+              <div style={{ marginTop: 4, fontSize: 10, color: peNote.warn ? T.amber : T.textDim, fontFamily: "'DM Mono', monospace", textAlign: "center" }}>
+                {peNote.warn ? "⚠ " : ""}{peNote.text}
+              </div>
+            )}
             {isRSM && rsmMeta?.detector_distance_applied_mm != null && (
               <div style={{ marginTop: 4, fontSize: 10, color: T.amber, fontFamily: "'DM Mono', monospace", textAlign: "center" }}>
                 detector distance {rsmMeta.detector_distance_applied_mm} mm (file: {rsmMeta.detector_distance_mm ?? "—"} mm)
@@ -2769,6 +2876,22 @@ const AFM_CM = [
   [0.90, [249, 228,  52]],
   [1.00, [255, 255, 188]],
 ];
+// Colormap for AFM maps: "afm" (the original palette) or a notebook scale, with the
+// notebooks' Trim %: cut `trim` % off each end of the palette.
+function afmColormap(name = "afm", trim = 0) {
+  const lo = Math.max(0, Math.min(0.49, (Number(trim) || 0) / 100));
+  const span = 1 - 2 * lo;
+  if (!name || name === "afm" || !COLOR_SCALES[name]) return t => cmAfm(lo + Math.max(0, Math.min(1, t)) * span);
+  const anchors = COLOR_SCALES[name].map(hexToRgb);
+  return t => {
+    const u = (lo + Math.max(0, Math.min(1, t)) * span) * (anchors.length - 1);
+    const i = Math.min(Math.floor(u), anchors.length - 2), f = u - i;
+    return anchors[i].map((c, j) => Math.round(c + f * (anchors[i + 1][j] - c)));
+  };
+}
+const afmGradient = (cmap, dir = "to right") => `linear-gradient(${dir}, ${Array.from({ length: 21 }, (_, i) => { const [r, g, b] = cmap(i / 20); return `rgb(${r},${g},${b}) ${i * 5}%`; }).join(", ")})`;
+const AFM_COLORMAP_OPTS = ["afm", "viridis", "cividis", "inferno", "magma", "plasma", "coolwarm"];
+
 function cmAfm(t) {
   t = Math.max(0, Math.min(1, t));
   let i = 0;
@@ -2787,7 +2910,55 @@ function afmShortLabel(name) {
   return name.replace(/Retrace|Trace/gi, "").trim().slice(0, 4);
 }
 
-function AfmChannelMap({ grid, scanSizeUm, vmin, vmax }) {
+// Nice tick values strictly inside [lo, hi] for a vertical color bar.
+function afmColorTicks(lo, hi) {
+  if (!isFinite(lo) || !isFinite(hi) || hi <= lo) return { ticks: [], decimals: 0 };
+  const raw = (hi - lo) / 4;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const n = raw / mag;
+  const step = (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * mag;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) out.push(Math.round(v / step) * step);
+  // decimals needed to print the step exactly (2.5 → 1, 0.25 → 2, 20 → 0)
+  let decimals = 0;
+  while (decimals < 6 && Math.abs(step * 10 ** decimals - Math.round(step * 10 ** decimals)) > 1e-9) decimals++;
+  return { ticks: out, decimals };
+}
+
+// Vertical color scale with nice ticks, for placing beside a map.
+function AfmColorBar({ vmin, vmax, cmap = cmAfm, unit = "", font = "'DM Mono', monospace", fontSize = 9, color, border = null }) {
+  const { ticks, decimals } = afmColorTicks(vmin, vmax);
+  const fmt = v => (Math.abs(v) < 1e-12 ? 0 : v).toFixed(decimals);
+  const pos = v => (1 - (v - vmin) / (vmax - vmin)) * 100;
+  const c = color || T.textDim;
+  return (
+    <div style={{ position: "relative", width: 16 + fontSize * 3.2, flexShrink: 0 }}>
+      <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: 9, borderRadius: border ? 0 : 1, background: afmGradient(cmap, "to top"), ...(border ? { border, boxSizing: "border-box" } : {}) }} />
+      {ticks.map(v => (
+        <div key={v} style={{ position: "absolute", left: 9, top: `${pos(v)}%`, transform: "translateY(-50%)", display: "flex", alignItems: "center", gap: 2 }}>
+          <div style={{ width: 3, height: 1, background: c }} />
+          <span style={{ fontSize, color: c, fontFamily: font, whiteSpace: "nowrap" }}>{fmt(v)}</span>
+        </div>
+      ))}
+      <span style={{ position: "absolute", left: 13, bottom: -fontSize - 4, fontSize, color: c, fontFamily: font }}>{unit}</span>
+    </div>
+  );
+}
+
+// Map plus, when `colorbar` is given (the unit), a vertical color scale on its right.
+function AfmChannelMap({ grid, scanSizeUm, vmin, vmax, colorbar = null, cmap = cmAfm }) {
+  if (colorbar != null && vmin != null && vmax != null && vmax > vmin) {
+    return (
+      <div style={{ display: "flex", alignItems: "stretch", gap: 6 }}>
+        <div style={{ flex: 1, minWidth: 0 }}><AfmChannelMapCanvas grid={grid} scanSizeUm={scanSizeUm} vmin={vmin} vmax={vmax} cmap={cmap} /></div>
+        <AfmColorBar vmin={vmin} vmax={vmax} cmap={cmap} unit={colorbar} />
+      </div>
+    );
+  }
+  return <AfmChannelMapCanvas grid={grid} scanSizeUm={scanSizeUm} vmin={vmin} vmax={vmax} cmap={cmap} />;
+}
+
+function AfmChannelMapCanvas({ grid, scanSizeUm, vmin, vmax, cmap = cmAfm }) {
   const canvasRef = useRef();
   useEffect(() => {
     if (!grid?.length || !canvasRef.current) return;
@@ -2808,7 +2979,7 @@ function AfmChannelMap({ grid, scanSizeUm, vmin, vmax }) {
     const rng = mx - mn || 1;
     for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) {
       const t = Math.max(0, Math.min(1, (grid[r][c] - mn) / rng));
-      const [rv, gv, bv] = cmAfm(t);
+      const [rv, gv, bv] = cmap(t);
       const idx = (r * W + c) * 4;
       img.data[idx] = rv; img.data[idx+1] = gv; img.data[idx+2] = bv; img.data[idx+3] = 255;
     }
@@ -2842,11 +3013,418 @@ function AfmChannelMap({ grid, scanSizeUm, vmin, vmax }) {
       ctx.fillStyle = "white";
       ctx.fillText(label, barX + barPx / 2, barY - Math.round(fontSize * 0.3));
     }
-  }, [grid, scanSizeUm, vmin, vmax]);
+  }, [grid, scanSizeUm, vmin, vmax, cmap]);
   return <canvas ref={canvasRef} style={{ width: "100%", height: "auto", imageRendering: "pixelated", display: "block", borderRadius: 4 }} />;
 }
 
-function AfmCard({ afmData, filename, onFile }) {
+// ── AFM height flattening (settings in module_config.afm, processing in backend/afm.py) ──
+const AFM_FLATTEN_DEFAULTS = { line: "linear", surface: "poly2", outlier_iqr: 3, zero: "none", regions: [], range_min: null, range_max: null, colormap: "afm", color_trim: 0 };
+const AFM_LINE_OPTS    = [["off", "off"], ["offset", "offset"], ["linear", "linear"], ["quadratic", "quad"]];
+const AFM_SURFACE_OPTS = [["off", "off"], ["plane", "plane"], ["poly2", "2nd"], ["poly3", "3rd"]];
+const AFM_ZERO_OPTS    = [["none", "none"], ["mean", "mean"], ["median", "median"], ["min", "min"]];
+
+// One line describing a non-default flatten, e.g. "line offset · surface plane · 2 regions".
+function afmProcessingSummary(proc) {
+  if (!proc || proc.default) return null;
+  if (Array.isArray(proc.chain)) return proc.chain.length ? proc.chain.map(afmStepText).join(" → ") : "raw scan (empty chain)";
+  const st = proc.settings || {};
+  const surf = { off: "off", plane: "plane", poly2: "2nd order", poly3: "3rd order" }[st.surface] || st.surface;
+  const parts = [`line ${st.line}`, `surface ${surf}`];
+  if (st.outlier_iqr !== 3) parts.push(st.outlier_iqr > 0 ? `outliers ${st.outlier_iqr}·IQR` : "outliers kept");
+  if (st.zero && st.zero !== "none") parts.push(`zero ${st.zero}`);
+  const regs = st.regions || [];
+  if (regs.length) {
+    const inc = regs.filter(r => r.mode === "include").length, exc = regs.length - inc;
+    parts.push([inc && `${inc} include`, exc && `${exc} exclude`].filter(Boolean).join(" + ") + (regs.length === 1 ? " region" : " regions"));
+  }
+  return parts.join(" · ");
+}
+
+// Roughness of the processed height map: full map and, when regions are set, the region mask.
+function AfmStats({ stats, compact = false }) {
+  if (!stats?.full) return null;
+  const f = v => v == null ? "—" : v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
+  const mono = "'DM Mono', monospace";
+  if (compact) {
+    return (
+      <div style={{ fontSize: 10, color: T.textDim, fontFamily: mono, lineHeight: 1.5 }}>
+        Rq {f(stats.full.rq_nm)} nm{stats.region ? ` · masked region ${f(stats.region.rq_nm)} nm` : ""}
+      </div>
+    );
+  }
+  const rows = [["full map", stats.full], ...(stats.region ? [["masked region", stats.region]] : [])];
+  const cell = { padding: "1px 6px", textAlign: "right" };
+  return (
+    <table style={{ borderCollapse: "collapse", fontSize: 10, fontFamily: mono, color: T.textSecondary, marginTop: 6 }}>
+      <thead><tr style={{ color: T.textDim }}>
+        <td style={{ padding: "1px 6px 1px 0" }}></td><td style={cell}>Rq</td><td style={cell}>Ra</td><td style={cell}>P–V</td><td style={cell}>px</td>
+      </tr></thead>
+      <tbody>{rows.map(([name, r]) => (
+        <tr key={name}>
+          <td style={{ padding: "1px 6px 1px 0", color: T.textDim }}>{name}</td>
+          <td style={cell}>{f(r.rq_nm)}</td><td style={cell}>{f(r.ra_nm)}</td><td style={cell}>{f(r.pv_nm)}</td>
+          <td style={{ ...cell, color: T.textDim }}>{r.pixels.toLocaleString()}</td>
+        </tr>
+      ))}
+      <tr><td colSpan={5} style={{ padding: "2px 0 0", color: T.textDim }}>nm, after flattening</td></tr>
+      </tbody>
+    </table>
+  );
+}
+
+function AfmSegmented({ options, value, onChange }) {
+  return (
+    <div style={{ display: "flex", border: `1px solid ${T.border}`, borderRadius: 4, overflow: "hidden" }}>
+      {options.map(([val, label], idx) => (
+        <button key={val} onClick={() => onChange(val)}
+          style={{ padding: "3px 8px", fontSize: 10, fontFamily: "'DM Mono', monospace", border: "none", cursor: "pointer",
+            borderRight: idx < options.length - 1 ? `1px solid ${T.border}` : "none",
+            background: value === val ? T.bg3 : T.bg0, color: value === val ? T.textPrimary : T.textDim }}>
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── AFM processing chain editor ────────────────────────────────────────────────
+// Steps run in order on the height map and share one mask of excluded pixels
+// (backend/afm.py run_chain). Build the chain one step at a time: pick a step,
+// preview it live, Apply it, continue. Click an earlier step to go back to that
+// point; applying there replaces the later steps. Save stores the chain up to the
+// selected step for this sample; nothing is saved until then.
+const AFM_STEP_LABELS = { particles: "Particles", regions: "Regions", lines: "Lines", surface: "Surface", scars: "Scars", zero: "Zero" };
+const AFM_STEP_DEFAULTS = {
+  particles: { type: "particles", k: 5, grow: 2, min_px: 4, passes: 3, polarity: "up" },
+  regions:   { type: "regions", regions: [] },
+  lines:     { type: "lines", mode: "linear" },
+  surface:   { type: "surface", order: "poly2" },
+  scars:     { type: "scars", k: 4, min_len: 8 },
+  zero:      { type: "zero", mode: "median" },
+};
+const AFM_RECOMMENDED_CHAIN = [AFM_STEP_DEFAULTS.particles, AFM_STEP_DEFAULTS.lines, AFM_STEP_DEFAULTS.surface, AFM_STEP_DEFAULTS.zero];
+
+function afmStepText(st) {
+  if (!st) return "";
+  switch (st.type) {
+    case "particles": return `particles · ${st.k}×σ ${st.polarity === "both" ? "±" : "above"} · grow ${st.grow} px · ${st.passes} pass${st.passes === 1 ? "" : "es"}`;
+    case "regions": {
+      const inc = (st.regions || []).filter(r => r.mode === "include").length, exc = (st.regions || []).length - inc;
+      return `regions · ${[inc && `${inc} include`, exc && `${exc} exclude`].filter(Boolean).join(" + ") || "none"}`;
+    }
+    case "lines":   return `lines · ${{ offset: "offset", linear: "linear", quadratic: "quadratic", mdiff: "median of differences" }[st.mode]}`;
+    case "surface": return `surface · ${{ plane: "plane", poly2: "2nd order", poly3: "3rd order" }[st.order]}`;
+    case "scars":   return `scars · ${st.k}×σ · ≥ ${st.min_len} px`;
+    case "zero":    return `zero · ${st.mode}`;
+    default:        return st.type;
+  }
+}
+function afmStepResult(info) {
+  if (!info) return "";
+  if (info.skipped) return `skipped: ${info.skipped}`;
+  if (info.type === "particles") return `${info.found} found · ${(info.coverage * 100).toFixed(1)}% masked`;
+  if (info.type === "regions") return `${(info.kept * 100).toFixed(0)}% of map kept`;
+  if (info.type === "lines" && info.fallback_lines) return `${info.fallback_lines} lines used the whole line`;
+  if (info.type === "scars") return `${info.fixed_lines} line${info.fixed_lines === 1 ? "" : "s"} repaired`;
+  return "";
+}
+
+// Semi-transparent red overlay of the excluded pixels (bit-packed mask from the preview).
+function AfmMaskOverlay({ b64, shape }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!b64 || !shape || !ref.current) return;
+    const [H, W] = shape;
+    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const c = ref.current; c.width = W; c.height = H;
+    const ctx = c.getContext("2d"); const img = ctx.createImageData(W, H);
+    for (let i = 0; i < H * W; i++) {
+      if ((bytes[i >> 3] >> (7 - (i & 7))) & 1) { const o = i * 4; img.data[o] = 255; img.data[o + 1] = 60; img.data[o + 2] = 60; img.data[o + 3] = 105; }
+    }
+    ctx.putImageData(img, 0, 0);
+  }, [b64, shape]);
+  return <canvas ref={ref} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", imageRendering: "pixelated", pointerEvents: "none", borderRadius: 4 }} />;
+}
+
+function AfmFlattenModal({ sampleId, afmData, initial, legacyCustom = false, onClose, onApply }) {
+  const legacy = !Array.isArray(initial?.steps);
+  const [steps, setSteps]   = useState(() => (Array.isArray(initial?.steps) ? initial.steps.map(s => ({ ...s })) : []));
+  const [cursor, setCursor] = useState(() => (Array.isArray(initial?.steps) ? initial.steps.length : 0));
+  const [draft, setDraft]   = useState(null);
+  const [display, setDisplay] = useState(() => ({
+    range_min: initial?.range_min ?? null, range_max: initial?.range_max ?? null,
+    colormap: initial?.colormap || "afm", color_trim: initial?.color_trim ?? 0,
+  }));
+  const [showMask, setShowMask] = useState(true);
+  const [drawMode, setDrawMode] = useState("include");
+  const [dragRect, setDragRect] = useState(null);
+  const [preview, setPreview]   = useState(null);
+  const [busy, setBusy]         = useState(false);
+  const [error, setError]       = useState(null);
+  const [saving, setSaving]     = useState(false);
+  const overlayRef = useRef(null);
+  const reqId = useRef(0);
+  const mono = "'DM Mono', monospace";
+  const setD = (k, v) => setDisplay(d => ({ ...d, [k]: v }));
+  const setP = (k, v) => setDraft(d => ({ ...d, [k]: v }));
+
+  const active = steps.slice(0, cursor);
+  const running = draft ? [...active, draft] : active;
+  const reqKey = JSON.stringify({ running, display });
+  useEffect(() => {
+    const id = ++reqId.current;
+    setBusy(true);
+    const t = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/samples/${encodeURIComponent(sampleId)}/afm_preview`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ settings: { ...display, steps: running.map(s => s.type === "regions" ? { ...s, file: afmData?.filename } : s) } }),
+        });
+        const json = await res.json();
+        if (id !== reqId.current) return;
+        if (!res.ok) throw new Error(json.detail || `preview failed (${res.status})`);
+        setPreview(json); setError(null);
+      } catch (e) { if (id === reqId.current) setError(e.message); }
+      if (id === reqId.current) setBusy(false);
+    }, 300);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reqKey, sampleId]);
+
+  const heightName = preview?.channel_names?.[0];
+  const grid  = preview?.channels?.[heightName] ?? null;
+  const range = preview?.channel_ranges?.[heightName] ?? [null, null];
+  const stats = preview?.stats?.[heightName];
+  const proc  = preview?.processing;
+  const infos = proc?.step_infos || [];
+  const cmap  = useMemo(() => afmColormap(display.colormap, display.color_trim), [display.colormap, display.color_trim]);
+  const rangeBad = display.range_min != null && display.range_max != null && display.range_min >= display.range_max;
+  const numOrNull = v => (v === "" || v == null || !isFinite(Number(v))) ? null : Number(v);
+
+  // rectangle drawing (only while a Regions step is being built)
+  const drawing = draft?.type === "regions";
+  const frac = e => {
+    const r = overlayRef.current.getBoundingClientRect();
+    return { x: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)), y: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)) };
+  };
+  const onDown = e => { if (!drawing || e.button !== 0) return; const p = frac(e); setDragRect({ x0: p.x, y0: p.y, x1: p.x, y1: p.y }); };
+  const onMove = e => { if (!dragRect) return; const p = frac(e); setDragRect(r => ({ ...r, x1: p.x, y1: p.y })); };
+  const onUp = () => {
+    if (!dragRect) return;
+    const r = { x0: Math.min(dragRect.x0, dragRect.x1), y0: Math.min(dragRect.y0, dragRect.y1), x1: Math.max(dragRect.x0, dragRect.x1), y1: Math.max(dragRect.y0, dragRect.y1), mode: drawMode };
+    setDragRect(null);
+    if (r.x1 - r.x0 > 0.01 && r.y1 - r.y0 > 0.01) setDraft(d => ({ ...d, regions: [...(d.regions || []), r] }));
+  };
+  const rectStyle = (r, mode, dashed) => ({
+    position: "absolute", left: `${r.x0 * 100}%`, top: `${r.y0 * 100}%`, width: `${(r.x1 - r.x0) * 100}%`, height: `${(r.y1 - r.y0) * 100}%`,
+    border: `1.5px ${dashed ? "dashed" : "solid"} ${mode === "exclude" ? T.red : T.teal}`, boxSizing: "border-box",
+  });
+
+  const applyDraft = () => {
+    if (!draft || (draft.type === "regions" && !(draft.regions || []).length)) return;
+    const next = [...active, { ...draft }];
+    setSteps(next); setCursor(next.length); setDraft(null);
+  };
+  const removeStep = i => {
+    const next = steps.filter((_, j) => j !== i);
+    setSteps(next); setCursor(c => (i < c ? c - 1 : Math.min(c, next.length))); setDraft(null);
+  };
+  const save = async (useStandard = false) => {
+    setSaving(true); setError(null);
+    try {
+      const chain = active.map(s => s.type === "regions" ? { ...s, file: afmData?.filename || null } : s);
+      await onApply(useStandard
+        ? { ...AFM_FLATTEN_DEFAULTS, ...display, steps: null }
+        : { ...display, steps: chain });
+      onClose();
+    } catch (e) { setError(e.message || "Could not save"); }
+    setSaving(false);
+  };
+
+  const label = txt => <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, width: 64, flexShrink: 0 }}>{txt}</span>;
+  const numInput = (value, onChange, width = 52, props = {}) => (
+    <DeferredInput type="number" value={value ?? ""} onChange={onChange} className="no-spin" step="any" {...props}
+      style={{ width, background: T.bg0, border: `1px solid ${props.bad ? T.red : T.border}`, borderRadius: 4, color: T.textPrimary, fontFamily: mono, fontSize: 11, padding: "3px 6px", outline: "none", textAlign: "center" }} />
+  );
+  const later = steps.length - cursor;
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 10, padding: 18, width: "min(1000px, 96vw)", maxHeight: "94vh", overflow: "auto", boxShadow: "0 10px 40px rgba(0,0,0,.4)" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 18, color: T.textPrimary }}>Height processing · {sampleId}</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, fontSize: 18, cursor: "pointer" }}>✕</button>
+        </div>
+        {legacy && (
+          <div style={{ fontFamily: mono, fontSize: 10, color: T.amber, marginBottom: 10, lineHeight: 1.5 }}>
+            This sample uses the standard single-pass flatten{legacyCustom ? " with its own settings" : ""}. It stays that way unless you save a chain.
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
+          {/* map */}
+          <div style={{ width: 440, maxWidth: "100%" }}>
+            <div style={{ position: "relative", width: "100%", aspectRatio: "1 / 1", background: T.bg3, borderRadius: 4 }}>
+              {grid && <AfmChannelMapCanvas grid={grid} scanSizeUm={preview.scan_size_um} vmin={range[0]} vmax={range[1]} cmap={cmap} />}
+              {showMask && proc?.mask && <AfmMaskOverlay b64={proc.mask} shape={proc.mask_shape} />}
+              <div ref={overlayRef} onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
+                style={{ position: "absolute", inset: 0, cursor: drawing ? "crosshair" : "default" }}>
+                {drawing && (draft.regions || []).map((r, i) => (
+                  <div key={i} style={rectStyle(r, r.mode, false)}>
+                    <button onMouseDown={e => e.stopPropagation()} onClick={() => setP("regions", draft.regions.filter((_, j) => j !== i))} title="Remove rectangle"
+                      style={{ position: "absolute", top: -1, right: -1, width: 16, height: 16, lineHeight: "14px", padding: 0, fontSize: 11, border: "none", borderRadius: 2, cursor: "pointer", background: r.mode === "exclude" ? T.red : T.teal, color: T.bg0 }}>×</button>
+                  </div>
+                ))}
+                {dragRect && <div style={rectStyle({ x0: Math.min(dragRect.x0, dragRect.x1), y0: Math.min(dragRect.y0, dragRect.y1), x1: Math.max(dragRect.x0, dragRect.x1), y1: Math.max(dragRect.y0, dragRect.y1) }, drawMode, true)} />}
+              </div>
+              {busy && <div style={{ position: "absolute", top: 6, left: 8, fontSize: 10, fontFamily: mono, color: T.textDim, pointerEvents: "none" }}>updating…</div>}
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, fontSize: 10, fontFamily: mono, color: T.textDim }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                <input type="checkbox" checked={showMask} onChange={e => setShowMask(e.target.checked)} /> show mask
+              </label>
+              {stats?.mask_fraction > 0 && <span>{(stats.mask_fraction * 100).toFixed(1)}% of pixels masked</span>}
+              <span style={{ marginLeft: "auto" }}>{range[0]} to {range[1]} nm</span>
+            </div>
+            <AfmStats stats={stats} />
+          </div>
+
+          {/* chain + next step + display */}
+          <div style={{ flex: 1, minWidth: 320, display: "flex", flexDirection: "column", gap: 10 }}>
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textSecondary, letterSpacing: 1 }}>CHAIN</span>
+                <div style={{ flex: 1 }} />
+                <Btn variant="ghost" small disabled={cursor === 0} onClick={() => { setCursor(c => Math.max(0, c - 1)); setDraft(null); }}>◀ step back</Btn>
+                <Btn variant="ghost" small disabled={!steps.length} onClick={() => { setSteps([]); setCursor(0); setDraft(null); }}>reset</Btn>
+                <Btn variant="ghost" small onClick={() => { setSteps(AFM_RECOMMENDED_CHAIN.map(s => ({ ...s }))); setCursor(AFM_RECOMMENDED_CHAIN.length); setDraft(null); }}>recommended</Btn>
+              </div>
+              {[{ key: "raw", text: "raw scan", idx: 0 }, ...steps.map((st, i) => ({ key: i, text: afmStepText(st), idx: i + 1, i }))].map(row => {
+                const current = row.idx === cursor && !draft;
+                const dimmed = row.idx > cursor;
+                const info = row.i != null && row.i < cursor ? afmStepResult(infos[row.i]) : "";
+                return (
+                  <div key={row.key} onClick={() => { setCursor(row.idx); setDraft(null); }}
+                    style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 8px", marginBottom: 2, borderRadius: 4, cursor: "pointer",
+                      background: current ? T.bg3 : "transparent", border: `1px solid ${current ? T.borderBright : "transparent"}`, opacity: dimmed ? 0.45 : 1 }}>
+                    <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim, width: 14 }}>{row.idx}</span>
+                    <span style={{ fontFamily: mono, fontSize: 11, color: T.textPrimary }}>{row.text}</span>
+                    {info && <span style={{ fontFamily: mono, fontSize: 10, color: /skipped/.test(info) ? T.amber : T.textDim }}>{info}</span>}
+                    {row.i != null && (
+                      <button onClick={e => { e.stopPropagation(); removeStep(row.i); }} title="Remove step"
+                        style={{ marginLeft: "auto", background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 12 }}>×</button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap", marginBottom: 8 }}>
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textSecondary, letterSpacing: 1, marginRight: 4 }}>NEXT STEP</span>
+                {Object.keys(AFM_STEP_LABELS).map(t => (
+                  <button key={t} onClick={() => setDraft(draft?.type === t ? null : { ...AFM_STEP_DEFAULTS[t], ...(t === "regions" ? { regions: [] } : {}) })}
+                    style={{ fontFamily: mono, fontSize: 10, padding: "3px 8px", borderRadius: 4, cursor: "pointer",
+                      background: draft?.type === t ? T.bg3 : T.bg0, color: draft?.type === t ? T.textPrimary : T.textDim, border: `1px solid ${draft?.type === t ? T.borderBright : T.border}` }}>
+                    + {AFM_STEP_LABELS[t]}
+                  </button>
+                ))}
+              </div>
+              {draft && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, padding: 10 }}>
+                  {draft.type === "particles" && <>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("THRESHOLD")}
+                      {numInput(draft.k, v => setP("k", Math.max(1, Math.min(50, Number(v) || 5))))}
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>× robust σ from the background</span></div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("DIRECTION")}
+                      <AfmSegmented options={[["up", "above (particles)"], ["both", "above + below"]]} value={draft.polarity} onChange={v => setP("polarity", v)} /></div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("GROW")}
+                      {numInput(draft.grow, v => setP("grow", Math.max(0, Math.min(20, Math.round(Number(v) || 0)))))}
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>px around each particle</span></div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("MIN SIZE")}
+                      {numInput(draft.min_px, v => setP("min_px", Math.max(1, Math.round(Number(v) || 1))))}
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>px; smaller specks ignored</span></div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("PASSES")}
+                      <AfmSegmented options={[[1, "1"], [2, "2"], [3, "3"], [4, "4"]]} value={draft.passes} onChange={v => setP("passes", v)} />
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>re-level without particles, detect again</span></div>
+                  </>}
+                  {draft.type === "regions" && <>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("DRAW")}
+                      <AfmSegmented options={[["include", "include"], ["exclude", "exclude"]]} value={drawMode} onChange={setDrawMode} />
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>drag on the map · {(draft.regions || []).length} drawn</span></div>
+                    <div style={{ fontFamily: mono, fontSize: 10, color: T.textDim, lineHeight: 1.5 }}>Include keeps only the rectangles; exclude masks them. The flatten still acts on the whole map.</div>
+                  </>}
+                  {draft.type === "lines" && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("MODE")}
+                      <AfmSegmented options={[["offset", "offset"], ["linear", "linear"], ["quadratic", "quad"], ["mdiff", "median diff"]]} value={draft.mode} onChange={v => setP("mode", v)} /></div>
+                  )}
+                  {draft.type === "surface" && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("ORDER")}
+                      <AfmSegmented options={[["plane", "plane"], ["poly2", "2nd"], ["poly3", "3rd"]]} value={draft.order} onChange={v => setP("order", v)} /></div>
+                  )}
+                  {draft.type === "scars" && <>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("THRESHOLD")}
+                      {numInput(draft.k, v => setP("k", Math.max(1, Math.min(50, Number(v) || 4))))}
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>× σ above or below both neighbouring lines</span></div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("MIN LENGTH")}
+                      {numInput(draft.min_len, v => setP("min_len", Math.max(2, Math.round(Number(v) || 8))))}
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>px along the line</span></div>
+                  </>}
+                  {draft.type === "zero" && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("SET 0 AT")}
+                      <AfmSegmented options={[["median", "median"], ["mean", "mean"], ["min", "min"]]} value={draft.mode} onChange={v => setP("mode", v)} />
+                      <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>of unmasked pixels</span></div>
+                  )}
+                  {infos[cursor] && <div style={{ fontFamily: mono, fontSize: 10, color: T.teal }}>preview: {afmStepResult(infos[cursor]) || "applied"}</div>}
+                  {later > 0 && <div style={{ fontFamily: mono, fontSize: 10, color: T.amber }}>Applying here replaces the {later} later step{later === 1 ? "" : "s"}.</div>}
+                  <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                    <Btn variant="ghost" small onClick={() => setDraft(null)}>discard</Btn>
+                    <Btn variant="teal" small disabled={draft.type === "regions" && !(draft.regions || []).length} onClick={applyDraft}>apply step</Btn>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 8, display: "flex", flexDirection: "column", gap: 8 }}>
+              <span style={{ fontFamily: mono, fontSize: 10, color: T.textSecondary, letterSpacing: 1 }}>DISPLAY</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("COLOR")}
+                {numInput(display.range_min, v => setD("range_min", numOrNull(v)), 68, { placeholder: "min auto", bad: rangeBad })}
+                {numInput(display.range_max, v => setD("range_max", numOrNull(v)), 68, { placeholder: "max auto", bad: rangeBad })}
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>nm · blank = auto from the unmasked pixels</span>
+              </div>
+              {rangeBad && <div style={{ fontSize: 10, fontFamily: mono, color: T.red }}>min must be below max; using the automatic scale until fixed</div>}
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>{label("PALETTE")}
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                  {AFM_COLORMAP_OPTS.map(name => (
+                    <button key={name} onClick={() => setD("colormap", name)} title={name}
+                      style={{ display: "flex", flexDirection: "column", gap: 3, padding: "3px 5px", borderRadius: 4, cursor: "pointer", background: display.colormap === name ? T.bg3 : "none", border: `1px solid ${display.colormap === name ? T.borderBright : T.border}` }}>
+                      <span style={{ fontFamily: mono, fontSize: 9, color: display.colormap === name ? T.textPrimary : T.textDim, textAlign: "left" }}>{name === "afm" ? "AFM" : name}</span>
+                      <div style={{ width: 52, height: 7, borderRadius: 2, background: afmGradient(afmColormap(name, display.color_trim)) }} />
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>{label("TRIM %")}
+                {numInput(display.color_trim, v => setD("color_trim", Math.max(0, Math.min(49, Number(v) || 0))))}
+                <span style={{ fontFamily: mono, fontSize: 10, color: T.textDim }}>cut from each end of the palette</span>
+              </div>
+            </div>
+
+            {error && <div style={{ fontSize: 10, fontFamily: mono, color: T.red }}>{error}</div>}
+            <div style={{ display: "flex", gap: 8, marginTop: "auto", justifyContent: "flex-end", flexWrap: "wrap" }}>
+              <Btn variant="ghost" small disabled={saving} onClick={() => save(true)}>use standard flatten</Btn>
+              <Btn variant="ghost" small onClick={onClose}>cancel</Btn>
+              <Btn variant="primary" small disabled={saving || !!draft} onClick={() => save(false)}>
+                {saving ? "saving…" : draft ? "apply or discard the step first" : `save chain (${cursor} step${cursor === 1 ? "" : "s"})`}
+              </Btn>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AfmCard({ afmData, filename, onFile, sampleId, afmConfig, onAfmSettings }) {
   const inputRef = useRef();
   const channels = afmData?.channel_names || [];
   const [channel, setChannel] = useState(null);
@@ -2862,8 +3440,12 @@ function AfmCard({ afmData, filename, onFile }) {
   const [mn, mx] = range ?? [null, null];
 
   const isHeight = channel?.toLowerCase().includes("height");
-  const unit = isHeight ? "nm" : channel?.toLowerCase().includes("phase") ? "°" : "V";
-  const cmGrad = AFM_CM.map(([t,[r,g,b]]) => `rgb(${r},${g},${b}) ${(t*100).toFixed(0)}%`).join(", ");
+  const unit = afmData?.channel_units?.[channel] ?? (isHeight ? "nm" : channel?.toLowerCase().includes("phase") ? "°" : "V");
+  const [flattenOpen, setFlattenOpen] = useState(false);
+  const proc = afmData?.processing;
+  const procSummary = afmProcessingSummary(proc);
+  const chStats = afmData?.stats?.[channel];
+  const cardCmap = useMemo(() => afmColormap(proc?.settings?.colormap, proc?.settings?.color_trim), [proc?.settings?.colormap, proc?.settings?.color_trim]);
 
   const dropZone = (children) => (
     <div onClick={() => inputRef.current?.click()}
@@ -2895,17 +3477,26 @@ function AfmCard({ afmData, filename, onFile }) {
             ))}
           </div>
         )}
+        {has && onAfmSettings && (
+          <button onClick={() => setFlattenOpen(true)} title="Height flattening and roughness"
+            style={{ background: "none", border: "none", color: procSummary ? T.amber : T.textDim, cursor: "pointer", fontSize: 13, lineHeight: 1, padding: "0 2px" }}>⚙</button>
+        )}
         {filename && <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filename}</span>}
       </div>
+      {flattenOpen && (
+        <AfmFlattenModal sampleId={sampleId} afmData={afmData}
+          initial={proc?.settings ? { ...afmConfig, ...proc.settings } : afmConfig}
+          legacyCustom={!!proc && !proc.default && !Array.isArray(proc.chain)}
+          onClose={() => setFlattenOpen(false)} onApply={onAfmSettings} />
+      )}
       <div style={{ padding: "10px 12px" }}>
         {has ? (
           <>
-            <AfmChannelMap grid={grid} scanSizeUm={afmData?.scan_size_um} vmin={mn} vmax={mx} />
-            {mn !== null && (
-              <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
-                <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", minWidth: 34, textAlign: "right" }}>{mn.toFixed(1)}</span>
-                <div style={{ flex: 1, height: 5, borderRadius: 3, background: `linear-gradient(to right, ${cmGrad})` }} />
-                <span style={{ fontSize: 9, color: T.textDim, fontFamily: "'DM Mono', monospace", minWidth: 50 }}>{mx.toFixed(1)} {unit}</span>
+            <AfmChannelMap grid={grid} scanSizeUm={afmData?.scan_size_um} vmin={mn} vmax={mx} colorbar={unit} cmap={cardCmap} />
+            {chStats && (proc?.range_manual?.some(Boolean) || proc?.range_basis === "region") && (
+              <div style={{ marginTop: 14, fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>
+                color scale {mn} to {mx} {unit}
+                {proc.range_manual?.every(Boolean) ? " (set)" : proc.range_manual?.some(Boolean) ? ` (partly set, auto from ${proc.range_basis})` : ` (auto from ${proc.range_basis})`}
               </div>
             )}
             {afmData?.scan_size_um != null && (
@@ -2913,6 +3504,13 @@ function AfmCard({ afmData, filename, onFile }) {
                 {afmData.scan_size_um} µm · {afmData.pixels?.[0]}×{afmData.pixels?.[1]} px
               </div>
             )}
+            {chStats && procSummary && (
+              <div style={{ marginTop: 4, fontSize: 10, color: T.amber, fontFamily: "'DM Mono', monospace", lineHeight: 1.5 }}>flattened: {procSummary}</div>
+            )}
+            {chStats && proc?.regions_ignored && (
+              <div style={{ marginTop: 4, fontSize: 10, color: T.amber, fontFamily: "'DM Mono', monospace", lineHeight: 1.5 }}>⚠ saved regions were drawn on a different file and are not applied</div>
+            )}
+            {chStats && <AfmStats stats={chStats} />}
             <div style={{ marginTop: 8 }}>{dropZone("↑ replace file")}</div>
           </>
         ) : (
@@ -3267,6 +3865,10 @@ function LayerEditor({ layer, technique: sampleTechnique, onRemove, onDuplicate,
           {layer.role === "buffer" && (
             <span style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", fontWeight: 600, color: T.teal, background: `${T.teal}22`, border: `1px solid ${T.teal}66`, borderRadius: 3, padding: "1px 5px", letterSpacing: 0.5 }}>BUF</span>
           )}
+          {layer.vault_source?.mapping === "partial" && (
+            <span title={`Partially mapped from the vault — left unset: ${(layer.vault_source.unmapped || []).map(u => `${u.term} (${u.reason})`).join("; ")}`}
+              style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", fontWeight: 600, color: T.amber, background: `${T.amber}22`, border: `1px solid ${T.amber}66`, borderRadius: 3, padding: "1px 5px", letterSpacing: 0.5, cursor: "help" }}>PARTIAL</span>
+          )}
         </div>
         {layer.thickness_nm != null && (
           <div style={{ textAlign: "center" }}>
@@ -3471,7 +4073,7 @@ function AddDataModal({ onClose, moduleOptions = [], sampleId, sample, onModuleF
 
 // ── SampleDetail ──────────────────────────────────────────────────────────────
 
-function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onRsmDistance, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [], materialsLib = [] }) {
+function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles, onRsmDistance, onPeXInput, onXrayFrame, onAfmSettings, onBack, onDelete, editingMeta, setEditingMeta, settings, onSaveSettings, modules = [], materialsLib = [] }) {
   const [addingLayer, setAddingLayer]   = useState(false);
   const [meta, setMeta]                 = useState({ date: sample.date, substrate: sample.substrate, notes: sample.notes, thickness_nm: sample.thickness_nm ?? "" });
   const [dragIdx, setDragIdx]           = useState(null);
@@ -3549,14 +4151,22 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
   const handleFile = async (measType, file) => {
     if (!file) return;
     if (measType === "afm") { onUploadFile("afm", file, null, null); return; }
-    // Route PE through the server-side module
-    if (measType === "pe") { onUploadFile("pe", file, null, null, true); return; }
+    // P-E: parsed here with the sample's x-input setting so the card, reload and
+    // Reparse all go through parsePEText. The raw file is still stored.
+    if (measType === "pe") {
+      const text = await file.text();
+      const { points, meta } = parsePEText(text, sample.thickness_nm || 0, sample.module_config?.pe?.x_input);
+      if (!points || !hasPlotData(points)) { showUploadError("pe", "No numeric data found in this file."); return; }
+      clearUploadError("pe");
+      onUploadFile("pe", file, points, findAreaFromFile(text), false, meta);
+      return;
+    }
     // X-ray cards: validate (extension, content, .rasx kind) before anything is uploaded
     if (XRAY_ACCEPTS[measType]) {
       const r = await validateXrayFile(file, measType);
       if (r.error) { showUploadError(measType, r.error); return; }
       clearUploadError(measType);
-      onUploadFile(measType, file, r.parsed, null);
+      onUploadFile(measType, file, r.parsed, null, false, r.meta || null);
       return;
     }
     const text = await file.text();
@@ -3634,6 +4244,8 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
         )}
       </section>
 
+      {sample.has_source_record && <VaultRecordSection key={sample.id} sampleId={sample.id} layers={sample.layers} />}
+
       {isSputter && sample.layers.some(l => l.sputter_log) && (
         <section>
           <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Deposition Log</div>
@@ -3649,6 +4261,8 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               onFile={(measType, file) => handleFile(measType, file)}
               uploadError={uploadErrors[t]}
               rsmMeta={t === "rsm" ? pd.rsm_meta : undefined}
+              xrayMeta={t !== "rsm" ? pd[`${t}_meta`] : undefined}
+              onXrayFrame={t !== "rsm" ? idx => onXrayFrame?.(sample.id, t, idx) : undefined}
               rsmConfig={t === "rsm" ? sample.module_config?.rsm : undefined}
               onRsmDistance={t === "rsm" ? mm => onRsmDistance?.(sample.id, mm) : undefined}
               substrate={t === "xrd_ot" ? sample.substrate : undefined}
@@ -3674,7 +4288,9 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
       <section>
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2, marginBottom: 10 }}>Scanning Probe</div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, 340px)", justifyContent: "center", gap: 12 }}>
-          <AfmCard afmData={pd.afm} filename={sample.filenames?.afm} onFile={file => handleFile("afm", file)} />
+          <AfmCard afmData={pd.afm} filename={sample.filenames?.afm} onFile={file => handleFile("afm", file)}
+            sampleId={sample.id} afmConfig={sample.module_config?.afm}
+            onAfmSettings={settings => onAfmSettings?.(sample.id, settings)} />
           {modulesForSection("scanning_probe").map(m => (
             <ModuleCard key={m.id} mod={m} sample={sample} modules={modules} onRemoved={refreshSample} onSampleUpdate={refreshSample} />
           ))}
@@ -3694,6 +4310,9 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
               filenames={sample.filenames}
               onFile={(measType, file) => handleFile(measType, file)}
               uploadError={uploadErrors[t] || uploadErrors[`${t}_up`] || uploadErrors[`${t}_down`]}
+              peMeta={t === "pe" ? pd.pe_meta : undefined}
+              peConfig={t === "pe" ? sample.module_config?.pe : undefined}
+              onPeXInput={t === "pe" ? mode => onPeXInput?.(sample.id, mode) : undefined}
               thicknessNm={sample.thickness_nm || 0}
               areaM2={sample.area_m2 ?? null}
               areaCorrFactor={sample.area_correction ?? 1.0}
@@ -3747,6 +4366,69 @@ function SampleDetail({ sample, plotData, onUpdate, onUploadFile, onReparseFiles
 }
 
 // ── AddLayerModal ─────────────────────────────────────────────────────────────
+
+// Read-only view of the original vault note a sample was created from.
+// Note content is shown as text only — never rendered as HTML, fetched, or followed.
+// Rendered with key={sample.id} so switching samples resets its state.
+function VaultRecordSection({ sampleId, layers = [] }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  const [open, setOpen] = useState(false);
+  const [rec,  setRec]  = useState(null);
+  const [err,  setErr]  = useState(null);
+
+  const toggle = async () => {
+    const next = !open;
+    setOpen(next);
+    if (next && !rec) {
+      try { setRec(await apiDetail("GET", `/samples/${encodeURIComponent(sampleId)}/source-record`)); }
+      catch (e) { setErr(e.message); }
+    }
+  };
+
+  const sub = (label) => <div style={{ ...mono, fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, margin: "12px 0 4px" }}>{label}</div>;
+  const pre = { ...mono, fontSize: 11, color: T.textSecondary, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, padding: 8, margin: 0, maxHeight: 320, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word" };
+  const src = rec?.source || {};
+  const nativeMark = { id: "→ ID", date: "→ date", technique: "→ technique", substrate: "→ substrate", lot: "→ lot", bin: "→ bin", description: "→ notes", stack: "→ layers" };
+
+  return (
+    <section>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <span style={{ ...mono, fontSize: 12, color: T.textSecondary, textTransform: "uppercase", letterSpacing: 2 }}>
+          Vault Record <span style={{ fontSize: 10, color: T.textDim, textTransform: "none", letterSpacing: 0 }}>· read-only, imported from Obsidian</span>
+        </span>
+        <Btn variant="ghost" small onClick={toggle}>{open ? "Hide" : "Show"}</Btn>
+      </div>
+      {open && (
+        <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: "10px 14px" }}>
+          {err && <div style={{ ...mono, fontSize: 11, color: T.red }}>{err}</div>}
+          {!rec && !err && <div style={{ ...mono, fontSize: 11, color: T.textDim }}>Loading…</div>}
+          {rec && <>
+            <VaultKeyValues values={{
+              "Source note": src.relative_path,
+              "SHA-256": src.sha256,
+              "Imported": rec.imported_at,
+              "Evidence": rec.evidence,
+              "Acknowledged": (rec.import_choices?.acknowledged_warnings || []).join(", ") || null,
+              "Confirmed grown": rec.import_choices?.confirmed_physical_sample ? "yes" : null,
+            }} />
+            {rec.warnings?.length > 0 && sub("Conversion notes")}
+            {(rec.warnings || []).map((w, i) => <div key={i} style={{ ...mono, fontSize: 11, color: w.ack ? T.amber : T.textDim, marginBottom: 2 }}>{w.ack ? "⚠" : "·"} {w.message}</div>)}
+            {sub("Stack as recorded")}
+            <VaultStackTable lines={rec.stack || []} layers={layers} />
+            {sub("Frontmatter")}
+            <VaultKeyValues values={src.frontmatter || {}} mark={nativeMark} />
+            {sub("Notes")}
+            <pre style={pre}>{src.body || "(empty)"}</pre>
+            <details style={{ marginTop: 10 }}>
+              <summary style={{ ...mono, fontSize: 11, color: T.textDim, cursor: "pointer" }}>Original note text</summary>
+              <pre style={{ ...pre, marginTop: 6 }}>{src.text}</pre>
+            </details>
+          </>}
+        </div>
+      )}
+    </section>
+  );
+}
 
 function AddLayerModal({ technique: sampleTechnique, knownMaterials, settings, materialsLib = [], onAdd, onClose }) {
   useEscClose(onClose);
@@ -7668,6 +8350,373 @@ function ImportModal({ type, onConfirm, onClose }) {
 
 // ── SettingsModal ─────────────────────────────────────────────────────────────
 
+// ── Obsidian vault import (create-only) ───────────────────────────────────────
+// Scans are read-only on the backend; apply creates only the selected, still-valid
+// records and never updates an existing sample or writes to the vault.
+
+const VAULT_CATEGORIES = [
+  ["ready",    "Ready"],
+  ["review",   "Needs review"],
+  ["existing", "Already in LabLog"],
+  ["planned",  "Planned — not imported"],
+  ["invalid",  "Invalid"],
+];
+const VAULT_OUTCOMES = [
+  ["created",        "Created"],
+  ["already_exists", "Already in LabLog"],
+  ["source_changed", "Source changed"],
+  ["skipped",        "Skipped"],
+  ["failed",         "Failed"],
+];
+const VAULT_CONDITION_LABELS = [["temp", "T", "°C"], ["pressure", "P", "mTorr"], ["oxygen_pct", "O₂", "%"], ["time_s", "t", "s"], ["frequency_hz", "f", "Hz"]];
+
+// Like api(), but surfaces the backend's error detail.
+async function apiDetail(method, path, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  const res  = await fetch(`${API_BASE}${path}`, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `${method} ${path} → ${res.status}`);
+  return data;
+}
+
+function vaultValue(v) {
+  if (v === null || v === undefined || v === "") return "—";
+  return typeof v === "object" ? JSON.stringify(v) : String(v);
+}
+
+// One-line native summary of an imported layer: targets, then set conditions only.
+function vaultLayerSummary(layer) {
+  const targets = (layer.targets || []).map(t => {
+    const parts = [t.material || "?"];
+    if (t.power_W   != null) parts.push(`${t.power_W} W`);
+    if (t.energy_mJ != null) parts.push(`${t.energy_mJ} mJ`);
+    if (t.pulses    != null) parts.push(`${t.pulses} p`);
+    if (t.power_type) parts.push(t.power_type_basis === "explicit" ? t.power_type : `${t.power_type} (convention)`);
+    return parts.join(" ");
+  }).join(" + ") || "no target";
+  const conds = VAULT_CONDITION_LABELS.filter(([k]) => layer[k] != null).map(([k, l, u]) => `${l} ${layer[k]} ${u}`);
+  Object.entries(layer.custom || {}).forEach(([k, v]) => conds.push(`${k} ${v}`));
+  return [targets, ...conds].join(" · ");
+}
+
+function VaultStackTable({ lines = [], layers = [] }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  if (!lines.length) return <div style={{ ...mono, fontSize: 11, color: T.textDim }}>No stack entries — no layers.</div>;
+  const byIndex = Object.fromEntries(layers.map(l => [l.vault_source?.index, l]));
+  const statusColor = { full: T.teal, partial: T.amber, unparsed: T.red, "not created": T.textDim };
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <table style={{ borderCollapse: "collapse", width: "100%", ...mono, fontSize: 11 }}>
+        <thead>
+          <tr style={{ color: T.textDim, textAlign: "left" }}>
+            {["#", "Role", "Vault stack line (bottom → top)", "LabLog layer", "Mapping"].map(h => <th key={h} style={{ padding: "3px 6px", fontWeight: 400, borderBottom: `1px solid ${T.border}` }}>{h}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {lines.map(line => {
+            const layer = byIndex[line.index];
+            return (
+              <tr key={line.index} style={{ verticalAlign: "top" }}>
+                <td style={{ padding: "3px 6px", color: T.textDim }}>{line.index + 1}</td>
+                <td style={{ padding: "3px 6px", color: T.textSecondary, whiteSpace: "nowrap" }}>
+                  {line.role || "—"}{line.role_label ? `:${line.role_label}` : ""}{line.primary ? " ★" : ""}
+                </td>
+                <td style={{ padding: "3px 6px", color: T.textPrimary, wordBreak: "break-word" }}>{vaultValue(line.raw)}</td>
+                <td style={{ padding: "3px 6px", color: T.textSecondary }}>
+                  {layer ? vaultLayerSummary(layer) : "—"}
+                  {(line.unmapped || []).map((u, i) => <div key={i} style={{ color: T.amber }}>unset: {u.term} — {u.reason}</div>)}
+                  {(line.problems || []).map((p, i) => <div key={i} style={{ color: T.red }}>{p}</div>)}
+                </td>
+                <td style={{ padding: "3px 6px", color: statusColor[line.status] || T.textDim, whiteSpace: "nowrap" }}>{line.status}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function VaultKeyValues({ values = {}, mark = {} }) {
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  const keys = Object.keys(values);
+  if (!keys.length) return <div style={{ ...mono, fontSize: 11, color: T.textDim }}>None.</div>;
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "max-content 1fr", gap: "2px 12px", ...mono, fontSize: 11 }}>
+      {keys.map(k => (
+        <Fragment key={k}>
+          <span style={{ color: T.textDim }}>{k}{mark[k] ? <span style={{ color: T.teal }}> {mark[k]}</span> : null}</span>
+          <span style={{ color: T.textPrimary, wordBreak: "break-word" }}>{vaultValue(values[k])}</span>
+        </Fragment>
+      ))}
+    </div>
+  );
+}
+
+function VaultImportModal({ onClose, onImported }) {
+  useEscClose(onClose);
+  const mono = { fontFamily: "'DM Mono', monospace" };
+  const [root,      setRoot]      = useState("");
+  const [savedRoot, setSavedRoot] = useState("");
+  const [scanning,  setScanning]  = useState(false);
+  const [error,     setError]     = useState(null);
+  const [preview,   setPreview]   = useState(null);
+  const [tab,       setTab]       = useState("ready");
+  const [expanded,  setExpanded]  = useState(null);
+  const [choices,   setChoices]   = useState({});   // key → { selected, acknowledged, confirmed_physical }
+  const [applying,  setApplying]  = useState(false);
+  const [result,    setResult]    = useState(null);
+
+  // Loading the saved path is not a scan; nothing is read from disk until Scan is clicked.
+  useEffect(() => {
+    api("GET", "/vault-import/root").then(r => { setRoot(r.root || ""); setSavedRoot(r.root || ""); }).catch(() => {});
+  }, []);
+
+  const records   = preview?.records || [];
+  const needsAck  = r => r.warnings.some(w => w.ack);
+  const choiceOf  = r => choices[r.key] || {};
+  const reviewed  = (r, c) => (!needsAck(r) || c.acknowledged) && (!r.needs_confirmation || c.confirmed_physical);
+  const importable = r => r.category === "ready" || r.category === "review";
+  const selectable = r => importable(r) && reviewed(r, choiceOf(r));
+  const selected  = records.filter(r => choiceOf(r).selected && selectable(r));
+
+  const setChoice = (r, patch) => setChoices(p => {
+    const next = { ...(p[r.key] || {}), ...patch };
+    if (!reviewed(r, next)) next.selected = false;
+    return { ...p, [r.key]: next };
+  });
+  const selectReady = () => setChoices(p => {
+    const n = { ...p };
+    records.filter(r => r.category === "ready").forEach(r => { n[r.key] = { ...(n[r.key] || {}), selected: true }; });
+    return n;
+  });
+  const clearSelection = () => setChoices(p => Object.fromEntries(Object.entries(p).map(([k, v]) => [k, { ...v, selected: false }])));
+
+  const scan = async () => {
+    setScanning(true); setError(null); setResult(null);
+    try {
+      const data = await apiDetail("POST", "/vault-import/preview", { root });
+      setPreview(data); setChoices({}); setExpanded(null);
+      setTab(data.counts.ready ? "ready" : data.counts.review ? "review" : "existing");
+    } catch (e) { setError(e.message); setPreview(null); }
+    setScanning(false);
+  };
+
+  const saveRoot = async () => {
+    try { const r = await apiDetail("PUT", "/vault-import/root", { root }); setSavedRoot(r.root); }
+    catch (e) { setError(e.message); }
+  };
+
+  const applySelected = async () => {
+    setApplying(true); setError(null);
+    try {
+      const res = await apiDetail("POST", "/vault-import/apply", {
+        preview_id: preview.preview_id,
+        selections: selected.map(r => ({ key: r.key, acknowledged: !!choiceOf(r).acknowledged, confirmed_physical: !!choiceOf(r).confirmed_physical })),
+      });
+      setResult(res);
+      onImported?.();
+    } catch (e) { setError(e.message); }
+    setApplying(false);
+  };
+
+  const inputStyle = { ...mono, fontSize: 12, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, padding: "6px 10px", color: T.textPrimary, outline: "none", flex: 1, minWidth: 0, boxSizing: "border-box" };
+  const sub = (label) => <div style={{ ...mono, fontSize: 10, color: T.textDim, textTransform: "uppercase", letterSpacing: 1, margin: "10px 0 4px" }}>{label}</div>;
+  const rowSummary = r => {
+    if (r.category === "existing") return "Already in LabLog — skipped entirely";
+    if (r.category === "planned")  return "Planned — stays in Obsidian";
+    if (r.category === "invalid")  return r.errors[0];
+    const s = r.sample;
+    return [s.date || "no date", s.technique, s.substrate || "no substrate", `${s.layers.length} layer${s.layers.length === 1 ? "" : "s"}`].join(" · ");
+  };
+
+  const renderDetail = r => {
+    const s = r.sample;
+    const c = choiceOf(r);
+    const ackWarnings  = r.warnings.filter(w => w.ack);
+    const infoWarnings = r.warnings.filter(w => !w.ack);
+    const sub_ = r.substrate;
+    return (
+      <div style={{ padding: "4px 14px 14px 36px", borderTop: `1px solid ${T.border}` }}>
+        <div style={{ ...mono, fontSize: 10, color: T.textDim, marginTop: 8 }}>{r.path}{r.status != null ? ` · lablog_status: ${vaultValue(r.status)}` : ""}</div>
+        {r.errors.map((e, i) => <div key={i} style={{ ...mono, fontSize: 11, color: T.red, marginTop: 6 }}>✕ {e}</div>)}
+        {s && <>
+          {sub("Proposed new sample")}
+          <VaultKeyValues values={{
+            "ID": s.id,
+            "Growth date": s.date,
+            "Technique": s.technique,
+            "Substrate": s.substrate ? (sub_?.original && sub_.original !== s.substrate ? `${s.substrate}   ← ${sub_.original}` : s.substrate) : null,
+            "Lot": s.lot,
+            "Bin": s.bin,
+            "Brief note": s.notes,
+            "Folder": "Uncategorized",
+            "Thickness / device area": "not set",
+            "Measurements": "none",
+          }} />
+          {sub("Layers")}
+          <VaultStackTable lines={r.stack} layers={s.layers} />
+          {(ackWarnings.length > 0 || infoWarnings.length > 0) && sub("Conversion notes")}
+          {ackWarnings.map((w, i) => <div key={i} style={{ ...mono, fontSize: 11, color: T.amber, marginBottom: 2 }}>⚠ {w.message}</div>)}
+          {infoWarnings.map((w, i) => <div key={i} style={{ ...mono, fontSize: 11, color: T.textDim, marginBottom: 2 }}>· {w.message}</div>)}
+          {(needsAck(r) || r.needs_confirmation) && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8, padding: "8px 10px", background: T.bg1, border: `1px solid ${T.amber}55`, borderRadius: 6 }}>
+              {needsAck(r) && (
+                <label style={{ ...mono, fontSize: 11, color: T.textPrimary, display: "flex", gap: 6, alignItems: "center", cursor: "pointer" }}>
+                  <input type="checkbox" checked={!!c.acknowledged} onChange={e => setChoice(r, { acknowledged: e.target.checked })} style={{ accentColor: T.amber }} />
+                  I have reviewed the warnings above; unset values stay unset
+                </label>
+              )}
+              {r.needs_confirmation && (
+                <label style={{ ...mono, fontSize: 11, color: T.textPrimary, display: "flex", gap: 6, alignItems: "center", cursor: "pointer" }}>
+                  <input type="checkbox" checked={!!c.confirmed_physical} onChange={e => setChoice(r, { confirmed_physical: e.target.checked })} style={{ accentColor: T.amber }} />
+                  This is an existing, physically grown sample
+                </label>
+              )}
+            </div>
+          )}
+          {sub("Retained, not mapped to LabLog fields")}
+          <VaultKeyValues values={r.retained} />
+          {sub("Markdown body (kept intact in the sample's Vault record)")}
+          <pre style={{ ...mono, fontSize: 11, color: T.textSecondary, background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 5, padding: 8, margin: 0, maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{r.body || "(empty)"}</pre>
+        </>}
+      </div>
+    );
+  };
+
+  return (
+    <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+      <div style={{ background: T.bg1, border: `1px solid ${T.borderBright}`, borderRadius: 12, width: "min(1000px, 94vw)", display: "flex", flexDirection: "column", maxHeight: "90vh", overflow: "hidden" }}>
+
+        <div style={{ padding: "16px 22px", borderBottom: `1px solid ${T.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+          <span style={{ ...mono, fontSize: 14, color: T.amber, fontWeight: 600 }}>Import from Obsidian</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 16, lineHeight: 1 }}>✕</button>
+        </div>
+
+        <div style={{ padding: "16px 22px", display: "flex", flexDirection: "column", gap: 12, overflowY: "auto" }}>
+          <div style={{ ...mono, fontSize: 12, color: T.textPrimary, fontWeight: 600, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 12px" }}>
+            This import creates missing samples only. It does not update existing samples or write back to Obsidian.
+          </div>
+
+          <div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input value={root} onChange={e => setRoot(e.target.value)} placeholder="/path/to/vault" style={inputStyle}
+                onKeyDown={e => { if (e.key === "Enter" && root.trim() && !scanning) scan(); }} />
+              <Btn small onClick={scan} disabled={!root.trim() || scanning || applying}>{scanning ? "Scanning…" : preview ? "Rescan" : "Scan"}</Btn>
+              <Btn variant="ghost" small onClick={saveRoot} disabled={!root.trim() || root.trim() === savedRoot}>Save path</Btn>
+            </div>
+            <div style={{ ...mono, fontSize: 10, color: T.textDim, marginTop: 5 }}>
+              Vault root folder containing <b>Samples/</b>, as a path on the computer running the LabLog backend. Scanning only reads notes.
+            </div>
+            {error && <div style={{ ...mono, fontSize: 11, color: T.red, marginTop: 8 }}>{error}</div>}
+          </div>
+
+          {result ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {VAULT_OUTCOMES.map(([k, label]) => (
+                  <span key={k} style={{ ...mono, fontSize: 11, color: k === "created" ? T.teal : k === "failed" ? T.red : T.textSecondary, background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 4, padding: "3px 8px" }}>
+                    {label}: {result.counts[k] || 0}
+                  </span>
+                ))}
+              </div>
+              {VAULT_OUTCOMES.map(([k, label]) => {
+                const rows = result.results.filter(x => x.outcome === k);
+                if (!rows.length) return null;
+                return (
+                  <div key={k}>
+                    {sub(label)}
+                    {rows.map(x => (
+                      <div key={x.key} style={{ ...mono, fontSize: 11, color: T.textPrimary }}>
+                        {x.id ?? x.key} <span style={{ color: T.textDim }}>— {x.message}</span>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+              <div style={{ ...mono, fontSize: 11, color: T.textSecondary, lineHeight: 1.6 }}>
+                New samples are uncategorized. Nothing in the vault was changed, so imported notes may still say <b>lablog_status: draft</b> — that is expected: later scans check this database, not that label.
+                {result.backup && <> A database backup was taken first ({result.backup}, in the LabLog data folder under backups/).</>}
+              </div>
+            </div>
+          ) : preview && (
+            <>
+              <div style={{ ...mono, fontSize: 10, color: T.textDim }}>
+                {preview.root} · {records.length} sample notes{preview.counts.ignored ? ` · ${preview.counts.ignored} other notes ignored` : ""}
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {VAULT_CATEGORIES.map(([k, label]) => (
+                  <button key={k} onClick={() => setTab(k)}
+                    style={{ ...mono, fontSize: 11, cursor: "pointer", borderRadius: 4, padding: "4px 10px", border: `1px solid ${tab === k ? T.amber : T.border}`, background: tab === k ? T.amberGlow : "transparent", color: tab === k ? T.amber : T.textSecondary }}>
+                    {label} · {preview.counts[k]}
+                  </button>
+                ))}
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {records.filter(r => r.category === tab).map(r => {
+                  const c = choiceOf(r);
+                  const ackCount = r.warnings.filter(w => w.ack).length;
+                  const open = expanded === r.key;
+                  return (
+                    <div key={r.key} style={{ border: `1px solid ${open ? T.borderBright : T.border}`, borderRadius: 7, background: T.bg2 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 12px", cursor: "pointer" }} onClick={() => setExpanded(open ? null : r.key)}>
+                        {importable(r) ? (
+                          <input type="checkbox" checked={!!c.selected && selectable(r)} disabled={!selectable(r)}
+                            title={selectable(r) ? "Select for import" : "Review the record and acknowledge its warnings first"}
+                            onClick={e => e.stopPropagation()} onChange={e => setChoice(r, { selected: e.target.checked })} style={{ accentColor: T.amber, cursor: "pointer" }} />
+                        ) : <span style={{ width: 13 }} />}
+                        <span style={{ ...mono, fontSize: 13, fontWeight: 600, color: T.textPrimary, whiteSpace: "nowrap" }}>{r.id}</span>
+                        <span style={{ ...mono, fontSize: 11, color: r.category === "invalid" ? T.red : T.textDim, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{rowSummary(r)}</span>
+                        {importable(r) && ackCount > 0 && (
+                          <span style={{ ...mono, fontSize: 10, color: c.acknowledged ? T.teal : T.amber, border: `1px solid ${c.acknowledged ? T.teal : T.amber}66`, borderRadius: 3, padding: "1px 6px", whiteSpace: "nowrap" }}>
+                            {c.acknowledged ? "reviewed" : `${ackCount} warning${ackCount === 1 ? "" : "s"}`}
+                          </span>
+                        )}
+                        {r.needs_confirmation && !c.confirmed_physical && (
+                          <span style={{ ...mono, fontSize: 10, color: T.amber, border: `1px solid ${T.amber}66`, borderRadius: 3, padding: "1px 6px", whiteSpace: "nowrap" }}>confirm grown</span>
+                        )}
+                        <span style={{ color: T.textDim, fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+                      </div>
+                      {open && renderDetail(r)}
+                    </div>
+                  );
+                })}
+                {!records.some(r => r.category === tab) && <div style={{ ...mono, fontSize: 11, color: T.textDim }}>No records in this group.</div>}
+              </div>
+            </>
+          )}
+        </div>
+
+        {preview && (
+          <div style={{ padding: "12px 22px", borderTop: `1px solid ${T.border}`, display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+            {result ? (
+              <>
+                <div style={{ flex: 1 }} />
+                <Btn variant="ghost" small onClick={scan} disabled={scanning}>Scan again</Btn>
+                <Btn small onClick={onClose}>Done</Btn>
+              </>
+            ) : (
+              <>
+                <Btn variant="ghost" small onClick={selectReady} disabled={!preview.counts.ready}>Select ready</Btn>
+                <Btn variant="ghost" small onClick={clearSelection} disabled={!selected.length}>Clear</Btn>
+                <span style={{ ...mono, fontSize: 11, color: T.textSecondary, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                  title={selected.map(r => r.id).join(", ")}>
+                  {selected.length ? `Will create ${selected.length} uncategorized sample${selected.length === 1 ? "" : "s"}: ${selected.map(r => r.id).join(", ")}` : "Nothing selected"}
+                </span>
+                <Btn small onClick={applySelected} disabled={!selected.length || applying || scanning}>
+                  {applying ? "Importing…" : `Import selected (${selected.length})`}
+                </Btn>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function MaterialEditorModal({ material, settings, onSave, onDelete, onClose, materialsLib = [] }) {
   useEscClose(onClose);
   // material is null for new entries, or an existing entry for editing
@@ -9102,7 +10151,7 @@ const DEFAULT_PLOT_STYLE = {
   rsmBins: 256, rsmColorbar: false, rsmLogIntensity: true,
   rsmXMin: null, rsmXMax: null, rsmYMin: null, rsmYMax: null,
   rsmBgMethod: "percentile", rsmBgPct: 5, rsmWhiteFade: 0.15, rsmQ2pi: false,
-  rsmMaxCols: null, rsmTight: false, rsmLabelColor: "sample",
+  rsmMaxCols: null, rsmTight: false, rsmLabelColor: "sample", rsmColorScale: "per_scan",
   colorScale: "viridis", colorTrim: 5,
 };
 
@@ -9402,6 +10451,19 @@ function SciPlotWrap({ ps, cursorLabel, children, noSpacer = false }) {
 
 // ── XRD ω–2θ comparison ───────────────────────────────────────────────────────
 
+// ── XRD substrate alignment (backend/xrdref.py, docs/xrd-substrate-alignment.md) ──
+// The offset is stored per sample in xrd_peaks.alignment; this only APPLIES it, to the
+// whole stored scan, before any range crop: Δ2θ(θ) = Z + D·cos θ, subtracted.
+function xrdAlignmentDelta(alignment, twoTheta) {
+  const c = alignment?.conditions || {};
+  return (Number(c.Z) || 0) + (Number(c.D) || 0) * Math.cos((twoTheta / 2) * Math.PI / 180);
+}
+function applyXrdAlignment(pts, alignment) {
+  if (!alignment || alignment.value == null) return pts;
+  return pts.map(p => ({ ...p, x: p.x - xrdAlignmentDelta(alignment, p.x) }));
+}
+const XRD_ALIGN_STATUS_COLOR = { ok: "teal", ok_flagged: "amber", failed_measurement: "red", not_applicable: "textDim" };
+
 function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, config, plotStyle, structures = [], onUpdate, samples = [] }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const offsetDecades   = config.offset_decades ?? 2;
@@ -9410,26 +10472,49 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
   const padAbove        = config.pad_above  ?? 2;
   const padBelow        = config.pad_below  ?? 1;
   const normalizeBase   = config.normalize_baseline ?? true;
-  const zeroSubstrate   = config.zero_substrate ?? false;
-
-  const substrateMap = useMemo(
-    () => Object.fromEntries(samples.map(s => [s.id, s.substrate || ""])),
-    [samples]
-  );
+  // Substrate alignment. Older books used `zero_substrate` (shift the largest peak onto the
+  // substrate position); that option now means "align", which does it properly.
+  const alignOn         = config.xrd_align_substrate ?? config.zero_substrate ?? false;
+  const [alignments, setAlignments] = useState({});        // sid → {alignment, stale, available, reason}
+  const [alignBusy, setAlignBusy]   = useState({});
+  // Everything the stored alignment depends on, per sample: refetch (and let the backend
+  // recompute stale ones) whenever any of it changes.
+  const alignKey = sampleOrder.map(sid => {
+    const s = samples.find(x => x.id === sid);
+    return [sid, s?.filenames?.xrd_ot, s?.substrate, s?.substrate_orientation, JSON.stringify(s?.module_config?.xrd_ot || {})].join("|");
+  }).join(";");
+  useEffect(() => {
+    if (!alignOn) return;
+    let cancelled = false;
+    (async () => {
+      const out = {};
+      for (const sid of sampleOrder) {
+        if (!plotCache[sid]?.xrd_ot?.length) continue;
+        try { out[sid] = await api("GET", `/samples/${encodeURIComponent(sid)}/xrd-alignment?ensure=1`); }
+        catch (e) { out[sid] = { alignment: null, available: false, reason: e.message }; }
+      }
+      if (!cancelled) setAlignments(out);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [alignOn, alignKey, Object.keys(plotCache).length]);
+  const recomputeAlignment = async sid => {
+    setAlignBusy(b => ({ ...b, [sid]: true }));
+    try {
+      const r = await api("POST", `/samples/${encodeURIComponent(sid)}/xrd-alignment`);
+      setAlignments(a => ({ ...a, [sid]: { alignment: r.alignment, stale: false, available: true } }));
+    } catch (e) { setAlignments(a => ({ ...a, [sid]: { ...(a[sid] || {}), reason: e.message } })); }
+    setAlignBusy(b => ({ ...b, [sid]: false }));
+  };
+  const appliedOf = sid => (alignOn ? alignments[sid]?.alignment : null);
+  const [alignDetailsOpen, setAlignDetailsOpen] = useState(false);
 
   const { traces, yDomMin, yDomMax, xTicks, xDomain } = useMemo(() => {
     const traces = sampleOrder.map((sid, i) => {
-      let pts = plotCache[sid]?.xrd_ot || [];
+      // Correct the WHOLE stored scan first; the range crop below only scopes the view.
+      let pts = applyXrdAlignment(plotCache[sid]?.xrd_ot || [], appliedOf(sid));
       if (thetaMin != null && !isNaN(thetaMin)) pts = pts.filter(p => p.x >= thetaMin);
       if (thetaMax != null && !isNaN(thetaMax)) pts = pts.filter(p => p.x <= thetaMax);
-      if (zeroSubstrate && pts.length) {
-        const ref = xrdSubstrateRef(substrateMap[sid], structures);
-        if (ref) {
-          const maxPt = pts.reduce((best, p) => (p.y > best.y ? p : best), pts[0]);
-          const shift = ref.twoTheta - maxPt.x;
-          pts = pts.map(p => ({ ...p, x: p.x + shift }));
-        }
-      }
       const pos = pts.filter(p => p.y > 0);
       if (pos.length === 0) return null;
       const sorted = [...pos.map(p => p.y)].sort((a, b) => a - b);
@@ -9456,7 +10541,7 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
       : { ticks: xTicksAuto };
     return { traces, yDomMin, yDomMax, xTicks, xDomain };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sampleOrder.join(","), plotCache, thetaMin, thetaMax, offsetDecades, padAbove, padBelow, normalizeBase, zeroSubstrate, substrateMap, colors.join(",")]);
+  }, [sampleOrder.join(","), plotCache, thetaMin, thetaMax, offsetDecades, padAbove, padBelow, normalizeBase, alignOn, alignments, colors.join(",")]);
 
   const lines = config.lines || [];
   const addLine    = () => onUpdate({ lines: [...lines, { id: String(Date.now()), material: structures[0]?.name || "", hkl: "", style: "solid", color: "#888888", mode: "bulk", substrate: "" }] });
@@ -9549,6 +10634,57 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
             )}
           </SciPlotWrap>
           <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
+          {alignOn && (
+            <button onClick={() => setAlignDetailsOpen(v => !v)}
+              style={{ marginTop: 8, background: "none", border: "none", padding: 0, cursor: "pointer", fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>
+              {alignDetailsOpen ? "▾" : "▸"} substrate alignment details
+            </button>
+          )}
+          {alignOn && alignDetailsOpen && (
+            <div style={{ marginTop: 6, overflowX: "auto" }}>
+              <table style={{ borderCollapse: "collapse", fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textSecondary, width: "100%" }}>
+                <thead><tr style={{ color: T.textDim, textAlign: "left" }}>
+                  {["sample", "status", "reference", "expected → measured", "Δ2θ applied", "model", "notes", ""].map(h => <th key={h} style={{ padding: "2px 8px", fontWeight: 400 }}>{h}</th>)}
+                </tr></thead>
+                <tbody>
+                  {sampleOrder.filter(sid => plotCache[sid]?.xrd_ot?.length).map(sid => {
+                    const st = alignments[sid];
+                    const a = st?.alignment;
+                    const c = a?.conditions || {};
+                    const used = (c.references || []).filter(r => (c.used || []).includes(r.label));
+                    const xs = (plotCache[sid]?.xrd_ot || []).map(p => p.x);
+                    const lo = xs.length ? Math.min(...xs) : null, hi = xs.length ? Math.max(...xs) : null;
+                    const applied = a?.value != null
+                      ? (c.correction_model === "zero_plus_displacement"
+                          ? `${(-xrdAlignmentDelta(a, lo)).toFixed(4)}° … ${(-xrdAlignmentDelta(a, hi)).toFixed(4)}°`
+                          : `${(-xrdAlignmentDelta(a, 45)).toFixed(4)}°`)
+                      : "none";
+                    const col = T[XRD_ALIGN_STATUS_COLOR[a?.status] || "textDim"];
+                    return (
+                      <tr key={sid} style={{ borderTop: `1px solid ${T.border}`, verticalAlign: "top" }}>
+                        <td style={{ padding: "3px 8px", color: colors[sampleOrder.indexOf(sid)] || T.textPrimary, whiteSpace: "nowrap" }}>{labels[sid] || sid}</td>
+                        <td style={{ padding: "3px 8px", color: col, whiteSpace: "nowrap" }}>{st ? (a ? a.status : (st.reason || "unavailable")) : "…"}{st?.stale ? " (stale)" : ""}</td>
+                        <td style={{ padding: "3px 8px", whiteSpace: "nowrap" }}>{c.reference_material ? `${c.reference_material} ${c.orientation || ""}` : "—"}</td>
+                        <td style={{ padding: "3px 8px", whiteSpace: "nowrap" }}>
+                          {used.map(r => <div key={r.label}>{r.label} {r.expected.toFixed(3)} → {r.measured.toFixed(3)}</div>)}
+                          {(c.references || []).filter(r => r.cross_check).map(r => <div key={r.label} style={{ color: T.textDim }}>{r.label} check {r.residual >= 0 ? "+" : ""}{r.residual.toFixed(4)}°</div>)}
+                        </td>
+                        <td style={{ padding: "3px 8px", whiteSpace: "nowrap", color: a?.value != null ? T.textPrimary : T.textDim }}>{applied}</td>
+                        <td style={{ padding: "3px 8px", whiteSpace: "nowrap" }}>{c.correction_model ? c.correction_model.replace(/_/g, " ") : ""}{c.wavelength_source && c.wavelength_source !== "file" ? <div style={{ color: T.textDim }}>λ assumed Kα1</div> : null}</td>
+                        <td style={{ padding: "3px 8px", color: T.textDim, maxWidth: 360 }}>{a?.note || ""}</td>
+                        <td style={{ padding: "3px 8px" }}>
+                          <button onClick={() => recomputeAlignment(sid)} disabled={!!alignBusy[sid]} title="Recompute from the stored scan"
+                            style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, padding: "1px 6px", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 3, color: T.textDim, cursor: "pointer" }}>
+                            {alignBusy[sid] ? "…" : "recompute"}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </>
       )}
 
@@ -10330,6 +11466,13 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
         const rows       = Math.ceil(entries.length / cols);
         const labelStyle = ps.rsmLabelColor ?? "sample";
 
+        // Color range: each map uses its own robust range unless the book asks for one shared range.
+        const sharedScale = ps.rsmColorScale === "shared";
+        const validBinned = allBinned.filter(Boolean);
+        const zMins = validBinned.map(b => b.zmin).filter(v => v != null);
+        const zMaxs = validBinned.map(b => b.zmax).filter(v => v != null);
+        const sharedZ = sharedScale && zMins.length && zMaxs.length ? [Math.min(...zMins), Math.max(...zMaxs)] : null;
+
         // ── non-tight: individual RSMPlot components (original layout) ────────
         if (!tight) {
           const panelW = ps.plotWidth ? Math.round(ps.plotWidth * 96) : 280;
@@ -10338,7 +11481,7 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
               {entries.map(e => (
                 <div key={e.sid} style={{ flex: "0 0 auto", width: panelW }}>
                   {labelStyle !== "off" && <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: labelStyle === "sample" ? e.color : T.textPrimary, marginBottom: 4, textAlign: "center" }}>{labels[e.sid] || e.sid}</div>}
-                  <RSMPlot data={e.data} cfg={rsmCfg} forcedXDomain={forcedXDomain} forcedYDomain={forcedYDomain} plotStyle={ps} showColorbar={ps.rsmColorbar} points={resolvedPoints} />
+                  <RSMPlot data={e.data} cfg={rsmCfg} forcedXDomain={forcedXDomain} forcedYDomain={forcedYDomain} plotStyle={ps} showColorbar={ps.rsmColorbar} points={resolvedPoints} zRange={sharedZ} />
                 </div>
               ))}
             </div>
@@ -10352,10 +11495,6 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
         const zLabel   = logIntensity ? "log I" : "I";
         const colorscale = makeHeatmapColorscale(ps.colorScale || "viridis", ps.rsmWhiteFade ?? 0);
 
-        // Global robust color range — shared across all panels for direct comparison
-        const validBinned = allBinned.filter(Boolean);
-        const globalZmin = validBinned.length ? Math.min(...validBinned.map(b => b.zmin).filter(v => v != null)) : null;
-        const globalZmax = validBinned.length ? Math.max(...validBinned.map(b => b.zmax).filter(v => v != null)) : null;
 
         // Figure pixel dimensions (W × H = whole collection)
         const defPW = 280, defPH = 280;
@@ -10376,6 +11515,16 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
         const annotations  = [];
         const shapes       = [];
 
+        // Per-scan colorbars: each map has its own range, so each gets its own bar.
+        // The maps normally touch; open a gap between columns to hold the bars.
+        const perScanBar = !sharedScale && !!ps.rsmColorbar;
+        const marginL = 68, marginR = perScanBar ? 44 : 14;
+        const barGapPx = 44;
+        const plotAreaW = Math.max(1, figW - marginL - marginR);
+        const gapFrac = perScanBar && cols > 1 ? barGapPx / plotAreaW : 0;
+        const cellW = (1 - gapFrac * (cols - 1)) / cols;
+        const colDomain = c => [c * (cellW + gapFrac), c * (cellW + gapFrac) + cellW];
+
         entries.forEach((e, idx) => {
           const binned = allBinned[idx];
           if (!binned) return;
@@ -10391,15 +11540,22 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
           const xTicks   = makeTicks(binned.xDomain[0], binned.xDomain[1], ps.xTick);
           const yTicks   = makeTicks(binned.yDomain[0], binned.yDomain[1], ps.yTick);
 
-          // Heatmap
+          // Heatmap. Shared scale: one colorbar on the last map. Per-scan scale: a
+          // bar per map, placed in the gap just right of it.
           plotlyTraces.push({
             type: "heatmap", x: binned.x, y: binned.y, z: binned.z,
             xaxis: xRef, yaxis: yRef,
-            colorscale, showscale: !!(ps.rsmColorbar && idx === entries.length - 1),
+            colorscale, showscale: perScanBar || !!(ps.rsmColorbar && idx === entries.length - 1),
+            ...(perScanBar ? { colorbar: {
+              x: colDomain(col)[1] + 0.004, xanchor: "left", xref: "paper",
+              y: 1 - (row + 0.5) / rows, yanchor: "middle", yref: "paper",
+              len: 0.8 / rows, thickness: 7, outlinewidth: 0, xpad: 2,
+              tickfont: { size: Math.max(8, (ps.fontSize || 12) - 5), family: ps.font, color: T.textDim },
+            } } : {}),
             connectgaps: false, zsmooth: false,
             zauto: false,
-            zmin: globalZmin != null ? globalZmin : binned.zmin,
-            zmax: globalZmax != null ? globalZmax : binned.zmax,
+            zmin: sharedZ ? sharedZ[0] : binned.zmin,
+            zmax: sharedZ ? sharedZ[1] : binned.zmax,
             hovertemplate: `Qₓ: %{x:.4f}<br>Qz: %{y:.4f}<br>${zLabel}: %{z:.2f}<extra></extra>`,
           });
 
@@ -10417,6 +11573,7 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
           // Axes — labels only on outer edges
           axesLayout[xAxisKey] = {
             ...axisBase, ...spikeProps,
+            ...(perScanBar ? { domain: colDomain(col) } : {}),
             range: [binned.xDomain[0], binned.xDomain[1]],
             ...(xTicks ? { tickvals: xTicks, tickmode: "array" } : {}),
             showticklabels: isBottom,
@@ -10460,7 +11617,7 @@ function RSMComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, plotS
           autosize: false, width: figW, height: figH,
           paper_bgcolor: T.bg1, plot_bgcolor: T.bg1,
           font: { family: ps.font, size: ps.fontSize, color: T.textPrimary },
-          margin: { t: 40, r: 14, b: 58, l: 68, pad: 0 },
+          margin: { t: 40, r: marginR, b: 58, l: marginL, pad: 0 },
           grid: {
             rows, columns: cols,
             pattern: "independent",
@@ -10626,6 +11783,178 @@ function DfComparisonPanel({ sampleOrder, samples, plotCache, colors, labels = {
 
 // ── AFM Comparison Panel ───────────────────────────────────────────────────────
 
+// RMS in pm below 1 nm, nm above — the same switch the scale bar makes between nm and µm.
+function fmtAfmRms(nm) {
+  if (nm == null || !isFinite(nm)) return "—";
+  if (nm < 1) return `${Math.round(nm * 1000)} pm`;
+  return `${nm >= 10 ? nm.toFixed(1) : nm.toFixed(2)} nm`;
+}
+
+// Notebook AFM map: solid box, scan-area axes in µm with ticks and labels, side color bar,
+// optional RMS (masked region) in the top-right corner.
+function AfmFramedMap({ grid, scanSizeUm, vmin, vmax, cmap, unit, rmsNm = null, font, fontSize = 11, width = 240 }) {
+  const f = font || "'DM Mono', monospace";
+  const fs = Math.max(8, fontSize - 1);
+  const size = Number(scanSizeUm) || 0;
+  const { ticks, decimals } = afmColorTicks(0, size);
+  const fmt = v => v.toFixed(decimals);
+  const yAxisW = fs * 3 + 10;
+  const box = `1.5px solid ${T.textPrimary}`;
+  const hasBar = vmin != null && vmax != null && vmax > vmin;
+  const barW = hasBar ? 16 + fs * 3.2 + 6 : 0;
+  return (
+    <div style={{ width: width + yAxisW + barW }}>
+      <div style={{ display: "flex", alignItems: "stretch" }}>
+        {/* y axis: 0 at the bottom */}
+        <div style={{ position: "relative", width: yAxisW, flexShrink: 0 }}>
+          {size > 0 && ticks.map(v => (
+            <div key={v} style={{ position: "absolute", right: 0, top: `${(1 - v / size) * 100}%`, transform: "translateY(-50%)", display: "flex", alignItems: "center", gap: 2 }}>
+              <span style={{ fontSize: fs, color: T.textSecondary, fontFamily: f }}>{fmt(v)}</span>
+              <div style={{ width: 4, height: 1.5, background: T.textPrimary }} />
+            </div>
+          ))}
+        </div>
+        <div style={{ position: "relative", width, border: box, boxSizing: "content-box", lineHeight: 0 }}>
+          <AfmChannelMapCanvas grid={grid} scanSizeUm={scanSizeUm} vmin={vmin} vmax={vmax} cmap={cmap} />
+          {rmsNm != null && (
+            <div style={{ position: "absolute", top: 4, right: 6, fontFamily: f, fontSize: fs + 1, fontWeight: 700, color: "#fff", lineHeight: 1.2,
+              textShadow: "0 0 3px rgba(0,0,0,.9), 0 0 2px rgba(0,0,0,.9)" }}>
+              RMS {fmtAfmRms(rmsNm)}
+            </div>
+          )}
+        </div>
+        {hasBar && <div style={{ width: 6 }} />}
+        {hasBar && <AfmColorBar vmin={vmin} vmax={vmax} cmap={cmap} unit={unit} font={f} fontSize={fs} color={T.textSecondary} border={box} />}
+      </div>
+      {/* x axis */}
+      <div style={{ position: "relative", marginLeft: yAxisW, width: width + 3, height: fs + 8 }}>
+        {size > 0 && ticks.map(v => (
+          <div key={v} style={{ position: "absolute", left: `${(v / size) * 100}%`, top: 0, transform: "translateX(-50%)", display: "flex", flexDirection: "column", alignItems: "center" }}>
+            <div style={{ width: 1.5, height: 4, background: T.textPrimary }} />
+            <span style={{ fontSize: fs, color: T.textSecondary, fontFamily: f, lineHeight: 1.1 }}>{fmt(v)}</span>
+          </div>
+        ))}
+      </div>
+      <div style={{ marginLeft: yAxisW, width, textAlign: "center", fontSize: fs, color: T.textSecondary, fontFamily: f, marginTop: 2 }}>µm</div>
+    </div>
+  );
+}
+
+// ── Per-scan export of a notebook AFM map ─────────────────────────────────────
+// Builds an SVG of exactly what AfmFramedMap shows (map pixels embedded as an image,
+// box, µm axes, bordered color bar, scale bar, RMS) and offers it as SVG, PNG (4×)
+// or a clipboard PNG, like the Plotly panels' export buttons.
+function afmMapDataUrl(grid, vmin, vmax, cmap) {
+  const H = grid.length, W = grid[0].length;
+  const c = document.createElement("canvas"); c.width = W; c.height = H;
+  const ctx = c.getContext("2d"); const img = ctx.createImageData(W, H);
+  const rng = (vmax - vmin) || 1;
+  for (let r = 0; r < H; r++) for (let q = 0; q < W; q++) {
+    const [rv, gv, bv] = cmap(Math.max(0, Math.min(1, (grid[r][q] - vmin) / rng)));
+    const o = (r * W + q) * 4; img.data[o] = rv; img.data[o + 1] = gv; img.data[o + 2] = bv; img.data[o + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return c.toDataURL("image/png");
+}
+
+function buildAfmMapSvg({ grid, scanSizeUm, vmin, vmax, cmap, unit, rmsNm, font, fontSize = 11, width = 240, title = "" }) {
+  const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const f = (font || "Arial, sans-serif").replace(/"/g, "'");
+  const fs = Math.max(8, fontSize - 1);
+  const size = Number(scanSizeUm) || 0;
+  const { ticks, decimals } = afmColorTicks(0, size);
+  const yAxisW = fs * 3 + 10, pad = 6;
+  const hasBar = vmin != null && vmax != null && vmax > vmin;
+  const barX = yAxisW + width + 6 + 1.5, barW = 9;
+  const cb = hasBar ? afmColorTicks(vmin, vmax) : { ticks: [], decimals: 0 };
+  const W = yAxisW + width + (hasBar ? 6 + 16 + fs * 3.2 : 0) + pad * 2;
+  const Hm = width;                                        // square scan
+  const top = hasBar ? fs + 6 : 0;                         // room for the color-bar unit above the bar
+  const H = top + Hm + fs + 8 + fs + 10 + pad * 2;
+  const x0 = pad + yAxisW, y0 = pad + top;
+  // Exports are for slides and papers: dark lines and text on a transparent background,
+  // whatever the app theme.
+  const tp = "#111111", ts = "#333333";
+  const out = [];
+  out.push(`<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="${f}">`);
+  if (title) out.push(`<title>${esc(title)}</title>`);
+  out.push(`<image x="${x0}" y="${y0}" width="${width}" height="${Hm}" preserveAspectRatio="none" style="image-rendering:pixelated" href="${afmMapDataUrl(grid, vmin, vmax, cmap)}" xlink:href="${afmMapDataUrl(grid, vmin, vmax, cmap)}"/>`);
+  out.push(`<rect x="${x0}" y="${y0}" width="${width}" height="${Hm}" fill="none" stroke="${tp}" stroke-width="1.5"/>`);
+  if (size > 0) {
+    for (const v of ticks) {
+      const px = x0 + (v / size) * width, py = y0 + (1 - v / size) * Hm;
+      out.push(`<line x1="${px}" y1="${y0 + Hm}" x2="${px}" y2="${y0 + Hm + 4}" stroke="${tp}" stroke-width="1.5"/>`);
+      out.push(`<text x="${px}" y="${y0 + Hm + 5 + fs}" font-size="${fs}" fill="${ts}" text-anchor="middle">${v.toFixed(decimals)}</text>`);
+      out.push(`<line x1="${x0 - 4}" y1="${py}" x2="${x0}" y2="${py}" stroke="${tp}" stroke-width="1.5"/>`);
+      out.push(`<text x="${x0 - 6}" y="${py + fs * 0.35}" font-size="${fs}" fill="${ts}" text-anchor="end">${v.toFixed(decimals)}</text>`);
+    }
+    out.push(`<text x="${x0 + width / 2}" y="${y0 + Hm + 8 + fs * 2 + 2}" font-size="${fs}" fill="${ts}" text-anchor="middle">µm</text>`);
+    // scale bar, as drawn on the card
+    const stops = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100];
+    const barUm = stops.reduce((a, b) => Math.abs(b - size / 5) < Math.abs(a - size / 5) ? b : a);
+    const bpx = barUm / size * width, bx = x0 + width - bpx - width * 0.04, by = y0 + Hm - Hm * 0.07, bh = Math.max(3, Hm * 0.025);
+    const bfs = Math.max(11, width / 16);
+    out.push(`<rect x="${bx}" y="${by}" width="${bpx}" height="${bh}" fill="#fff"/>`);
+    out.push(`<text x="${bx + bpx / 2}" y="${by - bfs * 0.3}" font-size="${bfs}" font-weight="700" fill="#fff" stroke="rgba(0,0,0,0.7)" stroke-width="3" paint-order="stroke" text-anchor="middle">${barUm >= 1 ? `${barUm} µm` : `${barUm * 1000} nm`}</text>`);
+  }
+  if (rmsNm != null) {
+    out.push(`<text x="${x0 + width - 6}" y="${y0 + 4 + fs + 1}" font-size="${fs + 1}" font-weight="700" fill="#fff" stroke="rgba(0,0,0,0.85)" stroke-width="3" paint-order="stroke" text-anchor="end">RMS ${esc(fmtAfmRms(rmsNm))}</text>`);
+  }
+  if (hasBar) {
+    const gid = "g" + Math.random().toString(36).slice(2, 8);
+    out.push(`<defs><linearGradient id="${gid}" x1="0" y1="1" x2="0" y2="0">${Array.from({ length: 21 }, (_, i) => { const [r, g, b] = cmap(i / 20); return `<stop offset="${i * 5}%" stop-color="rgb(${r},${g},${b})"/>`; }).join("")}</linearGradient></defs>`);
+    out.push(`<rect x="${barX}" y="${y0}" width="${barW}" height="${Hm}" fill="url(#${gid})" stroke="${tp}" stroke-width="1.5"/>`);
+    for (const v of cb.ticks) {
+      const py = y0 + (1 - (v - vmin) / (vmax - vmin)) * Hm;
+      out.push(`<line x1="${barX + barW}" y1="${py}" x2="${barX + barW + 3}" y2="${py}" stroke="${ts}" stroke-width="1"/>`);
+      out.push(`<text x="${barX + barW + 5}" y="${py + fs * 0.35}" font-size="${fs}" fill="${ts}">${(Math.abs(v) < 1e-12 ? 0 : v).toFixed(cb.decimals)}</text>`);
+    }
+    out.push(`<text x="${barX}" y="${y0 - 4}" font-size="${fs}" fill="${ts}">${esc(unit || "")}</text>`);
+  }
+  out.push(`</svg>`);
+  return { svg: out.join(""), width: W, height: H };
+}
+
+async function afmSvgToPngBlob({ svg, width, height }, scale = 4) {
+  const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
+  try {
+    const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
+    const c = document.createElement("canvas"); c.width = Math.round(width * scale); c.height = Math.round(height * scale);
+    const ctx = c.getContext("2d"); ctx.imageSmoothingEnabled = false; ctx.drawImage(img, 0, 0, c.width, c.height);
+    return await new Promise(res => c.toBlob(res, "image/png"));
+  } finally { URL.revokeObjectURL(url); }
+}
+
+function AfmExportButtons({ build, filename }) {
+  const [msg, setMsg] = useState(null);
+  const flash = t => { setMsg(t); setTimeout(() => setMsg(null), 1800); };
+  const save = (blob, ext) => {
+    const url = URL.createObjectURL(blob); const a = document.createElement("a");
+    a.href = url; a.download = `${filename}.${ext}`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  const run = async kind => {
+    try {
+      const svg = build();
+      if (kind === "svg") save(new Blob([svg.svg], { type: "image/svg+xml" }), "svg");
+      else {
+        const png = await afmSvgToPngBlob(svg, 4);
+        if (kind === "png") save(png, "png");
+        else { await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]); flash("copied"); }
+      }
+    } catch (e) { console.error("AFM export failed", e); flash("export failed"); }
+  };
+  const b = { fontFamily: "'DM Mono', monospace", fontSize: 9, padding: "1px 6px", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 3, color: T.textDim, cursor: "pointer" };
+  return (
+    <div style={{ display: "flex", gap: 4, justifyContent: "center", alignItems: "center", marginTop: 4 }}>
+      <button style={b} title="Download SVG (map embedded, axes and text editable)" onClick={() => run("svg")}>SVG</button>
+      <button style={b} title="Download PNG at 4×" onClick={() => run("png")}>PNG</button>
+      <button style={b} title="Copy PNG to clipboard" onClick={() => run("copy")}>copy</button>
+      {msg && <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: msg === "copied" ? T.teal : T.red }}>{msg}</span>}
+    </div>
+  );
+}
+
 function AfmComparisonPanel({ sampleOrder, plotCache, labels = {}, plotStyle, config = {}, onUpdate }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
 
@@ -10661,10 +11990,24 @@ function AfmComparisonPanel({ sampleOrder, plotCache, labels = {}, plotStyle, co
           const vmax = chOverride[1] != null ? chOverride[1] : perSample[1];
           return (
             <div key={sid} style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
-              <div style={{ width: mapPx }}>
-                {grid ? (
-                  <AfmChannelMap grid={grid} scanSizeUm={afmData.scan_size_um} vmin={vmin} vmax={vmax} />
-                ) : (
+              <div>
+                {grid ? (() => {
+                  const mapProps = {
+                    grid, scanSizeUm: afmData.scan_size_um, vmin, vmax, width: mapPx,
+                    cmap: afmColormap(afmData.processing?.settings?.colormap, afmData.processing?.settings?.color_trim),
+                    unit: afmData.channel_units?.[activeChannel] ?? (activeChannel?.toLowerCase().includes("height") ? "nm" : activeChannel?.toLowerCase().includes("phase") ? "°" : ""),
+                    font: ps.font, fontSize: ps.fontSize || 11,
+                    rmsNm: config.afm_show_rms && afmData.stats?.[activeChannel]
+                      ? (afmData.stats[activeChannel].region?.rq_nm ?? afmData.stats[activeChannel].full?.rq_nm) : null,
+                  };
+                  const fname = `${String(label).replace(/[^\w.-]+/g, "_")}_${afmShortLabel(activeChannel || "map")}`;
+                  return (
+                    <>
+                      <AfmFramedMap {...mapProps} />
+                      <AfmExportButtons filename={fname} build={() => buildAfmMapSvg({ ...mapProps, title: `${label} ${activeChannel || ""}` })} />
+                    </>
+                  );
+                })() : (
                   <div style={{ width: mapPx, height: mapPx, background: T.bg3, borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center" }}>
                     <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>no data</span>
                   </div>
@@ -10673,6 +12016,14 @@ function AfmComparisonPanel({ sampleOrder, plotCache, labels = {}, plotStyle, co
               <div style={{ marginTop: 5, fontSize: (ps.fontSize || 11) - 1, color: T.textDim, fontFamily: ps.font || "'DM Mono', monospace" }}>
                 {label}
               </div>
+              {afmData?.stats?.[activeChannel] && (
+                <div style={{ textAlign: "center", maxWidth: mapPx }}>
+                  <AfmStats stats={afmData.stats[activeChannel]} compact />
+                  {afmProcessingSummary(afmData.processing) && (
+                    <div style={{ fontSize: 9, color: T.amber, fontFamily: "'DM Mono', monospace", lineHeight: 1.4 }}>{afmProcessingSummary(afmData.processing)}</div>
+                  )}
+                </div>
+              )}
             </div>
           );
         })}
@@ -12700,6 +14051,9 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
     rsmMaxCols:     config.rsm_max_cols      != null ? Number(config.rsm_max_cols) : null,
     rsmTight:       config.rsm_tight         ?? false,
     rsmLabelColor:  config.rsm_label_color   ?? "sample",
+    // Color range of each map: "per_scan" (each map's own robust 2–99.5% range after
+    // its own background subtraction) or "shared" (one range across all maps).
+    rsmColorScale:  config.rsm_color_scale   === "shared" ? "shared" : "per_scan",
     colorScale:     bookColorScale,
     colorTrim:      config.color_trim        ?? 5,
     xMin:           config.x_min  != null ? Number(config.x_min)  : null,
@@ -12882,6 +14236,20 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                   </div>
                 ) : null;
               })()}
+              {type === "afm" && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }} title="RMS roughness of the masked region (the pixels the fits use), shown in each map's top-right corner">
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>RMS</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {["off", "on"].map((opt, idx) => (
+                      <button key={opt} onClick={() => onUpdate({ afm_show_rms: opt === "on" })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (config.afm_show_rms ? "on" : "off") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (config.afm_show_rms ? "on" : "off") === opt ? T.textPrimary : T.textDim, cursor: "pointer" }}>
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>masked region, top right</span>
+                </div>
+              )}
               {/* Color range — AFM only, keyed per channel */}
               {type === "afm" && (() => {
                 const afmChannelNames = sampleOrder.map(sid => plotCache[sid]?.afm?.channel_names).find(Boolean) || [];
@@ -13059,12 +14427,13 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                 </div>
                 {type === "xrd" && (
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>ZERO</span>
-                    <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
-                      <input type="checkbox" checked={config.zero_substrate ?? false}
-                        onChange={e => onUpdate({ zero_substrate: e.target.checked })}
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>ALIGN</span>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}
+                      title="Shift each scan by its fitted substrate offset (stored per sample; the scan itself is never changed). Computed on first use and when the scan, substrate or cut changes.">
+                      <input type="checkbox" checked={config.xrd_align_substrate ?? config.zero_substrate ?? false}
+                        onChange={e => onUpdate({ xrd_align_substrate: e.target.checked, zero_substrate: false })}
                         style={{ accentColor: T.amber }} />
-                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>to substrate peak</span>
+                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>to substrate reflection</span>
                     </label>
                   </div>
                 )}
@@ -13097,6 +14466,17 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                       <button key={opt} onClick={() => onUpdate({ rsm_log_intensity: opt === "log" })}
                         style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: (ps.rsmLogIntensity ? "log" : "linear") === opt ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: (ps.rsmLogIntensity ? "log" : "linear") === opt ? T.textPrimary : T.textDim, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 }}>
                         {opt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }} title="Per scan: each map's colors span its own intensity range. Shared: one range across all maps, for comparing absolute intensity.">
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>SCALE</span>
+                  <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${T.border}` }}>
+                    {[["per scan", "per_scan"], ["shared", "shared"]].map(([label, val], idx) => (
+                      <button key={val} onClick={() => onUpdate({ rsm_color_scale: val })}
+                        style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: ps.rsmColorScale === val ? T.bg3 : T.bg0, border: "none", borderRight: idx === 0 ? `1px solid ${T.border}` : "none", color: ps.rsmColorScale === val ? T.textPrimary : T.textDim, cursor: "pointer" }}>
+                        {label}
                       </button>
                     ))}
                   </div>
@@ -14577,6 +15957,7 @@ export default function App() {
   const [editingFolder, setEditingFolder] = useState(null); // folder object being edited — type inferred from its flags
   const [importModalType, setImportModalType] = useState(null); // "sample"|"book"|"module"|null
   const [importing,       setImporting]       = useState(false);
+  const [vaultImportOpen, setVaultImportOpen] = useState(false);
   const [sampleFilterConds, setSampleFilterConds] = useState([]);
   const [filteredSampleIds,  setFilteredSampleIds]  = useState(null); // null = no filter active
   const [addingBook,    setAddingBook]    = useState(false);
@@ -14713,7 +16094,7 @@ export default function App() {
 
   // ── File upload + plotCache ──────────────────────────────────────────────
 
-  const handleUploadFile = async (measType, file, parsed, peArea, useModule = false) => {
+  const handleUploadFile = async (measType, file, parsed, peArea, useModule = false, parsedMeta = null) => {
     if (!active) return;
     const sample = samples.find(s => s.id === active);
     if (!sample) return;
@@ -14754,8 +16135,14 @@ export default function App() {
             const dir = measType === "diel_b_up" ? "up" : "down";
             return { ...p, [active]: { ...prev, [`diel_b_${dir}`]: parsed } };
           }
+          if (parsedMeta) return { ...p, [active]: { ...prev, [measType]: parsed, [`${measType}_meta`]: parsedMeta } };
           return { ...p, [active]: { ...prev, [measType]: parsed } };
         });
+      }
+      if ((measType === "xrd_ot" || measType === "xrr") && sample.module_config?.[measType]?.frame_file === filename) {
+        await api("PATCH", `/samples/${active}/module-config/${measType}`, { frame: null, frame_file: null });
+        const fresh = await api("GET", `/samples/${active}`);
+        sample.module_config = fresh.module_config;
       }
       // update sample filenames + area if PE
       const updatedSample = {
@@ -14849,11 +16236,11 @@ export default function App() {
         try { newCache.afm = await api("GET", `/samples/${sample.id}/afm_data`); } catch {}
         continue;
       }
-      const { parsed, text, meta } = await loadStoredPlotData(sample.id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample) });
+      const { parsed, text, meta } = await loadStoredPlotData(sample.id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample), peXInput: peXInputOf(sample), frame: xrayFrameOf(sample, measType) });
       if (!parsed || !hasPlotData(parsed)) continue;
       if (measType === "pe" && !newArea && text) newArea = findAreaFromFile(text);
       newCache[measType] = parsed;
-      if (measType === "rsm") newCache.rsm_meta = meta || null;
+      if (meta) newCache[`${measType}_meta`] = meta;
     }
     setPlotCache(p => ({ ...p, [active]: { ...(p[active] || {}), ...newCache } }));
     if (newArea !== sample.area_m2) await updateSample({ ...sample, area_m2: newArea });
@@ -14874,13 +16261,64 @@ export default function App() {
         try { cache.afm = await api("GET", `/samples/${id}/afm_data`); } catch {}
         continue;
       }
-      const { parsed, meta } = await loadStoredPlotData(id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample) });
+      const { parsed, meta } = await loadStoredPlotData(id, filename, measType, thick, { detectorDistance: rsmDetectorDistance(sample), peXInput: peXInputOf(sample), frame: xrayFrameOf(sample, measType) });
       if (parsed && hasPlotData(parsed)) {
         cache[measType] = parsed;
-        if (measType === "rsm") cache.rsm_meta = meta || null;
+        if (meta) cache[`${measType}_meta`] = meta;
       }
     }
     setPlotCache(p => ({ ...p, [id]: cache }));
+  };
+
+  // Save AFM height-flatten settings (module_config.afm) and reload the processed map,
+  // so the card, the book panels and exports all show the same processed data.
+  const handleAfmSettings = async (sampleId, settings) => {
+    await api("PATCH", `/samples/${encodeURIComponent(sampleId)}/module-config/afm`, settings);
+    const updated = await api("GET", `/samples/${encodeURIComponent(sampleId)}`);
+    setSamples(p => p.map(s => s.id === sampleId ? { ...s, module_config: updated.module_config } : s));
+    const afm = await api("GET", `/samples/${encodeURIComponent(sampleId)}/afm_data`);
+    setPlotCache(p => ({ ...p, [sampleId]: { ...(p[sampleId] || {}), afm } }));
+  };
+
+  // Saved scan choice for a multi-scan .rasx on the XRD / XRR card
+  // (module_config.<type>.frame). Only applies to the file it was chosen for.
+  const xrayFrameOf = (sample, measType) => {
+    if (measType !== "xrd_ot" && measType !== "xrr") return null;
+    const c = sample?.module_config?.[measType];
+    return c && Number.isInteger(c.frame) && c.frame_file === sample.filenames?.[measType] ? c.frame : null;
+  };
+
+  // Persist the scan choice and reload that scan into the plot cache, so the
+  // card, books, XRD analysis and the XRR module all use the same frame.
+  const handleXrayFrame = async (sampleId, measType, frame) => {
+    const sample = samples.find(s => s.id === sampleId);
+    const filename = sample?.filenames?.[measType];
+    if (!sample || !filename) return;
+    await api("PATCH", `/samples/${sampleId}/module-config/${measType}`, { frame, frame_file: filename });
+    const updated = await api("GET", `/samples/${sampleId}`);
+    setSamples(p => p.map(s => s.id === sampleId ? { ...s, module_config: updated.module_config } : s));
+    const { parsed, meta } = await loadStoredPlotData(sampleId, filename, measType, sample.thickness_nm || 0, { frame });
+    if (!parsed || !hasPlotData(parsed)) return;
+    setPlotCache(p => ({ ...p, [sampleId]: { ...(p[sampleId] || {}), [measType]: parsed, [`${measType}_meta`]: meta || null } }));
+  };
+
+  // Saved P-E x-input setting for a sample (module_config.pe.x_input): "auto" | "voltage" | "field".
+  const peXInputOf = sample => {
+    const v = sample?.module_config?.pe?.x_input;
+    return PE_X_INPUTS.includes(v) ? v : "auto";
+  };
+
+  // Persist the P-E x-input choice and re-parse the stored file with it.
+  const handlePeXInput = async (sampleId, mode) => {
+    const sample = samples.find(s => s.id === sampleId);
+    const filename = sample?.filenames?.pe;
+    if (!sample || !filename) return;
+    await api("PATCH", `/samples/${sampleId}/module-config/pe`, { x_input: mode });
+    const updated = await api("GET", `/samples/${sampleId}`);
+    setSamples(p => p.map(s => s.id === sampleId ? { ...s, module_config: updated.module_config } : s));
+    const { parsed, meta } = await loadStoredPlotData(sampleId, filename, "pe", sample.thickness_nm || 0, { peXInput: mode });
+    if (!parsed || !hasPlotData(parsed)) return;
+    setPlotCache(p => ({ ...p, [sampleId]: { ...(p[sampleId] || {}), pe: parsed, pe_meta: meta || null } }));
   };
 
   // Saved RSM detector-distance override for a sample (module_config.rsm), or null.
@@ -15219,6 +16657,9 @@ export default function App() {
               onUploadFile={handleUploadFile}
               onReparseFiles={handleReparseFiles}
               onRsmDistance={handleRsmDistance}
+              onPeXInput={handlePeXInput}
+              onXrayFrame={handleXrayFrame}
+              onAfmSettings={handleAfmSettings}
               onBack={() => setActive(null)}
               onDelete={deleteSample}
               editingMeta={editingMeta}
@@ -15259,6 +16700,11 @@ export default function App() {
                   <Btn variant="ghost" small onClick={() => setImportModalType("sample")} disabled={importing}>
                     {importing ? "Importing…" : "Import"}
                   </Btn>
+                  <Btn variant="ghost" small onClick={() => setVaultImportOpen(true)}>Import from Obsidian</Btn>
+                  {vaultImportOpen && (
+                    <VaultImportModal onClose={() => setVaultImportOpen(false)}
+                      onImported={() => api("GET", "/samples").then(setSamples).catch(() => {})} />
+                  )}
                   {/* Export hidden for now — keep for future reintroduction */}
                   {false && <Btn variant="ghost" small onClick={() => setExportOpen(true)}>Export</Btn>}
                   <Btn variant="primary" small onClick={() => setAdding(true)}>+ New Sample</Btn>

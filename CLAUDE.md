@@ -104,7 +104,8 @@ Schema JSON lives at `backend/data/module_schemas/{id}.json` (optional, drives t
 
 ```sql
 samples (id, date, substrate, notes, thickness_nm, area_m2, area_correction,
-         technique, folder_id, layers, filenames, lot, bin, created_at)
+         technique, folder_id, layers, filenames, lot, bin, created_at,
+         source_record)   -- JSON provenance from Obsidian import; see docs/architecture.md
 
 folders (id, name, color, book_folder, created_at)
 
