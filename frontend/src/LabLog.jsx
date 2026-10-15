@@ -250,8 +250,41 @@ const COLOR_SCALES = {
   inferno:  ["#000004","#1b0c42","#4a0c4e","#781c6d","#a52c60","#cf4446","#ed6925","#fb9b07","#f7d03c","#fcffa4"],
   magma:    ["#000004","#180c3c","#40074e","#6b1b62","#982d80","#c24490","#e8688c","#f9a9a3","#fddac7","#fcfdbf"],
   plasma:   ["#0d0887","#45039e","#7201a8","#9c179e","#bd3786","#d8576b","#ed7953","#fb9f3a","#fdcf18","#f0f921"],
+  blue_red: ["#2166ac","#67a9cf","#d1e5f0","#f7f7f7","#fddbc7","#ef8a62","#b2182b"],
+  purple_green: ["#762a83","#af8dc3","#e7d4e8","#f7f7f7","#d9f0d3","#7fbf7b","#1b7837"],
+  brown_teal: ["#8c510a","#d8b365","#f6e8c3","#f5f5f5","#c7eae5","#5ab4ac","#01665e"],
   coolwarm: ["#3b4cc0","#6e8ef0","#9ebcd8","#d1dae9","#e8d0c6","#f0a880","#e36a53","#b40426"],
 };
+
+// Grouped palettes stay separate from intensity scales used by heatmaps.
+const GROUPED_PALETTES = {
+  grouped_classic: { hues: [210, 28, 275, 170], saturation: 75 },
+  grouped_coolwarm: { hues: [175, 335, 43, 240], saturation: 65 },
+  grouped_muted: { hues: [215, 18, 85, 300], saturation: 43 },
+};
+function colorGroupCount(value) {
+  return [2, 3, 4].includes(Number(value)) ? Number(value) : 3;
+}
+function groupedShade(palette, group, t) {
+  const h = palette.hues[group] / 30, s = palette.saturation / 100;
+  const l = (65 - 36 * t) / 100;
+  const a = s * Math.min(l, 1 - l);
+  const channel = n => {
+    const k = (n + h) % 12;
+    return 255 * (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)));
+  };
+  return rgbToHex(channel(0), channel(8), channel(4));
+}
+function colorScaleGradient(name, trim = 5, groups = 3) {
+  if (!GROUPED_PALETTES[name]) return `linear-gradient(to right, ${sampleColorScale(name, 20, trim).join(",")})`;
+  const count = colorGroupCount(groups);
+  const colors = sampleColorScale(name, count * 12, trim, count);
+  // Duplicate boundary positions so adjacent hue ramps never blend together.
+  return `linear-gradient(to right, ${colors.map((color, i) => {
+    const group = Math.floor(i / 12), step = i % 12;
+    return `${color} ${(group + step / 11) * 100 / count}%`;
+  }).join(",")})`;
+}
 
 function hexToRgb(hex) {
   const h = hex.replace("#", "");
@@ -261,7 +294,19 @@ function rgbToHex(r, g, b) {
   return "#" + [r,g,b].map(v => Math.round(Math.max(0,Math.min(255,v))).toString(16).padStart(2,"0")).join("");
 }
 // trim = % to cut from each end of the scale, e.g. 5 → use t ∈ [0.05, 0.95]
-function sampleColorScale(scaleName, n, trim = 5) {
+function sampleColorScale(scaleName, n, trim = 5, groups = 3) {
+  const palette = GROUPED_PALETTES[scaleName];
+  if (palette) {
+    if (n <= 0) return [];
+    const count = Math.min(n, colorGroupCount(groups));
+    const base = Math.floor(n / count), extra = n % count;
+    const lo = Math.max(0, Math.min(0.49, (trim || 0) / 100));
+    return Array.from({ length: count }, (_, group) => {
+      const size = base + (group < extra ? 1 : 0);
+      return Array.from({ length: size }, (_, i) => groupedShade(palette, group,
+        size === 1 ? 0.5 : lo + i / (size - 1) * (1 - 2 * lo)));
+    }).flat();
+  }
   const anchors = COLOR_SCALES[scaleName] || COLOR_SCALES.viridis;
   const tLo = Math.max(0, Math.min(0.49, (trim || 0) / 100));
   const tHi = 1 - tLo;
@@ -9552,12 +9597,18 @@ function AddMatFolderModal({ onSave, onClose, existing }) {
 // ── Analysis Books ────────────────────────────────────────────────────────────
 
 const SCALE_OPTIONS = [
-  { value: "viridis",  label: "Viridis"  },
-  { value: "cividis",  label: "Cividis"  },
-  { value: "inferno",  label: "Inferno"  },
-  { value: "magma",    label: "Magma"    },
-  { value: "plasma",   label: "Plasma"   },
-  { value: "coolwarm", label: "Coolwarm" },
+  { value: "viridis", label: "Viridis", family: "Sequential" },
+  { value: "cividis", label: "Cividis", family: "Sequential" },
+  { value: "inferno", label: "Inferno", family: "Sequential" },
+  { value: "magma", label: "Magma", family: "Sequential" },
+  { value: "plasma", label: "Plasma", family: "Sequential" },
+  { value: "coolwarm", label: "Coolwarm", family: "Diverging" },
+  { value: "blue_red", label: "Blue–Red", family: "Diverging" },
+  { value: "purple_green", label: "Purple–Green", family: "Diverging" },
+  { value: "brown_teal", label: "Brown–Teal", family: "Diverging" },
+  { value: "grouped_classic", label: "Classic", family: "Grouped" },
+  { value: "grouped_coolwarm", label: "Cool / Warm", family: "Grouped" },
+  { value: "grouped_muted", label: "Muted", family: "Grouped" },
 ];
 
 // Keys that are data/instance-specific and should never be saved as defaults
@@ -9808,11 +9859,12 @@ function SampleRosterRow({ sid, s, color, label, hidden = false, onToggleVisibil
   );
 }
 
-function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, labels = {}, hidden, onToggleVisibility, activeMaterial, onChangeActiveMaterial, onReorder, onRemove, onAddSamples, onChangeScale, onChangeTrim, onLabelChange }) {
+function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, colorGroups, labels = {}, hidden, onToggleVisibility, activeMaterial, onChangeActiveMaterial, onReorder, onRemove, onAddSamples, onChangeScale, onChangeTrim, onChangeGroups, onLabelChange }) {
   const [dragIdx,       setDragIdx]       = useState(null);
   const [dragOverIdx,   setDragOverIdx]   = useState(null);
   const [showPicker,    setShowPicker]    = useState(false);
   const [scaleDropOpen, setScaleDropOpen] = useState(false);
+  const [paletteTab, setPaletteTab] = useState(() => SCALE_OPTIONS.find(o => o.value === colorScale)?.family || "Sequential");
   const [localTrim,     setLocalTrim]     = useState(colorTrim ?? 5);
   useEffect(() => { setLocalTrim(colorTrim ?? 5); }, [colorTrim]);
   const commitTrim = () => onChangeTrim(Math.max(0, Math.min(49, Number(localTrim) || 0)));
@@ -9847,19 +9899,33 @@ function SampleRoster({ sampleOrder, samples, colors, colorScale, colorTrim, lab
         </div>
         {scaleDropOpen && <div onClick={() => setScaleDropOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />}
         <div style={{ position: "relative" }}>
-          <button onClick={() => setScaleDropOpen(v => !v)}
+          <button aria-label="Notebook color palette" aria-expanded={scaleDropOpen} onClick={() => {
+            if (!scaleDropOpen) setPaletteTab(SCALE_OPTIONS.find(o => o.value === colorScale)?.family || "Sequential");
+            setScaleDropOpen(v => !v);
+          }}
             style={{ display: "flex", alignItems: "center", gap: 5, background: T.bg0, border: `1px solid ${scaleDropOpen ? T.borderBright : T.border}`, borderRadius: 4, padding: "4px 8px", cursor: "pointer", outline: "none" }}>
-            <div style={{ width: 84, height: 14, borderRadius: 2, background: `linear-gradient(to right, ${sampleColorScale(colorScale, 20, colorTrim).join(",")})` }} />
+            <div style={{ width: 84, height: 14, borderRadius: 2, background: colorScaleGradient(colorScale, colorTrim, colorGroups) }} />
             <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, lineHeight: 1 }}>▾</span>
           </button>
           {scaleDropOpen && (
             <div onClick={e => e.stopPropagation()}
-              style={{ position: "absolute", right: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, padding: 6, zIndex: 200, boxShadow: "0 4px 12px rgba(0,0,0,.5)", display: "flex", flexDirection: "column", gap: 3, minWidth: 140 }}>
-              {SCALE_OPTIONS.map(o => (
+              style={{ position: "absolute", right: 0, top: "calc(100% + 4px)", background: T.bg2, border: `1px solid ${T.borderBright}`, borderRadius: 6, padding: 6, zIndex: 200, boxShadow: "0 4px 12px rgba(0,0,0,.5)", display: "flex", flexDirection: "column", gap: 3, minWidth: 280 }}>
+              <div role="tablist" aria-label="Palette family" style={{ display: "flex", gap: 3, marginBottom: 5 }}>
+                {["Sequential", "Diverging", "Grouped"].map(family => (
+                  <button key={family} role="tab" aria-selected={paletteTab === family} onClick={() => setPaletteTab(family)}
+                    style={{ flex: 1, background: paletteTab === family ? T.bg3 : "transparent", color: paletteTab === family ? T.textPrimary : T.textDim, border: `1px solid ${paletteTab === family ? T.borderBright : T.border}`, borderRadius: 4, padding: "6px", fontSize: 11, cursor: "pointer" }}>{family}</button>
+                ))}
+              </div>
+              {paletteTab === "Grouped" && <div style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 8px", color: T.textDim, fontSize: 11 }}>
+                <span>Groups</span>
+                {[2, 3, 4].map(count => <button key={count} aria-label={`${count} color groups`} aria-pressed={colorGroups === count} onClick={() => onChangeGroups(count)}
+                  style={{ background: colorGroups === count ? T.bg3 : "transparent", color: colorGroups === count ? T.textPrimary : T.textDim, border: `1px solid ${colorGroups === count ? T.borderBright : T.border}`, borderRadius: 4, padding: "3px 9px", cursor: "pointer" }}>{count}</button>)}
+              </div>}
+              {SCALE_OPTIONS.filter(o => o.family === paletteTab).map(o => (
                 <button key={o.value} onClick={() => { onChangeScale(o.value); setScaleDropOpen(false); }}
                   style={{ display: "flex", flexDirection: "column", gap: 4, background: colorScale === o.value ? T.bg3 : "none", border: `1px solid ${colorScale === o.value ? T.borderBright : "transparent"}`, borderRadius: 4, padding: "5px 8px", cursor: "pointer", alignItems: "stretch" }}>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: colorScale === o.value ? T.textPrimary : T.textDim, textAlign: "left" }}>{o.label}</span>
-                  <div style={{ height: 10, borderRadius: 2, background: `linear-gradient(to right, ${sampleColorScale(o.value, 20, colorTrim).join(",")})` }} />
+                  <div style={{ height: 10, borderRadius: 2, background: colorScaleGradient(o.value, colorTrim, colorGroups) }} />
                 </button>
               ))}
             </div>
@@ -14994,10 +15060,12 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, 
   const sampleOrder    = cfg.sample_order?.length ? cfg.sample_order : (book.sample_ids || []);
   const colorScale     = cfg.color_scale    || "viridis";
   const colorTrim      = cfg.color_trim     ?? 5;
+  const colorGroups    = colorGroupCount(cfg.color_groups);
+  const heatmapScale   = GROUPED_PALETTES[colorScale] ? (cfg.heatmap_color_scale || "viridis") : colorScale;
   const panels         = cfg.panels         || [];
   const labels         = cfg.labels         || {};
   const activeMaterial = cfg.active_material ?? null;
-  const colors      = sampleColorScale(colorScale, sampleOrder.length, colorTrim);
+  const colors      = sampleColorScale(colorScale, sampleOrder.length, colorTrim, colorGroups);
 
   // Colors are assigned over the FULL sample order, so each sample keeps its color
   // regardless of visibility. Hidden samples drop out of plots but not the palette.
@@ -15044,6 +15112,7 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, 
         colors={colors}
         colorScale={colorScale}
         colorTrim={colorTrim}
+        colorGroups={colorGroups}
         labels={labels}
         hidden={hiddenSet}
         onToggleVisibility={toggleVisibility}
@@ -15055,8 +15124,10 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, 
           const existing = new Set(sampleOrder);
           updateCfg({ sample_order: [...sampleOrder, ...ids.filter(id => !existing.has(id))] });
         }}
-        onChangeScale={scale => updateCfg({ color_scale: scale })}
+        onChangeScale={scale => updateCfg({ color_scale: scale,
+          ...(GROUPED_PALETTES[scale] && !GROUPED_PALETTES[colorScale] ? { heatmap_color_scale: colorScale } : {}) })}
         onChangeTrim={trim => updateCfg({ color_trim: trim })}
+        onChangeGroups={count => updateCfg({ color_groups: count })}
         onLabelChange={(sid, val) => updateCfg({ labels: { ...labels, [sid]: val } })}
       />
       {panels.map((panel, i) => (
@@ -15068,7 +15139,7 @@ function AnalysisBookDetail({ book, samples, plotCache, onUpdateBook, settings, 
           plotCache={plotCache}
           colors={visibleColors}
           labels={labels}
-          colorScale={colorScale}
+          colorScale={heatmapScale}
           structures={structuresCompat}
           activeMaterial={activeMaterial}
           modules={modules}
@@ -15266,7 +15337,7 @@ function AnalysisBookTile({ book, onDelete, onEdit, onDuplicate, onClick, onDrag
   const n = orderedIds.length;
   const scaleName  = book.config?.color_scale || "viridis";
   const colorTrim  = book.config?.color_trim  ?? 5;
-  const colors = sampleColorScale(scaleName, n, colorTrim);
+  const colors = sampleColorScale(scaleName, n, colorTrim, colorGroupCount(book.config?.color_groups));
   const colorMap = Object.fromEntries(orderedIds.map((id, i) => [id, colors[i]]));
   return (
     <div
