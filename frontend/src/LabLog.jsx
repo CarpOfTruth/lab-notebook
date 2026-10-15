@@ -10015,6 +10015,19 @@ function SciPlotWrap({ ps, cursorLabel, children, noSpacer = false }) {
 
 // ── XRD ω–2θ comparison ───────────────────────────────────────────────────────
 
+// ── XRD substrate alignment (backend/xrdref.py, docs/xrd-substrate-alignment.md) ──
+// The offset is stored per sample in xrd_peaks.alignment; this only APPLIES it, to the
+// whole stored scan, before any range crop: Δ2θ(θ) = Z + D·cos θ, subtracted.
+function xrdAlignmentDelta(alignment, twoTheta) {
+  const c = alignment?.conditions || {};
+  return (Number(c.Z) || 0) + (Number(c.D) || 0) * Math.cos((twoTheta / 2) * Math.PI / 180);
+}
+function applyXrdAlignment(pts, alignment) {
+  if (!alignment || alignment.value == null) return pts;
+  return pts.map(p => ({ ...p, x: p.x - xrdAlignmentDelta(alignment, p.x) }));
+}
+const XRD_ALIGN_STATUS_COLOR = { ok: "teal", ok_flagged: "amber", failed_measurement: "red", not_applicable: "textDim" };
+
 function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, config, plotStyle, structures = [], onUpdate, samples = [] }) {
   const ps = plotStyle || DEFAULT_PLOT_STYLE;
   const offsetDecades   = config.offset_decades ?? 2;
@@ -10023,26 +10036,48 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
   const padAbove        = config.pad_above  ?? 2;
   const padBelow        = config.pad_below  ?? 1;
   const normalizeBase   = config.normalize_baseline ?? true;
-  const zeroSubstrate   = config.zero_substrate ?? false;
-
-  const substrateMap = useMemo(
-    () => Object.fromEntries(samples.map(s => [s.id, s.substrate || ""])),
-    [samples]
-  );
+  // Substrate alignment. Older books used `zero_substrate` (shift the largest peak onto the
+  // substrate position); that option now means "align", which does it properly.
+  const alignOn         = config.xrd_align_substrate ?? config.zero_substrate ?? false;
+  const [alignments, setAlignments] = useState({});        // sid → {alignment, stale, available, reason}
+  const [alignBusy, setAlignBusy]   = useState({});
+  // Everything the stored alignment depends on, per sample: refetch (and let the backend
+  // recompute stale ones) whenever any of it changes.
+  const alignKey = sampleOrder.map(sid => {
+    const s = samples.find(x => x.id === sid);
+    return [sid, s?.filenames?.xrd_ot, s?.substrate, s?.substrate_orientation, JSON.stringify(s?.module_config?.xrd_ot || {})].join("|");
+  }).join(";");
+  useEffect(() => {
+    if (!alignOn) return;
+    let cancelled = false;
+    (async () => {
+      const out = {};
+      for (const sid of sampleOrder) {
+        if (!plotCache[sid]?.xrd_ot?.length) continue;
+        try { out[sid] = await api("GET", `/samples/${encodeURIComponent(sid)}/xrd-alignment?ensure=1`); }
+        catch (e) { out[sid] = { alignment: null, available: false, reason: e.message }; }
+      }
+      if (!cancelled) setAlignments(out);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [alignOn, alignKey, Object.keys(plotCache).length]);
+  const recomputeAlignment = async sid => {
+    setAlignBusy(b => ({ ...b, [sid]: true }));
+    try {
+      const r = await api("POST", `/samples/${encodeURIComponent(sid)}/xrd-alignment`);
+      setAlignments(a => ({ ...a, [sid]: { alignment: r.alignment, stale: false, available: true } }));
+    } catch (e) { setAlignments(a => ({ ...a, [sid]: { ...(a[sid] || {}), reason: e.message } })); }
+    setAlignBusy(b => ({ ...b, [sid]: false }));
+  };
+  const appliedOf = sid => (alignOn ? alignments[sid]?.alignment : null);
 
   const { traces, yDomMin, yDomMax, xTicks, xDomain } = useMemo(() => {
     const traces = sampleOrder.map((sid, i) => {
-      let pts = plotCache[sid]?.xrd_ot || [];
+      // Correct the WHOLE stored scan first; the range crop below only scopes the view.
+      let pts = applyXrdAlignment(plotCache[sid]?.xrd_ot || [], appliedOf(sid));
       if (thetaMin != null && !isNaN(thetaMin)) pts = pts.filter(p => p.x >= thetaMin);
       if (thetaMax != null && !isNaN(thetaMax)) pts = pts.filter(p => p.x <= thetaMax);
-      if (zeroSubstrate && pts.length) {
-        const ref = xrdSubstrateRef(substrateMap[sid], structures);
-        if (ref) {
-          const maxPt = pts.reduce((best, p) => (p.y > best.y ? p : best), pts[0]);
-          const shift = ref.twoTheta - maxPt.x;
-          pts = pts.map(p => ({ ...p, x: p.x + shift }));
-        }
-      }
       const pos = pts.filter(p => p.y > 0);
       if (pos.length === 0) return null;
       const sorted = [...pos.map(p => p.y)].sort((a, b) => a - b);
@@ -10069,7 +10104,7 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
       : { ticks: xTicksAuto };
     return { traces, yDomMin, yDomMax, xTicks, xDomain };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sampleOrder.join(","), plotCache, thetaMin, thetaMax, offsetDecades, padAbove, padBelow, normalizeBase, zeroSubstrate, substrateMap, colors.join(",")]);
+  }, [sampleOrder.join(","), plotCache, thetaMin, thetaMax, offsetDecades, padAbove, padBelow, normalizeBase, alignOn, alignments, colors.join(",")]);
 
   const lines = config.lines || [];
   const addLine    = () => onUpdate({ lines: [...lines, { id: String(Date.now()), material: structures[0]?.name || "", hkl: "", style: "solid", color: "#888888", mode: "bulk", substrate: "" }] });
@@ -10145,7 +10180,17 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
       showticklabels: false, showgrid: false,
       title: { text: "Intensity (arb.)", font: { size: ps.fontSize, family: ps.font, color: T.textSecondary }, standoff: 8 } },
     lineShapes,
-    { uirevision: `xrd-${thetaMin ?? "a"}-${thetaMax ?? "a"}`, dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 } }
+    { uirevision: `xrd-${thetaMin ?? "a"}-${thetaMax ?? "a"}`, dragmode: "zoom", margin: { t: 12, r: 20, b: 52, l: 65, pad: 0 },
+      annotations: [{ xref: "paper", yref: "paper", x: 0.01, y: 0.99, xanchor: "left", yanchor: "top", showarrow: false,
+        font: { size: Math.max(8, (ps.fontSize || 12) - 3), family: ps.font, color: T.textDim },
+        text: (() => {
+          if (!alignOn) return "2θ as measured (not aligned)";
+          const shown = traces.map(t => t.sid);
+          const done = shown.filter(sid => appliedOf(sid)?.value != null);
+          if (!done.length) return "2θ as measured (alignment found no reference)";
+          const missing = shown.filter(sid => !done.includes(sid)).map(sid => labels[sid] || sid);
+          return `2θ aligned to substrate` + (missing.length ? `; not aligned: ${missing.join(", ")}` : "");
+        })() }] }
   );
 
   return (
@@ -10162,6 +10207,51 @@ function XRDComparisonPanel({ sampleOrder, plotCache, colors, labels = {}, confi
             )}
           </SciPlotWrap>
           <BookColorLegend sampleOrder={sampleOrder} colors={colors} labels={labels} ps={ps} />
+          {alignOn && (
+            <div style={{ marginTop: 10, overflowX: "auto" }}>
+              <table style={{ borderCollapse: "collapse", fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textSecondary, width: "100%" }}>
+                <thead><tr style={{ color: T.textDim, textAlign: "left" }}>
+                  {["sample", "status", "reference", "expected → measured", "Δ2θ applied", "model", "notes", ""].map(h => <th key={h} style={{ padding: "2px 8px", fontWeight: 400 }}>{h}</th>)}
+                </tr></thead>
+                <tbody>
+                  {sampleOrder.filter(sid => plotCache[sid]?.xrd_ot?.length).map(sid => {
+                    const st = alignments[sid];
+                    const a = st?.alignment;
+                    const c = a?.conditions || {};
+                    const used = (c.references || []).filter(r => (c.used || []).includes(r.label));
+                    const xs = (plotCache[sid]?.xrd_ot || []).map(p => p.x);
+                    const lo = xs.length ? Math.min(...xs) : null, hi = xs.length ? Math.max(...xs) : null;
+                    const applied = a?.value != null
+                      ? (c.correction_model === "zero_plus_displacement"
+                          ? `${(-xrdAlignmentDelta(a, lo)).toFixed(4)}° … ${(-xrdAlignmentDelta(a, hi)).toFixed(4)}°`
+                          : `${(-xrdAlignmentDelta(a, 45)).toFixed(4)}°`)
+                      : "none";
+                    const col = T[XRD_ALIGN_STATUS_COLOR[a?.status] || "textDim"];
+                    return (
+                      <tr key={sid} style={{ borderTop: `1px solid ${T.border}`, verticalAlign: "top" }}>
+                        <td style={{ padding: "3px 8px", color: colors[sampleOrder.indexOf(sid)] || T.textPrimary, whiteSpace: "nowrap" }}>{labels[sid] || sid}</td>
+                        <td style={{ padding: "3px 8px", color: col, whiteSpace: "nowrap" }}>{st ? (a ? a.status : (st.reason || "unavailable")) : "…"}{st?.stale ? " (stale)" : ""}</td>
+                        <td style={{ padding: "3px 8px", whiteSpace: "nowrap" }}>{c.reference_material ? `${c.reference_material} ${c.orientation || ""}` : "—"}</td>
+                        <td style={{ padding: "3px 8px", whiteSpace: "nowrap" }}>
+                          {used.map(r => <div key={r.label}>{r.label} {r.expected.toFixed(3)} → {r.measured.toFixed(3)}</div>)}
+                          {(c.references || []).filter(r => r.cross_check).map(r => <div key={r.label} style={{ color: T.textDim }}>{r.label} check {r.residual >= 0 ? "+" : ""}{r.residual.toFixed(4)}°</div>)}
+                        </td>
+                        <td style={{ padding: "3px 8px", whiteSpace: "nowrap", color: a?.value != null ? T.textPrimary : T.textDim }}>{applied}</td>
+                        <td style={{ padding: "3px 8px", whiteSpace: "nowrap" }}>{c.correction_model ? c.correction_model.replace(/_/g, " ") : ""}{c.wavelength_source && c.wavelength_source !== "file" ? <div style={{ color: T.textDim }}>λ assumed Kα1</div> : null}</td>
+                        <td style={{ padding: "3px 8px", color: T.textDim, maxWidth: 360 }}>{a?.note || ""}</td>
+                        <td style={{ padding: "3px 8px" }}>
+                          <button onClick={() => recomputeAlignment(sid)} disabled={!!alignBusy[sid]} title="Recompute from the stored scan"
+                            style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, padding: "1px 6px", background: T.bg0, border: `1px solid ${T.border}`, borderRadius: 3, color: T.textDim, cursor: "pointer" }}>
+                            {alignBusy[sid] ? "…" : "recompute"}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </>
       )}
 
@@ -13904,12 +13994,13 @@ function AnalysisPanelBlock({ panel, sampleOrder, samples, plotCache, colors, la
                 </div>
                 {type === "xrd" && (
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>ZERO</span>
-                    <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
-                      <input type="checkbox" checked={config.zero_substrate ?? false}
-                        onChange={e => onUpdate({ zero_substrate: e.target.checked })}
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim, width: 66, flexShrink: 0 }}>ALIGN</span>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}
+                      title="Shift each scan by its fitted substrate offset (stored per sample; the scan itself is never changed). Computed on first use and when the scan, substrate or cut changes.">
+                      <input type="checkbox" checked={config.xrd_align_substrate ?? config.zero_substrate ?? false}
+                        onChange={e => onUpdate({ xrd_align_substrate: e.target.checked, zero_substrate: false })}
                         style={{ accentColor: T.amber }} />
-                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>to substrate peak</span>
+                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: T.textDim }}>to substrate reflection</span>
                     </label>
                   </div>
                 )}
